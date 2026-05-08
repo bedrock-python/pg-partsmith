@@ -1,0 +1,305 @@
+"""Partition creation domain service."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import TYPE_CHECKING
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from pg_partsmith.entities import PartitionInfo, Period
+from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionAlreadyExistsError
+from pg_partsmith.utils import pg_sqlstate, qualify, split_qualified_name
+
+from .base import BasePartitionService
+
+if TYPE_CHECKING:
+    from pg_partsmith.aio.hooks import PartitionLifecycleHooks
+    from pg_partsmith.aio.protocols import PartitionMetadataProvider, PartitionRepository
+    from pg_partsmith.entities import TablePartitionConfig
+    from pg_partsmith.protocols import PeriodCalculator
+
+logger = logging.getLogger(__name__)
+
+_PG_IDENTIFIER_MAX_BYTES = 63
+# SQLSTATEs that indicate partition already attached or duplicate (race with another worker).
+_ATTACH_CONFLICT_SQLSTATES = frozenset({"42P07", "42710", "55006"})  # duplicate_table, duplicate_object, object_in_use
+_PG_CHECK_VIOLATION = "23514"
+_DEFAULT_CONFLICT_MAX_RETRIES = 2
+
+
+def _is_default_partition_conflict(exc: SQLAlchemyError) -> bool:
+    """Check if error is DEFAULT partition conflict."""
+    if pg_sqlstate(exc) != _PG_CHECK_VIOLATION:
+        return False
+
+    error_text = str(exc).lower()
+    return (
+        "updated partition constraint" in error_text
+        and "default partition" in error_text
+        and "would be violated" in error_text
+    )
+
+
+class PartitionCreationService(BasePartitionService):
+    """Service for creating future partitions."""
+
+    def __init__(
+        self,
+        repo: PartitionRepository,
+        metadata: PartitionMetadataProvider,
+        calculator: PeriodCalculator[Period],
+        hooks: list[PartitionLifecycleHooks] | None = None,
+    ) -> None:
+        super().__init__(hooks=hooks)
+        self._repo = repo
+        self._metadata = metadata
+        self._calculator = calculator
+
+    async def create_future_partitions(
+        self,
+        config: TablePartitionConfig,
+        *,
+        existing_partitions: list[PartitionInfo] | None = None,
+    ) -> list[PartitionInfo]:
+        """Create partitions for future periods.
+
+        Returns:
+            List of newly created and attached partitions.
+
+        Raises:
+            Exception: Any error during creation, listing or hooks (if fail_on_hook_error is True).
+        """
+        created: list[PartitionInfo] = []
+        qualified_parent = qualify(config.db_schema, config.table_name)
+        periods = self._calculator.next_periods(config.create_ahead_count)
+
+        if existing_partitions is None:
+            existing_partitions = await self._metadata.list_partitions(qualified_parent)
+
+        existing_by_period = self._map_partitions_to_periods(qualified_parent, existing_partitions)
+
+        for period in periods:
+            p_info = await self._ensure_partition_for_period(config, period, existing_by_period.get(period))
+            if p_info:
+                created.append(p_info)
+
+        return created
+
+    def _map_partitions_to_periods(
+        self, qualified_parent: str, partitions: list[PartitionInfo]
+    ) -> dict[Period, PartitionInfo]:
+        """Map partitions to periods, handling ambiguities."""
+        candidates: dict[Period, list[PartitionInfo]] = {}
+
+        for p in partitions:
+            if p.is_default:
+                continue
+            try:
+                _, relname = split_qualified_name(p.name)
+                period = self._calculator.parse_partition_name(relname)
+                if period is not None:
+                    candidates.setdefault(period, []).append(p)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.debug(
+                    "Failed to parse partition name; skipping dedupe",
+                    extra={
+                        "partition_name": p.name,
+                        "error": str(exc),
+                    },
+                )
+
+        existing_by_period: dict[Period, PartitionInfo] = {}
+        for period, parts in candidates.items():
+            if len(parts) == 1:
+                existing_by_period[period] = parts[0]
+                continue
+
+            attached = [p for p in parts if p.is_attached]
+            pool = attached or parts
+            chosen = sorted(pool, key=lambda x: x.name)[0]
+            existing_by_period[period] = chosen
+
+            names = ", ".join(sorted(p.name for p in parts))
+            logger.warning(
+                "Multiple partitions match period; using one of them",
+                extra={
+                    "period": str(period),
+                    "chosen": chosen.name,
+                    "all_matches": names,
+                },
+            )
+
+        return existing_by_period
+
+    async def _ensure_partition_for_period(
+        self,
+        config: TablePartitionConfig,
+        period: Period,
+        existing: PartitionInfo | None,
+    ) -> PartitionInfo | None:
+        """Ensure a partition exists and is attached for a specific period."""
+        partition_name, from_value, to_value = self._get_partition_metadata(config, period)
+
+        if existing is not None:
+            await self._handle_existing_partition(config, existing, from_value, to_value)
+            return None
+
+        # Hooks: before create
+        await self._run_hooks(
+            lambda h: h.before_create(config, partition_name, from_value, to_value),
+            "before_create",
+            partition_name=partition_name,
+        )
+
+        # Creation and optional attachment
+        partition_info = await self._create_and_attach_partition(config, partition_name, from_value, to_value)
+
+        if partition_info:
+            # Hooks: after create
+            await self._run_hooks(
+                lambda h: h.after_create(config, partition_info),
+                "after_create",
+                partition_name=partition_name,
+            )
+
+        return partition_info
+
+    def _get_partition_metadata(self, config: TablePartitionConfig, period: Period) -> tuple[str, str, str]:
+        """Prepare partition name and boundaries, validating limits."""
+        partition_relname = self._calculator.format_partition_name(config.table_name, period)
+        partition_name = qualify(config.db_schema, partition_relname)
+        from_value, to_value = self._calculator.get_boundaries(period)
+
+        if len(partition_relname.encode("utf-8")) > _PG_IDENTIFIER_MAX_BYTES:
+            msg = (
+                f"Generated partition name '{partition_relname}' exceeds PostgreSQL's "
+                f"{_PG_IDENTIFIER_MAX_BYTES}-byte identifier limit"
+            )
+            raise InvalidPartitionConfigError(msg)
+
+        return partition_name, from_value, to_value
+
+    async def _attach_with_reconcile(
+        self,
+        config: TablePartitionConfig,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+    ) -> None:
+        """Attach partition with automatic DEFAULT reconciliation."""
+        qualified_parent = qualify(config.db_schema, config.table_name)
+
+        for attempt in range(1, _DEFAULT_CONFLICT_MAX_RETRIES + 1):
+            try:
+                await self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
+            except (OSError, TimeoutError):
+                raise
+            except SQLAlchemyError as e:
+                if not _is_default_partition_conflict(e):
+                    raise
+
+                if attempt == _DEFAULT_CONFLICT_MAX_RETRIES:
+                    logger.exception(
+                        "Failed to attach after reconciliation retries",
+                        extra={
+                            "partition_name": partition_name,
+                            "attempts": attempt,
+                        },
+                    )
+                    raise
+
+                # Get DEFAULT partition
+                default_partition = await self._metadata.get_default_partition(qualified_parent)
+                if not default_partition:
+                    logger.warning(
+                        "DEFAULT conflict detected but no DEFAULT partition found",
+                        extra={"partition_name": partition_name},
+                    )
+                    raise
+
+                # Reconcile conflicting rows
+                logger.info(
+                    "Reconciling DEFAULT partition before attach",
+                    extra={
+                        "partition_name": partition_name,
+                        "default_partition": default_partition.name,
+                        "attempt": attempt,
+                    },
+                )
+
+                moved_count = await self._repo.reconcile_default_rows(
+                    default_partition_name=default_partition.name,
+                    target_partition_name=partition_name,
+                    partition_column=config.partition_column,
+                    from_value=from_value,
+                    to_value=to_value,
+                )
+
+                logger.info(
+                    "Reconciliation completed",
+                    extra={
+                        "partition_name": partition_name,
+                        "moved_rows": moved_count,
+                    },
+                )
+            else:
+                return  # Success
+
+    async def _handle_existing_partition(
+        self, config: TablePartitionConfig, existing: PartitionInfo, from_value: str, to_value: str
+    ) -> None:
+        """Handle case where partition already exists in metadata."""
+        if config.auto_attach_after_create and not existing.is_attached:
+            try:
+                await self._attach_with_reconcile(config, existing.name, from_value, to_value)
+            except (OSError, TimeoutError):
+                raise
+            except SQLAlchemyError as e:
+                state = pg_sqlstate(e)
+                if state not in _ATTACH_CONFLICT_SQLSTATES:
+                    raise
+                logger.debug(
+                    "Partition already attached (race with another worker)",
+                    extra={"partition_name": existing.name, "sqlstate": state},
+                )
+
+    async def _create_and_attach_partition(
+        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
+    ) -> PartitionInfo | None:
+        """Create partition and optionally attach it to parent."""
+        try:
+            partition_info = await self._repo.create_partition(config, partition_name, from_value, to_value)
+        except PartitionAlreadyExistsError:
+            if config.auto_attach_after_create:
+                try:
+                    await self._attach_with_reconcile(config, partition_name, from_value, to_value)
+                except (OSError, TimeoutError):
+                    raise
+                except SQLAlchemyError as e:
+                    if pg_sqlstate(e) not in _ATTACH_CONFLICT_SQLSTATES:
+                        raise
+                    logger.debug(
+                        "Partition already attached (race)",
+                        extra={"partition_name": partition_name, "sqlstate": pg_sqlstate(e)},
+                    )
+            return None
+
+        if config.auto_attach_after_create:
+            try:
+                await self._attach_with_reconcile(config, partition_name, from_value, to_value)
+            except (OSError, TimeoutError):
+                raise
+            except SQLAlchemyError as e:
+                if pg_sqlstate(e) not in _ATTACH_CONFLICT_SQLSTATES:
+                    raise
+                logger.debug(
+                    "Partition already attached (race)",
+                    extra={"partition_name": partition_name, "sqlstate": pg_sqlstate(e)},
+                )
+            partition_info = partition_info.model_copy(update={"is_attached": True})
+
+        return partition_info

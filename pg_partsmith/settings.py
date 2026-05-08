@@ -1,0 +1,114 @@
+"""Pydantic-settings base class for env-driven partition configuration.
+
+Requires the ``pydantic-settings`` extra::
+
+    pip install pg-partsmith[pydantic-settings]
+
+Usage::
+
+    from pydantic_settings import SettingsConfigDict
+    from pg_partsmith.settings import PartitionTableSettings
+
+    class OutboxSettings(PartitionTableSettings):
+        model_config = SettingsConfigDict(env_prefix="OUTBOX_")
+
+    cfg = OutboxSettings()          # reads OUTBOX_TABLE_NAME, OUTBOX_GRANULARITY, …
+    config = cfg.to_config()        # → TablePartitionConfig
+    calculator = cfg.get_period_calculator()  # → MonthPeriodCalculator() etc.
+"""
+
+from __future__ import annotations
+
+try:
+    from pydantic_settings import BaseSettings
+except ImportError as _err:
+    _msg = (
+        "pydantic-settings is required for PartitionTableSettings. "
+        "Install it with: pip install pg-partsmith[pydantic-settings]"
+    )
+    raise ImportError(_msg) from _err
+
+from pydantic import Field
+
+from .constants import DEFAULT_CREATE_AHEAD_COUNT, DEFAULT_RETENTION_COUNT
+from .entities import PartitionGranularity, PartitionStrategy, PartitionType, TablePartitionConfig
+from .strategies import BasePeriodCalculator
+from .strategies.selector import get_period_calculator
+
+
+class PartitionTableSettings(BaseSettings):
+    """Env-loadable base class that maps 1-to-1 with :class:`~pg_partsmith.TablePartitionConfig`.
+
+    Subclass it, set ``model_config`` with your env prefix, then call
+    :meth:`to_config` to get a ready-to-use ``TablePartitionConfig``.
+
+    All fields correspond directly to ``TablePartitionConfig`` arguments.
+    ``PartitionType``, ``PartitionStrategy``, and ``PartitionGranularity``
+    are ``StrEnum`` values — env vars accept their lowercase string forms
+    (e.g. ``GRANULARITY=month``).
+
+    Example::
+
+        class OutboxSettings(PartitionTableSettings):
+            model_config = SettingsConfigDict(env_prefix="OUTBOX_")
+
+        # Reads: OUTBOX_TABLE_NAME, OUTBOX_PARTITION_TYPE, OUTBOX_GRANULARITY, …
+        settings = OutboxSettings()
+        config = settings.to_config()
+        calculator = settings.get_period_calculator()
+    """
+
+    schema_name: str | None = Field(default=None, description="PostgreSQL schema (omit for public)")
+    table_name: str = Field(..., description="Partitioned table name")
+    partition_type: PartitionType = Field(..., description="Partition type: range, list, hash")
+    partition_strategy: PartitionStrategy = Field(
+        ...,
+        description="Strategy: time_based, value_based, hash_based",
+    )
+    partition_column: str = Field(..., description="Column used for partitioning")
+    granularity: PartitionGranularity | None = Field(
+        default=None,
+        description="Time granularity: day, week, month, year",
+    )
+    create_ahead_count: int = Field(
+        default=DEFAULT_CREATE_AHEAD_COUNT,
+        ge=1,
+        description="Number of future periods to keep created",
+    )
+    retention_count: int = Field(
+        default=DEFAULT_RETENTION_COUNT,
+        ge=1,
+        description="Number of past partitions to retain before pruning",
+    )
+    auto_attach_after_create: bool = Field(
+        default=True,
+        description="Attach new partitions immediately after creation",
+    )
+
+    def to_config(self) -> TablePartitionConfig:
+        """Build a :class:`~pg_partsmith.TablePartitionConfig` from these settings."""
+        return TablePartitionConfig(
+            schema=self.schema_name,
+            table_name=self.table_name,
+            partition_type=self.partition_type,
+            partition_strategy=self.partition_strategy,
+            partition_column=self.partition_column,
+            granularity=self.granularity,
+            create_ahead_count=self.create_ahead_count,
+            retention_count=self.retention_count,
+            auto_attach_after_create=self.auto_attach_after_create,
+        )
+
+    def get_period_calculator(self) -> BasePeriodCalculator:
+        """Return the period calculator matching :attr:`granularity`.
+
+        Raises:
+            ValueError: If ``granularity`` is ``None`` or has no registered calculator.
+        """
+        if self.granularity is None:
+            msg = "Cannot resolve a period calculator: granularity is not set"
+            raise ValueError(msg)
+        return get_period_calculator(self.granularity)
+
+
+__all__ = ["PartitionTableSettings"]
