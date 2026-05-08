@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.1.0...pg-partsmith-v0.2.0) (2026-05-08)
+
+
+### Features
+
+* initial release of pg-partsmith 0.1.0 ([dcc471c](https://github.com/bedrock-python/pg-partsmith/commit/dcc471c082aac7a3ce281f0aa707d67bc97d7219))
+
 ## [0.1.0] - 2026-05-08
 
 First public release of `pg-partsmith`.
