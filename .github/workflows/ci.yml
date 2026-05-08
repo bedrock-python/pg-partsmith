@@ -45,6 +45,7 @@ jobs:
       - run: uv run pytest -m integration --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
       - uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
         continue-on-error: true
 
