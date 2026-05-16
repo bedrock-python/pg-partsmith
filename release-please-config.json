@@ -8,7 +8,8 @@
       "extra-files": [
         {
           "type": "generic",
-          "path": "pg_partsmith/__version__.py"
+          "path": "pg_partsmith/__version__.py",
+          "search": "__version__ = \"$1\""
         }
       ]
     }
