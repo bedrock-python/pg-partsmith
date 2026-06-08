@@ -43,7 +43,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv sync --group dev --extra pydantic-settings
       - run: uv run pytest -m integration --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
