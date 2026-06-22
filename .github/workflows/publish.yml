@@ -25,7 +25,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_sha }}
           fetch-tags: true
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.check.outputs.tag }}
 
