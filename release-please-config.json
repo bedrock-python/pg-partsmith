@@ -5,6 +5,7 @@
       "release-type": "python",
       "package-name": "pg-partsmith",
       "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
       "extra-files": [
         {
           "type": "generic",
