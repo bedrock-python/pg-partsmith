@@ -6,6 +6,7 @@ import time
 
 from pg_partsmith.aio.protocols import PartitionLifecycle
 from pg_partsmith.entities import MaintenanceResult, TablePartitionConfig
+from pg_partsmith.exceptions import PartitionError
 from pg_partsmith.utils import format_duration_ms, qualify
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,18 @@ class PartitionMaintainer:
                 extra={
                     "table_name": qualified_table,
                     "duration_ms": duration_ms,
+                },
+            )
+            raise
+        except PartitionError as e:
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.warning(
+                "Partition maintenance failed (operational error)",
+                extra={
+                    "table_name": qualified_table,
+                    "duration_ms": duration_ms,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
                 },
             )
             raise

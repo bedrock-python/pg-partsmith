@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -205,6 +206,66 @@ async def test__postgres_lock__shield_raises_cancelled_error__invalidates_connec
 
     # Assert
     conn.invalidate.assert_called()
+
+
+async def test__postgres_lock__rate_limit_first_acquire_small_monotonic__does_not_sleep() -> None:
+    # Arrange — host uptime (monotonic) is smaller than the interval; a first-ever acquire owes no delay
+    engine, _ = _make_engine_mock(lock_acquired=True)
+    manager = PostgresAdvisoryLockManager(engine, acquire_min_interval_seconds=30.0)
+    sleep_mock = AsyncMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.aio.lock.postgres.time.monotonic", return_value=5.0),
+        patch("pg_partsmith.aio.lock.postgres.asyncio.sleep", sleep_mock),
+    ):
+        await manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_awaited()
+    assert manager._last_acquire_time["events"] == 5.0
+
+
+async def test__postgres_lock__rate_limit_other_table_recent__new_table_not_delayed() -> None:
+    # Arrange — an unrelated table has a fresh timestamp; a first-ever table must not owe any delay
+    engine, _ = _make_engine_mock(lock_acquired=True)
+    manager = PostgresAdvisoryLockManager(engine, acquire_min_interval_seconds=30.0)
+    manager._last_acquire_time["orders"] = 100.0
+    sleep_mock = AsyncMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.aio.lock.postgres.time.monotonic", return_value=100.0),
+        patch("pg_partsmith.aio.lock.postgres.asyncio.sleep", sleep_mock),
+    ):
+        await manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_awaited()
+    assert manager._last_acquire_time["events"] == 100.0
+    assert manager._last_acquire_time["orders"] == 100.0
+
+
+async def test__postgres_lock__rate_limit_same_table_within_interval__sleeps_remainder_outside_mutex() -> None:
+    # Arrange
+    engine, _ = _make_engine_mock(lock_acquired=True)
+    manager = PostgresAdvisoryLockManager(engine, acquire_min_interval_seconds=2.0)
+    manager._last_acquire_time["events"] = 100.0
+    observed: list[tuple[float, bool]] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        observed.append((delay, manager._rate_limit_lock.locked()))
+
+    # Act — 0.5s since the last acquire, 1.5s still owed
+    with (
+        patch("pg_partsmith.aio.lock.postgres.time.monotonic", return_value=100.5),
+        patch("pg_partsmith.aio.lock.postgres.asyncio.sleep", _fake_sleep),
+    ):
+        await manager._respect_rate_limit("events")
+
+    # Assert — the owed delay is slept with the mutex already released, and the next slot is reserved
+    assert observed == [(1.5, False)]
+    assert manager._last_acquire_time["events"] == 102.0
 
 
 async def test__postgres_lock__unlock_raises__invalidates_connection() -> None:
@@ -474,3 +535,131 @@ async def test__redis_lock__unlock_raises__logs_warning_without_reraise() -> Non
     warnings = [call for call in logger.warning.call_args_list if "Failed to release Redis lock" in call.args[0]]
     assert len(warnings) == 1
     assert logger.warning.call_args.kwargs["extra"]["table_name"] == "test"
+
+
+async def test__redis_lock__rate_limit_first_acquire_small_monotonic__does_not_sleep() -> None:
+    # Arrange — host uptime (monotonic) is smaller than the interval; a first-ever acquire owes no delay
+    redis_client, _, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client, acquire_min_interval_seconds=30.0)
+    sleep_mock = AsyncMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.aio.lock.redis.time.monotonic", return_value=5.0),
+        patch("pg_partsmith.aio.lock.redis.asyncio.sleep", sleep_mock),
+    ):
+        await manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_awaited()
+    assert manager._last_acquire_time["events"] == 5.0
+
+
+async def test__redis_lock__rate_limit_other_table_recent__new_table_not_delayed() -> None:
+    # Arrange — an unrelated table has a fresh timestamp; a first-ever table must not owe any delay
+    redis_client, _, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client, acquire_min_interval_seconds=30.0)
+    manager._last_acquire_time["orders"] = 100.0
+    sleep_mock = AsyncMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.aio.lock.redis.time.monotonic", return_value=100.0),
+        patch("pg_partsmith.aio.lock.redis.asyncio.sleep", sleep_mock),
+    ):
+        await manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_awaited()
+    assert manager._last_acquire_time["events"] == 100.0
+    assert manager._last_acquire_time["orders"] == 100.0
+
+
+async def test__redis_lock__rate_limit_same_table_within_interval__sleeps_remainder_outside_mutex() -> None:
+    # Arrange
+    redis_client, _, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client, acquire_min_interval_seconds=2.0)
+    manager._last_acquire_time["events"] = 100.0
+    observed: list[tuple[float, bool]] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        observed.append((delay, manager._rate_limit_lock.locked()))
+
+    # Act — 0.5s since the last acquire, 1.5s still owed
+    with (
+        patch("pg_partsmith.aio.lock.redis.time.monotonic", return_value=100.5),
+        patch("pg_partsmith.aio.lock.redis.asyncio.sleep", _fake_sleep),
+    ):
+        await manager._respect_rate_limit("events")
+
+    # Assert — the owed delay is slept with the mutex already released, and the next slot is reserved
+    assert observed == [(1.5, False)]
+    assert manager._last_acquire_time["events"] == 102.0
+
+
+async def test__redis_lock__watchdog_task_start_fails__releases_key_and_propagates() -> None:
+    # Arrange
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    def _failing_create_task(coro: Any, **_kwargs: Any) -> None:
+        coro.close()  # avoid an "unawaited coroutine" warning for the abandoned watchdog
+        raise RuntimeError("cannot schedule task")
+
+    # Act — the original error must propagate, but the key must be released, not leaked until TTL
+    with (
+        patch("pg_partsmith.aio.lock.redis.asyncio.create_task", side_effect=_failing_create_task),
+        pytest.raises(RuntimeError, match="cannot schedule task"),
+    ):
+        async with manager.acquire_lock("events"):
+            pass
+
+    # Assert
+    unlock_script.assert_awaited_once()
+
+
+async def test__redis_lock__holder_cancelled_while_awaiting_watchdog__cancellation_propagates() -> None:
+    """Regression: an external ``task.cancel()`` landing inside ``_cancel_watchdog`` must not be swallowed."""
+    # Arrange
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client, ttl_seconds=3)
+
+    watchdog_started = asyncio.Event()
+    watchdog_cancelled = asyncio.Event()
+
+    async def _stubborn_watchdog(*_args: object, **_kwargs: object) -> None:
+        try:
+            watchdog_started.set()
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            watchdog_cancelled.set()
+            # Linger so the holder is parked in ``await watchdog`` when the external cancel lands.
+            await asyncio.sleep(0.2)
+            raise
+
+    async def _holder() -> None:
+        async with manager.acquire_lock("events"):
+            # Yield so the watchdog task gets its first step (enters its try block) before teardown.
+            await watchdog_started.wait()
+
+    # Act — cancel the holder task while it is awaiting the watchdog inside _cancel_watchdog
+    with patch.object(manager, "_renewal_watchdog", _stubborn_watchdog):
+        task = asyncio.create_task(_holder())
+        await watchdog_cancelled.wait()
+        assert task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Assert — the holder task ends cancelled and the key was still released
+    assert task.cancelled()
+    assert unlock_script.called
+
+    # Cleanup — let the lingering watchdog task finish so it does not outlive the test
+    for pending in [t for t in asyncio.all_tasks() if t.get_name().startswith("redis-lock-watchdog:")]:
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending

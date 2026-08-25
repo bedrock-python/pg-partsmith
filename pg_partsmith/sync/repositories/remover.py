@@ -71,7 +71,15 @@ class PartitionRemover:
         self._allow_unmanaged = allow_unmanaged
 
     def detach(self, table_name: str, partition_name: str, *, concurrent: bool = True) -> None:
-        """Detach partition from parent."""
+        """Detach partition from parent.
+
+        A partition left in ``inhdetachpending`` state by a cancelled
+        ``DETACH CONCURRENTLY`` (e.g. our own DDL timeout) is completed with
+        ``DETACH PARTITION ... FINALIZE`` instead of failing forever.
+        """
+        if self._finalize_if_pending(table_name, partition_name):
+            return
+
         if concurrent and self._detach_concurrently(table_name, partition_name):
             return
 
@@ -90,6 +98,46 @@ class PartitionRemover:
                 if domain_exc is not None:
                     raise domain_exc from exc
                 raise
+
+    def _finalize_if_pending(self, table_name: str, partition_name: str) -> bool:
+        """Complete a detach left pending by a cancelled DETACH CONCURRENTLY.
+
+        Returns True if the partition was in pending-detach state and has been
+        finalized (i.e. it is now fully detached).
+        """
+        with self._engine.connect() as base_conn:
+            conn = base_conn.execution_options(isolation_level="AUTOCOMMIT")
+            with session_statement_timeout(conn, self._ddl_timeout):
+                result = conn.execute(
+                    text(
+                        """
+                        SELECT inh.inhdetachpending
+                        FROM pg_inherits inh
+                        WHERE inh.inhrelid = to_regclass(:partition_name)
+                          AND inh.inhparent = to_regclass(:table_name)
+                        """
+                    ),
+                    {
+                        "partition_name": to_regclass_argument(partition_name),
+                        "table_name": to_regclass_argument(table_name),
+                    },
+                )
+                if not result.scalar():
+                    return False
+
+                logger.warning(
+                    "Completing pending detach left by a cancelled DETACH CONCURRENTLY",
+                    extra={"table_name": table_name, "partition_name": partition_name},
+                )
+                self._mark_orphaned(conn, table_name, partition_name)
+                conn.execute(
+                    build_ddl_statement(
+                        "ALTER TABLE {parent} DETACH PARTITION {partition} FINALIZE",
+                        parent=table_name,
+                        partition=partition_name,
+                    )
+                )
+                return True
 
     def _detach_concurrently(self, table_name: str, partition_name: str) -> bool:
         stmt = build_ddl_statement(

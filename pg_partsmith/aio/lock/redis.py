@@ -8,7 +8,6 @@ Requires the ``redis-locks`` optional dependency::
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import random
 import secrets
@@ -152,31 +151,41 @@ class RedisDistributedLockManager:
         if not await self._redis.set(key, token, ex=self._ttl, nx=True):
             raise LockAcquisitionError(table_name, "Redis lock unavailable")
 
-        holder_task = asyncio.current_task()
-        if holder_task is None:
-            raise RuntimeError("Could not determine current asyncio task")
-
-        watchdog = asyncio.create_task(
-            self._renewal_watchdog(key, token, table_name, holder_task),
-            name=f"redis-lock-watchdog:{key}",
-        )
+        # From here on the key is held: any failure must release it rather than leak it until TTL.
+        watchdog: asyncio.Task[None] | None = None
         try:
+            holder_task = asyncio.current_task()
+            if holder_task is None:
+                raise RuntimeError("Could not determine current asyncio task")
+
+            watchdog = asyncio.create_task(
+                self._renewal_watchdog(key, token, table_name, holder_task),
+                name=f"redis-lock-watchdog:{key}",
+            )
             yield
         finally:
-            await self._cancel_watchdog(watchdog)
-            await asyncio.shield(self._release_safely(key, token, table_name))
+            try:
+                if watchdog is not None:
+                    await self._cancel_watchdog(watchdog)
+            finally:
+                await asyncio.shield(self._release_safely(key, token, table_name))
 
     async def _respect_rate_limit(self, table_name: str) -> None:
-        """Sleep enough to enforce the configured min-interval between acquires."""
+        """Sleep enough to enforce the configured min-interval between acquires.
+
+        The per-table slot is reserved under the mutex; the sleep itself happens
+        outside it so one table's owed delay never blocks acquires for other tables.
+        """
         if self._acquire_min_interval <= 0:
             return
         async with self._rate_limit_lock:
             now = time.monotonic()
-            last = self._last_acquire_time.get(table_name, 0.0)
-            delay = last + self._acquire_min_interval - now
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._last_acquire_time[table_name] = time.monotonic()
+            last = self._last_acquire_time.get(table_name)
+            slot = now if last is None else max(now, last + self._acquire_min_interval)
+            self._last_acquire_time[table_name] = slot
+        delay = slot - now
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     async def _renewal_watchdog(
         self,
@@ -230,10 +239,18 @@ class RedisDistributedLockManager:
             holder_task.cancel()
 
     async def _cancel_watchdog(self, watchdog: asyncio.Task[None]) -> None:
-        """Cancel the renewal watchdog and absorb its CancelledError."""
+        """Cancel the renewal watchdog and absorb its CancelledError.
+
+        If the holder task itself is being cancelled while awaiting the watchdog
+        (e.g. app shutdown calls ``task.cancel()``), the cancellation must
+        propagate — only the watchdog's own cancellation is swallowed.
+        """
         watchdog.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await watchdog
+        except asyncio.CancelledError:
+            if (cur := asyncio.current_task()) is not None and cur.cancelling() > 0:
+                raise
 
     async def _release_safely(self, key: str, token: str, table_name: str) -> None:
         """Release the lock; failures are logged but do not propagate.

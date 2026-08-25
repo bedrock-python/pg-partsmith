@@ -9,6 +9,7 @@ from pg_partsmith.entities import (
     PartitionType,
     TablePartitionConfig,
 )
+from pg_partsmith.exceptions import LockAcquisitionError, PartitionNotFoundError
 from pg_partsmith.sync import maintain_partitions
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 
@@ -87,6 +88,47 @@ def test__run_maintenance__service_raises_exception__reraises_and_logs(
             maintainer.run_maintenance(config)
 
         mock_logger.exception.assert_called_once()
+
+
+def test__run_maintenance__lock_acquisition_error__logs_warning_not_exception(
+    config: TablePartitionConfig,
+) -> None:
+    """Lock contention is a routine operational failure — warning path, not the "unexpected" exception path."""
+    # Arrange
+    service = _make_service(side_effect=LockAcquisitionError("events", "advisory lock unavailable"))
+    mock_logger = MagicMock()
+    maintainer = PartitionMaintainer(service)
+
+    # Act / Assert
+    with patch("pg_partsmith.sync.maintainer.logger", mock_logger), pytest.raises(LockAcquisitionError):
+        maintainer.run_maintenance(config)
+
+    mock_logger.exception.assert_not_called()
+    warnings = [c for c in mock_logger.warning.call_args_list if "operational error" in c.args[0]]
+    assert len(warnings) == 1
+    extra = warnings[0].kwargs["extra"]
+    assert extra["table_name"] == "events"
+    assert extra["error_type"] == "LockAcquisitionError"
+    assert extra["duration_ms"] >= 0
+
+
+def test__run_maintenance__partition_error__logs_warning_not_exception(
+    config: TablePartitionConfig,
+) -> None:
+    """Domain ``PartitionError`` subclasses are operational failures — warning path, not the exception path."""
+    # Arrange
+    service = _make_service(side_effect=PartitionNotFoundError("events_2024_01"))
+    mock_logger = MagicMock()
+    maintainer = PartitionMaintainer(service)
+
+    # Act / Assert
+    with patch("pg_partsmith.sync.maintainer.logger", mock_logger), pytest.raises(PartitionNotFoundError):
+        maintainer.run_maintenance(config)
+
+    mock_logger.exception.assert_not_called()
+    warnings = [c for c in mock_logger.warning.call_args_list if "operational error" in c.args[0]]
+    assert len(warnings) == 1
+    assert warnings[0].kwargs["extra"]["error_type"] == "PartitionNotFoundError"
 
 
 def test__run_maintenance__keyboard_interrupt__propagates_and_logs_interrupted(

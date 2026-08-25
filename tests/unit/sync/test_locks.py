@@ -171,6 +171,66 @@ def test__postgres_lock__unlock_keyboard_interrupt__invalidates_connection() -> 
     conn.invalidate.assert_called()
 
 
+def test__postgres_lock__rate_limit_first_acquire_small_monotonic__does_not_sleep() -> None:
+    # Arrange — host uptime (monotonic) is smaller than the interval; a first-ever acquire owes no delay
+    engine, _ = _make_engine_mock(lock_acquired=True)
+    manager = PostgresAdvisoryLockManager(engine, acquire_min_interval_seconds=30.0)
+    sleep_mock = MagicMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.sync.lock.postgres.time.monotonic", return_value=5.0),
+        patch("pg_partsmith.sync.lock.postgres.time.sleep", sleep_mock),
+    ):
+        manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_called()
+    assert manager._last_acquire_time["events"] == 5.0
+
+
+def test__postgres_lock__rate_limit_other_table_recent__new_table_not_delayed() -> None:
+    # Arrange — an unrelated table has a fresh timestamp; a first-ever table must not owe any delay
+    engine, _ = _make_engine_mock(lock_acquired=True)
+    manager = PostgresAdvisoryLockManager(engine, acquire_min_interval_seconds=30.0)
+    manager._last_acquire_time["orders"] = 100.0
+    sleep_mock = MagicMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.sync.lock.postgres.time.monotonic", return_value=100.0),
+        patch("pg_partsmith.sync.lock.postgres.time.sleep", sleep_mock),
+    ):
+        manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_called()
+    assert manager._last_acquire_time["events"] == 100.0
+    assert manager._last_acquire_time["orders"] == 100.0
+
+
+def test__postgres_lock__rate_limit_same_table_within_interval__sleeps_remainder_outside_mutex() -> None:
+    # Arrange
+    engine, _ = _make_engine_mock(lock_acquired=True)
+    manager = PostgresAdvisoryLockManager(engine, acquire_min_interval_seconds=2.0)
+    manager._last_acquire_time["events"] = 100.0
+    observed: list[tuple[float, bool]] = []
+
+    def _fake_sleep(delay: float) -> None:
+        observed.append((delay, manager._rate_limit_lock.locked()))
+
+    # Act — 0.5s since the last acquire, 1.5s still owed
+    with (
+        patch("pg_partsmith.sync.lock.postgres.time.monotonic", return_value=100.5),
+        patch("pg_partsmith.sync.lock.postgres.time.sleep", _fake_sleep),
+    ):
+        manager._respect_rate_limit("events")
+
+    # Assert — the owed delay is slept with the mutex already released, and the next slot is reserved
+    assert observed == [(1.5, False)]
+    assert manager._last_acquire_time["events"] == 102.0
+
+
 def test__postgres_lock__unlock_raises__invalidates_connection() -> None:
     # Arrange
     engine, conn = _make_engine_mock(lock_acquired=True)
@@ -447,3 +507,86 @@ def test__redis_lock__unlock_raises__logs_warning_without_reraise() -> None:
     warnings = [call for call in logger.warning.call_args_list if "Failed to release Redis lock" in call.args[0]]
     assert len(warnings) == 1
     assert logger.warning.call_args.kwargs["extra"]["table_name"] == "test"
+
+
+def test__redis_lock__rate_limit_first_acquire_small_monotonic__does_not_sleep() -> None:
+    # Arrange — host uptime (monotonic) is smaller than the interval; a first-ever acquire owes no delay
+    redis_client, _, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client, acquire_min_interval_seconds=30.0)
+    sleep_mock = MagicMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.sync.lock.redis.time.monotonic", return_value=5.0),
+        patch("pg_partsmith.sync.lock.redis.time.sleep", sleep_mock),
+    ):
+        manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_called()
+    assert manager._last_acquire_time["events"] == 5.0
+
+
+def test__redis_lock__rate_limit_other_table_recent__new_table_not_delayed() -> None:
+    # Arrange — an unrelated table has a fresh timestamp; a first-ever table must not owe any delay
+    redis_client, _, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client, acquire_min_interval_seconds=30.0)
+    manager._last_acquire_time["orders"] = 100.0
+    sleep_mock = MagicMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.sync.lock.redis.time.monotonic", return_value=100.0),
+        patch("pg_partsmith.sync.lock.redis.time.sleep", sleep_mock),
+    ):
+        manager._respect_rate_limit("events")
+
+    # Assert
+    sleep_mock.assert_not_called()
+    assert manager._last_acquire_time["events"] == 100.0
+    assert manager._last_acquire_time["orders"] == 100.0
+
+
+def test__redis_lock__rate_limit_same_table_within_interval__sleeps_remainder_outside_mutex() -> None:
+    # Arrange
+    redis_client, _, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client, acquire_min_interval_seconds=2.0)
+    manager._last_acquire_time["events"] = 100.0
+    observed: list[tuple[float, bool]] = []
+
+    def _fake_sleep(delay: float) -> None:
+        observed.append((delay, manager._rate_limit_lock.locked()))
+
+    # Act — 0.5s since the last acquire, 1.5s still owed
+    with (
+        patch("pg_partsmith.sync.lock.redis.time.monotonic", return_value=100.5),
+        patch("pg_partsmith.sync.lock.redis.time.sleep", _fake_sleep),
+    ):
+        manager._respect_rate_limit("events")
+
+    # Assert — the owed delay is slept with the mutex already released, and the next slot is reserved
+    assert observed == [(1.5, False)]
+    assert manager._last_acquire_time["events"] == 102.0
+
+
+def test__redis_lock__watchdog_thread_start_fails__releases_key_and_propagates() -> None:
+    # Arrange
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=True)
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act — the original error must propagate, but the key must be released, not leaked until TTL
+    with (
+        patch(
+            "pg_partsmith.sync.lock.redis.threading.Thread.start", side_effect=RuntimeError("can't start new thread")
+        ),
+        pytest.raises(RuntimeError, match="can't start new thread"),
+        manager.acquire_lock("events"),
+    ):
+        pass
+
+    # Assert
+    unlock_script.assert_called_once()

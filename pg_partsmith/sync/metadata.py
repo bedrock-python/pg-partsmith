@@ -1,5 +1,6 @@
 """PostgreSQL metadata provider."""
 
+import logging
 import re
 
 from sqlalchemy import Engine, text
@@ -14,11 +15,31 @@ from pg_partsmith.utils import (
 )
 
 # Pre-compiled regex patterns for partition boundary parsing.
+_RANGE_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+FROM\s*\(", re.IGNORECASE)
 _BOUNDARY_SEP_PATTERN = re.compile(r"\)\s+TO\s+\(", re.IGNORECASE)
 _FROM_PREFIX_PATTERN = re.compile(r"^.*?FROM\s*\(", re.IGNORECASE | re.DOTALL)
 _TRAILING_PAREN_PATTERN = re.compile(r"\)\s*$", re.IGNORECASE | re.DOTALL)
 _CAST_PATTERN = re.compile(r"^CAST\((?P<inner>.*)\s+AS\s+.*\)$", re.IGNORECASE | re.DOTALL)
 _STR_LITERAL_PATTERN = re.compile(r"'(?P<s>(?:[^']|'')*)'")
+
+logger = logging.getLogger(__name__)
+
+
+def _is_addressable(schema: str, relname: str) -> bool:
+    """Return False for relations whose schema or name contains a dot.
+
+    The library addresses relations as ``schema.relname`` strings, so a dot
+    inside either part would be re-split into a different relation by
+    ``quote_identifier`` — DDL could then target the wrong table.  Such
+    partitions are never created by this library; skip them with a warning.
+    """
+    if "." in schema or "." in relname:
+        logger.warning(
+            "Skipping partition with '.' in its schema or name; not addressable by qualified-name DDL",
+            extra={"partition_schema": schema, "partition_name": relname},
+        )
+        return False
+    return True
 
 
 class PostgresMetadataProvider:
@@ -216,6 +237,9 @@ class PostgresMetadataProvider:
             if isinstance(part_schema, bytes):
                 part_schema = part_schema.decode("utf-8", errors="replace")
 
+            if not _is_addressable(part_schema, relname):
+                continue
+
             name = qualify(part_schema if want_qualified else None, relname)
 
             boundaries = row.boundaries
@@ -246,6 +270,9 @@ class PostgresMetadataProvider:
             orphan_schema: str | bytes = row.partition_schema
             if isinstance(orphan_schema, bytes):
                 orphan_schema = orphan_schema.decode("utf-8", errors="replace")
+
+            if not _is_addressable(orphan_schema, orphan_relname):
+                continue
 
             name = qualify(orphan_schema if want_qualified else None, orphan_relname)
             partitions.append(
@@ -369,6 +396,11 @@ class PostgresMetadataProvider:
             return None, None
 
         if boundaries_expr.strip().upper() == "DEFAULT":
+            return None, None
+
+        # Only RANGE bounds carry FROM/TO values; LIST/HASH expressions could
+        # contain a ") TO (" inside a string value and must not be mis-parsed.
+        if not _RANGE_BOUND_PATTERN.match(boundaries_expr):
             return None, None
 
         # Split into FROM and TO parts by finding ") TO (" which is the most

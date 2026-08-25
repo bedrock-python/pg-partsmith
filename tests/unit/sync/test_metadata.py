@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -198,6 +198,49 @@ def test__metadata_provider__list_partitions__default_partition__sets_is_default
     assert partitions[0].to_value is None
 
 
+def test__metadata_provider__list_partitions__dotted_relname__skipped_with_warning() -> None:
+    # Arrange — a relname containing '.' cannot be addressed as schema.relname DDL; must be skipped
+    good_row = MagicMock()
+    good_row.partition_schema = "public"
+    good_row.partition_name = "events__2024_01"
+    good_row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
+    good_row.is_attached = True
+    dotted_row = MagicMock()
+    dotted_row.partition_schema = "public"
+    dotted_row.partition_name = "events.2024_02"
+    dotted_row.boundaries = "FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')"
+    dotted_row.is_attached = True
+    engine = _make_engine(("r", "public.events"), [good_row, dotted_row], [])
+    provider = PostgresMetadataProvider(engine)
+    mock_logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.metadata.logger", mock_logger):
+        partitions = provider.list_partitions("events")
+
+    # Assert
+    assert [p.name for p in partitions] == ["events__2024_01"]
+    mock_logger.warning.assert_called_once()
+
+
+def test__metadata_provider__list_partitions__dotted_schema_orphan__skipped_with_warning() -> None:
+    # Arrange — an orphan whose schema contains '.' is equally unaddressable
+    orphan = MagicMock()
+    orphan.partition_schema = "bad.schema"
+    orphan.partition_name = "events__2023_12"
+    engine = _make_engine(("r", "public.events"), [], [orphan])
+    provider = PostgresMetadataProvider(engine)
+    mock_logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.metadata.logger", mock_logger):
+        partitions = provider.list_partitions("events")
+
+    # Assert
+    assert partitions == []
+    mock_logger.warning.assert_called_once()
+
+
 def test__metadata_provider__list_partitions__orphan_row__returns_detached_partition() -> None:
     # Arrange
     orphan = MagicMock()
@@ -303,6 +346,9 @@ def test__metadata_provider__get_partition_boundaries__not_found__returns_none()
         ("FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)", ("2024-01-01", "2024-02-01")),
         (None, (None, None)),
         ("INVALID EXPR", (None, None)),
+        ("DEFAULT", (None, None)),
+        # LIST bound whose string value embeds ") TO (" must not be mis-parsed as a range
+        ("FOR VALUES IN ('a) TO (b')", (None, None)),
     ],
 )
 def test__parse_boundaries__various_expressions__returns_correct_tuple(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
 from typing import ClassVar
 
 from pg_partsmith.entities import Period
@@ -31,7 +30,7 @@ class DayPeriodCalculator(BasePeriodCalculator):
         if period.month is None or period.day is None:
             msg = "Month and day are required for DayPeriodCalculator"
             raise ValueError(msg)
-        return f"{table_name}__{period.year:04d}_{period.month:02d}_{period.day:02d}"
+        return f"{table_name}__{period}"
 
     def _period_from_match(self, match: re.Match[str]) -> Period:
         return Period(
@@ -46,7 +45,5 @@ class DayPeriodCalculator(BasePeriodCalculator):
             msg = "Month and day are required for DayPeriodCalculator"
             raise ValueError(msg)
 
-        start_date = datetime(period.year, period.month, period.day, tzinfo=UTC)
-        end_date = start_date + timedelta(days=1)
-
-        return (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        fmt = "%Y-%m-%d"
+        return (period.to_date().strftime(fmt), (period + 1).to_date().strftime(fmt))

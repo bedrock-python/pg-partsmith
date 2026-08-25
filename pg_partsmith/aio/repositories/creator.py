@@ -106,6 +106,10 @@ class PartitionCreator:
         )
 
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            # Boundary literals must be interpreted in the same timezone ATTACH uses,
+            # otherwise a non-UTC server timezone moves the wrong row range.
+            if self._ddl_timezone is not None:
+                await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             # Lock both tables to minimize race conditions
             await conn.execute(text(f"LOCK TABLE {default_quoted} IN SHARE ROW EXCLUSIVE MODE"))
             await conn.execute(text(f"LOCK TABLE {target_quoted} IN SHARE ROW EXCLUSIVE MODE"))

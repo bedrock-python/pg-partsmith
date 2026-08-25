@@ -108,16 +108,21 @@ class PostgresAdvisoryLockManager:
                 await self._release_safely(conn, lock_id, table_name, body_exc)
 
     async def _respect_rate_limit(self, table_name: str) -> None:
-        """Sleep enough to enforce the configured min-interval between acquires."""
+        """Sleep enough to enforce the configured min-interval between acquires.
+
+        The per-table slot is reserved under the mutex; the sleep itself happens
+        outside it so one table's owed delay never blocks acquires for other tables.
+        """
         if self._acquire_min_interval <= 0:
             return
         async with self._rate_limit_lock:
             now = time.monotonic()
-            last = self._last_acquire_time.get(table_name, 0.0)
-            delay = last + self._acquire_min_interval - now
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._last_acquire_time[table_name] = time.monotonic()
+            last = self._last_acquire_time.get(table_name)
+            slot = now if last is None else max(now, last + self._acquire_min_interval)
+            self._last_acquire_time[table_name] = slot
+        delay = slot - now
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     async def _try_acquire(self, conn: AsyncConnection, lock_id: int, table_name: str) -> None:
         """Run ``pg_try_advisory_lock`` and raise if not granted."""

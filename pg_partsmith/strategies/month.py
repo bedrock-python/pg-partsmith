@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
 from typing import ClassVar
-
-from dateutil.relativedelta import relativedelta
 
 from pg_partsmith.entities import Period
 from pg_partsmith.utils import utc_now
@@ -33,7 +30,7 @@ class MonthPeriodCalculator(BasePeriodCalculator):
         if period.month is None:
             msg = "Month is required for MonthPeriodCalculator"
             raise ValueError(msg)
-        return f"{table_name}__{period.year:04d}_{period.month:02d}"
+        return f"{table_name}__{period}"
 
     def _period_from_match(self, match: re.Match[str]) -> Period:
         return Period(year=int(match.group(2)), month=int(match.group(3)))
@@ -44,7 +41,5 @@ class MonthPeriodCalculator(BasePeriodCalculator):
             msg = "Month is required for MonthPeriodCalculator"
             raise ValueError(msg)
 
-        start_date = datetime(period.year, period.month, 1, tzinfo=UTC)
-        end_date = start_date + relativedelta(months=1)
-
-        return (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        fmt = "%Y-%m-%d"
+        return (period.to_date().strftime(fmt), (period + 1).to_date().strftime(fmt))

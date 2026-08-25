@@ -53,6 +53,15 @@ class PartitionPruningService:
             if partition.is_default:
                 continue
 
+            # A MAXVALUE upper bound means the partition holds current data no
+            # matter what its name suggests — never prune it via name fallback.
+            if partition.to_value is not None and partition.to_value.strip().upper() == "MAXVALUE":
+                logger.info(
+                    "Skipping partition with unbounded upper boundary (MAXVALUE)",
+                    extra={"partition_name": partition.name},
+                )
+                continue
+
             # Try boundary-based pruning first (more precise)
             end_dt = self._parse_boundary_to_utc_dt(partition.to_value)
             if cutoff_start_dt is not None and end_dt is not None:
