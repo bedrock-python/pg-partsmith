@@ -5,9 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.1.0...pg-partsmith-v0.2.0) (2026-08-26)
+
+### Added
+
+- `pg_partsmith.sync` — synchronous mirror of `pg_partsmith.aio` with the same class
+  names and API, built on the sync SQLAlchemy `Engine`: `PartitionLifecycleService`,
+  `PartitionMaintainer`, `maintain_partitions`, `PostgresPartitionRepository`,
+  `PostgresMetadataProvider`, `PostgresAdvisoryLockManager`, `RedisDistributedLockManager`,
+  sync `PartitionLifecycleHooks` / `BasePartitionLifecycleHooks`, and sync protocols.
+  Differences from the async package: `ddl_timeout_seconds` is enforced server-side via
+  PostgreSQL `statement_timeout` (per statement), and the Redis lock renews its TTL from a
+  background thread that logs (but cannot cancel maintenance) on renewal failure.
+  ([#13](https://github.com/bedrock-python/pg-partsmith/pull/13))
+- Hour and quarter partition granularities: `PartitionGranularity.HOUR` / `.QUARTER`,
+  `HourPeriodCalculator` (`table__YYYY_MM_DD_HH`, UTC boundaries with hour precision) and
+  `QuarterPeriodCalculator` (`table__YYYY_qN`), plus `hour` / `quarter` fields on `Period`
+  with validation, arithmetic, and ordering.
+  ([#15](https://github.com/bedrock-python/pg-partsmith/pull/15))
+- `Period.to_datetime()` — period start as a timezone-aware UTC datetime preserving the
+  hour component; the pruning fallback sort now uses it, so hourly partitions within one
+  day order chronologically.
+
+### Changed
+
+- `Period` internals were restructured around a single per-granularity dispatch;
+  behaviour is unchanged. Built-in calculators now derive names and boundaries
+  from `Period` itself instead of duplicating the formatting and arithmetic.
+  ([#16](https://github.com/bedrock-python/pg-partsmith/pull/16))
 
 ### Fixed
+
+Hardening from a full-library audit
+([#16](https://github.com/bedrock-python/pg-partsmith/pull/16)) and an external review
+([#17](https://github.com/bedrock-python/pg-partsmith/pull/17)):
 
 - Pruning fails closed: `infinity` upper bounds are treated as unbounded (like
   `MAXVALUE`), and an attached partition whose catalog boundary cannot be
@@ -28,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A cancellation that lands while awaiting the Redis `SET NX` response performs
   a token-checked release, so a server-side-applied SET no longer leaks the
   lock until TTL.
-
 - Detach: a partition left in `inhdetachpending` state by a cancelled
   `DETACH CONCURRENTLY` (e.g. a DDL timeout) is now completed with
   `DETACH PARTITION ... FINALIZE` instead of failing on every subsequent run.
@@ -61,31 +91,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   swallows an external task cancellation during watchdog teardown.
 - Maintainer logging: operational `PartitionError`s (e.g. lock contention) are
   logged as warnings instead of "unexpected exception" errors with tracebacks.
-
-### Changed
-
-- `Period` internals were restructured around a single per-granularity dispatch;
-  behaviour is unchanged. Built-in calculators now derive names and boundaries
-  from `Period` itself instead of duplicating the formatting and arithmetic.
-
-### Added
-
-- Hour and quarter partition granularities: `PartitionGranularity.HOUR` / `.QUARTER`,
-  `HourPeriodCalculator` (`table__YYYY_MM_DD_HH`, UTC boundaries with hour precision) and
-  `QuarterPeriodCalculator` (`table__YYYY_qN`), plus `hour` / `quarter` fields on `Period`
-  with validation, arithmetic, and ordering.
-- `Period.to_datetime()` — period start as a timezone-aware UTC datetime preserving the
-  hour component; the pruning fallback sort now uses it, so hourly partitions within one
-  day order chronologically.
-
-- `pg_partsmith.sync` — synchronous mirror of `pg_partsmith.aio` with the same class
-  names and API, built on the sync SQLAlchemy `Engine`: `PartitionLifecycleService`,
-  `PartitionMaintainer`, `maintain_partitions`, `PostgresPartitionRepository`,
-  `PostgresMetadataProvider`, `PostgresAdvisoryLockManager`, `RedisDistributedLockManager`,
-  sync `PartitionLifecycleHooks` / `BasePartitionLifecycleHooks`, and sync protocols.
-  Differences from the async package: `ddl_timeout_seconds` is enforced server-side via
-  PostgreSQL `statement_timeout` (per statement), and the Redis lock renews its TTL from a
-  background thread that logs (but cannot cancel maintenance) on renewal failure.
 
 ## [0.1.0] - 2026-05-08
 
