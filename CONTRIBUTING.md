@@ -72,9 +72,18 @@ make test-integration
 
 ## Adding a lock manager
 
-1. Implement the `LockManager` protocol from `pg_partsmith.aio.protocols`
-2. Add it to `pg_partsmith/aio/__init__.py` exports (optional extra if it has deps)
+1. Implement the `LockManager` protocol from `pg_partsmith.aio.protocols` (async)
+   and/or `pg_partsmith.sync.protocols` (sync)
+2. Add it to `pg_partsmith/aio/__init__.py` / `pg_partsmith/sync/__init__.py` exports
+   (optional extra if it has deps)
 3. Document it in `docs/guide/locks.md`
+
+## Keeping aio and sync in sync
+
+`pg_partsmith/sync` is a hand-maintained mirror of `pg_partsmith/aio` (same files, same
+class names, plain methods instead of coroutines). Any behavioural change to one package
+must be applied to the other, along with the mirrored tests in `tests/unit/sync/` and
+`tests/integration/sync/`.
 
 ## Releasing (maintainers only)
 

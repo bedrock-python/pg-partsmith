@@ -11,11 +11,12 @@ from uuid import uuid4
 import docker
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from tests.integration.aio.builder import PartitioningScenarioBuilder
+from tests.integration.sync.builder import PartitioningScenarioBuilder as SyncPartitioningScenarioBuilder
 
 # Set event loop policy for Windows as early as possible
 if sys.platform == "win32":
@@ -106,6 +107,45 @@ async def db_session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, Non
     async_session_maker = async_sessionmaker(db_engine, expire_on_commit=False)
     async with async_session_maker() as session:
         yield session
+
+
+@pytest.fixture
+def sync_db_engine(postgres_container: PostgresContainer) -> Generator[Engine, None, None]:
+    """Create sync database engine for testing."""
+    url = postgres_container.get_connection_url()
+    if "://" in url:
+        _, rest = url.split("://", 1)
+        url = f"postgresql+psycopg2://{rest}"
+
+    engine = create_engine(url, echo=False, pool_pre_ping=True)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def sync_partition_builder(sync_db_engine: Engine) -> Generator[SyncPartitioningScenarioBuilder, None, None]:
+    """Fixture for the sync PartitioningScenarioBuilder."""
+    table_name = f"scenario_{uuid4().hex[:8]}"
+
+    # create base partitioned table
+    with sync_db_engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id BIGSERIAL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    data TEXT,
+                    PRIMARY KEY (id, created_at)
+                ) PARTITION BY RANGE (created_at)
+                """
+            )
+        )
+
+    yield SyncPartitioningScenarioBuilder(sync_db_engine, table_name)
+
+    with sync_db_engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE"))
 
 
 @pytest_asyncio.fixture
