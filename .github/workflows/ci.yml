@@ -33,7 +33,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --group dev --extra pydantic-settings
       - run: uv run pytest -m unit --cov=pg_partsmith --cov-report=xml
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         if: matrix.python-version == '3.11'
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
