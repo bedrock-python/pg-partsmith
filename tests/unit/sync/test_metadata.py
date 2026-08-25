@@ -1,0 +1,364 @@
+from unittest.mock import MagicMock
+
+import pytest
+
+from pg_partsmith.entities import PartitionType
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
+
+# ── helpers ─────────────────────────────────────────────────────────────────────
+
+
+def _make_engine(*scalar_or_rows: object) -> MagicMock:
+    """Build an engine mock where each conn.execute() call returns the next value.
+
+    Pass scalar values for queries that use result.scalar(), or a list of row
+    objects for queries that use result.fetchall() / fetchone().
+    A tuple value sets both fetchone and scalar from the first element.
+    """
+    engine = MagicMock()
+    conn = MagicMock()
+    conn.execute = MagicMock(return_value=MagicMock())
+    conn.execution_options = MagicMock(return_value=conn)
+    results: list[MagicMock] = []
+
+    for value in scalar_or_rows:
+        r = MagicMock()
+        if isinstance(value, list):
+            r.fetchall.return_value = value
+            r.fetchone.return_value = value[0] if value else None
+        elif isinstance(value, tuple):
+            r.fetchone.return_value = value
+            r.scalar.return_value = value[0]
+        elif value is None:
+            r.fetchone.return_value = None
+            r.scalar.return_value = None
+        else:
+            r.scalar.return_value = value
+            r.fetchone.return_value = (value,)
+        results.append(r)
+
+    conn.execute.side_effect = results
+
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=conn)
+    cm.__exit__ = MagicMock(return_value=False)
+    engine.connect.return_value = cm
+    engine.begin.return_value = cm
+
+    return engine
+
+
+# ── get_partition_type ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "pg_letter,expected_type",
+    [
+        ("r", PartitionType.RANGE),
+        ("l", PartitionType.LIST),
+        ("h", PartitionType.HASH),
+        (None, None),
+    ],
+)
+def test__metadata_provider__get_partition_type__maps_pg_letter_to_enum(
+    pg_letter: str | None, expected_type: PartitionType | None
+) -> None:
+    # Arrange
+    engine = _make_engine(pg_letter)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.get_partition_type("events") == expected_type
+
+
+# ── get_partition_column ────────────────────────────────────────────────────────
+
+
+def test__metadata_provider__get_partition_column__single_column__returns_column_name() -> None:
+    # Arrange
+    row = MagicMock()
+    row.__getitem__ = MagicMock(return_value="created_at")
+    engine = _make_engine([row])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.get_partition_column("events") == "created_at"
+
+
+def test__metadata_provider__get_partition_column__no_columns__returns_none() -> None:
+    # Arrange
+    engine = _make_engine([])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.get_partition_column("events") is None
+
+
+def test__metadata_provider__get_partition_column__composite_key__raises_value_error() -> None:
+    # Arrange
+    row1, row2 = MagicMock(), MagicMock()
+    row1.__getitem__ = MagicMock(return_value="col_a")
+    row2.__getitem__ = MagicMock(return_value="col_b")
+    engine = _make_engine([row1, row2])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="composite"):
+        provider.get_partition_column("events")
+
+
+# ── list_partitions ─────────────────────────────────────────────────────────────
+
+
+def test__metadata_provider__list_partitions__not_partitioned_table__returns_empty_list() -> None:
+    # Arrange — get_partition_type returns None → early exit
+    engine = _make_engine(None)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.list_partitions("events") == []
+
+
+def test__metadata_provider__list_partitions__attached_partition__returns_partition_info() -> None:
+    # Arrange
+    row = MagicMock()
+    row.partition_schema = "public"
+    row.partition_name = "events__2024_01"
+    row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
+    row.is_attached = True
+    engine = _make_engine(("r", "public.events"), [row], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    partitions = provider.list_partitions("events")
+
+    # Assert
+    assert len(partitions) == 1
+    assert partitions[0].name == "events__2024_01"
+    assert partitions[0].from_value == "2024-01-01"
+    assert partitions[0].to_value == "2024-02-01"
+    assert partitions[0].is_attached is True
+    assert partitions[0].parent_table == "events"
+
+
+def test__metadata_provider__list_partitions__unparseable_boundaries__stores_raw_expr() -> None:
+    # Arrange
+    row = MagicMock()
+    row.partition_schema = "public"
+    row.partition_name = "events__weird"
+    row.boundaries = "FOR VALUES FROM (weird) ???"
+    row.is_attached = True
+    engine = _make_engine(("r", "public.events"), [row], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    partitions = provider.list_partitions("events")
+
+    # Assert
+    assert len(partitions) == 1
+    assert partitions[0].name == "events__weird"
+    assert partitions[0].is_attached is True
+    assert partitions[0].is_default is False
+    assert partitions[0].from_value is None
+    assert partitions[0].to_value is None
+    assert partitions[0].boundaries_expr == "FOR VALUES FROM (weird) ???"
+
+
+def test__metadata_provider__list_partitions__custom_marker_prefix__uses_prefix_in_orphan_query() -> None:
+    # Arrange
+    engine = _make_engine(("r", "public.events"), [], [])
+    provider = PostgresMetadataProvider(engine, marker_prefix="myapp:")
+
+    # Act
+    provider.list_partitions("events")
+
+    # Assert
+    conn = engine.connect.return_value.__enter__.return_value
+    params = conn.execute.call_args_list[2].args[1]
+    assert params["marker"] == "myapp:public.events"
+
+
+def test__metadata_provider__list_partitions__default_partition__sets_is_default_true() -> None:
+    # Arrange
+    row = MagicMock()
+    row.partition_schema = "public"
+    row.partition_name = "events_default"
+    row.boundaries = "DEFAULT"
+    row.is_attached = True
+    engine = _make_engine(("r", "public.events"), [row], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    partitions = provider.list_partitions("events")
+
+    # Assert
+    assert len(partitions) == 1
+    assert partitions[0].is_default is True
+    assert partitions[0].from_value is None
+    assert partitions[0].to_value is None
+
+
+def test__metadata_provider__list_partitions__orphan_row__returns_detached_partition() -> None:
+    # Arrange
+    orphan = MagicMock()
+    orphan.partition_schema = "public"
+    orphan.partition_name = "events__2023_12"
+    engine = _make_engine(("r", "public.events"), [], [orphan])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    partitions = provider.list_partitions("events")
+
+    # Assert
+    assert len(partitions) == 1
+    assert partitions[0].name == "events__2023_12"
+    assert partitions[0].is_attached is False
+    assert partitions[0].from_value is None
+
+
+# ── partition_exists / is_partition_attached ────────────────────────────────────
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test__metadata_provider__partition_exists__returns_correct_bool(exists: bool) -> None:
+    # Arrange
+    engine = _make_engine(exists)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.partition_exists("events__2024_01") is exists
+
+
+def test__metadata_provider__partition_exists__uses_quoted_regclass_argument() -> None:
+    # Arrange
+    engine = _make_engine(True)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    provider.partition_exists("events__2024_W12")
+
+    # Assert
+    conn = engine.connect.return_value.__enter__.return_value
+    params = conn.execute.call_args.args[1]
+    assert params["partition_name"] == '"events__2024_W12"'
+
+
+@pytest.mark.parametrize("attached", [True, False])
+def test__metadata_provider__is_partition_attached__returns_correct_bool(attached: bool) -> None:
+    # Arrange
+    engine = _make_engine(attached)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.is_partition_attached("events", "events__2024_01") is attached
+
+
+def test__metadata_provider__is_partition_attached__uses_quoted_regclass_arguments() -> None:
+    # Arrange
+    engine = _make_engine(True)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    provider.is_partition_attached("events", "events__2024_W12")
+
+    # Assert
+    conn = engine.connect.return_value.__enter__.return_value
+    params = conn.execute.call_args.args[1]
+    assert params["table_name"] == '"events"'
+    assert params["partition_name"] == '"events__2024_W12"'
+
+
+# ── get_partition_boundaries ────────────────────────────────────────────────────
+
+
+def test__metadata_provider__get_partition_boundaries__found__parses_from_and_to() -> None:
+    # Arrange
+    engine = _make_engine("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')")
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    result = provider.get_partition_boundaries("events__2024_01")
+
+    # Assert
+    assert result == ("2024-01-01", "2024-02-01")
+
+
+def test__metadata_provider__get_partition_boundaries__not_found__returns_none() -> None:
+    # Arrange
+    engine = _make_engine(None)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.get_partition_boundaries("events__2024_01") is None
+
+
+# ── _parse_boundaries ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr,expected",
+    [
+        ("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')", ("2024-01-01", "2024-02-01")),
+        ("FOR VALUES FROM (1) TO (5)", ("1", "5")),
+        ("FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)", ("2024-01-01", "2024-02-01")),
+        (None, (None, None)),
+        ("INVALID EXPR", (None, None)),
+    ],
+)
+def test__parse_boundaries__various_expressions__returns_correct_tuple(
+    expr: str | None, expected: tuple[str | None, str | None]
+) -> None:
+    # Arrange
+    provider = PostgresMetadataProvider(MagicMock())
+
+    # Act / Assert
+    assert provider._parse_boundaries(expr) == expected
+
+
+# ── get_default_partition ───────────────────────────────────────────────────────
+
+
+def test__metadata_provider__get_default_partition__default_exists__returns_it() -> None:
+    # Arrange
+    row = MagicMock()
+    row.partition_schema = "public"
+    row.partition_name = "events_default"
+    row.boundaries = "DEFAULT"
+    row.is_attached = True
+    engine = _make_engine(("r", "public.events"), [row], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    result = provider.get_default_partition("events")
+
+    # Assert
+    assert result is not None
+    assert result.name == "events_default"
+    assert result.is_default is True
+    assert result.is_attached is True
+
+
+def test__metadata_provider__get_default_partition__no_default__returns_none() -> None:
+    # Arrange
+    row = MagicMock()
+    row.partition_schema = "public"
+    row.partition_name = "events__2024_01"
+    row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
+    row.is_attached = True
+    engine = _make_engine(("r", "public.events"), [row], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.get_default_partition("events") is None
+
+
+def test__metadata_provider__get_default_partition__orphaned_default__returns_none() -> None:
+    # Arrange — detached DEFAULT (orphan row) must be ignored
+    orphan_row = MagicMock()
+    orphan_row.partition_schema = "public"
+    orphan_row.partition_name = "events_default"
+    engine = _make_engine(("r", "public.events"), [], [orphan_row])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.get_default_partition("events") is None

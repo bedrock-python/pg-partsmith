@@ -96,6 +96,33 @@ scheduler.add_job(
 )
 ```
 
+## Sync variant
+
+Every class above has a synchronous twin in `pg_partsmith.sync` with the same name and
+API. Build against the classic SQLAlchemy engine and drop the `await`:
+
+```python
+from sqlalchemy import create_engine
+from pg_partsmith.sync import (
+    PartitionLifecycleService,
+    PartitionMaintainer,
+    PostgresAdvisoryLockManager,
+    PostgresMetadataProvider,
+    PostgresPartitionRepository,
+)
+
+engine = create_engine("postgresql+psycopg2://user:pass@host/db")
+
+service = PartitionLifecycleService(
+    repo=PostgresPartitionRepository(engine),
+    metadata=PostgresMetadataProvider(engine),
+    locks=PostgresAdvisoryLockManager(engine),
+    period_calculator=MonthPeriodCalculator(),
+)
+maintainer = PartitionMaintainer(service)
+result = maintainer.run_maintenance_safe(config)
+```
+
 ## What happens each run
 
 1. **Create** — ensures partitions exist for `create_ahead_count` periods starting from now.

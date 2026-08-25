@@ -13,7 +13,7 @@ A single library that covers the full PostgreSQL partition lifecycle: creating p
 
 ## Features
 
-- **Async-first** — built on `asyncio` and SQLAlchemy async engine
+- **Async and sync** — `pg_partsmith.aio` on the SQLAlchemy async engine, `pg_partsmith.sync` on the classic sync engine
 - **Full lifecycle** — create ahead, detach expired, drop orphans in one call
 - **Extensible hooks** — 6 hook points (`before`/`after` create, detach, drop)
 - **Multiple strategies** — daily, weekly, monthly, yearly + fully custom
@@ -92,6 +92,43 @@ async def run_maintenance(engine: AsyncEngine) -> None:
 
 > **Cancellation semantics** — `run_maintenance_safe()` (and `maintain_partitions()`)
 > always returns `MaintenanceResult`, including on `asyncio.CancelledError`.
+
+## Sync usage
+
+Every class in `pg_partsmith.aio` has a synchronous twin in `pg_partsmith.sync` with the
+same name and API — built on the classic SQLAlchemy `Engine` instead of `AsyncEngine`:
+
+```python
+from sqlalchemy import create_engine
+
+from pg_partsmith import MonthPeriodCalculator
+from pg_partsmith.sync import (
+    PartitionLifecycleService,
+    PartitionMaintainer,
+    PostgresAdvisoryLockManager,
+    PostgresMetadataProvider,
+    PostgresPartitionRepository,
+)
+
+engine = create_engine("postgresql+psycopg2://user:pass@host/db")
+
+service = PartitionLifecycleService(
+    repo=PostgresPartitionRepository(engine),
+    metadata=PostgresMetadataProvider(engine),
+    locks=PostgresAdvisoryLockManager(engine),
+    period_calculator=MonthPeriodCalculator(),
+)
+maintainer = PartitionMaintainer(service)
+result = maintainer.run_maintenance_safe(config)
+```
+
+Hooks and custom lock managers implement the sync protocols from `pg_partsmith.sync`
+(plain methods instead of coroutines). Two behavioural differences from the async package:
+
+- `ddl_timeout_seconds` is enforced server-side via PostgreSQL `statement_timeout`
+  (per statement) rather than client-side around the whole operation.
+- The Redis lock renews its TTL from a background thread; on renewal failure it logs a
+  warning but cannot cancel the running maintenance (the TTL bounds a stale holder).
 
 ## Multi-schema databases
 
@@ -277,6 +314,11 @@ scheduler.add_job(
 **Lock managers** — `PostgresAdvisoryLockManager`, `RedisDistributedLockManager`
 
 **Orchestration** — `PartitionMaintainer`, `maintain_partitions`
+
+### `pg_partsmith.sync`
+
+Synchronous mirror of `pg_partsmith.aio` — same names, same layout, plain methods
+built on the sync SQLAlchemy `Engine`.
 
 ## Development
 

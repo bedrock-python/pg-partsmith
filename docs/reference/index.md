@@ -106,3 +106,49 @@ Async implementations: service, maintainer, repositories, lock managers, and hoo
 ::: pg_partsmith.aio.hooks.BasePartitionLifecycleHooks
     options:
       heading_level: 4
+
+---
+
+## pg_partsmith.sync
+
+Synchronous mirror of `pg_partsmith.aio`: same class names and API, plain methods
+built on the sync SQLAlchemy `Engine`.
+
+### Service and maintainer
+
+::: pg_partsmith.sync.service.PartitionLifecycleService
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.maintainer.PartitionMaintainer
+    options:
+      heading_level: 4
+      members:
+        - run_maintenance
+        - run_maintenance_safe
+
+### PostgreSQL implementations
+
+::: pg_partsmith.sync.repositories.repository.PostgresPartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.metadata.PostgresMetadataProvider
+    options:
+      heading_level: 4
+
+### Lock managers
+
+::: pg_partsmith.sync.lock.postgres.PostgresAdvisoryLockManager
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.lock.redis.RedisDistributedLockManager
+    options:
+      heading_level: 4
+
+### Hooks
+
+::: pg_partsmith.sync.hooks.BasePartitionLifecycleHooks
+    options:
+      heading_level: 4
