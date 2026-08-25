@@ -171,12 +171,14 @@ class PartitioningTestContext:
     service: PartitionLifecycleService
     maintainer: PartitionMaintainer
 
-    async def run_maintenance(self, at_time: str | datetime | None = None) -> MaintenanceResult:
+    async def run_maintenance(
+        self, at_time: str | datetime | None = None, *, skip_create: bool = False
+    ) -> MaintenanceResult:
         """Runs maintenance, optionally at a specific time."""
         if at_time:
             with freezegun.freeze_time(at_time):
-                return await self.maintainer.run_maintenance(self.config)
-        return await self.maintainer.run_maintenance(self.config)
+                return await self.maintainer.run_maintenance(self.config, skip_create=skip_create)
+        return await self.maintainer.run_maintenance(self.config, skip_create=skip_create)
 
     async def assert_partition_exists(self, name: str) -> None:
         """Asserts that a partition table exists in the database."""
@@ -205,7 +207,7 @@ class PartitioningTestContext:
         assert len(attached) == expected, f"Expected {expected} attached partitions, got {len(attached)}"
 
     async def list_partition_names(self, attached_only: bool = True) -> list[str]:
-        """Returns a list of partition names."""
+        """Returns a list of schema-qualified partition names."""
         partitions = await self.metadata.list_partitions(self.table_name)
         if attached_only:
             return [p.name for p in partitions if p.is_attached]

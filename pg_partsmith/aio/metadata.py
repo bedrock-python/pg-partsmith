@@ -11,7 +11,6 @@ from pg_partsmith.utils import (
     orphan_comment_prefix,
     orphan_table_comment,
     qualify,
-    split_qualified_name,
     to_regclass_argument,
 )
 
@@ -139,10 +138,11 @@ class PostgresMetadataProvider:
         detached by this library. They are detected by a COMMENT marker set on
         successful detach and returned with ``is_attached=False`` and ``None``
         boundaries.
-        """
-        parent_schema, _ = split_qualified_name(table_name)
-        want_qualified = parent_schema is not None
 
+        Partition names are always schema-qualified with the child's catalog
+        schema — a partition may live in a different schema than its parent,
+        and a bare name could resolve to an unrelated table via ``search_path``.
+        """
         async with self._engine.connect() as conn:
             # 1. Get partition type and canonical parent name in one query
             parent_info_result = await conn.execute(
@@ -210,7 +210,7 @@ class PostgresMetadataProvider:
                       ON d.objoid = c.oid
                      AND d.classoid = 'pg_class'::regclass
                      AND d.objsubid = 0
-                    WHERE c.relkind = 'r'
+                    WHERE c.relkind IN ('r', 'p')
                       AND c.relispartition = false
                       AND split_part(d.description, E'\\n', 1) = :marker
                        AND NOT EXISTS (
@@ -241,7 +241,7 @@ class PostgresMetadataProvider:
             if not _is_addressable(part_schema, relname):
                 continue
 
-            name = qualify(part_schema if want_qualified else None, relname)
+            name = qualify(part_schema, relname)
 
             boundaries = row.boundaries
             if isinstance(boundaries, bytes):
@@ -275,7 +275,7 @@ class PostgresMetadataProvider:
             if not _is_addressable(orphan_schema, orphan_relname):
                 continue
 
-            name = qualify(orphan_schema if want_qualified else None, orphan_relname)
+            name = qualify(orphan_schema, orphan_relname)
             partitions.append(
                 PartitionInfo(
                     name=name,
@@ -296,7 +296,8 @@ class PostgresMetadataProvider:
             partition_name: Partition table name.
 
         Returns:
-            True if the table exists as a regular table.
+            True if the table exists as a regular or partitioned table
+            (a partition may itself be subpartitioned).
         """
         async with self._engine.connect() as conn:
             result = await conn.execute(
@@ -306,7 +307,7 @@ class PostgresMetadataProvider:
                         SELECT 1
                         FROM pg_class
                         WHERE oid = to_regclass(:partition_name)
-                          AND relkind = 'r'
+                          AND relkind IN ('r', 'p')
                     )
                     """
                 ),

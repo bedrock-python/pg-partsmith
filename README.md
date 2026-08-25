@@ -145,6 +145,11 @@ database contains similarly named tables not managed by this library.
 Set `marker_prefix` explicitly on both `PostgresPartitionRepository` and
 `PostgresMetadataProvider` to ensure consistent orphan marker recognition across deployments.
 
+> **Marker semantics** — the `COMMENT` marker means "this library owns cleanup of this
+> table". It survives `pg_dump`/restore (comments are dumped by default), so a restored
+> copy of a marked table is again eligible for dropping. When repurposing such a table,
+> clear its comment (`COMMENT ON TABLE ... IS NULL`) or restore with `--no-comments`.
+
 ## DEFAULT partition reconciliation
 
 When creating a new partition, if the DEFAULT partition contains rows belonging to the

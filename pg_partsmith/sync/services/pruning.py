@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Upper-bound spellings that mean "no upper limit" — such partitions hold
+# current data and must never be pruned.
+_UNBOUNDED_UPPER = frozenset({"MAXVALUE", "INFINITY", "+INFINITY"})
+
 
 class PartitionPruningService:
     """Service for identifying partitions that should be pruned."""
@@ -53,12 +57,12 @@ class PartitionPruningService:
             if partition.is_default:
                 continue
 
-            # A MAXVALUE upper bound means the partition holds current data no
-            # matter what its name suggests — never prune it via name fallback.
-            if partition.to_value is not None and partition.to_value.strip().upper() == "MAXVALUE":
+            # An unbounded upper bound (MAXVALUE / infinity) means the partition
+            # holds current data no matter what its name suggests — never prune it.
+            if partition.to_value is not None and partition.to_value.strip().upper() in _UNBOUNDED_UPPER:
                 logger.info(
-                    "Skipping partition with unbounded upper boundary (MAXVALUE)",
-                    extra={"partition_name": partition.name},
+                    "Skipping partition with unbounded upper boundary",
+                    extra={"partition_name": partition.name, "to_value": partition.to_value},
                 )
                 continue
 
@@ -68,6 +72,16 @@ class PartitionPruningService:
                 if end_dt <= cutoff_start_dt:
                     partitions_to_prune.append(partition)
                     parsed_end_dt_by_name[partition.name] = end_dt
+                continue
+
+            # An attached partition always carries a catalog boundary; if we
+            # cannot interpret it while the cutoff is a real instant, guessing
+            # by name risks dropping live data — fail closed instead.
+            if partition.is_attached and cutoff_start_dt is not None:
+                logger.warning(
+                    "Cannot interpret attached partition boundary; skipping to avoid unsafe pruning",
+                    extra={"partition_name": partition.name, "to_value": partition.to_value},
+                )
                 continue
 
             # Fall back to name-based pruning

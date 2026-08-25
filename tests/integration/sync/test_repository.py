@@ -87,18 +87,20 @@ def test__repository__attach_partition__makes_it_visible_in_list(
     repo = PostgresPartitionRepository(sync_db_engine)
     metadata = PostgresMetadataProvider(sync_db_engine)
     partition_name = f"{config.table_name}__2024_02"
+    # list_partitions always returns schema-qualified names
+    qualified_name = f"public.{partition_name}"
     info = repo.create_partition(config, partition_name, "2024-02-01", "2024-03-01")
 
     # Not yet attached — not visible as attached
     partitions = metadata.list_partitions(config.table_name)
-    assert all(p.name != partition_name or not p.is_attached for p in partitions)
+    assert all(p.name != qualified_name or not p.is_attached for p in partitions)
 
     # Act
     repo.attach_partition(config.table_name, info.name, "2024-02-01", "2024-03-01")
 
     # Assert
     partitions = metadata.list_partitions(config.table_name)
-    attached = [p for p in partitions if p.name == partition_name and p.is_attached]
+    attached = [p for p in partitions if p.name == qualified_name and p.is_attached]
     assert len(attached) == 1
     assert attached[0].from_value is not None
     assert "2024-02-01" in attached[0].from_value
@@ -173,8 +175,8 @@ def test__repository__list_partitions__includes_orphan_after_detach(
     # Act
     partitions = metadata.list_partitions(config.table_name)
 
-    # Assert
-    orphan = next((p for p in partitions if p.name == partition_name), None)
+    # Assert — orphan is listed under its schema-qualified name
+    orphan = next((p for p in partitions if p.name == f"public.{partition_name}"), None)
     assert orphan is not None
     assert orphan.is_attached is False
 
@@ -203,9 +205,9 @@ def test__repository__list_partitions__ignores_similarly_named_table_without_mar
     partitions = metadata.list_partitions(config.table_name)
     names = {p.name for p in partitions}
 
-    # Assert
-    assert orphan_name in names
-    assert similar_name not in names
+    # Assert — names are schema-qualified; the unmarked look-alike is not listed
+    assert f"public.{orphan_name}" in names
+    assert f"public.{similar_name}" not in names
 
     repo.drop_partition(orphan_name)
     with sync_db_engine.begin() as conn:

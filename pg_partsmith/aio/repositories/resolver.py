@@ -25,7 +25,11 @@ class PartitionRelationResolver:
 
     @staticmethod
     async def exists_conn(conn: AsyncConnection, name: str) -> bool:
-        """Check existence using an existing connection."""
+        """Check existence using an existing connection.
+
+        Accepts regular and partitioned tables — a partition may itself be
+        subpartitioned.
+        """
         result = await conn.execute(
             text(
                 """
@@ -33,7 +37,7 @@ class PartitionRelationResolver:
                     SELECT 1
                     FROM pg_class
                     WHERE oid = to_regclass(:partition_name)
-                      AND relkind = 'r'
+                      AND relkind IN ('r', 'p')
                 )
                 """
             ),

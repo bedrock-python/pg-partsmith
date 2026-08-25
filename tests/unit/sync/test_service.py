@@ -612,14 +612,14 @@ def test__get_partitions_for_pruning__hourly_name_fallback__sorts_same_day_hours
     mock_calculator: MagicMock,
     config: TablePartitionConfig,
 ) -> None:
-    # Arrange — no boundary values forces the name-based fallback; hour suffixes are deliberately
-    # not zero-padded so lexical name order (10 < 7 < 8) differs from chronological order.
+    # Arrange — detached orphans carry no boundary values, forcing the name-based fallback; hour
+    # suffixes are deliberately not zero-padded so lexical name order (10 < 7 < 8) differs from
+    # chronological order. (Attached partitions with unparseable boundaries are now skipped fail-closed.)
     partitions = [
         PartitionInfo(
             name=f"events__2024_03_15_{hour}",
             partition_type=PartitionType.RANGE,
-            boundaries_expr="FOR VALUES FROM (...) TO (...)",
-            is_attached=True,
+            is_attached=False,
         )
         for hour in (10, 7, 11, 8)
     ]
@@ -693,6 +693,106 @@ def test__get_partitions_for_pruning__minvalue_lower_bound__still_pruned_by_uppe
 
     # Assert
     assert [p.name for p in to_prune] == ["events__historic"]
+
+
+def test__get_partitions_for_pruning__infinity_upper_bound__never_pruned_despite_ancient_name(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — 'infinity' is an unbounded upper bound just like MAXVALUE and must never be pruned
+    partition = PartitionInfo(
+        name="events__1970_01",
+        partition_type=PartitionType.RANGE,
+        from_value="2024-01-01",
+        to_value="infinity",
+        is_attached=True,
+    )
+    mock_metadata.list_partitions.return_value = [partition]
+    mock_calculator.parse_partition_name.return_value = Period(year=1970, month=1)
+    mock_calculator.period_before.return_value = Period(year=2024, month=2)
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    to_prune = service.get_partitions_for_pruning(config)
+
+    # Assert — skipped entirely: no pruning, not even the name-based fallback
+    assert to_prune == []
+    mock_calculator.parse_partition_name.assert_not_called()
+
+
+def test__get_partitions_for_pruning__attached_unparseable_boundary__skipped_while_orphan_pruned_by_name(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — an ATTACHED partition whose catalog boundary cannot be interpreted must fail closed
+    # (skip + warning), while a detached orphan without boundaries still prunes via the name fallback
+    attached = PartitionInfo(
+        name="events__2023_01",
+        partition_type=PartitionType.RANGE,
+        from_value="garbage",
+        to_value="garbage",
+        boundaries_expr="FOR VALUES FROM (garbage) TO (garbage)",
+        is_attached=True,
+    )
+    orphan = PartitionInfo(
+        name="events__2023_02",
+        partition_type=PartitionType.RANGE,
+        is_attached=False,
+    )
+    mock_metadata.list_partitions.return_value = [attached, orphan]
+    mock_calculator.parse_partition_name.side_effect = lambda name: Period(
+        year=2023, month=int(name.rsplit("_", 1)[-1])
+    )
+    mock_calculator.period_before.return_value = Period(year=2024, month=2)
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    mock_logger = MagicMock()
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    with patch("pg_partsmith.sync.services.pruning.logger", mock_logger):
+        to_prune = service.get_partitions_for_pruning(config)
+
+    # Assert — only the detached orphan is pruned; the attached one is skipped with a warning
+    assert [p.name for p in to_prune] == ["events__2023_02"]
+    mock_logger.warning.assert_called_once()
+    assert mock_logger.warning.call_args.kwargs["extra"]["partition_name"] == "events__2023_01"
+
+
+def test__get_partitions_for_pruning__unparseable_cutoff__attached_name_fallback_still_works(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — a custom calculator with non-datetime boundaries: the cutoff itself is unparseable,
+    # so the attached name fallback must keep working (backward compatibility)
+    partition = PartitionInfo(
+        name="events__old",
+        partition_type=PartitionType.RANGE,
+        from_value="A",
+        to_value="B",
+        boundaries_expr="FOR VALUES FROM ('A') TO ('B')",
+        is_attached=True,
+    )
+    mock_metadata.list_partitions.return_value = [partition]
+    mock_calculator.parse_partition_name.return_value = Period(year=2023, month=1)
+    mock_calculator.period_before.return_value = Period(year=2024, month=2)
+    mock_calculator.get_boundaries.return_value = ("A", "B")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    to_prune = service.get_partitions_for_pruning(config)
+
+    # Assert
+    assert [p.name for p in to_prune] == ["events__old"]
 
 
 # ── maintain_lifecycle ───────────────────────────────────────────────────────────
@@ -1265,9 +1365,11 @@ def test__create_future_partitions__42809_attach_race__treated_as_already_attach
     partition_info: PartitionInfo,
 ) -> None:
     # Arrange — another worker attached first: PostgreSQL raises 42809 ("is already a partition")
+    # and the post-condition check confirms the partition really is attached to our parent
     config = config.model_copy(update={"auto_attach_after_create": True})
     mock_repo.create_partition.return_value = partition_info
     mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42809", "is already a partition")
+    mock_metadata.is_partition_attached.return_value = True
     service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
 
     # Act
@@ -1276,6 +1378,7 @@ def test__create_future_partitions__42809_attach_race__treated_as_already_attach
     # Assert — race is swallowed and the partition is treated as attached
     assert len(created) == 1
     assert created[0].is_attached is True
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
 
 
 def test__create_future_partitions__55006_attach_error__propagates(
@@ -1295,3 +1398,158 @@ def test__create_future_partitions__55006_attach_error__propagates(
     # Act / Assert
     with pytest.raises(SQLAlchemyError, match="object is in use"):
         service.create_future_partitions(config)
+
+
+def test__create_future_partitions__conflict_sqlstate_but_not_attached__propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — a conflict SQLSTATE alone is not proof of a lost race: 42809 also fires for typed
+    # tables or attachments to a different parent; the post-condition check comes back False
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42809", "is already a partition")
+    mock_metadata.is_partition_attached.return_value = False
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert — the error must propagate instead of being swallowed
+    with pytest.raises(SQLAlchemyError, match="is already a partition"):
+        service.create_future_partitions(config)
+
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__existing_detached_attach_conflict_not_attached__propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — an existing detached partition is being re-attached; the attach hits a conflict
+    # SQLSTATE but the post-condition check says it is NOT attached to our parent
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_metadata.list_partitions.return_value = [
+        PartitionInfo(
+            name="events__2024_04",
+            partition_type=PartitionType.RANGE,
+            is_attached=False,
+            parent_table="events",
+        )
+    ]
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42809", "is already a partition")
+    mock_metadata.is_partition_attached.return_value = False
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert — the error must propagate instead of being swallowed
+    with pytest.raises(SQLAlchemyError, match="is already a partition"):
+        service.create_future_partitions(config)
+
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__existing_detached_attach_conflict_verified_attached__swallowed(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — re-attach of an existing detached partition loses the race, but the post-condition
+    # check confirms it really is attached to our parent: the conflict is benign
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_metadata.list_partitions.return_value = [
+        PartitionInfo(
+            name="events__2024_04",
+            partition_type=PartitionType.RANGE,
+            is_attached=False,
+            parent_table="events",
+        )
+    ]
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42809", "is already a partition")
+    mock_metadata.is_partition_attached.return_value = True
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act — must not raise
+    created = service.create_future_partitions(config)
+
+    # Assert
+    assert created == []
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__create_race_attach_conflict_not_attached__propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — another worker won the create race, then our attach hits a conflict SQLSTATE
+    # but the post-condition check says the partition is NOT attached to our parent
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_repo.create_partition.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42710", "duplicate object")
+    mock_metadata.is_partition_attached.return_value = False
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert — the error must propagate instead of being swallowed
+    with pytest.raises(SQLAlchemyError, match="duplicate object"):
+        service.create_future_partitions(config)
+
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__create_race_attach_conflict_verified_attached__swallowed(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — another worker won the create race AND the attach race, and the post-condition
+    # check confirms the partition is attached to our parent: the conflict is benign
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_repo.create_partition.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42710", "duplicate object")
+    mock_metadata.is_partition_attached.return_value = True
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act — must not raise
+    created = service.create_future_partitions(config)
+
+    # Assert
+    assert created == []
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__interrupted_during_attach_after_reconcile__restores_rows_and_reraises(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — first attach hits a DEFAULT conflict, reconcile moves rows out of DEFAULT, then the
+    # retried attach is interrupted: the moved rows must be restored before re-raising
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.attach_partition.side_effect = [_make_23514_exc(), KeyboardInterrupt()]
+    mock_repo.reconcile_default_rows.return_value = 5
+    mock_metadata.get_default_partition.return_value = PartitionInfo(
+        name="events_default", partition_type=PartitionType.RANGE, is_default=True, is_attached=True
+    )
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert — the interrupt propagates after the compensating move-back
+    with pytest.raises(KeyboardInterrupt):
+        service.create_future_partitions(config)
+
+    assert mock_repo.reconcile_default_rows.call_count == 2
+    restore_call = mock_repo.reconcile_default_rows.call_args_list[-1]
+    assert restore_call.kwargs["default_partition_name"] == "events__2024_04"
+    assert restore_call.kwargs["target_partition_name"] == "events_default"

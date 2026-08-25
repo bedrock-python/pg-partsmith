@@ -84,10 +84,11 @@ def test__maintainer__initial_run__creates_partitions_ahead(sync_db_engine: Engi
     # Assert
     assert result.success
     assert result.created_count == 2
+    # list_partitions always returns schema-qualified names
     partitions = metadata.list_partitions(partitioned_table)
     names = {p.name for p in partitions}
-    assert f"{partitioned_table}__2024_12" in names
-    assert f"{partitioned_table}__2025_01" in names
+    assert f"public.{partitioned_table}__2024_12" in names
+    assert f"public.{partitioned_table}__2025_01" in names
 
 
 @pytest.mark.integration
@@ -148,8 +149,8 @@ def test__maintainer__partitions_beyond_retention__detaches_and_drops_them(
     assert result.dropped_count >= 2
     partitions = metadata.list_partitions(partitioned_table)
     names = {p.name for p in partitions}
-    assert f"{partitioned_table}__2024_12" not in names
-    assert f"{partitioned_table}__2025_01" not in names
+    assert f"public.{partitioned_table}__2024_12" not in names
+    assert f"public.{partitioned_table}__2025_01" not in names
 
 
 @pytest.mark.integration

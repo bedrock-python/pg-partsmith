@@ -18,13 +18,14 @@ from pg_partsmith.exceptions import (
     UnmanagedPartitionDropError,
 )
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
+from pg_partsmith.sync.repositories.fk_manager import PartitionForeignKeyManager
 from pg_partsmith.utils import orphan_table_comment, pg_sqlstate
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
 #
 # Unlike the async repository, the sync repository enforces ``ddl_timeout_seconds``
 # server-side via extra ``set_config('statement_timeout', ...)`` executes:
-#   - every ``engine.begin()`` block and the drop read/FK-listing connections start
+#   - every ``engine.begin()`` block and the drop pre-check connection start
 #     with one extra ``set_config`` execute;
 #   - the autocommit DETACH CONCURRENTLY path wraps in a session-level ``set_config``
 #     plus a trailing ``RESET statement_timeout`` execute;
@@ -108,14 +109,12 @@ def _make_retry_engine(fail_with: Exception, fail_attempts: int) -> MagicMock:
             r.scalar.return_value = v
         return r
 
-    # read conn: set_config, exists, not attached, marker; FK conn: set_config, FK list
+    # read conn: set_config, exists, not attached, marker
     conn_read.execute.side_effect = [
         _r(None),
         _r(True),
         _r(None),
         _r(orphan_table_comment("events")),
-        _r(None),
-        _r([]),
     ]
 
     connect_cm = MagicMock()
@@ -127,6 +126,17 @@ def _make_retry_engine(fail_with: Exception, fail_attempts: int) -> MagicMock:
         ddl_conn = MagicMock()
         if should_fail:
             ddl_conn.execute.side_effect = fail_with
+        else:
+            # statement_timeout, lock_timeout, LOCK TABLE, revalidation (not attached, marker), FK list, DROP
+            ddl_conn.execute.side_effect = [
+                _r(None),
+                _r(None),
+                _r(None),
+                _r(None),
+                _r(orphan_table_comment("events")),
+                _r([]),
+                _r(None),
+            ]
         begin_cm = MagicMock()
         begin_cm.__enter__ = MagicMock(return_value=ddl_conn)
         begin_cm.__exit__ = MagicMock(return_value=False)
@@ -137,6 +147,42 @@ def _make_retry_engine(fail_with: Exception, fail_attempts: int) -> MagicMock:
     engine.begin.side_effect = begin_cms
 
     return engine
+
+
+def _make_drop_engine(read_values: list[object], ddl_values: list[object]) -> tuple[MagicMock, MagicMock]:
+    """Engine with separate connect() (pre-check) and begin() (DDL) connections for drop tests.
+
+    An Exception instance in a sequence is raised by that execute() call;
+    a list becomes result.fetchall(); anything else becomes result.scalar().
+    """
+
+    def _to_effect(value: object) -> object:
+        if isinstance(value, BaseException):
+            return value
+        r = MagicMock()
+        if isinstance(value, list):
+            r.fetchall.return_value = value
+        else:
+            r.scalar.return_value = value
+        return r
+
+    engine = MagicMock()
+
+    conn_read = MagicMock()
+    conn_read.execute.side_effect = [_to_effect(v) for v in read_values]
+    connect_cm = MagicMock()
+    connect_cm.__enter__ = MagicMock(return_value=conn_read)
+    connect_cm.__exit__ = MagicMock(return_value=False)
+    engine.connect.return_value = connect_cm
+
+    ddl_conn = MagicMock()
+    ddl_conn.execute.side_effect = [_to_effect(v) for v in ddl_values]
+    begin_cm = MagicMock()
+    begin_cm.__enter__ = MagicMock(return_value=ddl_conn)
+    begin_cm.__exit__ = MagicMock(return_value=False)
+    engine.begin.return_value = begin_cm
+
+    return engine, ddl_conn
 
 
 # ── constructor validation ──────────────────────────────────────────────────────
@@ -188,6 +234,20 @@ def test__repository__partition_exists__uses_quoted_regclass_argument() -> None:
     conn = engine.connect.return_value.__enter__.return_value
     params = conn.execute.call_args.args[1]
     assert params["partition_name"] == '"events__2024_W12"'
+
+
+def test__repository__partition_exists__accepts_partitioned_relkind() -> None:
+    # Arrange — a partition can itself be subpartitioned (relkind 'p'), not only a plain table ('r')
+    engine = _make_engine([True])
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.partition_exists("events__2024_01")
+
+    # Assert
+    conn = engine.connect.return_value.__enter__.return_value
+    sql = str(conn.execute.call_args.args[0])
+    assert "relkind IN ('r', 'p')" in sql
 
 
 # ── create_partition ────────────────────────────────────────────────────────────
@@ -526,9 +586,10 @@ def test__repository__drop_partition__not_exists__is_noop() -> None:
 
 
 def test__repository__drop_partition__detached_with_orphan_marker__drops_successfully() -> None:
-    # Arrange — set_config, exists, not attached, has orphan marker; FK conn: set_config, no FKs;
-    # DDL conn: set_config, lock_timeout, DROP
-    engine = _make_engine([None, True, None, orphan_table_comment("events"), None, [], None, None, None])
+    # Arrange — pre-check: set_config, exists, not attached, has orphan marker;
+    # DDL txn: set_config, lock_timeout, LOCK, not attached, marker, no FKs, DROP
+    marker = orphan_table_comment("events")
+    engine = _make_engine([None, True, None, marker, None, None, None, None, marker, [], None])
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -575,8 +636,9 @@ def test__repository__drop_partition__disappeared_between_checks__is_noop() -> N
 
 
 def test__repository__drop_partition__unmanaged_with_opt_in__drops_successfully() -> None:
-    # Arrange — set_config, exists, not attached; FK conn: set_config, no FKs; DDL conn: set_config, lock, DROP
-    engine = _make_engine([None, True, None, None, [], None, None, None])
+    # Arrange — pre-check: set_config, exists, not attached;
+    # DDL txn: set_config, lock_timeout, LOCK, not attached, no FKs, DROP
+    engine = _make_engine([None, True, None, None, None, None, None, [], None])
     repo = PostgresPartitionRepository(engine, drop_allow_unmanaged=True)
 
     # Act
@@ -590,7 +652,8 @@ def test__repository__drop_partition__unmanaged_with_opt_in__drops_successfully(
 
 
 def test__repository__drop_partition__single_fk__drops_fk_then_table() -> None:
-    # Arrange
+    # Arrange — pre-check: set_config, exists, not attached, marker;
+    # DDL txn: set_config, lock_timeout, LOCK, not attached, marker, FK list, DROP CONSTRAINT, DROP TABLE
     engine = _make_engine(
         [
             None,
@@ -598,9 +661,11 @@ def test__repository__drop_partition__single_fk__drops_fk_then_table() -> None:
             None,
             orphan_table_comment("events"),
             None,
+            None,
+            None,
+            None,
+            orphan_table_comment("events"),
             [("fk_events__2024_01_order_id",)],
-            None,
-            None,
             None,
             None,
         ]
@@ -612,12 +677,29 @@ def test__repository__drop_partition__single_fk__drops_fk_then_table() -> None:
 
     # Assert
     engine.begin.assert_called_once()
+    conn = engine.begin.return_value.__enter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert any("DROP CONSTRAINT" in stmt and "fk_events__2024_01_order_id" in stmt for stmt in statements)
+    assert any("DROP TABLE" in stmt for stmt in statements)
 
 
 def test__repository__drop_partition__multiple_fks__drops_all_fks() -> None:
     # Arrange
     engine = _make_engine(
-        [None, True, None, orphan_table_comment("events"), None, [("fk_a",), ("fk_b",)], None, None, None, None]
+        [
+            None,
+            True,
+            None,
+            orphan_table_comment("events"),
+            None,
+            None,
+            None,
+            None,
+            orphan_table_comment("events"),
+            [("fk_a",), ("fk_b",)],
+            None,
+            None,
+        ]
     )
     repo = PostgresPartitionRepository(engine)
 
@@ -626,6 +708,9 @@ def test__repository__drop_partition__multiple_fks__drops_all_fks() -> None:
 
     # Assert
     engine.begin.assert_called_once()
+    conn = engine.begin.return_value.__enter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert any("fk_a" in stmt and "fk_b" in stmt and "DROP CONSTRAINT" in stmt for stmt in statements)
 
 
 # ── drop_partition — retry logic ─────────────────────────────────────────────────
@@ -738,6 +823,129 @@ def test__repository__drop_partition__retry__logs_warning_with_attempt_number() 
 
     call_kwargs = logger.warning.call_args
     assert call_kwargs.kwargs.get("extra", {}).get("attempt") == 2
+
+
+# ── drop_partition — lock-then-revalidate transaction ────────────────────────────
+
+
+def test__repository__drop_partition__lock_precedes_revalidation_and_drop__single_transaction() -> None:
+    # Arrange — pre-check passes; DDL txn: set_config, lock_timeout, LOCK, not attached, marker, FK list, DROP
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, None, None, orphan_table_comment("events"), [], None],
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert — one transaction where LOCK TABLE runs before revalidation, which runs before DROP TABLE
+    engine.begin.assert_called_once()
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    lock_idx = next(i for i, s in enumerate(statements) if "LOCK TABLE" in s and "ACCESS EXCLUSIVE" in s)
+    revalidate_idx = next(i for i, s in enumerate(statements) if "pg_inherits" in s)
+    drop_idx = next(i for i, s in enumerate(statements) if "DROP TABLE" in s)
+    assert lock_idx < revalidate_idx < drop_idx
+
+
+def test__repository__drop_partition__lock_hits_42p01__returns_without_drop() -> None:
+    # Arrange — the table vanished between the pre-check and the LOCK TABLE statement
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, _make_retryable_exc("42P01")],
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act — treated as already-done, not an error and not a retry
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    engine.begin.assert_called_once()
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    assert not any("DROP TABLE" in s for s in statements)
+
+
+def test__repository__drop_partition__reattached_after_lock__raises_attached_error_without_drop() -> None:
+    # Arrange — pre-check saw it detached, but under the lock it is attached again
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, None, "public.events"],
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionAttachedError):
+        repo.drop_partition("events__2024_01")
+
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    assert not any("DROP TABLE" in s for s in statements)
+
+
+def test__repository__drop_partition__non_42p01_error_on_lock__propagates() -> None:
+    # Arrange — a non-retryable, non-42P01 error on the LOCK TABLE statement (e.g. permission denied)
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, _make_retryable_exc("42501")],
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert — must propagate, not be swallowed like 42P01 and not be retried
+    with pytest.raises(SQLAlchemyError):
+        repo.drop_partition("events__2024_01")
+
+    engine.begin.assert_called_once()
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    assert not any("DROP TABLE" in s for s in statements)
+
+
+def test__repository__drop_partition__vanished_after_lock__returns_without_drop() -> None:
+    # Arrange — under the lock the marker is gone AND the table no longer exists (dropped concurrently)
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, None, None, None, False],  # set_config, lock_timeout, LOCK, not attached, no marker, gone
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act — treated as already-done, no error
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    engine.begin.assert_called_once()
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    assert not any("DROP TABLE" in s for s in statements)
+
+
+def test__repository__drop_partition__marker_gone_after_lock__raises_unmanaged_error_without_drop() -> None:
+    # Arrange — pre-check saw the orphan marker, but under the lock the comment is gone (table replaced)
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, None, None, None, True],  # set_config, lock_timeout, LOCK, not attached, no marker, exists
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(UnmanagedPartitionDropError):
+        repo.drop_partition("events__2024_01")
+
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    assert not any("DROP TABLE" in s for s in statements)
+
+
+# ── fk_manager ──────────────────────────────────────────────────────────────────
+
+
+def test__fk_manager__list_constraints__opens_connection_and_returns_names() -> None:
+    # Arrange — the engine-connection wrapper applies the statement timeout then delegates
+    # to list_constraints_conn: set_config, FK query
+    engine = _make_engine([None, [("fk_a",), ("fk_b",)]])
+    manager = PartitionForeignKeyManager(engine, ddl_timeout=5.0)
+
+    # Act
+    names = manager.list_constraints("events__2024_01")
+
+    # Assert
+    assert names == ["fk_a", "fk_b"]
+    engine.connect.assert_called_once()
 
 
 # ── is_partition_attached ───────────────────────────────────────────────────────

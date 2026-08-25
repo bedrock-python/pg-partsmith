@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pruning fails closed: `infinity` upper bounds are treated as unbounded (like
+  `MAXVALUE`), and an attached partition whose catalog boundary cannot be
+  interpreted is skipped with a warning instead of being pruned by its name.
+- `list_partitions` always returns schema-qualified partition names taken from
+  the catalog — a partition living in a different schema than its parent can no
+  longer be re-resolved via `search_path` to an unrelated same-named table.
+- `drop_partition` revalidates attachment and the orphan marker under an
+  `ACCESS EXCLUSIVE` lock in the same transaction as `DROP TABLE`, closing the
+  window where a concurrently reattached or replaced relation could be dropped.
+- Subpartitioned partitions (`relkind='p'`) are now recognised by existence
+  checks and orphan discovery, so a detached partitioned child is dropped
+  instead of being silently leaked.
+- Attach conflict SQLSTATEs (incl. `42809`) are only treated as a lost race
+  after verifying the partition is actually attached to the requested parent.
+- The compensating "return rows to DEFAULT" step now also runs when the attach
+  is interrupted by cancellation (async, shielded) or KeyboardInterrupt (sync).
+- A cancellation that lands while awaiting the Redis `SET NX` response performs
+  a token-checked release, so a server-side-applied SET no longer leaks the
+  lock until TTL.
+
 - Detach: a partition left in `inhdetachpending` state by a cancelled
   `DETACH CONCURRENTLY` (e.g. a DDL timeout) is now completed with
   `DETACH PARTITION ... FINALIZE` instead of failing on every subsequent run.

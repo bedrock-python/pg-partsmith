@@ -315,6 +315,21 @@ def test__redis_lock__body_keyboard_interrupt__unlock_is_still_called() -> None:
     assert unlock_script.called  # type: ignore[unreachable]
 
 
+def test__redis_lock__keyboard_interrupt_during_set__releases_token_and_reraises() -> None:
+    # Arrange — the SET may have been applied server-side before the interrupt landed, so the
+    # token-checked unlock script must run (safe no-op otherwise) before the interrupt propagates
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=True)
+    redis_client.set = MagicMock(side_effect=KeyboardInterrupt())
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert
+    with pytest.raises(KeyboardInterrupt), manager.acquire_lock("events"):
+        pass
+
+    unlock_script.assert_called_once()
+
+
 def test__redis_lock__is_locked_true__returns_true() -> None:
     # Arrange
     redis_client = MagicMock()

@@ -219,7 +219,6 @@ class PartitionRemover:
             if not self._ensure_managed(conn, partition_name):
                 return
 
-        fk_constraints = self._fk_manager.list_constraints(partition_name)
         last_exc: BaseException | None = None
 
         for attempt in range(self._drop_max_retries):
@@ -227,7 +226,7 @@ class PartitionRemover:
                 self._handle_retry_delay(attempt, last_exc, partition_name)
 
             try:
-                self._execute_drop(partition_name, fk_constraints)
+                self._execute_drop(partition_name)
             except (SQLAlchemyError, OSError, TimeoutError) as exc:
                 if isinstance(exc, SQLAlchemyError) and pg_sqlstate(exc) not in _RETRYABLE_PG_STATES:
                     raise
@@ -237,13 +236,32 @@ class PartitionRemover:
 
         raise DropRetryExhaustedError(partition_name, self._drop_max_retries, last_exc) from last_exc
 
-    def _execute_drop(self, partition_name: str, fk_constraints: list[str]) -> None:
+    def _execute_drop(self, partition_name: str) -> None:
+        """Lock, revalidate, and drop in one transaction.
+
+        The pre-checks in :meth:`drop` run on a different connection, so the
+        relation could have been reattached or replaced since. Taking ACCESS
+        EXCLUSIVE first and revalidating under it closes that window —
+        PostgreSQL happily drops even an attached partition via DROP TABLE.
+        """
         with self._engine.begin() as conn:
             apply_local_statement_timeout(conn, self._ddl_timeout)
             conn.execute(
                 text("SELECT set_config('lock_timeout', :timeout, true)"),
                 {"timeout": str(self._drop_lock_timeout_ms)},
             )
+            try:
+                conn.execute(
+                    build_ddl_statement("LOCK TABLE {partition} IN ACCESS EXCLUSIVE MODE", partition=partition_name)
+                )
+            except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                if pg_sqlstate(exc) == "42P01":  # dropped concurrently — nothing left to do
+                    return
+                raise
+            self._ensure_not_attached(conn, partition_name)
+            if not self._ensure_managed(conn, partition_name):
+                return
+            fk_constraints = self._fk_manager.list_constraints_conn(conn, partition_name)
             self._fk_manager.drop_constraints(conn, partition_name, fk_constraints)
             conn.execute(build_ddl_statement("DROP TABLE IF EXISTS {partition}", partition=partition_name))
 
