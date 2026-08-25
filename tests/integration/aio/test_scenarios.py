@@ -231,3 +231,74 @@ async def test__scenario__default_partition_has_conflicting_rows__reconciles_and
     )
     assert count_in_default.scalar() == 0
     assert count_in_april.scalar() == 1
+
+
+@pytest.mark.integration
+async def test__scenario__hour_granularity__creates_ahead_and_prunes_old_hours(
+    partition_builder: PartitioningScenarioBuilder,
+) -> None:
+    # Arrange
+    ctx = await (
+        partition_builder.with_granularity(PartitionGranularity.HOUR).with_create_ahead(3).with_retention(2).build()
+    )
+
+    # Act — frozen mid-hour: current hour plus 2 ahead are created
+    result = await ctx.run_maintenance(at_time="2026-08-25 14:30:00+00:00")
+
+    # Assert
+    assert result.success
+    assert result.created_count == 3
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_25_14")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_25_15")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_25_16")
+
+    # Act — advance to 17:30: hours 14 and 15 fall outside retention, hour 16 stays
+    result = await ctx.run_maintenance(at_time="2026-08-25 17:30:00+00:00")
+
+    # Assert
+    assert result.success
+    assert result.dropped_count >= 2
+    await ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_08_25_14")
+    await ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_08_25_15")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_25_16")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_25_17")
+
+    # Act — advance to 23:30: create-ahead crosses midnight into the next day
+    result = await ctx.run_maintenance(at_time="2026-08-25 23:30:00+00:00")
+
+    # Assert
+    assert result.success
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_25_23")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_26_00")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_26_01")
+    await ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_08_25_16")
+
+
+@pytest.mark.integration
+async def test__scenario__quarter_granularity__creates_ahead_and_prunes_old_quarters(
+    partition_builder: PartitioningScenarioBuilder,
+) -> None:
+    # Arrange
+    ctx = await (
+        partition_builder.with_granularity(PartitionGranularity.QUARTER).with_create_ahead(2).with_retention(1).build()
+    )
+
+    # Act — frozen in Q3 2026: current quarter plus 1 ahead are created
+    result = await ctx.run_maintenance(at_time="2026-08-15")
+
+    # Assert
+    assert result.success
+    assert result.created_count == 2
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_q3")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2026_q4")
+
+    # Act — advance to Q1 2027: 2026 quarters fall outside retention, 2027 quarters created ahead
+    result = await ctx.run_maintenance(at_time="2027-01-10")
+
+    # Assert
+    assert result.success
+    assert result.dropped_count >= 2
+    await ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_q3")
+    await ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_q4")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2027_q1")
+    await ctx.assert_partition_attached(f"{ctx.table_name}__2027_q2")

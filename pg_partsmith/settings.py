@@ -68,7 +68,7 @@ class PartitionTableSettings(BaseSettings):
     partition_column: str = Field(..., description="Column used for partitioning")
     granularity: PartitionGranularity | None = Field(
         default=None,
-        description="Time granularity: day, week, month, year",
+        description="Time granularity: hour, day, week, month, quarter, year",
     )
     create_ahead_count: int = Field(
         default=DEFAULT_CREATE_AHEAD_COUNT,

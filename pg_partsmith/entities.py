@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -13,11 +13,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .constants import (
     DEFAULT_CREATE_AHEAD_COUNT,
     DEFAULT_RETENTION_COUNT,
+    MAX_HOUR,
     MAX_IDENTIFIER_LENGTH,
     MAX_ISO_WEEK,
     MAX_MONTH,
+    MAX_QUARTER,
+    MIN_HOUR,
     MIN_ISO_WEEK,
     MIN_MONTH,
+    MIN_QUARTER,
 )
 from .types import NonNegativeInt, PositiveInt, StrippedNonEmptyStr
 
@@ -40,15 +44,19 @@ class PartitionGranularity(StrEnum):
     """Time-based partition granularity.
 
     Attributes:
+        HOUR: Hourly partitions.
         DAY: Daily partitions.
         WEEK: Weekly partitions.
         MONTH: Monthly partitions.
+        QUARTER: Quarterly partitions.
         YEAR: Yearly partitions.
     """
 
+    HOUR = "hour"
     DAY = "day"
     WEEK = "week"
     MONTH = "month"
+    QUARTER = "quarter"
     YEAR = "year"
 
 
@@ -76,12 +84,16 @@ class Period:
         month: Month component (1-12), optional.
         day: Day component (1-31), optional.
         week: ISO week number (1-53), optional.
+        hour: Hour component (0-23), optional; requires day.
+        quarter: Quarter component (1-4), optional.
     """
 
     year: int
     month: int | None = None
     day: int | None = None
     week: int | None = None
+    hour: int | None = None
+    quarter: int | None = None
 
     def __post_init__(self) -> None:
         """Validate period components."""
@@ -89,10 +101,17 @@ class Period:
         self._check_month_range()
         self._check_day_resolves_to_real_date()
         self._check_week_resolves_to_real_iso_week()
+        self._check_hour()
+        self._check_quarter()
 
     def _check_kind_consistency(self) -> None:
-        if self.week is not None and (self.month is not None or self.day is not None):
-            msg = "Period cannot have both week and month/day"
+        if self.week is not None and (self.month is not None or self.day is not None or self.hour is not None):
+            msg = "Period cannot have both week and month/day/hour"
+            raise ValueError(msg)
+        if self.quarter is not None and (
+            self.month is not None or self.day is not None or self.week is not None or self.hour is not None
+        ):
+            msg = "Period cannot have both quarter and month/day/week/hour"
             raise ValueError(msg)
 
     def _check_month_range(self) -> None:
@@ -126,6 +145,23 @@ class Period:
             msg = f"Invalid ISO week: {self.year:04d}-W{self.week:02d}"
             raise ValueError(msg) from exc
 
+    def _check_hour(self) -> None:
+        if self.hour is None:
+            return
+        if self.day is None:
+            msg = "Day is required when hour is specified"
+            raise ValueError(msg)
+        if not MIN_HOUR <= self.hour <= MAX_HOUR:
+            msg = f"Hour must be between {MIN_HOUR} and {MAX_HOUR}, got {self.hour}"
+            raise ValueError(msg)
+
+    def _check_quarter(self) -> None:
+        if self.quarter is None:
+            return
+        if not MIN_QUARTER <= self.quarter <= MAX_QUARTER:
+            msg = f"Quarter must be between {MIN_QUARTER} and {MAX_QUARTER}, got {self.quarter}"
+            raise ValueError(msg)
+
     def to_date(self, day: int = 1) -> date:
         """Convert period to date.
 
@@ -140,10 +176,24 @@ class Period:
         if self.week is not None:
             return date.fromisocalendar(self.year, self.week, 1)
 
+        if self.quarter is not None:
+            return date(self.year, (self.quarter - 1) * 3 + 1, day)
+
         month = self.month if self.month is not None else 1
         day_value = self.day if self.day is not None else day
 
         return date(self.year, month, day_value)
+
+    def to_datetime(self) -> datetime:
+        """Convert period start to a timezone-aware UTC datetime.
+
+        Unlike :meth:`to_date`, preserves the hour component, so hourly
+        periods within one day map to distinct instants.
+        """
+        base = datetime.combine(self.to_date(), datetime.min.time(), tzinfo=UTC)
+        if self.hour is not None:
+            base = base.replace(hour=self.hour)
+        return base
 
     def __add__(self, offset: int) -> Period:
         """Add offset to period (implementation depends on granularity).
@@ -159,6 +209,14 @@ class Period:
             new_date = monday + timedelta(weeks=offset)
             iso_year, iso_week, _ = new_date.isocalendar()
             return Period(year=iso_year, week=iso_week)
+
+        if self.quarter is not None:
+            total_quarters = self.year * 4 + self.quarter - 1 + offset
+            return Period(year=total_quarters // 4, quarter=(total_quarters % 4) + 1)
+
+        if self.hour is not None and self.day is not None and self.month is not None:
+            dt = datetime(self.year, self.month, self.day, self.hour, tzinfo=UTC) + timedelta(hours=offset)
+            return Period(year=dt.year, month=dt.month, day=dt.day, hour=dt.hour)
 
         if self.day is not None and self.month is not None:
             d = date(self.year, self.month, self.day) + timedelta(days=offset)
@@ -204,6 +262,12 @@ class Period:
         if self_kind == "day":
             return (self.year, self.month, self.day) < (other.year, other.month, other.day)
 
+        if self_kind == "hour":
+            return (self.year, self.month, self.day, self.hour) < (other.year, other.month, other.day, other.hour)
+
+        if self_kind == "quarter":
+            return (self.year, self.quarter) < (other.year, other.quarter)
+
         # week
         return (self.year, self.week) < (other.year, other.week)
 
@@ -211,6 +275,10 @@ class Period:
     def _granularity_key(p: Period) -> str:
         if p.week is not None:
             return "week"
+        if p.quarter is not None:
+            return "quarter"
+        if p.hour is not None:
+            return "hour"
         if p.day is not None:
             return "day"
         if p.month is not None:
@@ -219,12 +287,16 @@ class Period:
 
     def __str__(self) -> str:
         """String representation."""
+        if self.month is not None and self.day is not None and self.hour is not None:
+            return f"{self.year:04d}_{self.month:02d}_{self.day:02d}_{self.hour:02d}"
         if self.month is not None and self.day is not None:
             return f"{self.year:04d}_{self.month:02d}_{self.day:02d}"
         if self.month is not None:
             return f"{self.year:04d}_{self.month:02d}"
         if self.week is not None:
             return f"{self.year:04d}_w{self.week:02d}"
+        if self.quarter is not None:
+            return f"{self.year:04d}_q{self.quarter}"
         return f"{self.year:04d}"
 
 
@@ -383,9 +455,11 @@ class TablePartitionConfig(BaseModel):
             # Validate that generated partition names will not exceed PostgreSQL's
             # 63-byte identifier limit (max_identifier_length default).
             suffix_len = {
+                PartitionGranularity.HOUR: len("__0000_00_00_00"),
                 PartitionGranularity.DAY: len("__0000_00_00"),
                 PartitionGranularity.WEEK: len("__0000_w00"),
                 PartitionGranularity.MONTH: len("__0000_00"),
+                PartitionGranularity.QUARTER: len("__0000_q0"),
                 PartitionGranularity.YEAR: len("__0000"),
             }[self.granularity]
             if len(self.table_name) + suffix_len > MAX_IDENTIFIER_LENGTH:

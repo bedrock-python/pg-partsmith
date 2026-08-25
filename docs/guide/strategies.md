@@ -1,21 +1,25 @@
 # Period strategies
 
 Period calculators determine how partitions are named and what range boundaries they get.
-pg-partsmith ships four built-in calculators and a base class for custom ones.
+pg-partsmith ships six built-in calculators and a base class for custom ones.
 
 ## Built-in calculators
 
 | Class | Granularity | Example partition name |
 |-------|-------------|------------------------|
+| `HourPeriodCalculator` | Hourly (UTC) | `events__2024_01_15_09` |
 | `DayPeriodCalculator` | Daily | `events__2024_01_15` |
 | `WeekPeriodCalculator` | ISO weekly | `events__2024_w03` |
 | `MonthPeriodCalculator` | Monthly | `events__2024_01` |
+| `QuarterPeriodCalculator` | Quarterly | `events__2024_q1` |
 | `YearPeriodCalculator` | Yearly | `events__2024` |
 
 ```python
 from pg_partsmith import (
     DayPeriodCalculator,
+    HourPeriodCalculator,
     MonthPeriodCalculator,
+    QuarterPeriodCalculator,
     WeekPeriodCalculator,
     YearPeriodCalculator,
 )
@@ -23,6 +27,10 @@ from pg_partsmith import (
 
 `WeekPeriodCalculator` uses lowercase `w` and enforces lowercase naming for all existing
 partitions to maintain consistency.
+
+`HourPeriodCalculator` works in UTC and emits boundaries with hour precision
+(`2024-01-15 09:00:00+00`), so it is suitable for short-lived buffer tables
+(e.g. transactional outboxes) where retention is measured in hours.
 
 ## Passing a calculator to the service
 
@@ -48,14 +56,16 @@ from pg_partsmith.entities import Period
 from datetime import datetime, timezone
 
 
-class QuarterPeriodCalculator(BasePeriodCalculator):
+class FiscalYearPeriodCalculator(BasePeriodCalculator):
+    """Yearly partitions aligned to a fiscal year starting April 1."""
+
     def current_period(self) -> Period:
         now = datetime.now(timezone.utc)
-        quarter = (now.month - 1) // 3 + 1
-        return Period(year=now.year, quarter=quarter)
+        fiscal_year = now.year if now.month >= 4 else now.year - 1
+        return Period(year=fiscal_year)
 
     def format_partition_name(self, table_name: str, period: Period) -> str:
-        return f"{table_name}__q{period.quarter}_{period.year}"
+        return f"{table_name}__fy{period.year}"
 
     def parse_partition_name(self, partition_name: str) -> Period | None:
         # parse back to Period for retention logic

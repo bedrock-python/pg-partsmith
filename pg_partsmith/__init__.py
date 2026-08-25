@@ -26,7 +26,9 @@ from .protocols import PeriodCalculator
 from .strategies import (
     BasePeriodCalculator,
     DayPeriodCalculator,
+    HourPeriodCalculator,
     MonthPeriodCalculator,
+    QuarterPeriodCalculator,
     WeekPeriodCalculator,
     YearPeriodCalculator,
 )
@@ -36,6 +38,7 @@ __all__ = [
     "BasePeriodCalculator",
     "DayPeriodCalculator",
     "DropRetryExhaustedError",
+    "HourPeriodCalculator",
     "InvalidPartitionConfigError",
     "LockAcquisitionError",
     "MaintenanceIssueStep",
@@ -52,6 +55,7 @@ __all__ = [
     "PartitionType",
     "Period",
     "PeriodCalculator",
+    "QuarterPeriodCalculator",
     "TablePartitionConfig",
     "UnmanagedPartitionDropError",
     "WeekPeriodCalculator",

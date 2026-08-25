@@ -4,7 +4,9 @@ from freezegun import freeze_time
 from pg_partsmith.entities import PartitionGranularity, Period
 from pg_partsmith.strategies import (
     DayPeriodCalculator,
+    HourPeriodCalculator,
     MonthPeriodCalculator,
+    QuarterPeriodCalculator,
     WeekPeriodCalculator,
     YearPeriodCalculator,
 )
@@ -427,15 +429,243 @@ def test__year_calculator__period_before__subtracts_offset_from_year() -> None:
     assert calc.period_before(Period(year=2024), 3) == Period(year=2021)
 
 
+# ── HourPeriodCalculator ────────────────────────────────────────────────────────
+
+
+def test__hour_calculator__format__produces_table_double_underscore_year_month_day_hour() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act
+    name = calc.format_partition_name("events", Period(year=2024, month=3, day=5, hour=7))
+
+    # Assert
+    assert name == "events__2024_03_05_07"
+
+
+def test__hour_calculator__format_without_hour__raises_value_error() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act / Assert
+    with pytest.raises(ValueError):
+        calc.format_partition_name("events", Period(year=2024, month=3, day=5))
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("events__2024_03_15_07", Period(year=2024, month=3, day=15, hour=7)),
+        ("events__2024_12_31_23", Period(year=2024, month=12, day=31, hour=23)),
+    ],
+)
+def test__hour_calculator__parse_valid_name__returns_period(name: str, expected: Period) -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act / Assert
+    assert calc.parse_partition_name(name) == expected
+
+
+def test__hour_calculator__parse_day_style_name__returns_none() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act / Assert — a day-granularity name must not parse as an hour period
+    assert calc.parse_partition_name("t__2026_08_25") is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["invalid", "events__2024_03_15_24", "events__2024_02_30_05", "events__2024_13_01_00"],
+)
+def test__hour_calculator__parse_invalid_name__returns_none(name: str) -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act / Assert
+    assert calc.parse_partition_name(name) is None
+
+
+def test__hour_calculator__get_boundaries__returns_hour_and_next_hour() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act
+    from_val, to_val = calc.get_boundaries(Period(year=2024, month=3, day=15, hour=7))
+
+    # Assert
+    assert from_val == "2024-03-15 07:00:00+00"
+    assert to_val == "2024-03-15 08:00:00+00"
+
+
+def test__hour_calculator__get_boundaries_last_hour_of_day__wraps_to_next_day_midnight() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act
+    from_val, to_val = calc.get_boundaries(Period(year=2024, month=3, day=31, hour=23))
+
+    # Assert
+    assert from_val == "2024-03-31 23:00:00+00"
+    assert to_val == "2024-04-01 00:00:00+00"
+
+
+def test__hour_calculator__get_boundaries_without_hour__raises_value_error() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act / Assert
+    with pytest.raises(ValueError):
+        calc.get_boundaries(Period(year=2024, month=3, day=15))
+
+
+@freeze_time("2024-03-15 14:30:00")
+def test__hour_calculator__current_period__returns_march_15_hour_14() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act
+    p = calc.current_period()
+
+    # Assert
+    assert p == Period(year=2024, month=3, day=15, hour=14)
+
+
+@freeze_time("2024-03-15 22:30:00")
+def test__hour_calculator__next_periods_3__crosses_midnight_into_next_day() -> None:
+    # Arrange
+    calc = HourPeriodCalculator()
+
+    # Act
+    periods = calc.next_periods(3)
+
+    # Assert
+    assert periods[0] == Period(year=2024, month=3, day=15, hour=22)
+    assert periods[1] == Period(year=2024, month=3, day=15, hour=23)
+    assert periods[2] == Period(year=2024, month=3, day=16, hour=0)
+
+
+# ── QuarterPeriodCalculator ─────────────────────────────────────────────────────
+
+
+def test__quarter_calculator__format__produces_table_double_underscore_year_lowercase_q_quarter() -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act
+    name = calc.format_partition_name("events", Period(year=2024, quarter=2))
+
+    # Assert
+    assert name == "events__2024_q2"
+
+
+def test__quarter_calculator__format_without_quarter__raises_value_error() -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act / Assert
+    with pytest.raises(ValueError):
+        calc.format_partition_name("events", Period(year=2024))
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("events__2024_q1", Period(year=2024, quarter=1)),
+        ("events__2024_q4", Period(year=2024, quarter=4)),
+    ],
+)
+def test__quarter_calculator__parse_valid_name__returns_period(name: str, expected: Period) -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act / Assert
+    assert calc.parse_partition_name(name) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["invalid", "events__2024_03", "events__2024_q0", "events__2024_q5", "events__2024_Q1"],
+)
+def test__quarter_calculator__parse_invalid_name__returns_none(name: str) -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act / Assert
+    assert calc.parse_partition_name(name) is None
+
+
+def test__quarter_calculator__get_boundaries__returns_first_day_of_quarter_and_next() -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act
+    from_val, to_val = calc.get_boundaries(Period(year=2024, quarter=2))
+
+    # Assert
+    assert from_val == "2024-04-01"
+    assert to_val == "2024-07-01"
+
+
+def test__quarter_calculator__get_boundaries_q4__wraps_to_january_next_year() -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act
+    from_val, to_val = calc.get_boundaries(Period(year=2024, quarter=4))
+
+    # Assert
+    assert from_val == "2024-10-01"
+    assert to_val == "2025-01-01"
+
+
+def test__quarter_calculator__get_boundaries_without_quarter__raises_value_error() -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act / Assert
+    with pytest.raises(ValueError):
+        calc.get_boundaries(Period(year=2024))
+
+
+@freeze_time("2024-08-15")
+def test__quarter_calculator__current_period__returns_q3_2024() -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act
+    p = calc.current_period()
+
+    # Assert
+    assert p == Period(year=2024, quarter=3)
+
+
+@freeze_time("2024-08-15")
+def test__quarter_calculator__next_periods_3__returns_q3_q4_and_next_year_q1() -> None:
+    # Arrange
+    calc = QuarterPeriodCalculator()
+
+    # Act
+    periods = calc.next_periods(3)
+
+    # Assert
+    assert periods[0] == Period(year=2024, quarter=3)
+    assert periods[1] == Period(year=2024, quarter=4)
+    assert periods[2] == Period(year=2025, quarter=1)
+
+
 # ── get_period_calculator ───────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
     "granularity,expected_cls",
     [
+        (PartitionGranularity.HOUR, HourPeriodCalculator),
         (PartitionGranularity.DAY, DayPeriodCalculator),
         (PartitionGranularity.WEEK, WeekPeriodCalculator),
         (PartitionGranularity.MONTH, MonthPeriodCalculator),
+        (PartitionGranularity.QUARTER, QuarterPeriodCalculator),
         (PartitionGranularity.YEAR, YearPeriodCalculator),
     ],
 )

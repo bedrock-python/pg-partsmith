@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -50,6 +50,22 @@ def test__period__year_and_week__sets_week() -> None:
     assert p.week == 12
 
 
+def test__period__year_month_day_hour__sets_hour() -> None:
+    # Arrange / Act
+    p = Period(year=2024, month=3, day=15, hour=7)
+
+    # Assert
+    assert p.hour == 7
+
+
+def test__period__year_and_quarter__sets_quarter() -> None:
+    # Arrange / Act
+    p = Period(year=2024, quarter=2)
+
+    # Assert
+    assert p.quarter == 2
+
+
 @pytest.mark.parametrize(
     "kwargs,match",
     [
@@ -59,6 +75,10 @@ def test__period__year_and_week__sets_week() -> None:
         ({"year": 2024, "month": 1, "day": 0}, "(?i)(day|date)"),
         ({"year": 2024, "week": 54}, "(?i)week"),
         ({"year": 2024, "week": 0}, "(?i)week"),
+        ({"year": 2024, "month": 1, "day": 1, "hour": 24}, "(?i)hour"),
+        ({"year": 2024, "month": 1, "day": 1, "hour": -1}, "(?i)hour"),
+        ({"year": 2024, "quarter": 5}, "(?i)quarter"),
+        ({"year": 2024, "quarter": 0}, "(?i)quarter"),
     ],
 )
 def test__period__out_of_range_field__raises_value_error(kwargs: dict, match: str) -> None:
@@ -72,6 +92,24 @@ def test__period__week_53_in_non_53_week_year__raises_value_error() -> None:
     # Arrange / Act / Assert
     with pytest.raises(ValueError):
         Period(year=2021, week=53)
+
+
+def test__period__hour_without_day__raises_value_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match=r"(?i)day"):
+        Period(year=2024, month=3, hour=5)
+
+
+def test__period__quarter_with_month__raises_value_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match=r"(?i)quarter"):
+        Period(year=2024, month=3, quarter=1)
+
+
+def test__period__week_with_hour__raises_value_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match=r"(?i)week"):
+        Period(year=2024, week=12, hour=5)
 
 
 def test__period__add_months_crosses_year_boundary__wraps_year() -> None:
@@ -109,6 +147,58 @@ def test__period__add_years__increments_year() -> None:
     assert result.year == 2025
 
 
+def test__period__add_hours_crosses_midnight_and_month__wraps_day_and_month() -> None:
+    # Arrange
+    p = Period(year=2024, month=3, day=31, hour=23)
+
+    # Act
+    result = p + 1
+
+    # Assert
+    assert result.year == 2024
+    assert result.month == 4
+    assert result.day == 1
+    assert result.hour == 0
+
+
+def test__period__subtract_hours_crosses_midnight__wraps_to_previous_day() -> None:
+    # Arrange
+    p = Period(year=2024, month=3, day=1, hour=0)
+
+    # Act
+    result = p - 1
+
+    # Assert — 2024 is a leap year, so 1 March minus one hour lands on 29 February
+    assert result.year == 2024
+    assert result.month == 2
+    assert result.day == 29
+    assert result.hour == 23
+
+
+def test__period__add_quarters_crosses_year_boundary__wraps_year() -> None:
+    # Arrange
+    p = Period(year=2024, quarter=4)
+
+    # Act
+    result = p + 2
+
+    # Assert
+    assert result.year == 2025
+    assert result.quarter == 2
+
+
+def test__period__subtract_quarters_crosses_year_boundary__wraps_to_previous_year() -> None:
+    # Arrange
+    p = Period(year=2024, quarter=1)
+
+    # Act
+    result = p - 1
+
+    # Assert
+    assert result.year == 2023
+    assert result.quarter == 4
+
+
 def test__period__same_granularity_comparison__orders_correctly() -> None:
     # Arrange
     p1 = Period(year=2024, month=1)
@@ -119,6 +209,26 @@ def test__period__same_granularity_comparison__orders_correctly() -> None:
     assert p2 > p1
     assert p1 <= p1
     assert p1 >= p1
+
+
+def test__period__hour_comparison__orders_within_same_day() -> None:
+    # Arrange
+    p1 = Period(year=2024, month=3, day=15, hour=7)
+    p2 = Period(year=2024, month=3, day=15, hour=9)
+
+    # Assert
+    assert p1 < p2
+    assert p2 > p1
+
+
+def test__period__quarter_comparison__orders_correctly() -> None:
+    # Arrange
+    p1 = Period(year=2024, quarter=1)
+    p2 = Period(year=2024, quarter=3)
+
+    # Assert
+    assert p1 < p2
+    assert p2 > p1
 
 
 def test__period__different_granularity_comparison__raises_type_error() -> None:
@@ -133,6 +243,30 @@ def test__period__different_granularity_comparison__raises_type_error() -> None:
         _ = p_week > p_month
 
 
+def test__period__hour_vs_day_comparison__raises_type_error() -> None:
+    # Arrange
+    p_hour = Period(year=2024, month=3, day=15, hour=7)
+    p_day = Period(year=2024, month=3, day=15)
+
+    # Act / Assert
+    with pytest.raises(TypeError):
+        _ = p_hour < p_day
+    with pytest.raises(TypeError):
+        _ = p_day > p_hour
+
+
+def test__period__quarter_vs_month_comparison__raises_type_error() -> None:
+    # Arrange
+    p_quarter = Period(year=2024, quarter=1)
+    p_month = Period(year=2024, month=1)
+
+    # Act / Assert
+    with pytest.raises(TypeError):
+        _ = p_quarter < p_month
+    with pytest.raises(TypeError):
+        _ = p_month > p_quarter
+
+
 def test__period__lt_with_non_period__returns_not_implemented() -> None:
     # Arrange
     p = Period(year=2024, month=1)
@@ -140,6 +274,8 @@ def test__period__lt_with_non_period__returns_not_implemented() -> None:
     # Act / Assert
     assert p.__lt__(1) == NotImplemented  # type: ignore[operator]
     assert p.__lt__(Period(year=2024, week=1)) == NotImplemented
+    assert p.__lt__(Period(year=2024, quarter=1)) == NotImplemented
+    assert p.__lt__(Period(year=2024, month=1, day=1, hour=0)) == NotImplemented
 
 
 @pytest.mark.parametrize(
@@ -148,7 +284,9 @@ def test__period__lt_with_non_period__returns_not_implemented() -> None:
         (Period(year=2024), "2024"),
         (Period(year=2024, month=3), "2024_03"),
         (Period(year=2024, month=3, day=5), "2024_03_05"),
+        (Period(year=2024, month=3, day=5, hour=7), "2024_03_05_07"),
         (Period(year=2024, week=7), "2024_w07"),
+        (Period(year=2024, quarter=2), "2024_q2"),
     ],
 )
 def test__period__str__formats_correctly(period: Period, expected_str: str) -> None:
@@ -164,6 +302,35 @@ def test__period__to_date__returns_correct_date_for_month() -> None:
 def test__period__to_date__returns_correct_date_for_day() -> None:
     # Arrange / Act / Assert
     assert Period(year=2024, month=3, day=15).to_date() == date(2024, 3, 15)
+
+
+def test__period__to_date__returns_first_day_of_quarter() -> None:
+    # Arrange / Act / Assert
+    assert Period(year=2024, quarter=3).to_date() == date(2024, 7, 1)
+
+
+@pytest.mark.parametrize(
+    "period,expected",
+    [
+        (Period(year=2024, month=3, day=15, hour=7), datetime(2024, 3, 15, 7, tzinfo=UTC)),
+        (Period(year=2024, month=3, day=15), datetime(2024, 3, 15, tzinfo=UTC)),
+        (Period(year=2024, month=3), datetime(2024, 3, 1, tzinfo=UTC)),
+        (Period(year=2024, week=12), datetime(2024, 3, 18, tzinfo=UTC)),  # Monday of ISO week 12
+        (Period(year=2024, quarter=4), datetime(2024, 10, 1, tzinfo=UTC)),
+    ],
+)
+def test__period__to_datetime__returns_utc_start_of_period(period: Period, expected: datetime) -> None:
+    # Arrange / Act / Assert
+    assert period.to_datetime() == expected
+
+
+# ── PartitionGranularity ────────────────────────────────────────────────────────
+
+
+def test__partition_granularity__hour_and_quarter__are_members() -> None:
+    # Arrange / Act / Assert
+    assert PartitionGranularity.HOUR.value == "hour"
+    assert PartitionGranularity.QUARTER.value == "quarter"
 
 
 # ── PartitionInfo ───────────────────────────────────────────────────────────────
@@ -301,6 +468,49 @@ def test__table_partition_config__table_name_too_long_for_monthly_suffix__raises
             partition_column="created_at",
             granularity=PartitionGranularity.MONTH,
         )
+
+
+def test__table_partition_config__table_name_too_long_for_hourly_suffix__raises_value_error() -> None:
+    # "a" * 49 + "__0000_00_00_00" (15 chars) = 64 > 63
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="too long"):
+        TablePartitionConfig(
+            table_name="a" * 49,
+            partition_type=PartitionType.RANGE,
+            partition_strategy=PartitionStrategy.TIME_BASED,
+            partition_column="created_at",
+            granularity=PartitionGranularity.HOUR,
+        )
+
+
+def test__table_partition_config__hour_granularity_with_max_length_name__accepted() -> None:
+    # "a" * 48 + "__0000_00_00_00" (15 chars) = 63
+    # Arrange / Act
+    cfg = TablePartitionConfig(
+        table_name="a" * 48,
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.HOUR,
+    )
+
+    # Assert
+    assert cfg.granularity == PartitionGranularity.HOUR
+
+
+def test__table_partition_config__quarter_granularity_with_max_length_name__accepted() -> None:
+    # "a" * 54 + "__0000_q0" (9 chars) = 63
+    # Arrange / Act
+    cfg = TablePartitionConfig(
+        table_name="a" * 54,
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.QUARTER,
+    )
+
+    # Assert
+    assert cfg.granularity == PartitionGranularity.QUARTER
 
 
 def test__table_partition_config__mixed_case_identifiers__normalised_to_lowercase() -> None:

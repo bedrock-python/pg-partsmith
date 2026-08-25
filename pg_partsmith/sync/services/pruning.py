@@ -93,8 +93,7 @@ class PartitionPruningService:
                 return (0, end_dt_key, p.name)
             period_key = parsed_period_by_name.get(p.name)
             if period_key is not None:
-                d = period_key.to_date()
-                return (1, datetime(d.year, d.month, d.day, tzinfo=UTC), p.name)
+                return (1, period_key.to_datetime(), p.name)
             return (2, None, p.name)
 
         # Precompute keys once (O(n)) to avoid O(n*log(n)) key evaluations during sort.
