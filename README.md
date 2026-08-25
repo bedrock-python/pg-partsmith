@@ -16,7 +16,7 @@ A single library that covers the full PostgreSQL partition lifecycle: creating p
 - **Async and sync** — `pg_partsmith.aio` on the SQLAlchemy async engine, `pg_partsmith.sync` on the classic sync engine
 - **Full lifecycle** — create ahead, detach expired, drop orphans in one call
 - **Extensible hooks** — 6 hook points (`before`/`after` create, detach, drop)
-- **Multiple strategies** — daily, weekly, monthly, yearly + fully custom
+- **Multiple strategies** — hourly, daily, weekly, monthly, quarterly, yearly + fully custom
 - **Distributed locking** — PostgreSQL advisory locks (built-in) or Redis
 - **Schema-aware** — multi-schema support, independent of `search_path`
 - **Safe by default** — refuses to drop tables not managed by this library
@@ -257,9 +257,11 @@ locks = RedisDistributedLockManager(
 
 | Class | Granularity | Example |
 |-------|-------------|---------|
+| `HourPeriodCalculator` | Hourly (UTC) | `events__2024_01_15_09` |
 | `DayPeriodCalculator` | Daily | `events__2024_01_15` |
 | `WeekPeriodCalculator` | ISO weekly | `events__2024_w03` |
 | `MonthPeriodCalculator` | Monthly | `events__2024_01` |
+| `QuarterPeriodCalculator` | Quarterly | `events__2024_q1` |
 | `YearPeriodCalculator` | Yearly | `events__2024` |
 
 ```python
@@ -299,7 +301,7 @@ scheduler.add_job(
 
 **Protocols** — `PeriodCalculator`
 
-**Strategies** — `BasePeriodCalculator`, `DayPeriodCalculator`, `WeekPeriodCalculator`, `MonthPeriodCalculator`, `YearPeriodCalculator`
+**Strategies** — `BasePeriodCalculator`, `HourPeriodCalculator`, `DayPeriodCalculator`, `WeekPeriodCalculator`, `MonthPeriodCalculator`, `QuarterPeriodCalculator`, `YearPeriodCalculator`
 
 ### `pg_partsmith.aio`
 

@@ -4,14 +4,18 @@ from pg_partsmith.entities import PartitionGranularity
 
 from .base import BasePeriodCalculator
 from .day import DayPeriodCalculator
+from .hour import HourPeriodCalculator
 from .month import MonthPeriodCalculator
+from .quarter import QuarterPeriodCalculator
 from .week import WeekPeriodCalculator
 from .year import YearPeriodCalculator
 
 _CALCULATORS: dict[PartitionGranularity, type[BasePeriodCalculator]] = {
+    PartitionGranularity.HOUR: HourPeriodCalculator,
     PartitionGranularity.DAY: DayPeriodCalculator,
     PartitionGranularity.WEEK: WeekPeriodCalculator,
     PartitionGranularity.MONTH: MonthPeriodCalculator,
+    PartitionGranularity.QUARTER: QuarterPeriodCalculator,
     PartitionGranularity.YEAR: YearPeriodCalculator,
 }
 

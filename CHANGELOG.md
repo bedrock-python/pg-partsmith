@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Hour and quarter partition granularities: `PartitionGranularity.HOUR` / `.QUARTER`,
+  `HourPeriodCalculator` (`table__YYYY_MM_DD_HH`, UTC boundaries with hour precision) and
+  `QuarterPeriodCalculator` (`table__YYYY_qN`), plus `hour` / `quarter` fields on `Period`
+  with validation, arithmetic, and ordering.
+- `Period.to_datetime()` — period start as a timezone-aware UTC datetime preserving the
+  hour component; the pruning fallback sort now uses it, so hourly partitions within one
+  day order chronologically.
+
 - `pg_partsmith.sync` — synchronous mirror of `pg_partsmith.aio` with the same class
   names and API, built on the sync SQLAlchemy `Engine`: `PartitionLifecycleService`,
   `PartitionMaintainer`, `maintain_partitions`, `PostgresPartitionRepository`,

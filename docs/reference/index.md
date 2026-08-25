@@ -46,6 +46,10 @@ Top-level public API: entities, enums, exceptions, and period calculators.
     options:
       heading_level: 4
 
+::: pg_partsmith.strategies.hour.HourPeriodCalculator
+    options:
+      heading_level: 4
+
 ::: pg_partsmith.strategies.day.DayPeriodCalculator
     options:
       heading_level: 4
@@ -55,6 +59,10 @@ Top-level public API: entities, enums, exceptions, and period calculators.
       heading_level: 4
 
 ::: pg_partsmith.strategies.month.MonthPeriodCalculator
+    options:
+      heading_level: 4
+
+::: pg_partsmith.strategies.quarter.QuarterPeriodCalculator
     options:
       heading_level: 4
 

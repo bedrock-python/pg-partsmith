@@ -597,6 +597,40 @@ async def test__get_partitions_for_pruning__retention_cutoff__includes_current_p
     mock_calculator.parse_partition_name.assert_not_called()
 
 
+async def test__get_partitions_for_pruning__hourly_name_fallback__sorts_same_day_hours_chronologically(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — no boundary values forces the name-based fallback; hour suffixes are deliberately
+    # not zero-padded so lexical name order (10 < 7 < 8) differs from chronological order.
+    partitions = [
+        PartitionInfo(
+            name=f"events__2024_03_15_{hour}",
+            partition_type=PartitionType.RANGE,
+            boundaries_expr="FOR VALUES FROM (...) TO (...)",
+            is_attached=True,
+        )
+        for hour in (10, 7, 11, 8)
+    ]
+    mock_metadata.list_partitions.return_value = partitions
+    mock_calculator.current_period.return_value = Period(year=2024, month=3, day=15, hour=12)
+    mock_calculator.period_before.return_value = Period(year=2024, month=3, day=15, hour=11)
+    mock_calculator.get_boundaries.return_value = ("2024-03-15 11:00:00+00", "2024-03-15 12:00:00+00")
+    mock_calculator.parse_partition_name.side_effect = lambda name: Period(
+        year=2024, month=3, day=15, hour=int(name.rsplit("_", 1)[-1])
+    )
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    to_prune = await service.get_partitions_for_pruning(config)
+
+    # Assert — hours 7, 8 and 10 are older than the cutoff (hour 11) and come back chronologically
+    assert [p.name for p in to_prune] == ["events__2024_03_15_7", "events__2024_03_15_8", "events__2024_03_15_10"]
+
+
 # ── maintain_lifecycle ───────────────────────────────────────────────────────────
 
 

@@ -24,7 +24,9 @@ from pg_partsmith.entities import (
 from pg_partsmith.protocols import PeriodCalculator
 from pg_partsmith.strategies import (
     DayPeriodCalculator,
+    HourPeriodCalculator,
     MonthPeriodCalculator,
+    QuarterPeriodCalculator,
     WeekPeriodCalculator,
     YearPeriodCalculator,
 )
@@ -104,9 +106,11 @@ class PartitioningScenarioBuilder:
         locks = PostgresAdvisoryLockManager(self._engine)
 
         calc_map: dict[PartitionGranularity, type[PeriodCalculator[Period]]] = {
+            PartitionGranularity.HOUR: HourPeriodCalculator,
             PartitionGranularity.DAY: DayPeriodCalculator,
             PartitionGranularity.WEEK: WeekPeriodCalculator,
             PartitionGranularity.MONTH: MonthPeriodCalculator,
+            PartitionGranularity.QUARTER: QuarterPeriodCalculator,
             PartitionGranularity.YEAR: YearPeriodCalculator,
         }
         calc_class = calc_map[self._granularity]
