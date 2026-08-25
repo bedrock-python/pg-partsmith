@@ -17,14 +17,7 @@ from pg_partsmith.entities import (
     TablePartitionConfig,
 )
 from pg_partsmith.protocols import PeriodCalculator
-from pg_partsmith.strategies import (
-    DayPeriodCalculator,
-    HourPeriodCalculator,
-    MonthPeriodCalculator,
-    QuarterPeriodCalculator,
-    WeekPeriodCalculator,
-    YearPeriodCalculator,
-)
+from pg_partsmith.strategies.selector import get_period_calculator
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
@@ -105,16 +98,7 @@ class PartitioningScenarioBuilder:
         metadata = PostgresMetadataProvider(self._engine)
         locks = PostgresAdvisoryLockManager(self._engine)
 
-        calc_map: dict[PartitionGranularity, type[PeriodCalculator[Period]]] = {
-            PartitionGranularity.HOUR: HourPeriodCalculator,
-            PartitionGranularity.DAY: DayPeriodCalculator,
-            PartitionGranularity.WEEK: WeekPeriodCalculator,
-            PartitionGranularity.MONTH: MonthPeriodCalculator,
-            PartitionGranularity.QUARTER: QuarterPeriodCalculator,
-            PartitionGranularity.YEAR: YearPeriodCalculator,
-        }
-        calc_class = calc_map[self._granularity]
-        calc = calc_class()
+        calc = get_period_calculator(self._granularity)
 
         config = TablePartitionConfig(
             table_name=self._table_name,

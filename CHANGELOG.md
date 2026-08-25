@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Detach: a partition left in `inhdetachpending` state by a cancelled
+  `DETACH CONCURRENTLY` (e.g. a DDL timeout) is now completed with
+  `DETACH PARTITION ... FINALIZE` instead of failing on every subsequent run.
+- Pruning: partitions with a `MAXVALUE` upper bound are never pruned any more —
+  previously the unparseable boundary fell back to name-based ageing, which could
+  drop a catch-all partition holding current data.
+- DEFAULT reconciliation now runs under the same `SET LOCAL TIME ZONE` as
+  `ATTACH PARTITION`, so a non-UTC server timezone no longer moves the wrong row
+  range; if the attach still fails after rows were reconciled, they are moved
+  back to the DEFAULT partition (best effort) instead of being stranded in a
+  detached table.
+- Attach race handling: SQLSTATE `42809` ("already a partition", the code
+  PostgreSQL actually raises when a concurrent worker wins the attach) is now
+  tolerated, while `55006` (partition mid-detach) correctly propagates instead of
+  being mislabelled as "already attached".
+- DDL statements no longer break when an identifier or literal contains `:`
+  (e.g. a pre-existing table comment) — colons are escaped before SQLAlchemy
+  `text()` parses them as bind parameters.
+- `list_partitions` skips (with a warning) partitions whose schema or name
+  contains a dot: such names cannot be addressed safely as `schema.relname`
+  strings and previously produced DDL against the wrong relation.
+- Boundary parsing only applies to RANGE bound expressions; LIST/HASH bounds no
+  longer yield fabricated from/to values.
+- Config validation rejects quoted mixed-case partition columns up front instead
+  of failing later inside reconciliation SQL.
+- Lock managers: the per-table acquire rate limit no longer serializes unrelated
+  tables (the delay is now slept outside the shared mutex) and no longer sleeps
+  spuriously on the first acquire after host boot; the Redis lock is released
+  even when the renewal watchdog fails to start; the async Redis lock no longer
+  swallows an external task cancellation during watchdog teardown.
+- Maintainer logging: operational `PartitionError`s (e.g. lock contention) are
+  logged as warnings instead of "unexpected exception" errors with tracebacks.
+
+### Changed
+
+- `Period` internals were restructured around a single per-granularity dispatch;
+  behaviour is unchanged. Built-in calculators now derive names and boundaries
+  from `Period` itself instead of duplicating the formatting and arithmetic.
+
 ### Added
 
 - Hour and quarter partition granularities: `PartitionGranularity.HOUR` / `.QUARTER`,

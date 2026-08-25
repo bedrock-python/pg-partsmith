@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -79,6 +80,12 @@ class PartitionStrategy(StrEnum):
 class Period:
     """Represents a time period for partition boundaries.
 
+    Every period has exactly one granularity kind (``year``, ``month``,
+    ``day``, ``week``, ``hour`` or ``quarter``), decided once by
+    :meth:`_granularity_key`. All kind-specific behaviour (validation,
+    arithmetic, ordering, formatting) lives in the ``_SPECS`` table below,
+    so supporting a new kind means adding one ``_GranularitySpec`` entry.
+
     Attributes:
         year: Year component.
         month: Month component (1-12), optional.
@@ -96,93 +103,47 @@ class Period:
     quarter: int | None = None
 
     def __post_init__(self) -> None:
-        """Validate period components."""
-        self._check_kind_consistency()
-        self._check_month_range()
-        self._check_day_resolves_to_real_date()
-        self._check_week_resolves_to_real_iso_week()
-        self._check_hour()
-        self._check_quarter()
+        """Validate period components for this period's granularity kind."""
+        self._spec.validate(self)
 
-    def _check_kind_consistency(self) -> None:
-        if self.week is not None and (self.month is not None or self.day is not None or self.hour is not None):
-            msg = "Period cannot have both week and month/day/hour"
-            raise ValueError(msg)
-        if self.quarter is not None and (
-            self.month is not None or self.day is not None or self.week is not None or self.hour is not None
-        ):
-            msg = "Period cannot have both quarter and month/day/week/hour"
-            raise ValueError(msg)
+    @property
+    def _spec(self) -> _GranularitySpec:
+        """Per-kind behaviour for this period."""
+        return _SPECS[self._granularity_key(self)]
 
-    def _check_month_range(self) -> None:
-        if self.month is None:
-            return
-        if not MIN_MONTH <= self.month <= MAX_MONTH:
-            msg = f"Month must be between {MIN_MONTH} and {MAX_MONTH}, got {self.month}"
-            raise ValueError(msg)
-
-    def _check_day_resolves_to_real_date(self) -> None:
-        if self.day is None:
-            return
-        if self.month is None:
-            msg = "Month is required when day is specified"
-            raise ValueError(msg)
-        try:
-            date(self.year, self.month, self.day)
-        except ValueError as exc:
-            msg = f"Invalid date: {self.year}-{self.month}-{self.day}"
-            raise ValueError(msg) from exc
-
-    def _check_week_resolves_to_real_iso_week(self) -> None:
-        if self.week is None:
-            return
-        if not MIN_ISO_WEEK <= self.week <= MAX_ISO_WEEK:
-            msg = f"Week must be between {MIN_ISO_WEEK} and {MAX_ISO_WEEK}, got {self.week}"
-            raise ValueError(msg)
-        try:
-            date.fromisocalendar(self.year, self.week, 1)
-        except ValueError as exc:
-            msg = f"Invalid ISO week: {self.year:04d}-W{self.week:02d}"
-            raise ValueError(msg) from exc
-
-    def _check_hour(self) -> None:
-        if self.hour is None:
-            return
-        if self.day is None:
-            msg = "Day is required when hour is specified"
-            raise ValueError(msg)
-        if not MIN_HOUR <= self.hour <= MAX_HOUR:
-            msg = f"Hour must be between {MIN_HOUR} and {MAX_HOUR}, got {self.hour}"
-            raise ValueError(msg)
-
-    def _check_quarter(self) -> None:
-        if self.quarter is None:
-            return
-        if not MIN_QUARTER <= self.quarter <= MAX_QUARTER:
-            msg = f"Quarter must be between {MIN_QUARTER} and {MAX_QUARTER}, got {self.quarter}"
-            raise ValueError(msg)
+    @staticmethod
+    def _granularity_key(p: Period) -> str:
+        if p.week is not None:
+            return "week"
+        if p.quarter is not None:
+            return "quarter"
+        if p.hour is not None:
+            return "hour"
+        if p.day is not None:
+            return "day"
+        if p.month is not None:
+            return "month"
+        return "year"
 
     def to_date(self, day: int = 1) -> date:
         """Convert period to date.
 
         Args:
             day: Day of month (default: 1). Ignored for weekly periods and
-                when self.day is already set.
+                when self.day is already set. For quarterly periods the day
+                applies within the quarter's first month.
 
         Returns:
-            Date object representing this period. For weekly periods returns the
-            Monday of the ISO week.
+            Date object representing this period. For weekly periods returns
+            the Monday of the ISO week. For hourly periods returns the
+            calendar date (the hour component is dropped; use
+            :meth:`to_datetime` to preserve it).
+
+        Raises:
+            ValueError: If ``day`` is out of range for the resolved month,
+                e.g. ``day=31`` for a Q2 period (April has 30 days).
         """
-        if self.week is not None:
-            return date.fromisocalendar(self.year, self.week, 1)
-
-        if self.quarter is not None:
-            return date(self.year, (self.quarter - 1) * 3 + 1, day)
-
-        month = self.month if self.month is not None else 1
-        day_value = self.day if self.day is not None else day
-
-        return date(self.year, month, day_value)
+        return self._spec.start_date(self, day)
 
     def to_datetime(self) -> datetime:
         """Convert period start to a timezone-aware UTC datetime.
@@ -204,31 +165,7 @@ class Period:
         Returns:
             New Period object.
         """
-        if self.week is not None:
-            monday = date.fromisocalendar(self.year, self.week, 1)
-            new_date = monday + timedelta(weeks=offset)
-            iso_year, iso_week, _ = new_date.isocalendar()
-            return Period(year=iso_year, week=iso_week)
-
-        if self.quarter is not None:
-            total_quarters = self.year * 4 + self.quarter - 1 + offset
-            return Period(year=total_quarters // 4, quarter=(total_quarters % 4) + 1)
-
-        if self.hour is not None and self.day is not None and self.month is not None:
-            dt = datetime(self.year, self.month, self.day, self.hour, tzinfo=UTC) + timedelta(hours=offset)
-            return Period(year=dt.year, month=dt.month, day=dt.day, hour=dt.hour)
-
-        if self.day is not None and self.month is not None:
-            d = date(self.year, self.month, self.day) + timedelta(days=offset)
-            return Period(year=d.year, month=d.month, day=d.day)
-
-        if self.month is not None:
-            total_months = self.year * 12 + self.month - 1 + offset
-            new_year = total_months // 12
-            new_month = (total_months % 12) + 1
-            return Period(year=new_year, month=new_month)
-
-        return Period(year=self.year + offset)
+        return self._spec.add(self, offset)
 
     def __sub__(self, offset: int) -> Period:
         """Subtract offset from period.
@@ -242,62 +179,275 @@ class Period:
         return self.__add__(-offset)
 
     def __lt__(self, other: Period) -> bool:
-        """Compare periods."""
+        """Compare periods of the same granularity kind."""
         # Required by Python's data model: returning NotImplemented lets Python
         # try the reflected comparison on `other`.
         if not isinstance(other, Period):  # type: ignore[unreachable]
             return NotImplemented  # type: ignore[unreachable]
 
-        self_kind = self._granularity_key(self)
-        other_kind = self._granularity_key(other)
-        if self_kind != other_kind:
+        kind = self._granularity_key(self)
+        if kind != self._granularity_key(other):
             return NotImplemented
 
-        if self_kind == "year":
-            return self.year < other.year
-
-        if self_kind == "month":
-            return (self.year, self.month) < (other.year, other.month)
-
-        if self_kind == "day":
-            return (self.year, self.month, self.day) < (other.year, other.month, other.day)
-
-        if self_kind == "hour":
-            return (self.year, self.month, self.day, self.hour) < (other.year, other.month, other.day, other.hour)
-
-        if self_kind == "quarter":
-            return (self.year, self.quarter) < (other.year, other.quarter)
-
-        # week
-        return (self.year, self.week) < (other.year, other.week)
-
-    @staticmethod
-    def _granularity_key(p: Period) -> str:
-        if p.week is not None:
-            return "week"
-        if p.quarter is not None:
-            return "quarter"
-        if p.hour is not None:
-            return "hour"
-        if p.day is not None:
-            return "day"
-        if p.month is not None:
-            return "month"
-        return "year"
+        spec = _SPECS[kind]
+        return spec.sort_key(self) < spec.sort_key(other)
 
     def __str__(self) -> str:
         """String representation."""
-        if self.month is not None and self.day is not None and self.hour is not None:
-            return f"{self.year:04d}_{self.month:02d}_{self.day:02d}_{self.hour:02d}"
-        if self.month is not None and self.day is not None:
-            return f"{self.year:04d}_{self.month:02d}_{self.day:02d}"
-        if self.month is not None:
-            return f"{self.year:04d}_{self.month:02d}"
-        if self.week is not None:
-            return f"{self.year:04d}_w{self.week:02d}"
-        if self.quarter is not None:
-            return f"{self.year:04d}_q{self.quarter}"
-        return f"{self.year:04d}"
+        return self._spec.fmt(self)
+
+
+# ── Per-granularity dispatch for Period ─────────────────────────────────────────
+#
+# Each granularity kind is described by one _GranularitySpec entry in _SPECS.
+# Period methods dispatch on the kind exactly once; adding a new kind means
+# adding one group of handlers plus one _SPECS entry (and teaching
+# Period._granularity_key to recognise it).
+#
+# The handlers may assume the invariants enforced by their kind's `validate`
+# (e.g. an "hour" period always has month, day and hour set).
+
+
+@dataclass(frozen=True)
+class _GranularitySpec:
+    """Kind-specific behaviour of :class:`Period`.
+
+    Attributes:
+        validate: Check field consistency and ranges; raise ``ValueError``.
+        start_date: Return the period's start date (``to_date`` semantics).
+        add: Return the period shifted by an offset of whole periods.
+        sort_key: Tuple used to order periods of the same kind.
+        fmt: Canonical string form (used in partition names).
+    """
+
+    validate: Callable[[Period], None]
+    start_date: Callable[[Period, int], date]
+    add: Callable[[Period, int], Period]
+    sort_key: Callable[[Period], tuple[int | None, ...]]
+    fmt: Callable[[Period], str]
+
+
+def _check_month_range(p: Period) -> None:
+    if p.month is None:
+        return
+    if not MIN_MONTH <= p.month <= MAX_MONTH:
+        msg = f"Month must be between {MIN_MONTH} and {MAX_MONTH}, got {p.month}"
+        raise ValueError(msg)
+
+
+def _check_day_resolves_to_real_date(p: Period) -> None:
+    if p.day is None:
+        return
+    if p.month is None:
+        msg = "Month is required when day is specified"
+        raise ValueError(msg)
+    try:
+        date(p.year, p.month, p.day)
+    except ValueError as exc:
+        msg = f"Invalid date: {p.year}-{p.month}-{p.day}"
+        raise ValueError(msg) from exc
+
+
+def _check_hour_requires_day_and_range(p: Period) -> None:
+    if p.hour is None:
+        return
+    if p.day is None:
+        msg = "Day is required when hour is specified"
+        raise ValueError(msg)
+    if not MIN_HOUR <= p.hour <= MAX_HOUR:
+        msg = f"Hour must be between {MIN_HOUR} and {MAX_HOUR}, got {p.hour}"
+        raise ValueError(msg)
+
+
+# ── year ──
+
+
+def _year_validate(p: Period) -> None:
+    """A year-only period has no extra components to validate."""
+
+
+def _year_start(p: Period, day: int) -> date:
+    return date(p.year, 1, day)
+
+
+def _year_add(p: Period, offset: int) -> Period:
+    return Period(year=p.year + offset)
+
+
+def _year_sort(p: Period) -> tuple[int | None, ...]:
+    return (p.year,)
+
+
+def _year_fmt(p: Period) -> str:
+    return f"{p.year:04d}"
+
+
+# ── month ──
+
+
+def _month_validate(p: Period) -> None:
+    _check_month_range(p)
+
+
+def _month_start(p: Period, day: int) -> date:
+    month = p.month if p.month is not None else 1
+    return date(p.year, month, day)
+
+
+def _month_add(p: Period, offset: int) -> Period:
+    month = p.month if p.month is not None else 1
+    total_months = p.year * 12 + month - 1 + offset
+    return Period(year=total_months // 12, month=(total_months % 12) + 1)
+
+
+def _month_sort(p: Period) -> tuple[int | None, ...]:
+    return (p.year, p.month)
+
+
+def _month_fmt(p: Period) -> str:
+    return f"{p.year:04d}_{p.month:02d}"
+
+
+# ── day ──
+
+
+def _day_validate(p: Period) -> None:
+    _check_month_range(p)
+    _check_day_resolves_to_real_date(p)
+
+
+def _day_start(p: Period, day: int) -> date:
+    return _day_date(p)
+
+
+def _day_add(p: Period, offset: int) -> Period:
+    d = _day_date(p) + timedelta(days=offset)
+    return Period(year=d.year, month=d.month, day=d.day)
+
+
+def _day_sort(p: Period) -> tuple[int | None, ...]:
+    return (p.year, p.month, p.day)
+
+
+def _day_fmt(p: Period) -> str:
+    return f"{p.year:04d}_{p.month:02d}_{p.day:02d}"
+
+
+def _day_date(p: Period) -> date:
+    """Calendar date of a day- or hour-kind period (fields guaranteed set)."""
+    month = p.month if p.month is not None else 1
+    day = p.day if p.day is not None else 1
+    return date(p.year, month, day)
+
+
+# ── week ──
+
+
+def _week_validate(p: Period) -> None:
+    if p.month is not None or p.day is not None or p.hour is not None:
+        msg = "Period cannot have both week and month/day/hour"
+        raise ValueError(msg)
+    if p.quarter is not None:
+        msg = "Period cannot have both quarter and month/day/week/hour"
+        raise ValueError(msg)
+    week = p.week if p.week is not None else 1
+    if not MIN_ISO_WEEK <= week <= MAX_ISO_WEEK:
+        msg = f"Week must be between {MIN_ISO_WEEK} and {MAX_ISO_WEEK}, got {week}"
+        raise ValueError(msg)
+    try:
+        date.fromisocalendar(p.year, week, 1)
+    except ValueError as exc:
+        msg = f"Invalid ISO week: {p.year:04d}-W{week:02d}"
+        raise ValueError(msg) from exc
+
+
+def _week_start(p: Period, day: int) -> date:
+    week = p.week if p.week is not None else 1
+    return date.fromisocalendar(p.year, week, 1)
+
+
+def _week_add(p: Period, offset: int) -> Period:
+    new_date = _week_start(p, 1) + timedelta(weeks=offset)
+    iso_year, iso_week, _ = new_date.isocalendar()
+    return Period(year=iso_year, week=iso_week)
+
+
+def _week_sort(p: Period) -> tuple[int | None, ...]:
+    return (p.year, p.week)
+
+
+def _week_fmt(p: Period) -> str:
+    return f"{p.year:04d}_w{p.week:02d}"
+
+
+# ── hour ──
+
+
+def _hour_validate(p: Period) -> None:
+    _check_month_range(p)
+    _check_day_resolves_to_real_date(p)
+    _check_hour_requires_day_and_range(p)
+
+
+def _hour_start(p: Period, day: int) -> date:
+    return _day_date(p)
+
+
+def _hour_add(p: Period, offset: int) -> Period:
+    hour = p.hour if p.hour is not None else 0
+    start = datetime.combine(_day_date(p), datetime.min.time(), tzinfo=UTC).replace(hour=hour)
+    dt = start + timedelta(hours=offset)
+    return Period(year=dt.year, month=dt.month, day=dt.day, hour=dt.hour)
+
+
+def _hour_sort(p: Period) -> tuple[int | None, ...]:
+    return (p.year, p.month, p.day, p.hour)
+
+
+def _hour_fmt(p: Period) -> str:
+    return f"{p.year:04d}_{p.month:02d}_{p.day:02d}_{p.hour:02d}"
+
+
+# ── quarter ──
+
+
+def _quarter_validate(p: Period) -> None:
+    if p.month is not None or p.day is not None or p.hour is not None:
+        msg = "Period cannot have both quarter and month/day/week/hour"
+        raise ValueError(msg)
+    quarter = p.quarter if p.quarter is not None else 1
+    if not MIN_QUARTER <= quarter <= MAX_QUARTER:
+        msg = f"Quarter must be between {MIN_QUARTER} and {MAX_QUARTER}, got {quarter}"
+        raise ValueError(msg)
+
+
+def _quarter_start(p: Period, day: int) -> date:
+    quarter = p.quarter if p.quarter is not None else 1
+    return date(p.year, (quarter - 1) * 3 + 1, day)
+
+
+def _quarter_add(p: Period, offset: int) -> Period:
+    quarter = p.quarter if p.quarter is not None else 1
+    total_quarters = p.year * 4 + quarter - 1 + offset
+    return Period(year=total_quarters // 4, quarter=(total_quarters % 4) + 1)
+
+
+def _quarter_sort(p: Period) -> tuple[int | None, ...]:
+    return (p.year, p.quarter)
+
+
+def _quarter_fmt(p: Period) -> str:
+    return f"{p.year:04d}_q{p.quarter}"
+
+
+_SPECS: dict[str, _GranularitySpec] = {
+    "year": _GranularitySpec(_year_validate, _year_start, _year_add, _year_sort, _year_fmt),
+    "month": _GranularitySpec(_month_validate, _month_start, _month_add, _month_sort, _month_fmt),
+    "day": _GranularitySpec(_day_validate, _day_start, _day_add, _day_sort, _day_fmt),
+    "week": _GranularitySpec(_week_validate, _week_start, _week_add, _week_sort, _week_fmt),
+    "hour": _GranularitySpec(_hour_validate, _hour_start, _hour_add, _hour_sort, _hour_fmt),
+    "quarter": _GranularitySpec(_quarter_validate, _quarter_start, _quarter_add, _quarter_sort, _quarter_fmt),
+}
 
 
 class PartitionInfo(BaseModel):

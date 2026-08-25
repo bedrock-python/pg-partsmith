@@ -110,6 +110,10 @@ class PartitionCreator:
 
         with self._engine.begin() as conn:
             apply_local_statement_timeout(conn, self._ddl_timeout)
+            # Boundary literals must be interpreted in the same timezone ATTACH uses,
+            # otherwise a non-UTC server timezone moves the wrong row range.
+            if self._ddl_timezone is not None:
+                conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             # Lock both tables to minimize race conditions
             conn.execute(text(f"LOCK TABLE {default_quoted} IN SHARE ROW EXCLUSIVE MODE"))
             conn.execute(text(f"LOCK TABLE {target_quoted} IN SHARE ROW EXCLUSIVE MODE"))

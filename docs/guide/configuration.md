@@ -80,11 +80,13 @@ partition_column="event_date"
 Controls which built-in period calculator to use when one is not passed explicitly.
 
 ```python
-class PartitionGranularity(str, Enum):
-    DAY   = "DAY"
-    WEEK  = "WEEK"
-    MONTH = "MONTH"
-    YEAR  = "YEAR"
+class PartitionGranularity(StrEnum):
+    HOUR    = "hour"
+    DAY     = "day"
+    WEEK    = "week"
+    MONTH   = "month"
+    QUARTER = "quarter"
+    YEAR    = "year"
 ```
 
 See [Period strategies](strategies.md) for details.

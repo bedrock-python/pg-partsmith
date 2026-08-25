@@ -48,16 +48,24 @@ service = PartitionLifecycleService(
 
 ## Custom calculator
 
-Subclass `BasePeriodCalculator` to define a custom naming scheme or non-standard boundaries:
+Subclass `BasePeriodCalculator` to define a custom naming scheme or non-standard boundaries.
+A subclass must define `_NAME_PATTERN` (a compiled regex whose group 1 is the table name)
+and implement `_period_from_match`; the inherited `parse_partition_name` then matches names
+against the pattern and returns `None` for names that do not match or encode invalid values:
 
 ```python
+import re
+from datetime import datetime, timezone
+from typing import ClassVar
+
 from pg_partsmith.strategies import BasePeriodCalculator
 from pg_partsmith.entities import Period
-from datetime import datetime, timezone
 
 
 class FiscalYearPeriodCalculator(BasePeriodCalculator):
     """Yearly partitions aligned to a fiscal year starting April 1."""
+
+    _NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^(.+)__fy(\d{4})$")
 
     def current_period(self) -> Period:
         now = datetime.now(timezone.utc)
@@ -67,13 +75,13 @@ class FiscalYearPeriodCalculator(BasePeriodCalculator):
     def format_partition_name(self, table_name: str, period: Period) -> str:
         return f"{table_name}__fy{period.year}"
 
-    def parse_partition_name(self, partition_name: str) -> Period | None:
-        # parse back to Period for retention logic
-        ...
+    def _period_from_match(self, match: re.Match[str]) -> Period:
+        # group 1 is the table name, group 2 encodes the fiscal year
+        return Period(year=int(match.group(2)))
 
     def get_boundaries(self, period: Period) -> tuple[str, str]:
-        # return (from_value, to_value) as SQL-compatible strings
-        ...
+        # fiscal year N runs from 1 April N to 1 April N+1
+        return (f"{period.year}-04-01", f"{period.year + 1}-04-01")
 ```
 
 ## Protocol

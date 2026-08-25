@@ -83,7 +83,10 @@ def build_ddl_statement(template: str, **params: str) -> TextClause:
 
     # Convert literal placeholders [key] to standard {key} for .format()
     formatted_template = _LIT_PLACEHOLDER_PATTERN.sub(r"{\1}", template)
-    return text(formatted_template.format(**format_params))
+    statement = formatted_template.format(**format_params)
+    # Escape colons so identifiers/literals containing ":" (e.g. a pre-existing
+    # table comment) are not parsed by text() as bind parameters.
+    return text(statement.replace(":", r"\:"))
 
 
 def quote_identifier(identifier: str) -> str:

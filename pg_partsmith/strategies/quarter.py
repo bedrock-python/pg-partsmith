@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
 from typing import ClassVar
-
-from dateutil.relativedelta import relativedelta
 
 from pg_partsmith.entities import Period
 from pg_partsmith.utils import utc_now
@@ -33,7 +30,7 @@ class QuarterPeriodCalculator(BasePeriodCalculator):
         if period.quarter is None:
             msg = "Quarter is required for QuarterPeriodCalculator"
             raise ValueError(msg)
-        return f"{table_name}__{period.year:04d}_q{period.quarter}"
+        return f"{table_name}__{period}"
 
     def _period_from_match(self, match: re.Match[str]) -> Period:
         return Period(year=int(match.group(2)), quarter=int(match.group(3)))
@@ -44,7 +41,5 @@ class QuarterPeriodCalculator(BasePeriodCalculator):
             msg = "Quarter is required for QuarterPeriodCalculator"
             raise ValueError(msg)
 
-        start_date = datetime(period.year, (period.quarter - 1) * 3 + 1, 1, tzinfo=UTC)
-        end_date = start_date + relativedelta(months=3)
-
-        return (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        fmt = "%Y-%m-%d"
+        return (period.to_date().strftime(fmt), (period + 1).to_date().strftime(fmt))

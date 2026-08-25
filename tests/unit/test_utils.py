@@ -1,4 +1,5 @@
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from pg_partsmith.utils import (
     _resolve_marker_prefix,
@@ -56,6 +57,22 @@ def test__build_ddl_statement__literal_brackets_and_template__replaces_only_temp
     assert "ARRAY[1,2,3]" in result
     assert "'x'" in result
     assert '"events"' in result
+
+
+def test__build_ddl_statement__literal_containing_colon__no_phantom_bind_parameters() -> None:
+    # Arrange — e.g. a pre-existing table comment; ":tag" must not become a bind parameter
+    stmt = build_ddl_statement(
+        "COMMENT ON TABLE {partition} IS [comment]",
+        partition="events__2024_01",
+        comment="pg-partsmith:orphan-parent=public.events see :tag",
+    )
+
+    # Act
+    compiled = stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+
+    # Assert — the literal colons survive verbatim and no bind params were created
+    assert "pg-partsmith:orphan-parent=public.events see :tag" in str(compiled)
+    assert compiled.params == {}
 
 
 # ── calculate_lock_id ───────────────────────────────────────────────────────────

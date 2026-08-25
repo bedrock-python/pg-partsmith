@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 _PG_IDENTIFIER_MAX_BYTES = 63
 # SQLSTATEs that indicate partition already attached or duplicate (race with another worker).
-_ATTACH_CONFLICT_SQLSTATES = frozenset({"42P07", "42710", "55006"})  # duplicate_table, duplicate_object, object_in_use
+# 42809 (wrong_object_type) is what PostgreSQL raises for "X is already a partition".
+_ATTACH_CONFLICT_SQLSTATES = frozenset({"42P07", "42710", "42809"})
 _PG_CHECK_VIOLATION = "23514"
 _DEFAULT_CONFLICT_MAX_RETRIES = 2
 
@@ -189,16 +190,25 @@ class PartitionCreationService(BasePartitionService):
         from_value: str,
         to_value: str,
     ) -> None:
-        """Attach partition with automatic DEFAULT reconciliation."""
+        """Attach partition with automatic DEFAULT reconciliation.
+
+        If the attach ultimately fails after rows were reconciled out of the
+        DEFAULT partition, the moved rows are returned to DEFAULT (best
+        effort) so they do not end up stranded in a table that is invisible
+        through the parent.
+        """
         qualified_parent = qualify(config.db_schema, config.table_name)
+        reconciled_from: str | None = None
 
         for attempt in range(1, _DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
                 self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
             except (OSError, TimeoutError):
+                self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                 raise
             except SQLAlchemyError as e:
                 if not _is_default_partition_conflict(e):
+                    self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                     raise
 
                 if attempt == _DEFAULT_CONFLICT_MAX_RETRIES:
@@ -209,6 +219,7 @@ class PartitionCreationService(BasePartitionService):
                             "attempts": attempt,
                         },
                     )
+                    self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                     raise
 
                 # Get DEFAULT partition
@@ -218,6 +229,7 @@ class PartitionCreationService(BasePartitionService):
                         "DEFAULT conflict detected but no DEFAULT partition found",
                         extra={"partition_name": partition_name},
                     )
+                    self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                     raise
 
                 # Reconcile conflicting rows
@@ -237,6 +249,8 @@ class PartitionCreationService(BasePartitionService):
                     from_value=from_value,
                     to_value=to_value,
                 )
+                if moved_count:
+                    reconciled_from = default_partition.name
 
                 logger.info(
                     "Reconciliation completed",
@@ -247,6 +261,48 @@ class PartitionCreationService(BasePartitionService):
                 )
             else:
                 return  # Success
+
+    def _restore_reconciled_rows(
+        self,
+        default_partition_name: str | None,
+        config: TablePartitionConfig,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+    ) -> None:
+        """Return previously reconciled rows to the DEFAULT partition (best effort).
+
+        Reconciliation commits independently of ATTACH, so a final attach
+        failure would otherwise leave the moved rows in a standalone table
+        that no query against the parent can see. Failures here are logged,
+        never raised, so the original attach error stays the primary one.
+        """
+        if default_partition_name is None:
+            return
+        try:
+            restored = self._repo.reconcile_default_rows(
+                default_partition_name=partition_name,
+                target_partition_name=default_partition_name,
+                partition_column=config.partition_column,
+                from_value=from_value,
+                to_value=to_value,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                "Failed to return reconciled rows to DEFAULT partition; rows remain in the detached table",
+                extra={"partition_name": partition_name, "default_partition": default_partition_name},
+            )
+        else:
+            logger.warning(
+                "Attach failed after reconciliation; returned rows to DEFAULT partition",
+                extra={
+                    "partition_name": partition_name,
+                    "default_partition": default_partition_name,
+                    "restored_rows": restored,
+                },
+            )
 
     def _handle_existing_partition(
         self, config: TablePartitionConfig, existing: PartitionInfo, from_value: str, to_value: str

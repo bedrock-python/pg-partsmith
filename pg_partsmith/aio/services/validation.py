@@ -46,7 +46,16 @@ class PartitionValidationService:
             msg = f"Could not determine partition column for table {qualified_parent!r}"
             raise InvalidPartitionConfigError(msg)
 
-        if actual_column.lower() != config.partition_column:
+        # A quoted mixed-case column would pass a lowercased comparison here but
+        # later fail in reconcile SQL, which quotes the config's lowercase name.
+        if actual_column != actual_column.lower():
+            msg = (
+                f"Partition column {actual_column!r} of table {qualified_parent!r} is mixed-case; "
+                "only lowercase partition columns are supported"
+            )
+            raise InvalidPartitionConfigError(msg)
+
+        if actual_column != config.partition_column:
             msg = (
                 f"Partition column mismatch for table {qualified_parent!r}: "
                 f"config={config.partition_column!r} actual={actual_column!r}"

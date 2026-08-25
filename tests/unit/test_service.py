@@ -112,6 +112,14 @@ def _make_23514_exc() -> SQLAlchemyError:
     return exc
 
 
+def _make_sqlstate_exc(sqlstate: str, message: str = "pg error") -> SQLAlchemyError:
+    exc = SQLAlchemyError(message)
+    orig = MagicMock()
+    orig.sqlstate = sqlstate
+    exc.orig = orig  # type: ignore[attr-defined]
+    return exc
+
+
 # ── create_future_partitions ─────────────────────────────────────────────────────
 
 
@@ -631,6 +639,62 @@ async def test__get_partitions_for_pruning__hourly_name_fallback__sorts_same_day
     assert [p.name for p in to_prune] == ["events__2024_03_15_7", "events__2024_03_15_8", "events__2024_03_15_10"]
 
 
+async def test__get_partitions_for_pruning__maxvalue_upper_bound__never_pruned_despite_ancient_name(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — an unbounded partition whose name would parse as far older than the cutoff
+    partition = PartitionInfo(
+        name="events__1970_01",
+        partition_type=PartitionType.RANGE,
+        from_value="2024-01-01",
+        to_value="MAXVALUE",
+        is_attached=True,
+    )
+    mock_metadata.list_partitions.return_value = [partition]
+    mock_calculator.parse_partition_name.return_value = Period(year=1970, month=1)
+    mock_calculator.period_before.return_value = Period(year=2024, month=2)
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    to_prune = await service.get_partitions_for_pruning(config)
+
+    # Assert — skipped entirely: no pruning, not even the name-based fallback
+    assert to_prune == []
+    mock_calculator.parse_partition_name.assert_not_called()
+
+
+async def test__get_partitions_for_pruning__minvalue_lower_bound__still_pruned_by_upper_boundary(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — only the upper bound matters: a MINVALUE lower bound does not protect the partition
+    partition = PartitionInfo(
+        name="events__historic",
+        partition_type=PartitionType.RANGE,
+        from_value="MINVALUE",
+        to_value="2024-02-01",
+        is_attached=True,
+    )
+    mock_metadata.list_partitions.return_value = [partition]
+    mock_calculator.period_before.return_value = Period(year=2024, month=2)
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    to_prune = await service.get_partitions_for_pruning(config)
+
+    # Assert
+    assert [p.name for p in to_prune] == ["events__historic"]
+
+
 # ── maintain_lifecycle ───────────────────────────────────────────────────────────
 
 
@@ -823,6 +887,51 @@ async def test__validation_service__column_none__raises_invalid_config(
     # Act / Assert
     with pytest.raises(InvalidPartitionConfigError, match="Could not determine partition column"):
         await service._validation_service.validate_config(config)
+
+
+async def test__validation_service__mixed_case_actual_column__raises_invalid_config(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange — a quoted mixed-case column would break the reconcile SQL later; fail fast instead
+    config = TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="createdat",
+        granularity=PartitionGranularity.MONTH,
+    )
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks, mock_calculator)
+    mock_metadata.get_partition_type.return_value = PartitionType.RANGE
+    mock_metadata.get_partition_column.return_value = "createdAt"
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="mixed-case"):
+        await service._validation_service.validate_config(config)
+
+
+async def test__validation_service__exact_lowercase_column_match__passes(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange
+    config = TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+    )
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks, mock_calculator)
+    mock_metadata.get_partition_type.return_value = PartitionType.RANGE
+    mock_metadata.get_partition_column.return_value = "created_at"
+
+    # Act / Assert — must not raise
+    await service._validation_service.validate_config(config)
 
 
 async def test__creation_service__list_partitions_error__propagates(
@@ -1086,4 +1195,103 @@ async def test__create_future_partitions__23514_retries_exhausted__raises(
         await service.create_future_partitions(config)
 
     assert mock_repo.attach_partition.call_count == 2
-    assert mock_repo.reconcile_default_rows.call_count == 1
+    # Reconciliation ran once, then the final failure restored the moved rows back to DEFAULT
+    assert mock_repo.reconcile_default_rows.call_count == 2
+    restore_call = mock_repo.reconcile_default_rows.call_args_list[-1]
+    assert restore_call.kwargs["default_partition_name"] == "events__2024_04"
+    assert restore_call.kwargs["target_partition_name"] == "events_default"
+
+
+async def test__create_future_partitions__attach_fails_after_reconcile__restores_rows_with_swapped_partitions(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — first attach hits a DEFAULT conflict, reconcile moves rows, second attach fails hard
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.attach_partition.side_effect = [_make_23514_exc(), SQLAlchemyError("attach failed")]
+    mock_repo.reconcile_default_rows.return_value = 5
+    mock_metadata.get_default_partition.return_value = PartitionInfo(
+        name="events_default", partition_type=PartitionType.RANGE, is_default=True, is_attached=True
+    )
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="attach failed"):
+        await service.create_future_partitions(config)
+
+    # First call moved rows DEFAULT → target; second call restored them target → DEFAULT
+    assert mock_repo.reconcile_default_rows.call_count == 2
+    first_call, restore_call = mock_repo.reconcile_default_rows.call_args_list
+    assert first_call.kwargs["default_partition_name"] == "events_default"
+    assert first_call.kwargs["target_partition_name"] == "events__2024_04"
+    assert restore_call.kwargs["default_partition_name"] == "events__2024_04"
+    assert restore_call.kwargs["target_partition_name"] == "events_default"
+
+
+async def test__create_future_partitions__restore_after_failed_attach_fails__original_error_propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — reconcile succeeds, final attach fails, and the best-effort restore also fails
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.attach_partition.side_effect = [_make_23514_exc(), SQLAlchemyError("attach failed")]
+    mock_repo.reconcile_default_rows.side_effect = [5, SQLAlchemyError("restore failed")]
+    mock_metadata.get_default_partition.return_value = PartitionInfo(
+        name="events_default", partition_type=PartitionType.RANGE, is_default=True, is_attached=True
+    )
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert — the restore failure is swallowed; the original attach error propagates
+    with pytest.raises(SQLAlchemyError, match="attach failed"):
+        await service.create_future_partitions(config)
+
+    assert mock_repo.reconcile_default_rows.call_count == 2
+
+
+async def test__create_future_partitions__42809_attach_race__treated_as_already_attached(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — another worker attached first: PostgreSQL raises 42809 ("is already a partition")
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42809", "is already a partition")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    created = await service.create_future_partitions(config)
+
+    # Assert — race is swallowed and the partition is treated as attached
+    assert len(created) == 1
+    assert created[0].is_attached is True
+
+
+async def test__create_future_partitions__55006_attach_error__propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — 55006 (object_in_use) is no longer treated as an attach-race conflict
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("55006", "object is in use")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="object is in use"):
+        await service.create_future_partitions(config)

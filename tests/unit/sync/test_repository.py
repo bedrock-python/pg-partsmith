@@ -27,7 +27,10 @@ from pg_partsmith.utils import orphan_table_comment, pg_sqlstate
 #   - every ``engine.begin()`` block and the drop read/FK-listing connections start
 #     with one extra ``set_config`` execute;
 #   - the autocommit DETACH CONCURRENTLY path wraps in a session-level ``set_config``
-#     plus a trailing ``RESET statement_timeout`` execute.
+#     plus a trailing ``RESET statement_timeout`` execute;
+#   - every ``detach`` starts with a pending-detach pre-check on its own autocommit
+#     connection: ``set_config``, SELECT inhdetachpending, ``RESET`` (3 executes when
+#     not pending).
 # Result sequences and call-count assertions below account for those extra calls.
 
 
@@ -251,10 +254,19 @@ def test__repository__attach_partition__sets_timeout_and_utc_timezone_then_attac
 
 
 def test__repository__detach_partition__table_not_found__raises_partition_not_found() -> None:
-    # Arrange — session set_config succeeds; first marker query raises 42P01; RESET timeout
+    # Arrange — pre-check: set_config, not pending, RESET; then set_config, marker query raises 42P01, RESET
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), _make_retryable_exc("42P01"), MagicMock()]
+    not_pending = MagicMock()
+    not_pending.scalar.return_value = False
+    conn.execute.side_effect = [
+        MagicMock(),
+        not_pending,
+        MagicMock(),
+        MagicMock(),
+        _make_retryable_exc("42P01"),
+        MagicMock(),
+    ]
     conn.execution_options = MagicMock(return_value=conn)
     connect_cm = MagicMock()
     connect_cm.__enter__ = MagicMock(return_value=conn)
@@ -268,26 +280,29 @@ def test__repository__detach_partition__table_not_found__raises_partition_not_fo
 
 
 def test__repository__detach_partition_concurrent__uses_connect_not_begin() -> None:
-    # Arrange — sequence: set_config, resolve_fqn, comment_result, COMMENT, DETACH CONCURRENTLY, RESET
-    engine = _make_engine([None, "public.events", None, None, None, None])
+    # Arrange — pre-check: set_config, not pending, RESET;
+    # then set_config, resolve_fqn, comment_result, COMMENT, DETACH CONCURRENTLY, RESET
+    engine = _make_engine([None, False, None, None, "public.events", None, None, None, None])
     repo = PostgresPartitionRepository(engine)
 
     # Act
     repo.detach_partition("events", "events__2024_01", concurrent=True)
 
-    # Assert
-    assert engine.connect.call_count == 1
+    # Assert — one connect for the pending pre-check, one for the concurrent detach
+    assert engine.connect.call_count == 2
     assert engine.begin.call_count == 0
 
 
 def test__repository__detach_partition_concurrent__non_ascii_comment__does_not_raise() -> None:
-    # Arrange
-    engine = _make_engine([None, "public.events", "существующий комментарий".encode(), None, None, None])
+    # Arrange — pre-check (3 executes), then concurrent detach flow
+    engine = _make_engine(
+        [None, False, None, None, "public.events", "существующий комментарий".encode(), None, None, None]
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert — must not raise
     repo.detach_partition("events", "events__2024_01", concurrent=True)
-    assert engine.connect.call_count == 1
+    assert engine.connect.call_count == 2
 
 
 def test__repository__detach_partition_concurrent__0a000_error__falls_back_to_non_concurrent() -> None:
@@ -295,10 +310,12 @@ def test__repository__detach_partition_concurrent__0a000_error__falls_back_to_no
     engine = MagicMock()
     concurrent_exc = _make_retryable_exc("0A000")
     concurrent_conn = MagicMock()
+    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
+    p0.scalar.return_value = False  # pending-detach pre-check → not pending
     s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
     c1.scalar.return_value = "public.events"
     c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [s0, c1, c2, c3, concurrent_exc, c5]
+    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, concurrent_exc, c5]
     concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
     connect_cm = MagicMock()
     connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
@@ -320,8 +337,8 @@ def test__repository__detach_partition_concurrent__0a000_error__falls_back_to_no
     # Act
     repo.detach_partition("events", "events__2024_01", concurrent=True)
 
-    # Assert
-    assert engine.connect.call_count == 1
+    # Assert — pre-check connect + concurrent connect, then non-concurrent begin
+    assert engine.connect.call_count == 2
     assert engine.begin.call_count == 1
 
 
@@ -330,10 +347,12 @@ def test__repository__detach_partition_concurrent__55000_error__falls_back_to_no
     engine = MagicMock()
     concurrent_exc = _make_retryable_exc("55000")
     concurrent_conn = MagicMock()
+    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
+    p0.scalar.return_value = False  # pending-detach pre-check → not pending
     s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
     c1.scalar.return_value = "public.events"
     c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [s0, c1, c2, c3, concurrent_exc, c5]
+    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, concurrent_exc, c5]
     concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
     connect_cm = MagicMock()
     connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
@@ -355,8 +374,8 @@ def test__repository__detach_partition_concurrent__55000_error__falls_back_to_no
     # Act
     repo.detach_partition("events", "events__2024_01", concurrent=True)
 
-    # Assert
-    assert engine.connect.call_count == 1
+    # Assert — pre-check connect + concurrent connect, then non-concurrent begin
+    assert engine.connect.call_count == 2
     assert engine.begin.call_count == 1
 
 
@@ -365,10 +384,12 @@ def test__repository__detach_partition_concurrent__55006_error__raises_detach_in
     engine = MagicMock()
     in_progress_exc = _make_retryable_exc("55006")
     concurrent_conn = MagicMock()
+    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
+    p0.scalar.return_value = False  # pending-detach pre-check → not pending
     s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
     c1.scalar.return_value = "public.events"
     c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [s0, c1, c2, c3, in_progress_exc, c5]
+    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, in_progress_exc, c5]
     concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
     connect_cm = MagicMock()
     connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
@@ -387,10 +408,12 @@ def test__repository__detach_partition_concurrent__generic_error__propagates() -
     # Arrange
     engine = MagicMock()
     concurrent_conn = MagicMock()
+    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
+    p0.scalar.return_value = False  # pending-detach pre-check → not pending
     s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
     c1.scalar.return_value = "public.events"
     c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [s0, c1, c2, c3, Exception("permission denied"), c5]
+    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, Exception("permission denied"), c5]
     concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
     connect_cm = MagicMock()
     connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
@@ -406,8 +429,8 @@ def test__repository__detach_partition_concurrent__generic_error__propagates() -
 
 
 def test__repository__detach_partition_non_concurrent__uses_begin() -> None:
-    # Arrange — sequence: set_config, resolve_fqn, comment_result, COMMENT, DETACH
-    engine = _make_engine([None, None, None, None, None])
+    # Arrange — pre-check: set_config, not pending, RESET; then set_config, resolve_fqn, comment_result, COMMENT, DETACH
+    engine = _make_engine([None, False, None, None, None, None, None, None])
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -418,11 +441,25 @@ def test__repository__detach_partition_non_concurrent__uses_begin() -> None:
 
 
 def test__repository__detach_partition_concurrent__marker_write_fails__aborts_before_detach() -> None:
-    # Arrange — session set_config succeeds; marker read fails; RESET timeout still runs
+    # Arrange — pre-check: set_config, not pending, RESET; then set_config, resolve_fqn and comment read
+    # succeed, COMMENT write fails; RESET timeout still runs
     engine = MagicMock()
     conn = MagicMock()
     conn.execution_options = MagicMock(return_value=conn)
-    conn.execute.side_effect = [MagicMock(), Exception("cannot comment table"), MagicMock()]
+    not_pending, resolve_result, comment_result = MagicMock(), MagicMock(), MagicMock()
+    not_pending.scalar.return_value = False
+    resolve_result.scalar.return_value = "public.events"
+    comment_result.scalar.return_value = None
+    conn.execute.side_effect = [
+        MagicMock(),
+        not_pending,
+        MagicMock(),
+        MagicMock(),
+        resolve_result,
+        comment_result,
+        Exception("cannot comment table"),
+        MagicMock(),
+    ]
     connect_cm = MagicMock()
     connect_cm.__enter__ = MagicMock(return_value=conn)
     connect_cm.__exit__ = MagicMock(return_value=False)
@@ -433,10 +470,44 @@ def test__repository__detach_partition_concurrent__marker_write_fails__aborts_be
     with pytest.raises(Exception, match="cannot comment table"):
         repo.detach_partition("events", "events__2024_01", concurrent=True)
 
-    # set_config + failed marker read + RESET — the DETACH itself never ran
-    assert conn.execute.call_count == 3
+    # pre-check (3) + set_config + resolve + comment read + failed COMMENT + RESET — the DETACH itself never ran
+    assert conn.execute.call_count == 8
     assert not any("DETACH" in str(call.args[0]) for call in conn.execute.call_args_list)
     engine.begin.assert_not_called()
+
+
+def test__repository__detach_partition__pending_detach__finalizes_without_plain_or_concurrent_detach() -> None:
+    # Arrange — pre-check: set_config, pending → True; then resolve_fqn, comment_result, COMMENT, FINALIZE, RESET
+    engine = _make_engine([None, True, "public.events", None, None, None, None])
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", concurrent=True)
+
+    # Assert — FINALIZE ran, the orphan marker was written, and no other detach was attempted
+    conn = engine.connect.return_value.__enter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert any("DETACH PARTITION" in stmt and "FINALIZE" in stmt for stmt in statements)
+    assert any("COMMENT ON TABLE" in stmt for stmt in statements)
+    assert not any("CONCURRENTLY" in stmt for stmt in statements)
+    assert engine.connect.call_count == 1
+    engine.begin.assert_not_called()
+
+
+def test__repository__detach_partition__not_pending__proceeds_with_concurrent_detach() -> None:
+    # Arrange — pre-check: set_config, not pending, RESET;
+    # then set_config, resolve_fqn, comment_result, COMMENT, DETACH CONCURRENTLY, RESET
+    engine = _make_engine([None, False, None, None, "public.events", None, None, None, None])
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", concurrent=True)
+
+    # Assert — normal concurrent flow runs; FINALIZE is never issued
+    conn = engine.connect.return_value.__enter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert any("DETACH PARTITION" in stmt and "CONCURRENTLY" in stmt for stmt in statements)
+    assert not any("FINALIZE" in stmt for stmt in statements)
 
 
 # ── drop_partition — happy path ──────────────────────────────────────────────────
@@ -746,7 +817,7 @@ def test__repository__reconcile_default_rows__matching_rows__returns_row_count()
     move_result.rowcount = 42
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -764,7 +835,7 @@ def test__repository__reconcile_default_rows__matching_rows__returns_row_count()
 
     # Assert
     assert count == 42
-    assert conn.execute.call_count == 4  # set_config + 2 LOCK TABLE + move
+    assert conn.execute.call_count == 5  # set_config + SET TIME ZONE + 2 LOCK TABLE + move
 
 
 def test__repository__reconcile_default_rows__acquires_locks_on_both_tables() -> None:
@@ -773,7 +844,7 @@ def test__repository__reconcile_default_rows__acquires_locks_on_both_tables() ->
     move_result.rowcount = 5
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -801,7 +872,7 @@ def test__repository__reconcile_default_rows__no_matching_rows__returns_zero() -
     move_result.rowcount = 0
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -819,6 +890,63 @@ def test__repository__reconcile_default_rows__no_matching_rows__returns_zero() -
 
     # Assert
     assert count == 0
+
+
+def test__repository__reconcile_default_rows__sets_timezone_before_locks() -> None:
+    # Arrange — default ddl_timezone is 'UTC'
+    move_result = MagicMock()
+    move_result.rowcount = 1
+    engine = MagicMock()
+    conn = MagicMock()
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
+    begin_cm = MagicMock()
+    begin_cm.__enter__ = MagicMock(return_value=conn)
+    begin_cm.__exit__ = MagicMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        partition_column="created_at",
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert — SET LOCAL TIME ZONE runs right after set_config, before either LOCK TABLE
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert "statement_timeout" in statements[0]
+    assert "time zone" in statements[1].lower() and "SET LOCAL" in statements[1]
+    assert all("LOCK TABLE" in stmt for stmt in statements[2:4])
+
+
+def test__repository__reconcile_default_rows__no_ddl_timezone__skips_set_time_zone() -> None:
+    # Arrange
+    move_result = MagicMock()
+    move_result.rowcount = 1
+    engine = MagicMock()
+    conn = MagicMock()
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    begin_cm = MagicMock()
+    begin_cm.__enter__ = MagicMock(return_value=conn)
+    begin_cm.__exit__ = MagicMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine, ddl_timezone=None)
+
+    # Act
+    repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        partition_column="created_at",
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert — only set_config + 2 LOCK TABLE + move; no timezone statement issued
+    assert conn.execute.call_count == 4
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert not any("time zone" in stmt.lower() for stmt in statements)
 
 
 # ── helper used by parametrize ──────────────────────────────────────────────────

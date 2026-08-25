@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
 from typing import ClassVar
 
 from pg_partsmith.entities import Period
@@ -32,7 +31,7 @@ class WeekPeriodCalculator(BasePeriodCalculator):
         if period.week is None:
             msg = "Week is required for WeekPeriodCalculator"
             raise ValueError(msg)
-        return f"{table_name}__{period.year:04d}_w{period.week:02d}"
+        return f"{table_name}__{period}"
 
     def _period_from_match(self, match: re.Match[str]) -> Period:
         return Period(year=int(match.group(2)), week=int(match.group(3)))
@@ -43,8 +42,5 @@ class WeekPeriodCalculator(BasePeriodCalculator):
             msg = "Week is required for WeekPeriodCalculator"
             raise ValueError(msg)
 
-        date_str = f"{period.year:04d}-W{period.week:02d}-1"
-        start_date = datetime.strptime(date_str, "%G-W%V-%u").replace(tzinfo=UTC)
-        end_date = start_date + timedelta(weeks=1)
-
-        return (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        fmt = "%Y-%m-%d"
+        return (period.to_date().strftime(fmt), (period + 1).to_date().strftime(fmt))
