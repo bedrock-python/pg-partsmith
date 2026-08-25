@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.1.0...pg-partsmith-v0.2.0) (2026-08-25)
+
+
+### Features
+
+* add hour and quarter partition granularities ([#15](https://github.com/bedrock-python/pg-partsmith/issues/15)) ([71305fb](https://github.com/bedrock-python/pg-partsmith/commit/71305fbf8b7b29f0fcd2065350465edffe8e2240))
+* add pg_partsmith.sync — synchronous mirror of the aio package ([#13](https://github.com/bedrock-python/pg-partsmith/issues/13)) ([a47da28](https://github.com/bedrock-python/pg-partsmith/commit/a47da280e1154428a86975d81128d74b171b809b))
+
+
+### Bug Fixes
+
+* address external review findings — pruning fail-closed, qualified names, drop revalidation ([#17](https://github.com/bedrock-python/pg-partsmith/issues/17)) ([810f8a0](https://github.com/bedrock-python/pg-partsmith/commit/810f8a0aa2d79f43d818c909c2b067cbf0a7409b))
+* harden partition lifecycle against wedges, data-loss edges, and lock races ([#16](https://github.com/bedrock-python/pg-partsmith/issues/16)) ([424a882](https://github.com/bedrock-python/pg-partsmith/commit/424a882acf0e921b38d4bac274b083b97036735d))
+* update publish workflow, release-please version search, gitignore ([#9](https://github.com/bedrock-python/pg-partsmith/issues/9)) ([2140d39](https://github.com/bedrock-python/pg-partsmith/commit/2140d395a0c9defdf5a6bd54ece09908bdf66a38))
+
 ## [Unreleased]
 
 ### Fixed
