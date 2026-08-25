@@ -18,6 +18,7 @@ from pg_partsmith.exceptions import (
     UnmanagedPartitionDropError,
 )
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
+from pg_partsmith.sync.repositories.fk_manager import PartitionForeignKeyManager
 from pg_partsmith.utils import orphan_table_comment, pg_sqlstate
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
@@ -880,6 +881,40 @@ def test__repository__drop_partition__reattached_after_lock__raises_attached_err
     assert not any("DROP TABLE" in s for s in statements)
 
 
+def test__repository__drop_partition__non_42p01_error_on_lock__propagates() -> None:
+    # Arrange — a non-retryable, non-42P01 error on the LOCK TABLE statement (e.g. permission denied)
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, _make_retryable_exc("42501")],
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert — must propagate, not be swallowed like 42P01 and not be retried
+    with pytest.raises(SQLAlchemyError):
+        repo.drop_partition("events__2024_01")
+
+    engine.begin.assert_called_once()
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    assert not any("DROP TABLE" in s for s in statements)
+
+
+def test__repository__drop_partition__vanished_after_lock__returns_without_drop() -> None:
+    # Arrange — under the lock the marker is gone AND the table no longer exists (dropped concurrently)
+    engine, ddl_conn = _make_drop_engine(
+        [None, True, None, orphan_table_comment("events")],
+        [None, None, None, None, None, False],  # set_config, lock_timeout, LOCK, not attached, no marker, gone
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act — treated as already-done, no error
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    engine.begin.assert_called_once()
+    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
+    assert not any("DROP TABLE" in s for s in statements)
+
+
 def test__repository__drop_partition__marker_gone_after_lock__raises_unmanaged_error_without_drop() -> None:
     # Arrange — pre-check saw the orphan marker, but under the lock the comment is gone (table replaced)
     engine, ddl_conn = _make_drop_engine(
@@ -894,6 +929,23 @@ def test__repository__drop_partition__marker_gone_after_lock__raises_unmanaged_e
 
     statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
     assert not any("DROP TABLE" in s for s in statements)
+
+
+# ── fk_manager ──────────────────────────────────────────────────────────────────
+
+
+def test__fk_manager__list_constraints__opens_connection_and_returns_names() -> None:
+    # Arrange — the engine-connection wrapper applies the statement timeout then delegates
+    # to list_constraints_conn: set_config, FK query
+    engine = _make_engine([None, [("fk_a",), ("fk_b",)]])
+    manager = PartitionForeignKeyManager(engine, ddl_timeout=5.0)
+
+    # Act
+    names = manager.list_constraints("events__2024_01")
+
+    # Assert
+    assert names == ["fk_a", "fk_b"]
+    engine.connect.assert_called_once()
 
 
 # ── is_partition_attached ───────────────────────────────────────────────────────

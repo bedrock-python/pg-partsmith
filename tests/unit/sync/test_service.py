@@ -1423,6 +1423,110 @@ def test__create_future_partitions__conflict_sqlstate_but_not_attached__propagat
     mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
 
 
+def test__create_future_partitions__existing_detached_attach_conflict_not_attached__propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — an existing detached partition is being re-attached; the attach hits a conflict
+    # SQLSTATE but the post-condition check says it is NOT attached to our parent
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_metadata.list_partitions.return_value = [
+        PartitionInfo(
+            name="events__2024_04",
+            partition_type=PartitionType.RANGE,
+            is_attached=False,
+            parent_table="events",
+        )
+    ]
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42809", "is already a partition")
+    mock_metadata.is_partition_attached.return_value = False
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert — the error must propagate instead of being swallowed
+    with pytest.raises(SQLAlchemyError, match="is already a partition"):
+        service.create_future_partitions(config)
+
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__existing_detached_attach_conflict_verified_attached__swallowed(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — re-attach of an existing detached partition loses the race, but the post-condition
+    # check confirms it really is attached to our parent: the conflict is benign
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_metadata.list_partitions.return_value = [
+        PartitionInfo(
+            name="events__2024_04",
+            partition_type=PartitionType.RANGE,
+            is_attached=False,
+            parent_table="events",
+        )
+    ]
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42809", "is already a partition")
+    mock_metadata.is_partition_attached.return_value = True
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act — must not raise
+    created = service.create_future_partitions(config)
+
+    # Assert
+    assert created == []
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__create_race_attach_conflict_not_attached__propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — another worker won the create race, then our attach hits a conflict SQLSTATE
+    # but the post-condition check says the partition is NOT attached to our parent
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_repo.create_partition.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42710", "duplicate object")
+    mock_metadata.is_partition_attached.return_value = False
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert — the error must propagate instead of being swallowed
+    with pytest.raises(SQLAlchemyError, match="duplicate object"):
+        service.create_future_partitions(config)
+
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
+def test__create_future_partitions__create_race_attach_conflict_verified_attached__swallowed(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — another worker won the create race AND the attach race, and the post-condition
+    # check confirms the partition is attached to our parent: the conflict is benign
+    config = config.model_copy(update={"auto_attach_after_create": True})
+    mock_repo.create_partition.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    mock_repo.attach_partition.side_effect = _make_sqlstate_exc("42710", "duplicate object")
+    mock_metadata.is_partition_attached.return_value = True
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act — must not raise
+    created = service.create_future_partitions(config)
+
+    # Assert
+    assert created == []
+    mock_metadata.is_partition_attached.assert_called_once_with("events", "events__2024_04")
+
+
 def test__create_future_partitions__interrupted_during_attach_after_reconcile__restores_rows_and_reraises(
     mock_repo: MagicMock,
     mock_metadata: MagicMock,
