@@ -25,19 +25,24 @@ class PartitionForeignKeyManager:
         """List FK constraints defined ON the partition."""
         with self._engine.connect() as conn:
             apply_local_statement_timeout(conn, self._ddl_timeout)
-            result = conn.execute(
-                text(
-                    """
-                    SELECT con.conname
-                    FROM pg_constraint con
-                    WHERE con.conrelid = to_regclass(:partition_name)
-                      AND con.contype = 'f'
-                    ORDER BY con.conname
-                    """
-                ),
-                {"partition_name": to_regclass_argument(partition_name)},
-            )
-            rows = result.fetchall()
+            return self.list_constraints_conn(conn, partition_name)
+
+    @staticmethod
+    def list_constraints_conn(conn: Connection, partition_name: str) -> list[str]:
+        """List FK constraints using an existing connection."""
+        result = conn.execute(
+            text(
+                """
+                SELECT con.conname
+                FROM pg_constraint con
+                WHERE con.conrelid = to_regclass(:partition_name)
+                  AND con.contype = 'f'
+                ORDER BY con.conname
+                """
+            ),
+            {"partition_name": to_regclass_argument(partition_name)},
+        )
+        rows = result.fetchall()
         names: list[str] = []
         for row in rows:
             conname = row[0]

@@ -134,7 +134,7 @@ async def test__metadata_provider__list_partitions__attached_partition__returns_
 
     # Assert
     assert len(partitions) == 1
-    assert partitions[0].name == "events__2024_01"
+    assert partitions[0].name == "public.events__2024_01"
     assert partitions[0].from_value == "2024-01-01"
     assert partitions[0].to_value == "2024-02-01"
     assert partitions[0].is_attached is True
@@ -156,7 +156,7 @@ async def test__metadata_provider__list_partitions__unparseable_boundaries__stor
 
     # Assert
     assert len(partitions) == 1
-    assert partitions[0].name == "events__weird"
+    assert partitions[0].name == "public.events__weird"
     assert partitions[0].is_attached is True
     assert partitions[0].is_default is False
     assert partitions[0].from_value is None
@@ -219,7 +219,7 @@ async def test__metadata_provider__list_partitions__dotted_relname__skipped_with
         partitions = await provider.list_partitions("events")
 
     # Assert
-    assert [p.name for p in partitions] == ["events__2024_01"]
+    assert [p.name for p in partitions] == ["public.events__2024_01"]
     mock_logger.warning.assert_called_once()
 
 
@@ -254,9 +254,41 @@ async def test__metadata_provider__list_partitions__orphan_row__returns_detached
 
     # Assert
     assert len(partitions) == 1
-    assert partitions[0].name == "events__2023_12"
+    assert partitions[0].name == "public.events__2023_12"
     assert partitions[0].is_attached is False
     assert partitions[0].from_value is None
+
+
+async def test__metadata_provider__list_partitions__bare_parent__returns_schema_qualified_names() -> None:
+    # Arrange — even for a bare parent name, children are qualified with their own catalog schema:
+    # a partition may live in a different schema, and a bare child name could resolve elsewhere
+    row = MagicMock()
+    row.partition_schema = "archive"
+    row.partition_name = "events__2024_01"
+    row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
+    row.is_attached = True
+    engine = _make_engine(("r", "public.events"), [row], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    partitions = await provider.list_partitions("events")
+
+    # Assert
+    assert [p.name for p in partitions] == ["archive.events__2024_01"]
+
+
+async def test__metadata_provider__list_partitions__orphan_query__accepts_partitioned_relkind() -> None:
+    # Arrange — an orphan may itself be subpartitioned (relkind 'p'), not only a plain table ('r')
+    engine = _make_engine(("r", "public.events"), [], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    await provider.list_partitions("events")
+
+    # Assert
+    conn = engine.connect.return_value.__aenter__.return_value
+    orphan_sql = str(conn.execute.call_args_list[2].args[0])
+    assert "relkind IN ('r', 'p')" in orphan_sql
 
 
 # ── partition_exists / is_partition_attached ────────────────────────────────────
@@ -284,6 +316,20 @@ async def test__metadata_provider__partition_exists__uses_quoted_regclass_argume
     conn = engine.connect.return_value.__aenter__.return_value
     params = conn.execute.call_args.args[1]
     assert params["partition_name"] == '"events__2024_W12"'
+
+
+async def test__metadata_provider__partition_exists__accepts_partitioned_relkind() -> None:
+    # Arrange — a partition can itself be subpartitioned (relkind 'p'), not only a plain table ('r')
+    engine = _make_engine(True)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    await provider.partition_exists("events__2024_01")
+
+    # Assert
+    conn = engine.connect.return_value.__aenter__.return_value
+    sql = str(conn.execute.call_args.args[0])
+    assert "relkind IN ('r', 'p')" in sql
 
 
 @pytest.mark.parametrize("attached", [True, False])
@@ -379,7 +425,7 @@ async def test__metadata_provider__get_default_partition__default_exists__return
 
     # Assert
     assert result is not None
-    assert result.name == "events_default"
+    assert result.name == "public.events_default"
     assert result.is_default is True
     assert result.is_attached is True
 

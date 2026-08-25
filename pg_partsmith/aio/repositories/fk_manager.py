@@ -23,19 +23,24 @@ class PartitionForeignKeyManager:
     async def list_constraints(self, partition_name: str) -> list[str]:
         """List FK constraints defined ON the partition."""
         async with asyncio.timeout(self._ddl_timeout), self._engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    """
-                    SELECT con.conname
-                    FROM pg_constraint con
-                    WHERE con.conrelid = to_regclass(:partition_name)
-                      AND con.contype = 'f'
-                    ORDER BY con.conname
-                    """
-                ),
-                {"partition_name": to_regclass_argument(partition_name)},
-            )
-            rows = result.fetchall()
+            return await self.list_constraints_conn(conn, partition_name)
+
+    @staticmethod
+    async def list_constraints_conn(conn: AsyncConnection, partition_name: str) -> list[str]:
+        """List FK constraints using an existing connection."""
+        result = await conn.execute(
+            text(
+                """
+                SELECT con.conname
+                FROM pg_constraint con
+                WHERE con.conrelid = to_regclass(:partition_name)
+                  AND con.contype = 'f'
+                ORDER BY con.conname
+                """
+            ),
+            {"partition_name": to_regclass_argument(partition_name)},
+        )
+        rows = result.fetchall()
         names: list[str] = []
         for row in rows:
             conname = row[0]

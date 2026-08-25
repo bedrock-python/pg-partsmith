@@ -149,7 +149,16 @@ class RedisDistributedLockManager:
         key = self._get_lock_key(table_name)
         token = secrets.token_hex(16)
 
-        if not self._redis.set(key, token, ex=self._ttl, nx=True):
+        try:
+            acquired = self._redis.set(key, token, ex=self._ttl, nx=True)
+        except (KeyboardInterrupt, SystemExit):
+            # The SET may have been applied server-side before the interrupt
+            # landed; the unlock script checks the token, so this is a safe
+            # no-op when it was not.
+            self._release_safely(key, token, table_name)
+            raise
+
+        if not acquired:
             raise LockAcquisitionError(table_name, "Redis lock unavailable")
 
         # From here on the key is held: any failure must release it rather than leak it until TTL.

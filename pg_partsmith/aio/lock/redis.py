@@ -148,7 +148,16 @@ class RedisDistributedLockManager:
         key = self._get_lock_key(table_name)
         token = secrets.token_hex(16)
 
-        if not await self._redis.set(key, token, ex=self._ttl, nx=True):
+        try:
+            acquired = await self._redis.set(key, token, ex=self._ttl, nx=True)
+        except asyncio.CancelledError:
+            # The SET may have been applied server-side before the cancellation
+            # landed; the unlock script checks the token, so this is a safe no-op
+            # when it was not.
+            await asyncio.shield(self._release_safely(key, token, table_name))
+            raise
+
+        if not acquired:
             raise LockAcquisitionError(table_name, "Redis lock unavailable")
 
         # From here on the key is held: any failure must release it rather than leak it until TTL.

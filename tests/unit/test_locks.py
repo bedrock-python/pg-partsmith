@@ -374,6 +374,22 @@ async def test__redis_lock__task_cancelled__unlock_completes_via_shield() -> Non
     assert unlock_completed.is_set()
 
 
+async def test__redis_lock__cancelled_during_set__releases_token_and_reraises() -> None:
+    # Arrange — the SET may have been applied server-side before the cancellation landed, so the
+    # token-checked unlock script must run (safe no-op otherwise) before the cancellation propagates
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=True)
+    redis_client.set = AsyncMock(side_effect=asyncio.CancelledError())
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert
+    with pytest.raises(asyncio.CancelledError):
+        async with manager.acquire_lock("events"):
+            pass
+
+    unlock_script.assert_awaited_once()
+
+
 async def test__redis_lock__is_locked_true__returns_true() -> None:
     # Arrange
     redis_client = MagicMock()

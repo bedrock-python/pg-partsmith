@@ -203,6 +203,10 @@ class PartitionCreationService(BasePartitionService):
         for attempt in range(1, _DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
                 self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
+            except (KeyboardInterrupt, SystemExit):
+                # Best-effort compensating move-back before the interrupt propagates.
+                self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
+                raise
             except (OSError, TimeoutError):
                 self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                 raise
@@ -309,23 +313,36 @@ class PartitionCreationService(BasePartitionService):
     ) -> None:
         """Handle case where partition already exists in metadata."""
         if config.auto_attach_after_create and not existing.is_attached:
+            qualified_parent = qualify(config.db_schema, config.table_name)
             try:
                 self._attach_with_reconcile(config, existing.name, from_value, to_value)
             except (OSError, TimeoutError):
                 raise
             except SQLAlchemyError as e:
-                state = pg_sqlstate(e)
-                if state not in _ATTACH_CONFLICT_SQLSTATES:
+                if not self._is_attach_conflict_benign(qualified_parent, existing.name, e):
                     raise
                 logger.debug(
                     "Partition already attached (race with another worker)",
-                    extra={"partition_name": existing.name, "sqlstate": state},
+                    extra={"partition_name": existing.name, "sqlstate": pg_sqlstate(e)},
                 )
+
+    def _is_attach_conflict_benign(self, qualified_parent: str, partition_name: str, exc: SQLAlchemyError) -> bool:
+        """A conflict SQLSTATE proves a lost race only if the postcondition holds.
+
+        42809 (wrong_object_type) also fires for typed tables, inheritance
+        children, and attachments to a *different* parent — verify the
+        partition is actually attached to our parent instead of trusting the
+        error code alone.
+        """
+        if pg_sqlstate(exc) not in _ATTACH_CONFLICT_SQLSTATES:
+            return False
+        return self._metadata.is_partition_attached(qualified_parent, partition_name)
 
     def _create_and_attach_partition(
         self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
     ) -> PartitionInfo | None:
         """Create partition and optionally attach it to parent."""
+        qualified_parent = qualify(config.db_schema, config.table_name)
         try:
             partition_info = self._repo.create_partition(config, partition_name, from_value, to_value)
         except PartitionAlreadyExistsError:
@@ -335,7 +352,7 @@ class PartitionCreationService(BasePartitionService):
                 except (OSError, TimeoutError):
                     raise
                 except SQLAlchemyError as e:
-                    if pg_sqlstate(e) not in _ATTACH_CONFLICT_SQLSTATES:
+                    if not self._is_attach_conflict_benign(qualified_parent, partition_name, e):
                         raise
                     logger.debug(
                         "Partition already attached (race)",
@@ -349,7 +366,7 @@ class PartitionCreationService(BasePartitionService):
             except (OSError, TimeoutError):
                 raise
             except SQLAlchemyError as e:
-                if pg_sqlstate(e) not in _ATTACH_CONFLICT_SQLSTATES:
+                if not self._is_attach_conflict_benign(qualified_parent, partition_name, e):
                     raise
                 logger.debug(
                     "Partition already attached (race)",

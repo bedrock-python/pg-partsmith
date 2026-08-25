@@ -1,9 +1,10 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import Engine, text
 
 from pg_partsmith.entities import PartitionGranularity, PartitionInfo, TablePartitionConfig
+from pg_partsmith.exceptions import PartitionAttachedError
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from tests.integration.sync.builder import PartitioningScenarioBuilder
 
@@ -312,3 +313,109 @@ def test__scenario__quarter_granularity__creates_ahead_and_prunes_old_quarters(
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_q4")
     ctx.assert_partition_attached(f"{ctx.table_name}__2027_q1")
     ctx.assert_partition_attached(f"{ctx.table_name}__2027_q2")
+
+
+@pytest.mark.integration
+def test__scenario__infinity_upper_bound__partition_never_pruned(
+    sync_partition_builder: PartitioningScenarioBuilder,
+    sync_db_engine: Engine,
+) -> None:
+    # Arrange — partition named like an ancient period but with an unbounded upper boundary
+    partition_name = f"{sync_partition_builder._table_name}__1970_01"
+    ctx = sync_partition_builder.with_retention(1).build()
+    ctx.repo.create_partition(ctx.config, partition_name, "1970-01-01", "infinity")
+    ctx.repo.attach_partition(ctx.table_name, partition_name, "1970-01-01", "infinity")
+
+    # A current row lands in the unbounded partition
+    with sync_db_engine.begin() as conn:
+        conn.execute(
+            text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
+            {"dt": datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC), "data": "live"},
+        )
+
+    # Act — skip create: any new range would overlap the unbounded partition
+    result = ctx.run_maintenance(at_time="2026-08-15", skip_create=True)
+
+    # Assert — never pruned despite the ancient-looking name; the row survives
+    assert result.success
+    assert result.detached_count == 0
+    assert result.dropped_count == 0
+    ctx.assert_partition_attached(partition_name)
+    with sync_db_engine.connect() as conn:
+        count = conn.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
+        assert count.scalar() == 1
+
+
+@pytest.mark.integration
+def test__scenario__subpartitioned_child__detached_and_dropped(
+    sync_partition_builder: PartitioningScenarioBuilder,
+    sync_db_engine: Engine,
+) -> None:
+    # Arrange — child that is itself PARTITION BY RANGE, attached under an old period
+    child = f"{sync_partition_builder._table_name}__2024_01"
+    leaf = f"{child}_leaf"
+    ctx = sync_partition_builder.with_create_ahead(1).with_retention(1).build()
+
+    with sync_db_engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE "{child}" (
+                    id BIGSERIAL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    data TEXT,
+                    PRIMARY KEY (id, created_at)
+                ) PARTITION BY RANGE (created_at)
+                """
+            )
+        )
+        conn.execute(
+            text(f"""CREATE TABLE "{leaf}" PARTITION OF "{child}" FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')""")
+        )
+    ctx.repo.attach_partition(ctx.table_name, child, "2024-01-01", "2024-02-01")
+    ctx.assert_partition_attached(child)
+
+    # Act — advance past retention
+    result = ctx.run_maintenance(at_time="2024-04-01")
+
+    # Assert — the partitioned child was detached and dropped along with its leaf
+    assert result.success
+    assert result.detached_count >= 1
+    assert result.dropped_count >= 1
+    ctx.assert_partition_not_exists(child)
+    ctx.assert_partition_not_exists(leaf)
+
+
+@pytest.mark.integration
+def test__scenario__attached_partition_with_reattached_race__drop_refused(
+    sync_partition_builder: PartitioningScenarioBuilder,
+    sync_db_engine: Engine,
+) -> None:
+    # Arrange — detached via the repo (orphan marker set), then re-attached behind its back
+    partition_name = f"{sync_partition_builder._table_name}__2024_01"
+    ctx = sync_partition_builder.with_attached_partition(partition_name, "2024-01-01", "2024-02-01").build()
+
+    with sync_db_engine.begin() as conn:
+        conn.execute(
+            text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
+            {"dt": datetime(2024, 1, 15, tzinfo=UTC), "data": "keep-me"},
+        )
+
+    ctx.repo.detach_partition(ctx.table_name, partition_name, concurrent=False)
+    with sync_db_engine.begin() as conn:
+        conn.execute(
+            text(
+                f'ALTER TABLE "{ctx.table_name}" ATTACH PARTITION "{partition_name}" '
+                f"FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
+            )
+        )
+
+    # Act / Assert — drop must refuse: the partition is attached again despite the marker
+    with pytest.raises(PartitionAttachedError):
+        ctx.repo.drop_partition(partition_name)
+
+    ctx.assert_partition_exists(partition_name)
+    ctx.assert_partition_attached(partition_name)
+    with sync_db_engine.connect() as conn:
+        count = conn.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
+        assert count.scalar() == 1

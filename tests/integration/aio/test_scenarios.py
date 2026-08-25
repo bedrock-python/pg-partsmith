@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.entities import PartitionGranularity, PartitionInfo, TablePartitionConfig
+from pg_partsmith.exceptions import PartitionAttachedError
 from tests.integration.aio.builder import PartitioningScenarioBuilder
 
 
@@ -302,3 +303,107 @@ async def test__scenario__quarter_granularity__creates_ahead_and_prunes_old_quar
     await ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_q4")
     await ctx.assert_partition_attached(f"{ctx.table_name}__2027_q1")
     await ctx.assert_partition_attached(f"{ctx.table_name}__2027_q2")
+
+
+@pytest.mark.integration
+async def test__scenario__infinity_upper_bound__partition_never_pruned(
+    partition_builder: PartitioningScenarioBuilder,
+    db_session: AsyncSession,
+) -> None:
+    # Arrange — partition named like an ancient period but with an unbounded upper boundary
+    partition_name = f"{partition_builder._table_name}__1970_01"
+    ctx = await partition_builder.with_retention(1).build()
+    await ctx.repo.create_partition(ctx.config, partition_name, "1970-01-01", "infinity")
+    await ctx.repo.attach_partition(ctx.table_name, partition_name, "1970-01-01", "infinity")
+
+    # A current row lands in the unbounded partition
+    await db_session.execute(
+        text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
+        {"dt": datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC), "data": "live"},
+    )
+    await db_session.commit()
+
+    # Act — skip create: any new range would overlap the unbounded partition
+    result = await ctx.run_maintenance(at_time="2026-08-15", skip_create=True)
+
+    # Assert — never pruned despite the ancient-looking name; the row survives
+    assert result.success
+    assert result.detached_count == 0
+    assert result.dropped_count == 0
+    await ctx.assert_partition_attached(partition_name)
+    count = await db_session.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
+    assert count.scalar() == 1
+
+
+@pytest.mark.integration
+async def test__scenario__subpartitioned_child__detached_and_dropped(
+    partition_builder: PartitioningScenarioBuilder,
+    db_session: AsyncSession,
+) -> None:
+    # Arrange — child that is itself PARTITION BY RANGE, attached under an old period
+    child = f"{partition_builder._table_name}__2024_01"
+    leaf = f"{child}_leaf"
+    ctx = await partition_builder.with_create_ahead(1).with_retention(1).build()
+
+    await db_session.execute(
+        text(
+            f"""
+            CREATE TABLE "{child}" (
+                id BIGSERIAL,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                data TEXT,
+                PRIMARY KEY (id, created_at)
+            ) PARTITION BY RANGE (created_at)
+            """
+        )
+    )
+    await db_session.execute(
+        text(f"""CREATE TABLE "{leaf}" PARTITION OF "{child}" FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')""")
+    )
+    await db_session.commit()
+    await ctx.repo.attach_partition(ctx.table_name, child, "2024-01-01", "2024-02-01")
+    await ctx.assert_partition_attached(child)
+
+    # Act — advance past retention
+    result = await ctx.run_maintenance(at_time="2024-04-01")
+
+    # Assert — the partitioned child was detached and dropped along with its leaf
+    assert result.success
+    assert result.detached_count >= 1
+    assert result.dropped_count >= 1
+    await ctx.assert_partition_not_exists(child)
+    await ctx.assert_partition_not_exists(leaf)
+
+
+@pytest.mark.integration
+async def test__scenario__attached_partition_with_reattached_race__drop_refused(
+    partition_builder: PartitioningScenarioBuilder,
+    db_session: AsyncSession,
+) -> None:
+    # Arrange — detached via the repo (orphan marker set), then re-attached behind its back
+    partition_name = f"{partition_builder._table_name}__2024_01"
+    ctx = await partition_builder.with_attached_partition(partition_name, "2024-01-01", "2024-02-01").build()
+
+    await db_session.execute(
+        text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
+        {"dt": datetime(2024, 1, 15, tzinfo=UTC), "data": "keep-me"},
+    )
+    await db_session.commit()
+
+    await ctx.repo.detach_partition(ctx.table_name, partition_name, concurrent=False)
+    await db_session.execute(
+        text(
+            f'ALTER TABLE "{ctx.table_name}" ATTACH PARTITION "{partition_name}" '
+            f"FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
+        )
+    )
+    await db_session.commit()
+
+    # Act / Assert — drop must refuse: the partition is attached again despite the marker
+    with pytest.raises(PartitionAttachedError):
+        await ctx.repo.drop_partition(partition_name)
+
+    await ctx.assert_partition_exists(partition_name)
+    await ctx.assert_partition_attached(partition_name)
+    count = await db_session.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
+    assert count.scalar() == 1
