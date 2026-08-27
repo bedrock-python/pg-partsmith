@@ -1,3 +1,6 @@
+from datetime import UTC
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from pg_partsmith.entities import (
@@ -98,3 +101,26 @@ def test__settings__get_period_calculator__granularity_none__raises_value_error(
     # Act / Assert
     with pytest.raises(ValueError, match="granularity is not set"):
         settings.get_period_calculator()
+
+
+def test__settings__get_period_calculator__custom_tz__forwards_tz_to_calculator() -> None:
+    # Arrange
+    settings = _make_settings(granularity=PartitionGranularity.MONTH)
+    moscow = ZoneInfo("Europe/Moscow")
+
+    # Act
+    calc = settings.get_period_calculator(tz=moscow)
+
+    # Assert
+    assert calc.tz is moscow
+
+
+def test__settings__get_period_calculator__no_tz_argument__defaults_to_utc() -> None:
+    # Arrange
+    settings = _make_settings(granularity=PartitionGranularity.MONTH)
+
+    # Act
+    calc = settings.get_period_calculator()
+
+    # Assert
+    assert calc.tz is UTC

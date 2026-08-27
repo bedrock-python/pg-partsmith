@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 from pg_partsmith.exceptions import InvalidPartitionConfigError
@@ -11,8 +10,6 @@ from pg_partsmith.utils import qualify
 if TYPE_CHECKING:
     from pg_partsmith.aio.protocols import PartitionMetadataProvider
     from pg_partsmith.entities import TablePartitionConfig
-
-logger = logging.getLogger(__name__)
 
 
 class PartitionValidationService:

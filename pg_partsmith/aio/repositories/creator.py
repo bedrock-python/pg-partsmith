@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 class PartitionCreator:
     """Helper for partition creation and attachment."""
 
-    def __init__(self, engine: AsyncEngine, ddl_timeout: float, ddl_timezone: str | None = None) -> None:
+    def __init__(self, *, engine: AsyncEngine, ddl_timeout: float, ddl_timezone: str | None) -> None:
         self._engine = engine
         self._ddl_timeout = ddl_timeout
         self._ddl_timezone = ddl_timezone

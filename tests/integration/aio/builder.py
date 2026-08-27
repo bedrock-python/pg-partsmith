@@ -190,22 +190,22 @@ class PartitioningTestContext:
 
     async def assert_partition_exists(self, name: str) -> None:
         """Asserts that a partition table exists in the database."""
-        exists = await self.repo.partition_exists(name)
+        exists = await self.metadata.partition_exists(name)
         assert exists, f"Partition {name} does not exist"
 
     async def assert_partition_not_exists(self, name: str) -> None:
         """Asserts that a partition table does not exist in the database."""
-        exists = await self.repo.partition_exists(name)
+        exists = await self.metadata.partition_exists(name)
         assert not exists, f"Partition {name} exists, but should not"
 
     async def assert_partition_attached(self, name: str) -> None:
         """Asserts that a partition is attached to the parent table."""
-        attached = await self.repo.is_partition_attached(self.table_name, name)
+        attached = await self.metadata.is_partition_attached(self.table_name, name)
         assert attached, f"Partition {name} is not attached to {self.table_name}"
 
     async def assert_partition_detached(self, name: str) -> None:
         """Asserts that a partition is NOT attached to the parent table."""
-        attached = await self.repo.is_partition_attached(self.table_name, name)
+        attached = await self.metadata.is_partition_attached(self.table_name, name)
         assert not attached, f"Partition {name} is attached to {self.table_name}, but should be detached"
 
     async def assert_partition_count(self, expected: int) -> None:

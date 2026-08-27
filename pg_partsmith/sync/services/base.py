@@ -44,9 +44,8 @@ class BasePartitionService:
             except (KeyboardInterrupt, SystemExit):
                 raise
             except (ValueError, TypeError, RuntimeError) as e:
-                # Catch known recoverable errors from hooks
                 logger.warning(
-                    f"{hook_name} hook failed (recoverable error)",
+                    f"{hook_name} hook failed",
                     extra={
                         "partition_name": partition_name,
                         "hook_type": type(hook).__name__,

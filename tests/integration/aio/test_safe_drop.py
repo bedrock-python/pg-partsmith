@@ -9,6 +9,7 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import (
     PartitionGranularity,
@@ -98,7 +99,7 @@ async def test__drop_partition__detached_no_fk__drops_cleanly(
     await repo.drop_partition(name)
 
     # Assert
-    assert not await repo.partition_exists(name)
+    assert not await PostgresMetadataProvider(db_engine).partition_exists(name)
 
 
 # ── FK cleanup ────────────────────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ async def test__drop_partition__single_fk__removes_constraint_and_drops_table(
     await repo.drop_partition(name)
 
     # Assert — partition gone, referenced table survives
-    assert not await repo.partition_exists(name)
+    assert not await PostgresMetadataProvider(db_engine).partition_exists(name)
     result = await db_session.execute(
         text("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = :t AND relkind = 'r')"),
         {"t": referenced_table},
@@ -175,7 +176,7 @@ async def test__drop_partition__multiple_fks__removes_all_constraints(
     await repo.drop_partition(name)
 
     # Assert
-    assert not await repo.partition_exists(name)
+    assert not await PostgresMetadataProvider(db_engine).partition_exists(name)
 
 
 # ── idempotency ───────────────────────────────────────────────────────────────────
@@ -196,7 +197,7 @@ async def test__drop_partition__double_drop__second_call_is_noop(
     await repo.drop_partition(name)  # must be a no-op
 
     # Assert
-    assert not await repo.partition_exists(name)
+    assert not await PostgresMetadataProvider(db_engine).partition_exists(name)
 
 
 @pytest.mark.integration
@@ -219,6 +220,7 @@ async def test__drop_partition__still_attached__raises_partition_attached_error(
     # Arrange
     name = f"{partitioned_table}__2024_11"
     repo = PostgresPartitionRepository(db_engine)
+    metadata = PostgresMetadataProvider(db_engine)
     await repo.create_partition(_config(partitioned_table), name, "2024-11-01", "2024-12-01")
     await repo.attach_partition(partitioned_table, name, "2024-11-01", "2024-12-01")
 
@@ -227,10 +229,10 @@ async def test__drop_partition__still_attached__raises_partition_attached_error(
         with pytest.raises(PartitionAttachedError):
             await repo.drop_partition(name)
 
-        assert await repo.partition_exists(name)
-        assert await repo.is_partition_attached(partitioned_table, name)
+        assert await metadata.partition_exists(name)
+        assert await metadata.is_partition_attached(partitioned_table, name)
     finally:
-        if await repo.is_partition_attached(partitioned_table, name):
+        if await metadata.is_partition_attached(partitioned_table, name):
             await repo.detach_partition(partitioned_table, name, concurrent=False)
         await repo.drop_partition(name)
 
@@ -284,8 +286,7 @@ async def test__drop_partition__lock_contention__retries_and_succeeds_after_rele
     await asyncio.gather(hold_exclusive_lock(), drop_after_lock())
 
     # Assert
-    repo = PostgresPartitionRepository(db_engine)
-    assert not await repo.partition_exists(name)
+    assert not await PostgresMetadataProvider(db_engine).partition_exists(name)
     assert len(retry_msgs) >= 1, (
         "Expected at least one retry warning; drop succeeded on first attempt without contention"
     )

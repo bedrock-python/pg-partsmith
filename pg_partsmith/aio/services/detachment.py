@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 from .base import BasePartitionService
@@ -11,8 +10,6 @@ if TYPE_CHECKING:
     from pg_partsmith.aio.hooks import PartitionLifecycleHooks
     from pg_partsmith.aio.protocols import PartitionRepository
     from pg_partsmith.entities import PartitionInfo
-
-logger = logging.getLogger(__name__)
 
 
 class PartitionDetachmentService(BasePartitionService):
@@ -34,7 +31,8 @@ class PartitionDetachmentService(BasePartitionService):
         """Detach old partitions from parent table.
 
         Returns:
-            List of successfully detached partition names.
+            List of successfully detached partition names; inputs that were
+            already detached are included.
 
         Raises:
             Exception: Any error during detachment or hooks.
@@ -55,7 +53,18 @@ class PartitionDetachmentService(BasePartitionService):
         table_name: str,
         partition: PartitionInfo,
     ) -> None:
-        """Detach a single partition with hooks."""
+        """Detach a single partition, running the detach hooks around it.
+
+        Extension point for callers that manage partitions one at a time.
+
+        Args:
+            table_name: Qualified parent table name (hook context).
+            partition: The attached partition to detach.
+
+        Raises:
+            PartitionDetachInProgressError: If a concurrent detach is in progress.
+            Exception: Any error from the repository or a ``before_detach`` hook.
+        """
         # Hooks: before detach
         await self._run_hooks(
             lambda h: h.before_detach(table_name, partition),

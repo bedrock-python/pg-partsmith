@@ -1,44 +1,24 @@
 """PostgreSQL metadata provider."""
 
-import logging
-import re
+from __future__ import annotations
 
-from sqlalchemy import Engine, text
+from typing import TYPE_CHECKING
 
+from sqlalchemy import text
+
+from pg_partsmith.catalog_queries import PARTITION_IS_ATTACHED_SQL, RELATION_EXISTS_SQL
 from pg_partsmith.entities import PartitionInfo, PartitionType
+from pg_partsmith.partition_bounds import is_addressable, parse_range_boundaries
 from pg_partsmith.utils import (
+    coerce_str,
     orphan_comment_prefix,
     orphan_table_comment,
     qualify,
     to_regclass_argument,
 )
 
-# Pre-compiled regex patterns for partition boundary parsing.
-_RANGE_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+FROM\s*\(", re.IGNORECASE)
-_BOUNDARY_SEP_PATTERN = re.compile(r"\)\s+TO\s+\(", re.IGNORECASE)
-_FROM_PREFIX_PATTERN = re.compile(r"^.*?FROM\s*\(", re.IGNORECASE | re.DOTALL)
-_TRAILING_PAREN_PATTERN = re.compile(r"\)\s*$", re.IGNORECASE | re.DOTALL)
-_CAST_PATTERN = re.compile(r"^CAST\((?P<inner>.*)\s+AS\s+.*\)$", re.IGNORECASE | re.DOTALL)
-_STR_LITERAL_PATTERN = re.compile(r"'(?P<s>(?:[^']|'')*)'")
-
-logger = logging.getLogger(__name__)
-
-
-def _is_addressable(schema: str, relname: str) -> bool:
-    """Return False for relations whose schema or name contains a dot.
-
-    The library addresses relations as ``schema.relname`` strings, so a dot
-    inside either part would be re-split into a different relation by
-    ``quote_identifier`` — DDL could then target the wrong table.  Such
-    partitions are never created by this library; skip them with a warning.
-    """
-    if "." in schema or "." in relname:
-        logger.warning(
-            "Skipping partition with '.' in its schema or name; not addressable by qualified-name DDL",
-            extra={"partition_schema": schema, "partition_name": relname},
-        )
-        return False
-    return True
+if TYPE_CHECKING:
+    from sqlalchemy import Engine
 
 
 class PostgresMetadataProvider:
@@ -63,15 +43,6 @@ class PostgresMetadataProvider:
         self._engine = engine
         self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
 
-    @staticmethod
-    def _maybe_decode(val: str | bytes | None, encoding: str = "utf-8") -> str | None:
-        """Decode bytes to string if needed."""
-        if val is None:
-            return None
-        if isinstance(val, bytes):
-            return val.decode(encoding, errors="replace")
-        return val
-
     def get_partition_type(self, table_name: str) -> PartitionType | None:
         """Get partition type for a table."""
         with self._engine.connect() as conn:
@@ -85,15 +56,9 @@ class PostgresMetadataProvider:
                 ),
                 {"table_name": to_regclass_argument(table_name)},
             )
-            strat = self._maybe_decode(result.scalar(), encoding="ascii")
+            strat = coerce_str(result.scalar(), encoding="ascii")
 
-        if strat == "r":
-            return PartitionType.RANGE
-        if strat == "l":
-            return PartitionType.LIST
-        if strat == "h":
-            return PartitionType.HASH
-        return None
+        return PartitionType.from_partstrat(strat)
 
     def get_partition_column(self, table_name: str) -> str | None:
         """Get partition column for a table.
@@ -128,7 +93,7 @@ class PostgresMetadataProvider:
             )
             raise ValueError(msg)
 
-        return self._maybe_decode(rows[0][0])
+        return coerce_str(rows[0][0])
 
     def list_partitions(self, table_name: str) -> list[PartitionInfo]:
         """List all partitions for a table, including orphaned detached ones.
@@ -143,7 +108,6 @@ class PostgresMetadataProvider:
         and a bare name could resolve to an unrelated table via ``search_path``.
         """
         with self._engine.connect() as conn:
-            # 1. Get partition type and canonical parent name in one query
             parent_info_result = conn.execute(
                 text(
                     """
@@ -162,21 +126,13 @@ class PostgresMetadataProvider:
             if not parent_row:
                 return []
 
-            strat = self._maybe_decode(parent_row[0], encoding="ascii")
-            parent_qualified = self._maybe_decode(parent_row[1]) or table_name
+            strat = coerce_str(parent_row[0], encoding="ascii")
+            parent_qualified = coerce_str(parent_row[1]) or table_name
 
-            partition_type: PartitionType | None = None
-            if strat == "r":
-                partition_type = PartitionType.RANGE
-            elif strat == "l":
-                partition_type = PartitionType.LIST
-            elif strat == "h":
-                partition_type = PartitionType.HASH
-
+            partition_type = PartitionType.from_partstrat(strat)
             if not partition_type:
                 return []
 
-            # 2. Get attached partitions
             attached_result = conn.execute(
                 text(
                     """
@@ -196,7 +152,6 @@ class PostgresMetadataProvider:
             )
             attached_rows = attached_result.fetchall()
 
-            # 3. Get orphan partitions
             orphan_result = conn.execute(
                 text(
                     """
@@ -229,24 +184,15 @@ class PostgresMetadataProvider:
         partitions: list[PartitionInfo] = []
 
         for row in attached_rows:
-            relname: str | bytes = row.partition_name
-            if isinstance(relname, bytes):
-                relname = relname.decode("utf-8", errors="replace")
+            relname = coerce_str(row.partition_name) or ""
+            part_schema = coerce_str(row.partition_schema) or ""
 
-            part_schema: str | bytes = row.partition_schema
-            if isinstance(part_schema, bytes):
-                part_schema = part_schema.decode("utf-8", errors="replace")
-
-            if not _is_addressable(part_schema, relname):
+            if not is_addressable(part_schema, relname):
                 continue
 
             name = qualify(part_schema, relname)
 
-            boundaries = row.boundaries
-            if isinstance(boundaries, bytes):
-                boundaries = boundaries.decode("utf-8", errors="replace")
-
-            boundaries_str = str(boundaries) if boundaries is not None else ""
+            boundaries_str = coerce_str(row.boundaries) or ""
             is_default = boundaries_str.strip().upper() == "DEFAULT"
             from_val, to_val = (None, None) if is_default else self._parse_boundaries(boundaries_str)
             partitions.append(
@@ -263,18 +209,13 @@ class PostgresMetadataProvider:
             )
 
         for row in orphan_rows:
-            orphan_relname: str | bytes = row.partition_name
-            if isinstance(orphan_relname, bytes):
-                orphan_relname = orphan_relname.decode("utf-8", errors="replace")
+            relname = coerce_str(row.partition_name) or ""
+            part_schema = coerce_str(row.partition_schema) or ""
 
-            orphan_schema: str | bytes = row.partition_schema
-            if isinstance(orphan_schema, bytes):
-                orphan_schema = orphan_schema.decode("utf-8", errors="replace")
-
-            if not _is_addressable(orphan_schema, orphan_relname):
+            if not is_addressable(part_schema, relname):
                 continue
 
-            name = qualify(orphan_schema, orphan_relname)
+            name = qualify(part_schema, relname)
             partitions.append(
                 PartitionInfo(
                     name=name,
@@ -300,16 +241,7 @@ class PostgresMetadataProvider:
         """
         with self._engine.connect() as conn:
             result = conn.execute(
-                text(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM pg_class
-                        WHERE oid = to_regclass(:partition_name)
-                          AND relkind IN ('r', 'p')
-                    )
-                    """
-                ),
+                text(RELATION_EXISTS_SQL),
                 {"partition_name": to_regclass_argument(partition_name)},
             )
             return bool(result.scalar())
@@ -326,18 +258,7 @@ class PostgresMetadataProvider:
         """
         with self._engine.connect() as conn:
             result = conn.execute(
-                text(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM pg_inherits inh
-                        JOIN pg_class child ON inh.inhrelid = child.oid
-                        WHERE inh.inhparent = to_regclass(:table_name)
-                          AND inh.inhrelid = to_regclass(:partition_name)
-                          AND child.relispartition = true
-                    )
-                    """
-                ),
+                text(PARTITION_IS_ATTACHED_SQL),
                 {
                     "table_name": to_regclass_argument(table_name),
                     "partition_name": to_regclass_argument(partition_name),
@@ -365,13 +286,10 @@ class PostgresMetadataProvider:
                 ),
                 {"partition_name": to_regclass_argument(partition_name)},
             )
-            boundaries_expr = result.scalar()
+            boundaries_expr = coerce_str(result.scalar())
 
         if not boundaries_expr:
             return None
-
-        if isinstance(boundaries_expr, bytes):
-            boundaries_expr = boundaries_expr.decode("utf-8", errors="replace")
 
         from_val, to_val = self._parse_boundaries(boundaries_expr)
         if from_val is not None and to_val is not None:
@@ -380,71 +298,8 @@ class PostgresMetadataProvider:
         return None
 
     def _parse_boundaries(self, boundaries_expr: str | None) -> tuple[str | None, str | None]:
-        """Parse boundary values from pg_get_expr output.
-
-        ``pg_get_expr(relpartbound, oid)`` can include casts and varying
-        whitespace depending on PostgreSQL version and the partition key type.
-        This parser aims to extract stable "boundary values" for the most common
-        cases, without trying to fully parse SQL expressions.
-
-        Examples:
-          FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')
-          FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)
-          FOR VALUES FROM (1::bigint) TO (5::bigint)
-          FOR VALUES FROM (MINVALUE) TO (MAXVALUE)
-        """
-        if not boundaries_expr:
-            return None, None
-
-        if boundaries_expr.strip().upper() == "DEFAULT":
-            return None, None
-
-        # Only RANGE bounds carry FROM/TO values; LIST/HASH expressions could
-        # contain a ") TO (" inside a string value and must not be mis-parsed.
-        if not _RANGE_BOUND_PATTERN.match(boundaries_expr):
-            return None, None
-
-        # Split into FROM and TO parts by finding ") TO (" which is the most
-        # reliable separator for range boundaries.
-        parts = _BOUNDARY_SEP_PATTERN.split(boundaries_expr)
-        if len(parts) != 2:
-            return None, None
-
-        from_part = parts[0]
-        to_part = parts[1]
-
-        # Strip "FOR VALUES FROM (" prefix from the first part
-        from_part = _FROM_PREFIX_PATTERN.sub("", from_part)
-        # Strip trailing ")" from the second part
-        to_part = _TRAILING_PAREN_PATTERN.sub("", to_part)
-
-        def _strip_outer_parens(s: str) -> str:
-            s = s.strip()
-            # pg_get_expr sometimes wraps constants in extra parentheses
-            while s.startswith("(") and s.endswith(")") and len(s) > 1:
-                s = s[1:-1].strip()
-            return s
-
-        def _normalize(expr: str) -> str:
-            expr = _strip_outer_parens(expr)
-
-            # CAST(x AS type) → x
-            cast_match = _CAST_PATTERN.match(expr)
-            if cast_match:
-                expr = _strip_outer_parens(cast_match.group("inner"))
-
-            # Prefer extracting a string literal if present.
-            str_match = _STR_LITERAL_PATTERN.search(expr)
-            if str_match:
-                return str_match.group("s").replace("''", "'")
-
-            # Strip ::type casts.
-            if "::" in expr:
-                expr = expr.split("::", 1)[0].strip()
-
-            return expr.strip()
-
-        return _normalize(from_part), _normalize(to_part)
+        """Delegate to :func:`pg_partsmith.partition_bounds.parse_range_boundaries`; override to customise parsing."""
+        return parse_range_boundaries(boundaries_expr)
 
     def is_partition_closed(self, partition_name: str, *, settle_seconds: int = 0) -> bool:
         """True when the partition's upper bound (+ settle buffer) has passed.

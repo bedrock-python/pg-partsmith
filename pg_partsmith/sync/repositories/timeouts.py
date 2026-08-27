@@ -9,8 +9,7 @@ whole block) is bounded by the configured timeout.
 
 from __future__ import annotations
 
-import contextlib
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -19,10 +18,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from sqlalchemy import Connection
-
-
-def _timeout_ms(timeout_seconds: float) -> str:
-    return str(max(1, int(timeout_seconds * 1000)))
 
 
 def apply_local_statement_timeout(conn: Connection, timeout_seconds: float) -> None:
@@ -51,5 +46,9 @@ def session_statement_timeout(conn: Connection, timeout_seconds: float) -> Itera
         try:
             conn.execute(text("RESET statement_timeout"))
         except Exception:
-            with contextlib.suppress(Exception):
+            with suppress(Exception):
                 conn.invalidate()
+
+
+def _timeout_ms(timeout_seconds: float) -> str:
+    return str(max(1, int(timeout_seconds * 1000)))

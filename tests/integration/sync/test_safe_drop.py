@@ -15,6 +15,7 @@ from pg_partsmith.entities import (
     TablePartitionConfig,
 )
 from pg_partsmith.exceptions import PartitionAttachedError
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 
 if TYPE_CHECKING:
@@ -102,7 +103,7 @@ def test__drop_partition__detached_no_fk__drops_cleanly(
     repo.drop_partition(name)
 
     # Assert
-    assert not repo.partition_exists(name)
+    assert not PostgresMetadataProvider(sync_db_engine).partition_exists(name)
 
 
 # ── FK cleanup ────────────────────────────────────────────────────────────────────
@@ -145,7 +146,7 @@ def test__drop_partition__single_fk__removes_constraint_and_drops_table(
     repo.drop_partition(name)
 
     # Assert — partition gone, referenced table survives
-    assert not repo.partition_exists(name)
+    assert not PostgresMetadataProvider(sync_db_engine).partition_exists(name)
     with sync_db_engine.begin() as conn:
         result = conn.execute(
             text("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = :t AND relkind = 'r')"),
@@ -179,7 +180,7 @@ def test__drop_partition__multiple_fks__removes_all_constraints(
     repo.drop_partition(name)
 
     # Assert
-    assert not repo.partition_exists(name)
+    assert not PostgresMetadataProvider(sync_db_engine).partition_exists(name)
 
 
 # ── idempotency ───────────────────────────────────────────────────────────────────
@@ -200,7 +201,7 @@ def test__drop_partition__double_drop__second_call_is_noop(
     repo.drop_partition(name)  # must be a no-op
 
     # Assert
-    assert not repo.partition_exists(name)
+    assert not PostgresMetadataProvider(sync_db_engine).partition_exists(name)
 
 
 @pytest.mark.integration
@@ -223,6 +224,7 @@ def test__drop_partition__still_attached__raises_partition_attached_error(
     # Arrange
     name = f"{partitioned_table}__2024_11"
     repo = PostgresPartitionRepository(sync_db_engine)
+    metadata = PostgresMetadataProvider(sync_db_engine)
     repo.create_partition(_config(partitioned_table), name, "2024-11-01", "2024-12-01")
     repo.attach_partition(partitioned_table, name, "2024-11-01", "2024-12-01")
 
@@ -231,10 +233,10 @@ def test__drop_partition__still_attached__raises_partition_attached_error(
         with pytest.raises(PartitionAttachedError):
             repo.drop_partition(name)
 
-        assert repo.partition_exists(name)
-        assert repo.is_partition_attached(partitioned_table, name)
+        assert metadata.partition_exists(name)
+        assert metadata.is_partition_attached(partitioned_table, name)
     finally:
-        if repo.is_partition_attached(partitioned_table, name):
+        if metadata.is_partition_attached(partitioned_table, name):
             repo.detach_partition(partitioned_table, name, concurrent=False)
         repo.drop_partition(name)
 
@@ -291,8 +293,7 @@ def test__drop_partition__lock_contention__retries_and_succeeds_after_release(
         holder.join()
 
     # Assert
-    repo = PostgresPartitionRepository(sync_db_engine)
-    assert not repo.partition_exists(name)
+    assert not PostgresMetadataProvider(sync_db_engine).partition_exists(name)
     assert len(retry_msgs) >= 1, (
         "Expected at least one retry warning; drop succeeded on first attempt without contention"
     )

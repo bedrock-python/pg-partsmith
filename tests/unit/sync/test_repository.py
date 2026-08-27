@@ -209,47 +209,6 @@ def test__repository__invalid_constructor_argument__raises_correct_exception(
         PostgresPartitionRepository(MagicMock(), **kwargs)  # type: ignore[arg-type]
 
 
-# ── partition_exists ────────────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("exists", [True, False])
-def test__repository__partition_exists__returns_correct_bool(exists: bool) -> None:
-    # Arrange
-    engine = _make_engine([exists])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    assert repo.partition_exists("events__2024_01") is exists
-
-
-def test__repository__partition_exists__uses_quoted_regclass_argument() -> None:
-    # Arrange
-    engine = _make_engine([True])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.partition_exists("events__2024_W12")
-
-    # Assert
-    conn = engine.connect.return_value.__enter__.return_value
-    params = conn.execute.call_args.args[1]
-    assert params["partition_name"] == '"events__2024_W12"'
-
-
-def test__repository__partition_exists__accepts_partitioned_relkind() -> None:
-    # Arrange — a partition can itself be subpartitioned (relkind 'p'), not only a plain table ('r')
-    engine = _make_engine([True])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.partition_exists("events__2024_01")
-
-    # Assert
-    conn = engine.connect.return_value.__enter__.return_value
-    sql = str(conn.execute.call_args.args[0])
-    assert "relkind IN ('r', 'p')" in sql
-
-
 # ── create_partition ────────────────────────────────────────────────────────────
 
 
@@ -1000,46 +959,21 @@ def test__repository__adopt_partition__marker_already_present__returns_true_with
 # ── fk_manager ──────────────────────────────────────────────────────────────────
 
 
-def test__fk_manager__list_constraints__opens_connection_and_returns_names() -> None:
-    # Arrange — the engine-connection wrapper applies the statement timeout then delegates
-    # to list_constraints_conn: set_config, FK query
-    engine = _make_engine([None, [("fk_a",), ("fk_b",)]])
-    manager = PartitionForeignKeyManager(engine, ddl_timeout=5.0)
+def test__fk_manager__list_constraints_conn__returns_names() -> None:
+    # Arrange — a mocked connection returning two FK constraint rows
+    conn = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = [("fk_a",), ("fk_b",)]
+    conn.execute.return_value = result
 
     # Act
-    names = manager.list_constraints("events__2024_01")
+    names = PartitionForeignKeyManager.list_constraints_conn(conn, "events__2024_01")
 
     # Assert
     assert names == ["fk_a", "fk_b"]
-    engine.connect.assert_called_once()
-
-
-# ── is_partition_attached ───────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("attached", [True, False])
-def test__repository__is_partition_attached__returns_correct_bool(attached: bool) -> None:
-    # Arrange
-    engine = _make_engine([attached])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    assert repo.is_partition_attached("events", "events__2024_01") is attached
-
-
-def test__repository__is_partition_attached__uses_quoted_regclass_arguments() -> None:
-    # Arrange
-    engine = _make_engine([True])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.is_partition_attached("events", "events__2024_W12")
-
-    # Assert
-    conn = engine.connect.return_value.__enter__.return_value
+    conn.execute.assert_called_once()
     params = conn.execute.call_args.args[1]
-    assert params["table_name"] == '"events"'
-    assert params["partition_name"] == '"events__2024_W12"'
+    assert params["partition_name"] == '"events__2024_01"'
 
 
 # ── pg_sqlstate helper ───────────────────────────────────────────────────────────

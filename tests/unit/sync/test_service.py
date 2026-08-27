@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith import pruning_rules
 from pg_partsmith.entities import (
     MaintenanceIssueStep,
     MaintenanceResult,
@@ -619,7 +620,7 @@ def test__get_partitions_for_pruning__invalid_qualified_name__skips_and_logs_war
     service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
 
     # Act
-    with patch("pg_partsmith.sync.services.pruning.logger", mock_logger):
+    with patch("pg_partsmith.pruning_rules.logger", mock_logger):
         to_prune = service.get_partitions_for_pruning(config)
 
     # Assert
@@ -650,7 +651,7 @@ def test__get_partitions_for_pruning__non_comparable_period__skips_and_logs_warn
     service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
 
     # Act
-    with patch("pg_partsmith.sync.services.pruning.logger", mock_logger):
+    with patch("pg_partsmith.pruning_rules.logger", mock_logger):
         to_prune = service.get_partitions_for_pruning(config)
 
     # Assert
@@ -843,7 +844,7 @@ def test__get_partitions_for_pruning__attached_unparseable_boundary__skipped_whi
     service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
 
     # Act
-    with patch("pg_partsmith.sync.services.pruning.logger", mock_logger):
+    with patch("pg_partsmith.pruning_rules.logger", mock_logger):
         to_prune = service.get_partitions_for_pruning(config)
 
     # Assert — only the detached orphan is pruned; the attached one is skipped with a warning
@@ -1843,7 +1844,7 @@ def test__service_init__no_ddl_timezone_with_non_utc_calculator__warns_without_e
     mock_logger = MagicMock()
 
     # Act
-    with patch("pg_partsmith.sync.service.logger", mock_logger):
+    with patch("pg_partsmith.utils.logger", mock_logger):
         service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
 
     # Assert
@@ -1863,7 +1864,7 @@ def test__service_init__no_ddl_timezone_with_utc_calculator__no_warning(
     mock_logger = MagicMock()
 
     # Act
-    with patch("pg_partsmith.sync.service.logger", mock_logger):
+    with patch("pg_partsmith.utils.logger", mock_logger):
         service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
 
     # Assert
@@ -1922,7 +1923,7 @@ def test__parse_boundary_to_utc_dt__naive_date_with_moscow_calculator__interpret
     service = _make_pruning_service(ZoneInfo("Europe/Moscow"))
 
     # Act
-    result = service._parse_boundary_to_utc_dt("2024-01-01")
+    result = pruning_rules.parse_boundary_to_utc_dt("2024-01-01", service._boundary_tz)
 
     # Assert — Moscow midnight (winter, UTC+3) is 21:00 UTC the previous day
     assert result == datetime(2023, 12, 31, 21, 0, tzinfo=UTC)
@@ -1933,7 +1934,7 @@ def test__parse_boundary_to_utc_dt__naive_timestamp_with_moscow_calculator__inte
     service = _make_pruning_service(ZoneInfo("Europe/Moscow"))
 
     # Act
-    result = service._parse_boundary_to_utc_dt("2024-01-01 12:00:00")
+    result = pruning_rules.parse_boundary_to_utc_dt("2024-01-01 12:00:00", service._boundary_tz)
 
     # Assert
     assert result == datetime(2024, 1, 1, 9, 0, tzinfo=UTC)
@@ -1944,7 +1945,7 @@ def test__parse_boundary_to_utc_dt__aware_timestamp_with_moscow_calculator__offs
     service = _make_pruning_service(ZoneInfo("Europe/Moscow"))
 
     # Act
-    result = service._parse_boundary_to_utc_dt("2024-01-01 00:00:00+00")
+    result = pruning_rules.parse_boundary_to_utc_dt("2024-01-01 00:00:00+00", service._boundary_tz)
 
     # Assert — an explicit offset wins over the calculator's timezone
     assert result == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
@@ -1955,7 +1956,7 @@ def test__parse_boundary_to_utc_dt__calculator_without_tz__naive_date_interprete
     service = _make_pruning_service(None)
 
     # Act
-    result = service._parse_boundary_to_utc_dt("2024-01-01")
+    result = pruning_rules.parse_boundary_to_utc_dt("2024-01-01", service._boundary_tz)
 
     # Assert
     assert result == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)

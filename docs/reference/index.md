@@ -70,6 +70,10 @@ Top-level public API: entities, enums, exceptions, and period calculators.
     options:
       heading_level: 4
 
+::: pg_partsmith.strategies.selector.get_period_calculator
+    options:
+      heading_level: 4
+
 ---
 
 ## pg_partsmith.aio
@@ -158,5 +162,18 @@ built on the sync SQLAlchemy `Engine`.
 ### Hooks
 
 ::: pg_partsmith.sync.hooks.BasePartitionLifecycleHooks
+    options:
+      heading_level: 4
+
+---
+
+## pg_partsmith.settings
+
+Env-driven configuration via [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/).
+Requires the `pydantic-settings` extra: `pip install pg-partsmith[pydantic-settings]`.
+
+### Settings
+
+::: pg_partsmith.settings.PartitionTableSettings
     options:
       heading_level: 4
