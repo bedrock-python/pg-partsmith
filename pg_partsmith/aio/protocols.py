@@ -31,7 +31,25 @@ class PartitionLifecycle(Protocol):
         skip_detach: bool = False,
         skip_drop: bool = False,
         continue_on_error: bool = False,
-    ) -> MaintenanceResult: ...
+    ) -> MaintenanceResult:
+        """Run create + detach + drop in a single locked maintenance window.
+
+        Args:
+            config: Table partitioning configuration.
+            skip_create: Skip the create-ahead step.
+            skip_detach: Skip detaching old partitions (orphans are still dropped).
+            skip_drop: Skip dropping detached partitions.
+            continue_on_error: Collect step failures into ``MaintenanceResult.issues``
+                and keep going instead of aborting the run.
+
+        Returns:
+            MaintenanceResult with the per-step counters and any collected issues.
+
+        Raises:
+            LockAcquisitionError: If the table-level maintenance lock is unavailable.
+            InvalidPartitionConfigError: If ``config`` does not match the parent table.
+        """
+        ...
 
 
 @runtime_checkable

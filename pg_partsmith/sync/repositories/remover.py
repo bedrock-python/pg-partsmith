@@ -18,6 +18,7 @@ from pg_partsmith.exceptions import (
 )
 from pg_partsmith.utils import (
     build_ddl_statement,
+    coerce_str,
     orphan_table_comment,
     pg_sqlstate,
     to_regclass_argument,
@@ -48,16 +49,17 @@ class PartitionRemover:
 
     def __init__(
         self,
+        *,
         engine: Engine,
         ddl_timeout: float,
         drop_lock_timeout_ms: int,
         drop_max_retries: int,
         drop_retry_delay: float,
+        drop_max_backoff: float,
         marker_prefix: str,
         resolver: PartitionRelationResolver,
         fk_manager: PartitionForeignKeyManager,
-        allow_unmanaged: bool = False,
-        drop_max_backoff: float = 300.0,
+        allow_unmanaged: bool,
     ) -> None:
         self._engine = engine
         self._ddl_timeout = ddl_timeout
@@ -204,9 +206,7 @@ class PartitionRemover:
             text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
             {"partition_name": to_regclass_argument(partition_name)},
         )
-        existing_comment = comment_result.scalar()
-        if isinstance(existing_comment, bytes):
-            existing_comment = existing_comment.decode("utf-8", errors="replace")
+        existing_comment = coerce_str(comment_result.scalar())
 
         if existing_comment == marker or (existing_comment and existing_comment.startswith(f"{marker}\n")):
             return
@@ -304,11 +304,9 @@ class PartitionRemover:
             ),
             {"partition_name": to_regclass_argument(partition_name)},
         )
-        parent_name = result.scalar()
+        parent_name = coerce_str(result.scalar())
         if parent_name is not None:
-            if isinstance(parent_name, bytes):
-                parent_name = parent_name.decode("utf-8", errors="replace")
-            raise PartitionAttachedError(partition_name, str(parent_name))
+            raise PartitionAttachedError(partition_name, parent_name)
 
     def _ensure_managed(self, conn: Connection, partition_name: str) -> bool:
         if self._allow_unmanaged:
@@ -318,10 +316,7 @@ class PartitionRemover:
             text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
             {"partition_name": to_regclass_argument(partition_name)},
         )
-        existing_comment = comment_result.scalar()
-        if isinstance(existing_comment, bytes):
-            existing_comment = existing_comment.decode("utf-8", errors="replace")
-        comment_str = str(existing_comment) if existing_comment is not None else None
+        comment_str = coerce_str(comment_result.scalar())
 
         if comment_str is None:
             if not self._resolver.exists_conn(conn, partition_name):

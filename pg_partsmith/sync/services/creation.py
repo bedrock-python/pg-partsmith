@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, DEFAULT_CONFLICT_MAX_RETRIES, MAX_IDENTIFIER_LENGTH
 from pg_partsmith.entities import PartitionInfo, Period
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionAlreadyExistsError
-from pg_partsmith.utils import pg_sqlstate, qualify, split_qualified_name
+from pg_partsmith.utils import is_default_partition_conflict, pg_sqlstate, qualify, split_qualified_name
 
 from .base import BasePartitionService
 
@@ -20,26 +21,6 @@ if TYPE_CHECKING:
     from pg_partsmith.sync.protocols import PartitionMetadataProvider, PartitionRepository
 
 logger = logging.getLogger(__name__)
-
-_PG_IDENTIFIER_MAX_BYTES = 63
-# SQLSTATEs that indicate partition already attached or duplicate (race with another worker).
-# 42809 (wrong_object_type) is what PostgreSQL raises for "X is already a partition".
-_ATTACH_CONFLICT_SQLSTATES = frozenset({"42P07", "42710", "42809"})
-_PG_CHECK_VIOLATION = "23514"
-_DEFAULT_CONFLICT_MAX_RETRIES = 2
-
-
-def _is_default_partition_conflict(exc: SQLAlchemyError) -> bool:
-    """Check if error is DEFAULT partition conflict."""
-    if pg_sqlstate(exc) != _PG_CHECK_VIOLATION:
-        return False
-
-    error_text = str(exc).lower()
-    return (
-        "updated partition constraint" in error_text
-        and "default partition" in error_text
-        and "would be violated" in error_text
-    )
 
 
 class PartitionCreationService(BasePartitionService):
@@ -69,7 +50,7 @@ class PartitionCreationService(BasePartitionService):
             List of newly created and attached partitions.
 
         Raises:
-            Exception: Any error during creation, listing or hooks (if fail_on_hook_error is True).
+            Exception: Any error during creation, listing, or from a hook (hook errors always propagate).
         """
         created: list[PartitionInfo] = []
         qualified_parent = qualify(config.db_schema, config.table_name)
@@ -78,7 +59,7 @@ class PartitionCreationService(BasePartitionService):
         if existing_partitions is None:
             existing_partitions = self._metadata.list_partitions(qualified_parent)
 
-        existing_by_period = self._map_partitions_to_periods(qualified_parent, existing_partitions)
+        existing_by_period = self._map_partitions_to_periods(existing_partitions)
 
         for period in periods:
             p_info = self._ensure_partition_for_period(config, period, existing_by_period.get(period))
@@ -101,12 +82,10 @@ class PartitionCreationService(BasePartitionService):
         """
         qualified_parent = qualify(config.db_schema, config.table_name)
         existing_partitions = self._metadata.list_partitions(qualified_parent)
-        existing = self._map_partitions_to_periods(qualified_parent, existing_partitions).get(period)
+        existing = self._map_partitions_to_periods(existing_partitions).get(period)
         return self._ensure_partition_for_period(config, period, existing)
 
-    def _map_partitions_to_periods(
-        self, qualified_parent: str, partitions: list[PartitionInfo]
-    ) -> dict[Period, PartitionInfo]:
+    def _map_partitions_to_periods(self, partitions: list[PartitionInfo]) -> dict[Period, PartitionInfo]:
         """Map partitions to periods, handling ambiguities."""
         candidates: dict[Period, list[PartitionInfo]] = {}
 
@@ -118,7 +97,7 @@ class PartitionCreationService(BasePartitionService):
                 period = self._calculator.parse_partition_name(relname)
                 if period is not None:
                     candidates.setdefault(period, []).append(p)
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, SystemExit):
                 raise
             except (ValueError, KeyError, TypeError) as exc:
                 logger.debug(
@@ -191,10 +170,10 @@ class PartitionCreationService(BasePartitionService):
         partition_name = qualify(config.db_schema, partition_relname)
         from_value, to_value = self._calculator.get_boundaries(period)
 
-        if len(partition_relname.encode("utf-8")) > _PG_IDENTIFIER_MAX_BYTES:
+        if len(partition_relname.encode("utf-8")) > MAX_IDENTIFIER_LENGTH:
             msg = (
                 f"Generated partition name '{partition_relname}' exceeds PostgreSQL's "
-                f"{_PG_IDENTIFIER_MAX_BYTES}-byte identifier limit"
+                f"{MAX_IDENTIFIER_LENGTH}-byte identifier limit"
             )
             raise InvalidPartitionConfigError(msg)
 
@@ -217,7 +196,7 @@ class PartitionCreationService(BasePartitionService):
         qualified_parent = qualify(config.db_schema, config.table_name)
         reconciled_from: str | None = None
 
-        for attempt in range(1, _DEFAULT_CONFLICT_MAX_RETRIES + 1):
+        for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
                 self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
             except (KeyboardInterrupt, SystemExit):
@@ -228,11 +207,11 @@ class PartitionCreationService(BasePartitionService):
                 self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                 raise
             except SQLAlchemyError as e:
-                if not _is_default_partition_conflict(e):
+                if not is_default_partition_conflict(e):
                     self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                     raise
 
-                if attempt == _DEFAULT_CONFLICT_MAX_RETRIES:
+                if attempt == DEFAULT_CONFLICT_MAX_RETRIES:
                     logger.exception(
                         "Failed to attach after reconciliation retries",
                         extra={
@@ -330,18 +309,7 @@ class PartitionCreationService(BasePartitionService):
     ) -> None:
         """Handle case where partition already exists in metadata."""
         if config.auto_attach_after_create and not existing.is_attached:
-            qualified_parent = qualify(config.db_schema, config.table_name)
-            try:
-                self._attach_with_reconcile(config, existing.name, from_value, to_value)
-            except (OSError, TimeoutError):
-                raise
-            except SQLAlchemyError as e:
-                if not self._is_attach_conflict_benign(qualified_parent, existing.name, e):
-                    raise
-                logger.debug(
-                    "Partition already attached (race with another worker)",
-                    extra={"partition_name": existing.name, "sqlstate": pg_sqlstate(e)},
-                )
+            self._attach_tolerating_lost_race(config, existing.name, from_value, to_value)
 
     def _is_attach_conflict_benign(self, qualified_parent: str, partition_name: str, exc: SQLAlchemyError) -> bool:
         """A conflict SQLSTATE proves a lost race only if the postcondition holds.
@@ -351,7 +319,7 @@ class PartitionCreationService(BasePartitionService):
         partition is actually attached to our parent instead of trusting the
         error code alone.
         """
-        if pg_sqlstate(exc) not in _ATTACH_CONFLICT_SQLSTATES:
+        if pg_sqlstate(exc) not in ATTACH_CONFLICT_SQLSTATES:
             return False
         return self._metadata.is_partition_attached(qualified_parent, partition_name)
 
@@ -359,36 +327,34 @@ class PartitionCreationService(BasePartitionService):
         self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
     ) -> PartitionInfo | None:
         """Create partition and optionally attach it to parent."""
-        qualified_parent = qualify(config.db_schema, config.table_name)
         try:
             partition_info = self._repo.create_partition(config, partition_name, from_value, to_value)
         except PartitionAlreadyExistsError:
             if config.auto_attach_after_create:
-                try:
-                    self._attach_with_reconcile(config, partition_name, from_value, to_value)
-                except (OSError, TimeoutError):
-                    raise
-                except SQLAlchemyError as e:
-                    if not self._is_attach_conflict_benign(qualified_parent, partition_name, e):
-                        raise
-                    logger.debug(
-                        "Partition already attached (race)",
-                        extra={"partition_name": partition_name, "sqlstate": pg_sqlstate(e)},
-                    )
+                self._attach_tolerating_lost_race(config, partition_name, from_value, to_value)
             return None
 
         if config.auto_attach_after_create:
-            try:
-                self._attach_with_reconcile(config, partition_name, from_value, to_value)
-            except (OSError, TimeoutError):
-                raise
-            except SQLAlchemyError as e:
-                if not self._is_attach_conflict_benign(qualified_parent, partition_name, e):
-                    raise
-                logger.debug(
-                    "Partition already attached (race)",
-                    extra={"partition_name": partition_name, "sqlstate": pg_sqlstate(e)},
-                )
+            self._attach_tolerating_lost_race(config, partition_name, from_value, to_value)
             partition_info = partition_info.model_copy(update={"is_attached": True})
 
         return partition_info
+
+    def _attach_tolerating_lost_race(
+        self,
+        config: TablePartitionConfig,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+    ) -> None:
+        """Attach with DEFAULT reconciliation, tolerating a benign lost attach race."""
+        qualified_parent = qualify(config.db_schema, config.table_name)
+        try:
+            self._attach_with_reconcile(config, partition_name, from_value, to_value)
+        except SQLAlchemyError as e:
+            if not self._is_attach_conflict_benign(qualified_parent, partition_name, e):
+                raise
+            logger.debug(
+                "Partition already attached (race with another worker)",
+                extra={"partition_name": partition_name, "sqlstate": pg_sqlstate(e)},
+            )

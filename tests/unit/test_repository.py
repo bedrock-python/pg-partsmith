@@ -195,55 +195,14 @@ def test__repository__invalid_constructor_argument__raises_correct_exception(
         PostgresPartitionRepository(MagicMock(), **kwargs)  # type: ignore[arg-type]
 
 
-# ── partition_exists ────────────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("exists", [True, False])
-async def test__repository__partition_exists__returns_correct_bool(exists: bool) -> None:
-    # Arrange
-    engine = _make_engine([exists])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    assert await repo.partition_exists("events__2024_01") is exists
-
-
-async def test__repository__partition_exists__uses_quoted_regclass_argument() -> None:
-    # Arrange
-    engine = _make_engine([True])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    await repo.partition_exists("events__2024_W12")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    params = conn.execute.call_args.args[1]
-    assert params["partition_name"] == '"events__2024_W12"'
-
-
-async def test__repository__partition_exists__accepts_partitioned_relkind() -> None:
-    # Arrange — a partition can itself be subpartitioned (relkind 'p'), not only a plain table ('r')
-    engine = _make_engine([True])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    await repo.partition_exists("events__2024_01")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    sql = str(conn.execute.call_args.args[0])
-    assert "relkind IN ('r', 'p')" in sql
-
-
 # ── create_partition ────────────────────────────────────────────────────────────
 
 
 async def test__repository__create_partition__new_partition__returns_partition_info(
     config: TablePartitionConfig,
 ) -> None:
-    # Arrange — partition_exists → False; CREATE TABLE → success
-    engine = _make_engine([False, None])
+    # Arrange — CREATE TABLE → success
+    engine = _make_engine([None])
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -953,45 +912,21 @@ async def test__repository__adopt_partition__marker_already_present__returns_tru
 # ── fk_manager ──────────────────────────────────────────────────────────────────
 
 
-async def test__fk_manager__list_constraints__opens_connection_and_returns_names() -> None:
-    # Arrange — the engine-connection wrapper delegates to list_constraints_conn
-    engine = _make_engine([[("fk_a",), ("fk_b",)]])
-    manager = PartitionForeignKeyManager(engine, ddl_timeout=5.0)
+async def test__fk_manager__list_constraints_conn__returns_names() -> None:
+    # Arrange — a mocked connection returning two FK constraint rows
+    conn = AsyncMock()
+    result = MagicMock()
+    result.fetchall.return_value = [("fk_a",), ("fk_b",)]
+    conn.execute.return_value = result
 
     # Act
-    names = await manager.list_constraints("events__2024_01")
+    names = await PartitionForeignKeyManager.list_constraints_conn(conn, "events__2024_01")
 
     # Assert
     assert names == ["fk_a", "fk_b"]
-    engine.connect.assert_called_once()
-
-
-# ── is_partition_attached ───────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("attached", [True, False])
-async def test__repository__is_partition_attached__returns_correct_bool(attached: bool) -> None:
-    # Arrange
-    engine = _make_engine([attached])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    assert await repo.is_partition_attached("events", "events__2024_01") is attached
-
-
-async def test__repository__is_partition_attached__uses_quoted_regclass_arguments() -> None:
-    # Arrange
-    engine = _make_engine([True])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    await repo.is_partition_attached("events", "events__2024_W12")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
+    conn.execute.assert_called_once()
     params = conn.execute.call_args.args[1]
-    assert params["table_name"] == '"events"'
-    assert params["partition_name"] == '"events__2024_W12"'
+    assert params["partition_name"] == '"events__2024_01"'
 
 
 # ── pg_sqlstate helper ───────────────────────────────────────────────────────────

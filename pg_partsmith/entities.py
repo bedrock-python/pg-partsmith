@@ -40,6 +40,11 @@ class PartitionType(StrEnum):
     LIST = "list"
     HASH = "hash"
 
+    @classmethod
+    def from_partstrat(cls, strat: str | None) -> PartitionType | None:
+        """Map a ``pg_partitioned_table.partstrat`` code to a partition type."""
+        return {"r": cls.RANGE, "l": cls.LIST, "h": cls.HASH}.get(strat or "")
+
 
 class PartitionGranularity(StrEnum):
     """Time-based partition granularity.
@@ -80,9 +85,9 @@ class PartitionStrategy(StrEnum):
 class Period:
     """Represents a time period for partition boundaries.
 
-    Every period has exactly one granularity kind (``year``, ``month``,
-    ``day``, ``week``, ``hour`` or ``quarter``), decided once by
-    :meth:`_granularity_key`. All kind-specific behaviour (validation,
+    Every period has exactly one granularity kind (a
+    :class:`PartitionGranularity` member), decided once by
+    ``_granularity_key``. All kind-specific behaviour (validation,
     arithmetic, ordering, formatting) lives in the ``_SPECS`` table below,
     so supporting a new kind means adding one ``_GranularitySpec`` entry.
 
@@ -109,41 +114,16 @@ class Period:
     @property
     def _spec(self) -> _GranularitySpec:
         """Per-kind behaviour for this period."""
-        return _SPECS[self._granularity_key(self)]
+        return _SPECS[_granularity_key(self)]
 
-    @staticmethod
-    def _granularity_key(p: Period) -> str:
-        if p.week is not None:
-            return "week"
-        if p.quarter is not None:
-            return "quarter"
-        if p.hour is not None:
-            return "hour"
-        if p.day is not None:
-            return "day"
-        if p.month is not None:
-            return "month"
-        return "year"
+    def to_date(self) -> date:
+        """Return the period's start date.
 
-    def to_date(self, day: int = 1) -> date:
-        """Convert period to date.
-
-        Args:
-            day: Day of month (default: 1). Ignored for weekly periods and
-                when self.day is already set. For quarterly periods the day
-                applies within the quarter's first month.
-
-        Returns:
-            Date object representing this period. For weekly periods returns
-            the Monday of the ISO week. For hourly periods returns the
-            calendar date (the hour component is dropped; use
-            :meth:`to_datetime` to preserve it).
-
-        Raises:
-            ValueError: If ``day`` is out of range for the resolved month,
-                e.g. ``day=31`` for a Q2 period (April has 30 days).
+        Weekly periods return the Monday of the ISO week; hourly periods
+        return the calendar date (use :meth:`to_datetime` to preserve the
+        hour component).
         """
-        return self._spec.start_date(self, day)
+        return self._spec.start_date(self)
 
     def to_datetime(self) -> datetime:
         """Convert period start to a timezone-aware UTC datetime.
@@ -178,15 +158,13 @@ class Period:
         """
         return self.__add__(-offset)
 
-    def __lt__(self, other: Period) -> bool:
+    def __lt__(self, other: object) -> bool:
         """Compare periods of the same granularity kind."""
-        # Required by Python's data model: returning NotImplemented lets Python
-        # try the reflected comparison on `other`.
-        if not isinstance(other, Period):  # type: ignore[unreachable]
-            return NotImplemented  # type: ignore[unreachable]
+        if not isinstance(other, Period):
+            return NotImplemented
 
-        kind = self._granularity_key(self)
-        if kind != self._granularity_key(other):
+        kind = _granularity_key(self)
+        if kind != _granularity_key(other):
             return NotImplemented
 
         spec = _SPECS[kind]
@@ -202,7 +180,7 @@ class Period:
 # Each granularity kind is described by one _GranularitySpec entry in _SPECS.
 # Period methods dispatch on the kind exactly once; adding a new kind means
 # adding one group of handlers plus one _SPECS entry (and teaching
-# Period._granularity_key to recognise it).
+# _granularity_key below to recognise it).
 #
 # The handlers may assume the invariants enforced by their kind's `validate`
 # (e.g. an "hour" period always has month, day and hour set).
@@ -214,14 +192,14 @@ class _GranularitySpec:
 
     Attributes:
         validate: Check field consistency and ranges; raise ``ValueError``.
-        start_date: Return the period's start date (``to_date`` semantics).
+        start_date: Return the period's start date.
         add: Return the period shifted by an offset of whole periods.
         sort_key: Tuple used to order periods of the same kind.
         fmt: Canonical string form (used in partition names).
     """
 
     validate: Callable[[Period], None]
-    start_date: Callable[[Period, int], date]
+    start_date: Callable[[Period], date]
     add: Callable[[Period, int], Period]
     sort_key: Callable[[Period], tuple[int | None, ...]]
     fmt: Callable[[Period], str]
@@ -266,8 +244,8 @@ def _year_validate(p: Period) -> None:
     """A year-only period has no extra components to validate."""
 
 
-def _year_start(p: Period, day: int) -> date:
-    return date(p.year, 1, day)
+def _year_start(p: Period) -> date:
+    return date(p.year, 1, 1)
 
 
 def _year_add(p: Period, offset: int) -> Period:
@@ -289,9 +267,9 @@ def _month_validate(p: Period) -> None:
     _check_month_range(p)
 
 
-def _month_start(p: Period, day: int) -> date:
+def _month_start(p: Period) -> date:
     month = p.month if p.month is not None else 1
-    return date(p.year, month, day)
+    return date(p.year, month, 1)
 
 
 def _month_add(p: Period, offset: int) -> Period:
@@ -316,7 +294,7 @@ def _day_validate(p: Period) -> None:
     _check_day_resolves_to_real_date(p)
 
 
-def _day_start(p: Period, day: int) -> date:
+def _day_start(p: Period) -> date:
     return _day_date(p)
 
 
@@ -361,13 +339,13 @@ def _week_validate(p: Period) -> None:
         raise ValueError(msg) from exc
 
 
-def _week_start(p: Period, day: int) -> date:
+def _week_start(p: Period) -> date:
     week = p.week if p.week is not None else 1
     return date.fromisocalendar(p.year, week, 1)
 
 
 def _week_add(p: Period, offset: int) -> Period:
-    new_date = _week_start(p, 1) + timedelta(weeks=offset)
+    new_date = _week_start(p) + timedelta(weeks=offset)
     iso_year, iso_week, _ = new_date.isocalendar()
     return Period(year=iso_year, week=iso_week)
 
@@ -389,7 +367,7 @@ def _hour_validate(p: Period) -> None:
     _check_hour_requires_day_and_range(p)
 
 
-def _hour_start(p: Period, day: int) -> date:
+def _hour_start(p: Period) -> date:
     return _day_date(p)
 
 
@@ -421,9 +399,9 @@ def _quarter_validate(p: Period) -> None:
         raise ValueError(msg)
 
 
-def _quarter_start(p: Period, day: int) -> date:
+def _quarter_start(p: Period) -> date:
     quarter = p.quarter if p.quarter is not None else 1
-    return date(p.year, (quarter - 1) * 3 + 1, day)
+    return date(p.year, (quarter - 1) * 3 + 1, 1)
 
 
 def _quarter_add(p: Period, offset: int) -> Period:
@@ -440,22 +418,30 @@ def _quarter_fmt(p: Period) -> str:
     return f"{p.year:04d}_q{p.quarter}"
 
 
-_SPECS: dict[str, _GranularitySpec] = {
-    "year": _GranularitySpec(_year_validate, _year_start, _year_add, _year_sort, _year_fmt),
-    "month": _GranularitySpec(_month_validate, _month_start, _month_add, _month_sort, _month_fmt),
-    "day": _GranularitySpec(_day_validate, _day_start, _day_add, _day_sort, _day_fmt),
-    "week": _GranularitySpec(_week_validate, _week_start, _week_add, _week_sort, _week_fmt),
-    "hour": _GranularitySpec(_hour_validate, _hour_start, _hour_add, _hour_sort, _hour_fmt),
-    "quarter": _GranularitySpec(_quarter_validate, _quarter_start, _quarter_add, _quarter_sort, _quarter_fmt),
+_SPECS: dict[PartitionGranularity, _GranularitySpec] = {
+    PartitionGranularity.YEAR: _GranularitySpec(_year_validate, _year_start, _year_add, _year_sort, _year_fmt),
+    PartitionGranularity.MONTH: _GranularitySpec(_month_validate, _month_start, _month_add, _month_sort, _month_fmt),
+    PartitionGranularity.DAY: _GranularitySpec(_day_validate, _day_start, _day_add, _day_sort, _day_fmt),
+    PartitionGranularity.WEEK: _GranularitySpec(_week_validate, _week_start, _week_add, _week_sort, _week_fmt),
+    PartitionGranularity.HOUR: _GranularitySpec(_hour_validate, _hour_start, _hour_add, _hour_sort, _hour_fmt),
+    PartitionGranularity.QUARTER: _GranularitySpec(
+        _quarter_validate, _quarter_start, _quarter_add, _quarter_sort, _quarter_fmt
+    ),
 }
 
 
-def _split_name(name: str) -> tuple[str | None, str]:
-    """Split ``schema.relname`` into parts; unqualified names get a None schema."""
-    parts = name.split(".")
-    if len(parts) == 2 and parts[0] and parts[1]:
-        return parts[0], parts[1]
-    return None, name
+def _granularity_key(p: Period) -> PartitionGranularity:
+    if p.week is not None:
+        return PartitionGranularity.WEEK
+    if p.quarter is not None:
+        return PartitionGranularity.QUARTER
+    if p.hour is not None:
+        return PartitionGranularity.HOUR
+    if p.day is not None:
+        return PartitionGranularity.DAY
+    if p.month is not None:
+        return PartitionGranularity.MONTH
+    return PartitionGranularity.YEAR
 
 
 class PartitionInfo(BaseModel):
@@ -529,23 +515,12 @@ class PartitionInfo(BaseModel):
         return relname
 
 
-def _validate_pg_identifier(v: str | None) -> str | None:
-    """Validate and normalise PostgreSQL identifier to lowercase.
-
-    PostgreSQL folds unquoted identifiers to lower-case; normalising here
-    ensures that metadata catalogue queries and quoted DDL identifiers
-    always refer to the same object.
-    """
-    if v is None:
-        return None
-    v = v.lower()
-    if not re.match(r"^[a-z_][a-z0-9_]*$", v):
-        msg = f"Invalid SQL identifier: {v!r}"
-        raise ValueError(msg)
-    if len(v) > MAX_IDENTIFIER_LENGTH:
-        msg = f"SQL identifier too long (max {MAX_IDENTIFIER_LENGTH} chars): {v!r}"
-        raise ValueError(msg)
-    return v
+def _split_name(name: str) -> tuple[str | None, str]:
+    """Split ``schema.relname`` into parts; unqualified names get a None schema."""
+    parts = name.split(".")
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0], parts[1]
+    return None, name
 
 
 class TablePartitionConfig(BaseModel):
@@ -629,14 +604,7 @@ class TablePartitionConfig(BaseModel):
 
             # Validate that generated partition names will not exceed PostgreSQL's
             # 63-byte identifier limit (max_identifier_length default).
-            suffix_len = {
-                PartitionGranularity.HOUR: len("__0000_00_00_00"),
-                PartitionGranularity.DAY: len("__0000_00_00"),
-                PartitionGranularity.WEEK: len("__0000_w00"),
-                PartitionGranularity.MONTH: len("__0000_00"),
-                PartitionGranularity.QUARTER: len("__0000_q0"),
-                PartitionGranularity.YEAR: len("__0000"),
-            }[self.granularity]
+            suffix_len = _NAME_SUFFIX_LEN[self.granularity]
             if len(self.table_name) + suffix_len > MAX_IDENTIFIER_LENGTH:
                 msg = (
                     f"table_name {self.table_name!r} is too long for "
@@ -649,19 +617,43 @@ class TablePartitionConfig(BaseModel):
         return self
 
 
+# Partition-name suffix lengths per granularity; must track the _SPECS fmt
+# handlers and the calculators' _NAME_PATTERNs.
+_NAME_SUFFIX_LEN: dict[PartitionGranularity, int] = {
+    PartitionGranularity.HOUR: len("__0000_00_00_00"),
+    PartitionGranularity.DAY: len("__0000_00_00"),
+    PartitionGranularity.WEEK: len("__0000_w00"),
+    PartitionGranularity.MONTH: len("__0000_00"),
+    PartitionGranularity.QUARTER: len("__0000_q0"),
+    PartitionGranularity.YEAR: len("__0000"),
+}
+
+
+def _validate_pg_identifier(v: str | None) -> str | None:
+    """Validate and normalise PostgreSQL identifier to lowercase.
+
+    PostgreSQL folds unquoted identifiers to lower-case; normalising here
+    ensures that metadata catalogue queries and quoted DDL identifiers
+    always refer to the same object.
+    """
+    if v is None:
+        return None
+    v = v.lower()
+    if not re.match(r"^[a-z_][a-z0-9_]*$", v):
+        msg = f"Invalid SQL identifier: {v!r}"
+        raise ValueError(msg)
+    if len(v) > MAX_IDENTIFIER_LENGTH:
+        msg = f"SQL identifier too long (max {MAX_IDENTIFIER_LENGTH} chars): {v!r}"
+        raise ValueError(msg)
+    return v
+
+
 class MaintenanceIssueStep(StrEnum):
-    """Maintenance step identifier for hooks."""
+    """Lifecycle step in which a non-fatal maintenance issue occurred."""
 
     CREATE = "create"
-    ATTACH = "attach"
     DETACH = "detach"
     DROP = "drop"
-    HOOK_BEFORE_CREATE = "hook_before_create"
-    HOOK_AFTER_CREATE = "hook_after_create"
-    HOOK_BEFORE_DETACH = "hook_before_detach"
-    HOOK_AFTER_DETACH = "hook_after_detach"
-    HOOK_BEFORE_DROP = "hook_before_drop"
-    HOOK_AFTER_DROP = "hook_after_drop"
 
 
 class MaintenanceIssue(BaseModel):

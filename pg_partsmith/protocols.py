@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import tzinfo
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .entities import Period
 
-__all__ = ["PeriodCalculator"]
+__all__ = ["DdlTimezoneAware", "PeriodCalculator", "TimezoneAwareCalculator"]
 
 PeriodT = TypeVar("PeriodT", bound=Period)
 
@@ -28,13 +29,13 @@ class PeriodCalculator(Protocol[PeriodT]):
         ...
 
     def next_periods(self, count: int) -> list[PeriodT]:
-        """Generate next N periods from current period.
+        """Generate N periods starting from the current period (inclusive).
 
         Args:
             count: Number of periods to generate.
 
         Returns:
-            List of future periods.
+            List of periods, the current one first.
         """
         ...
 
@@ -83,4 +84,36 @@ class PeriodCalculator(Protocol[PeriodT]):
         Returns:
             Tuple of (from_value, to_value) as SQL-compatible strings.
         """
+        ...
+
+
+@runtime_checkable
+class TimezoneAwareCalculator(Protocol):
+    """Calculator that declares the timezone its periods are computed in.
+
+    ``PartitionLifecycleService`` uses this to refuse a wiring whose calculator
+    and repository DDL timezones disagree, and the pruning services use it to
+    interpret naive catalog boundaries. Plain :class:`PeriodCalculator`
+    implementations without timezone metadata are checked leniently (assumed
+    UTC, no alignment enforcement).
+    """
+
+    @property
+    def tz(self) -> tzinfo:
+        """Timezone the calculator works in."""
+        ...
+
+    @property
+    def timezone_name(self) -> str:
+        """IANA name of :attr:`tz`, usable in ``SET LOCAL TIME ZONE``."""
+        ...
+
+
+@runtime_checkable
+class DdlTimezoneAware(Protocol):
+    """Repository that declares the timezone its boundary-sensitive DDL runs in."""
+
+    @property
+    def ddl_timezone(self) -> str | None:
+        """Timezone applied via ``SET LOCAL TIME ZONE``; None trusts the session."""
         ...

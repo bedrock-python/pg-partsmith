@@ -4,30 +4,36 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
 import re
-from datetime import UTC, datetime, tzinfo
+import time
+from datetime import UTC, tzinfo
 
 from sqlalchemy import TextClause, text
 
-from .constants import MAX_IDENTIFIER_LENGTH
+from .constants import DEFAULT_LOCK_PREFIX, MAX_IDENTIFIER_LENGTH, PG_CHECK_VIOLATION
+from .protocols import DdlTimezoneAware, TimezoneAwareCalculator
 
+logger = logging.getLogger(__name__)
 
-def utc_now() -> datetime:
-    """Return current time as timezone-aware datetime in UTC."""
-    return datetime.now(UTC)
-
-
-# Pre-compiled regex patterns for DDL statement building.
+# Placeholder syntax for build_ddl_statement templates.
 _ID_PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z0-9_]+)\}")
 _LIT_PLACEHOLDER_PATTERN = re.compile(r"\[([a-zA-Z0-9_]+)\]")
+
+# Safe characters for marker_prefix (no SQL injection risk in COMMENT).
+_MARKER_PREFIX_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-=:")
+
+_TIMEZONE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9/_+.\-]+$")
 
 
 def to_regclass_argument(identifier: str) -> str:
     """Return a safe ``to_regclass(text)`` argument preserving identifier case.
 
-    PostgreSQL folds unquoted identifiers to lowercase when parsing relation
-    names in ``to_regclass``. Quoting each identifier part keeps case-sensitive
-    names (for example, weekly partitions with ``..._W12``) resolvable.
+    Partition names come from ``pg_class.relname`` and may be mixed-case for
+    tables adopted from other tools; quoting each part keeps such names
+    resolvable and blocks case-folding. Deliberately an intent-alias of
+    :func:`quote_identifier` marking values bound into ``to_regclass(:name)``
+    rather than spliced into DDL.
     """
     return quote_identifier(identifier)
 
@@ -69,13 +75,11 @@ def build_ddl_statement(template: str, **params: str) -> TextClause:
     """
     format_params = {}
 
-    # Handle identifier placeholders {key}
     for match in _ID_PLACEHOLDER_PATTERN.finditer(template):
         key = match.group(1)
         if key in params:
             format_params[key] = quote_identifier(params[key])
 
-    # Handle literal placeholders [key]
     for match in _LIT_PLACEHOLDER_PATTERN.finditer(template):
         key = match.group(1)
         if key in params:
@@ -119,6 +123,19 @@ def quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def coerce_str(value: object, encoding: str = "utf-8") -> str | None:
+    """Coerce a driver-returned value to ``str``.
+
+    ``None`` stays ``None``; ``bytes`` are decoded with ``errors="replace"``;
+    anything else goes through ``str()``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode(encoding, errors="replace")
+    return str(value)
+
+
 def format_duration_ms(duration_ms: int) -> str:
     """Format duration in milliseconds to human-readable string.
 
@@ -143,8 +160,19 @@ def format_duration_ms(duration_ms: int) -> str:
     return f"{hours:.1f}h"
 
 
+def elapsed_ms(start: float) -> int:
+    """Milliseconds elapsed since a ``time.perf_counter()`` reading."""
+    return int((time.perf_counter() - start) * 1000)
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Render an exception as ``TypeName: message`` (bare ``TypeName`` when empty)."""
+    msg = str(exc)
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
 @functools.lru_cache(maxsize=1024)
-def calculate_lock_id(table_name: str, prefix: str = "partitioner") -> int:
+def calculate_lock_id(table_name: str, prefix: str = DEFAULT_LOCK_PREFIX) -> int:
     """Calculate PostgreSQL advisory lock ID from table name.
 
     Uses SHA256 hash to generate a consistent 64-bit lock ID.
@@ -164,10 +192,6 @@ def calculate_lock_id(table_name: str, prefix: str = "partitioner") -> int:
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
-# Safe characters for marker_prefix (no SQL injection risk in COMMENT).
-_MARKER_PREFIX_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-=:")
-
-
 def orphan_table_comment(parent_table: str, *, marker_prefix: str | None = None) -> str:
     """Return the COMMENT marker used to track detached-but-not-dropped tables."""
     return f"{_resolve_marker_prefix(marker_prefix)}{parent_table}"
@@ -176,56 +200,6 @@ def orphan_table_comment(parent_table: str, *, marker_prefix: str | None = None)
 def orphan_comment_prefix(*, marker_prefix: str | None = None) -> str:
     """Return the COMMENT marker prefix used for orphaned partitions."""
     return _resolve_marker_prefix(marker_prefix)
-
-
-def _resolve_marker_prefix(marker_prefix: str | None) -> str:
-    """Resolve the orphan marker prefix.
-
-    Custom marker_prefix is restricted to alphanumeric, dot, underscore, hyphen, and
-    colon to prevent SQL injection when the prefix is used in COMMENT ON TABLE.
-
-    Args:
-        marker_prefix: Custom marker prefix. When None, the library default is used.
-
-    Returns:
-        A non-empty prefix string.
-
-    Raises:
-        TypeError: If marker_prefix is not a str or None.
-        ValueError: If marker_prefix is empty, blank, or contains disallowed characters.
-    """
-    if marker_prefix is None:
-        return _orphan_comment_prefix()
-
-    # Defensive: protect against non-typed callers passing non-str values.
-    if not isinstance(marker_prefix, str):  # type: ignore[unreachable]
-        msg = f"marker_prefix must be a str or None, got {type(marker_prefix).__name__}"  # type: ignore[unreachable]
-        raise TypeError(msg)
-
-    prefix = marker_prefix.strip()
-    if not prefix:
-        msg = "marker_prefix must be a non-empty string or None"
-        raise ValueError(msg)
-
-    if not all(c in _MARKER_PREFIX_ALLOWED for c in prefix):
-        msg = "marker_prefix may only contain alphanumeric characters, dot, underscore, hyphen, and colon"
-        raise ValueError(msg)
-
-    return prefix
-
-
-@functools.lru_cache(maxsize=1)
-def _orphan_comment_prefix() -> str:
-    """Return the COMMENT marker prefix for orphaned partitions.
-
-    The prefix is deterministic and derived from the import package name
-    (``pg_partsmith`` -> ``pg-partsmith``).
-    A stable default is important for orphan discovery across environments.
-    """
-    pkg = __package__.split(".", 1)[0]
-    name = pkg.replace("_", "-").strip().lower()
-
-    return f"{name}:orphan-parent="
 
 
 def pg_sqlstate(exc: BaseException) -> str | None:
@@ -251,6 +225,19 @@ def pg_sqlstate(exc: BaseException) -> str | None:
     return None
 
 
+def is_default_partition_conflict(exc: BaseException) -> bool:
+    """Check if an error is a DEFAULT-partition constraint conflict on ATTACH."""
+    if pg_sqlstate(exc) != PG_CHECK_VIOLATION:
+        return False
+
+    error_text = str(exc).lower()
+    return (
+        "updated partition constraint" in error_text
+        and "default partition" in error_text
+        and "would be violated" in error_text
+    )
+
+
 def validate_ddl_timeout(val: float) -> float:
     """Validate DDL timeout value."""
     val = float(val)
@@ -266,7 +253,7 @@ def validate_timezone(tz: str | None) -> str | None:
     tz = tz.strip()
     if not tz:
         raise ValueError("ddl_timezone must be a non-empty string or None")
-    if not re.match(r"^[A-Za-z0-9/_+.\-]+$", tz):
+    if not _TIMEZONE_NAME_PATTERN.match(tz):
         raise ValueError(f"Invalid characters in ddl_timezone: {tz!r}")
     return tz
 
@@ -298,6 +285,40 @@ def timezone_name(tz: tzinfo) -> str:
     raise ValueError(msg)
 
 
+def validate_timezone_alignment(repo: object, calculator: object) -> None:
+    """Refuse a wiring whose calculator and DDL timezones disagree.
+
+    Periods and partition names are computed in the calculator's timezone,
+    while naive boundary literals are materialized under the repository's
+    ``ddl_timezone`` — a silent mismatch would shift real partition bounds
+    relative to their names. Implementations without timezone metadata
+    (custom repositories/calculators) are not checked.
+    """
+    if not isinstance(calculator, TimezoneAwareCalculator) or not isinstance(repo, DdlTimezoneAware):
+        return
+    # Runtime-checkable protocols only verify attribute presence, so mocks and
+    # loose implementations may still yield non-string values — re-check them.
+    calc_tz: object = calculator.timezone_name
+    ddl_tz: object = repo.ddl_timezone
+    if not isinstance(calc_tz, str):
+        return
+    if ddl_tz is None:
+        if calc_tz.lower() != "utc":
+            logger.warning(
+                "ddl_timezone=None trusts the session timezone; alignment with the "
+                "calculator timezone cannot be guaranteed",
+                extra={"calculator_timezone": calc_tz},
+            )
+        return
+    if isinstance(ddl_tz, str) and ddl_tz.lower() != calc_tz.lower():
+        msg = (
+            f"Timezone mismatch: the period calculator works in {calc_tz!r} but repository "
+            f"DDL runs in {ddl_tz!r}. Pass ddl_timezone={calc_tz!r} to the repository, or "
+            "align the calculator's tz."
+        )
+        raise ValueError(msg)
+
+
 def validate_int(val: int, name: str, min_val: int | None = None) -> int:
     """Validate integer value."""
     if not isinstance(val, int) or isinstance(val, bool):
@@ -315,3 +336,52 @@ def validate_float(val: float, name: str, min_val: float | None = None) -> float
     if min_val is not None and val < min_val:
         raise ValueError(f"{name} must be >= {min_val}, got {val!r}")
     return val
+
+
+def _resolve_marker_prefix(marker_prefix: object) -> str:
+    """Resolve the orphan marker prefix.
+
+    Custom marker_prefix is restricted to alphanumeric, dot, underscore, hyphen, and
+    colon to prevent SQL injection when the prefix is used in COMMENT ON TABLE.
+
+    Args:
+        marker_prefix: Custom marker prefix. When None, the library default is used.
+
+    Returns:
+        A non-empty prefix string.
+
+    Raises:
+        TypeError: If marker_prefix is not a str or None.
+        ValueError: If marker_prefix is empty, blank, or contains disallowed characters.
+    """
+    if marker_prefix is None:
+        return _orphan_comment_prefix()
+
+    if not isinstance(marker_prefix, str):
+        msg = f"marker_prefix must be a str or None, got {type(marker_prefix).__name__}"
+        raise TypeError(msg)
+
+    prefix = marker_prefix.strip()
+    if not prefix:
+        msg = "marker_prefix must be a non-empty string or None"
+        raise ValueError(msg)
+
+    if not all(c in _MARKER_PREFIX_ALLOWED for c in prefix):
+        msg = "marker_prefix may only contain alphanumeric characters, dot, underscore, hyphen, and colon"
+        raise ValueError(msg)
+
+    return prefix
+
+
+@functools.lru_cache(maxsize=1)
+def _orphan_comment_prefix() -> str:
+    """Return the COMMENT marker prefix for orphaned partitions.
+
+    The prefix is deterministic and derived from the import package name
+    (``pg_partsmith`` -> ``pg-partsmith``).
+    A stable default is important for orphan discovery across environments.
+    """
+    pkg = __package__.split(".", 1)[0]
+    name = pkg.replace("_", "-").strip().lower()
+
+    return f"{name}:orphan-parent="

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.constants import DEFAULT_LOCK_PREFIX
 from pg_partsmith.exceptions import LockAcquisitionError
 from pg_partsmith.utils import calculate_lock_id
 
@@ -39,7 +40,7 @@ class PostgresAdvisoryLockManager:
     def __init__(
         self,
         engine: Engine,
-        prefix: str = "partitioner",
+        prefix: str = DEFAULT_LOCK_PREFIX,
         acquire_min_interval_seconds: float = 0.0,
     ) -> None:
         """Initialize lock manager.
@@ -159,8 +160,6 @@ class PostgresAdvisoryLockManager:
         try:
             conn.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
         except (KeyboardInterrupt, SystemExit):
-            with contextlib.suppress(Exception):
-                conn.invalidate()
             raise
         except (SQLAlchemyError, OSError) as e:
             logger.warning(

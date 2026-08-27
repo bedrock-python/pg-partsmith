@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.constants import DEFAULT_LOCK_PREFIX
 from pg_partsmith.exceptions import LockAcquisitionError
 from pg_partsmith.utils import calculate_lock_id
 
@@ -39,7 +40,7 @@ class PostgresAdvisoryLockManager:
     def __init__(
         self,
         engine: AsyncEngine,
-        prefix: str = "partitioner",
+        prefix: str = DEFAULT_LOCK_PREFIX,
         acquire_min_interval_seconds: float = 0.0,
     ) -> None:
         """Initialize lock manager.
@@ -137,7 +138,10 @@ class PostgresAdvisoryLockManager:
         table_name: str,
         body_exc: BaseException | None,
     ) -> None:
-        """Release the lock with shielding so cancellation cannot leak a held lock."""
+        """Release the lock; a body exception takes precedence over unlock failures.
+
+        Shielded so cancellation cannot leak a held lock.
+        """
         try:
             await asyncio.shield(self._unlock(conn, lock_id, table_name))
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):

@@ -5,7 +5,6 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from pg_partsmith.utils import (
-    _resolve_marker_prefix,
     build_ddl_statement,
     calculate_lock_id,
     format_duration_ms,
@@ -36,12 +35,13 @@ def test__quote_identifier__various_inputs__wraps_in_double_quotes(identifier: s
 # ── to_regclass_argument ────────────────────────────────────────────────────────
 
 
-def test__to_regclass_argument__uppercase_week_partition__preserves_case() -> None:
-    # Arrange / Act / Assert
+def test__to_regclass_argument__mixed_case_relname__quotes_to_preserve_case() -> None:
+    # Arrange / Act / Assert — unquoted identifiers fold to lowercase; quoting keeps
+    # adopted mixed-case relnames resolvable via to_regclass()
     assert to_regclass_argument("events__2024_W12") == '"events__2024_W12"'
 
 
-def test__to_regclass_argument__schema_qualified__quotes_both_parts() -> None:
+def test__to_regclass_argument__schema_qualified_mixed_case_relname__quotes_both_parts() -> None:
     # Arrange / Act / Assert
     assert to_regclass_argument("public.events__2024_W12") == '"public"."events__2024_W12"'
 
@@ -136,6 +136,18 @@ def test__orphan_comment_prefix__default__returns_stable_string() -> None:
     assert orphan_comment_prefix() == "pg-partsmith:orphan-parent="
 
 
+def test__orphan_comment_prefix__non_string_marker_prefix__raises_type_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(TypeError, match="marker_prefix must be a str or None"):
+        orphan_comment_prefix(marker_prefix=123)
+
+
+def test__orphan_comment_prefix__blank_marker_prefix__raises_value_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="marker_prefix must be a non-empty string or None"):
+        orphan_comment_prefix(marker_prefix="")
+
+
 # ── split_qualified_name ────────────────────────────────────────────────────────
 
 
@@ -149,21 +161,6 @@ def test__split_qualified_name__three_part_name__raises_value_error() -> None:
     # Arrange / Act / Assert
     with pytest.raises(ValueError, match="Invalid qualified name"):
         split_qualified_name("a.b.c")
-
-
-# ── _resolve_marker_prefix ──────────────────────────────────────────────────────
-
-
-def test__resolve_marker_prefix__non_string_type__raises_type_error() -> None:
-    # Arrange / Act / Assert
-    with pytest.raises(TypeError, match="marker_prefix must be a str or None"):
-        _resolve_marker_prefix(123)  # type: ignore[arg-type]
-
-
-def test__resolve_marker_prefix__empty_string__raises_value_error() -> None:
-    # Arrange / Act / Assert
-    with pytest.raises(ValueError, match="marker_prefix must be a non-empty string or None"):
-        _resolve_marker_prefix("")
 
 
 # ── timezone_name ───────────────────────────────────────────────────────────────

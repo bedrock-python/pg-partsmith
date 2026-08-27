@@ -215,7 +215,7 @@ def test__metadata_provider__list_partitions__dotted_relname__skipped_with_warni
     mock_logger = MagicMock()
 
     # Act
-    with patch("pg_partsmith.sync.metadata.logger", mock_logger):
+    with patch("pg_partsmith.partition_bounds.logger", mock_logger):
         partitions = provider.list_partitions("events")
 
     # Assert
@@ -233,7 +233,7 @@ def test__metadata_provider__list_partitions__dotted_schema_orphan__skipped_with
     mock_logger = MagicMock()
 
     # Act
-    with patch("pg_partsmith.sync.metadata.logger", mock_logger):
+    with patch("pg_partsmith.partition_bounds.logger", mock_logger):
         partitions = provider.list_partitions("events")
 
     # Assert

@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from pg_partsmith.constants import DEFAULT_LOCK_PREFIX
 from pg_partsmith.exceptions import LockAcquisitionError
 
 if TYPE_CHECKING:
@@ -30,6 +31,8 @@ try:
     _redis_available = True
 except ImportError:
     _redis_available = False
+
+_DEFAULT_REDIS_LOCK_PREFIX = f"{DEFAULT_LOCK_PREFIX}:lock"
 
 # Lua scripts for atomic lock operations.
 _UNLOCK_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
@@ -82,7 +85,7 @@ class RedisDistributedLockManager:
     def __init__(
         self,
         redis_client: RedisClientProtocol,
-        prefix: str = "partitioner:lock",
+        prefix: str = _DEFAULT_REDIS_LOCK_PREFIX,
         ttl_seconds: int = 300,
         acquire_min_interval_seconds: float = 0.0,
     ) -> None:

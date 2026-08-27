@@ -51,7 +51,18 @@ class PartitionDeletionService(BasePartitionService):
         table_name: str,
         partition_name: str,
     ) -> bool:
-        """Drop a single partition with hooks."""
+        """Drop a single partition, running the drop hooks around it.
+
+        Extension point for callers that manage partitions one at a time.
+
+        Args:
+            table_name: Qualified parent table name (hook context).
+            partition_name: Name of the detached partition to drop.
+
+        Returns:
+            True when the partition was dropped; False when it is still
+            attached (logged and skipped).
+        """
         # Hooks: before drop
         self._run_hooks(
             lambda h: h.before_drop(table_name, partition_name),

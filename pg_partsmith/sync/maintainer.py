@@ -6,7 +6,7 @@ import time
 from pg_partsmith.entities import MaintenanceResult, TablePartitionConfig
 from pg_partsmith.exceptions import PartitionError
 from pg_partsmith.sync.protocols import PartitionLifecycle
-from pg_partsmith.utils import format_duration_ms, qualify
+from pg_partsmith.utils import describe_exception, elapsed_ms, format_duration_ms, qualify
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ class PartitionMaintainer:
                 continue_on_error=continue_on_error,
             )
 
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            duration_ms = elapsed_ms(start_time)
             result = result.model_copy(update={"duration_ms": duration_ms})
 
             logger.info(
@@ -94,7 +94,7 @@ class PartitionMaintainer:
                 },
             )
         except (KeyboardInterrupt, SystemExit):
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            duration_ms = elapsed_ms(start_time)
 
             logger.info(
                 "Partition maintenance was interrupted by system signal",
@@ -105,7 +105,7 @@ class PartitionMaintainer:
             )
             raise
         except PartitionError as e:
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            duration_ms = elapsed_ms(start_time)
             logger.warning(
                 "Partition maintenance failed (operational error)",
                 extra={
@@ -116,10 +116,10 @@ class PartitionMaintainer:
                 },
             )
             raise
-        except (RuntimeError, ValueError) as e:
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
+        except (ValueError, TypeError, RuntimeError) as e:
+            duration_ms = elapsed_ms(start_time)
             logger.warning(
-                "Partition maintenance failed (recoverable error)",
+                "Partition maintenance failed",
                 extra={
                     "table_name": qualified_table,
                     "duration_ms": duration_ms,
@@ -129,7 +129,7 @@ class PartitionMaintainer:
             )
             raise
         except Exception:
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            duration_ms = elapsed_ms(start_time)
 
             logger.exception(
                 "Partition maintenance raised unexpected exception",
@@ -179,15 +179,9 @@ class PartitionMaintainer:
                 continue_on_error=continue_on_error,
             )
         except (KeyboardInterrupt, SystemExit) as e:
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-            msg = str(e)
-            error = f"{type(e).__name__}: {msg}" if msg else type(e).__name__
-            return MaintenanceResult(duration_ms=duration_ms, error=error)
+            return MaintenanceResult(duration_ms=elapsed_ms(start_time), error=describe_exception(e))
         except Exception as e:
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-            msg = str(e)
-            error = f"{type(e).__name__}: {msg}" if msg else type(e).__name__
-            return MaintenanceResult(duration_ms=duration_ms, error=error)
+            return MaintenanceResult(duration_ms=elapsed_ms(start_time), error=describe_exception(e))
 
 
 def maintain_partitions(

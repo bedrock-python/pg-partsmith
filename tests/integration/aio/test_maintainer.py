@@ -183,9 +183,9 @@ async def test__maintainer__still_attached_partition__skips_drop(
 
     # Assert
     assert dropped == 1
-    assert not await repo.partition_exists(p1.name)
-    assert await repo.partition_exists(p2.name)
-    assert await repo.is_partition_attached(partitioned_table, p2.name)
+    assert not await metadata.partition_exists(p1.name)
+    assert await metadata.partition_exists(p2.name)
+    assert await metadata.is_partition_attached(partitioned_table, p2.name)
 
 
 @pytest.mark.integration
@@ -291,7 +291,7 @@ async def test__maintainer__orphaned_partition__dropped_on_next_run(
     await repo.attach_partition(partitioned_table, partition_name, "2024-01-01", "2024-02-01")
     # Simulate interrupted previous run: detached but not dropped
     await repo.detach_partition(partitioned_table, partition_name, concurrent=False)
-    assert await repo.partition_exists(partition_name)
+    assert await metadata.partition_exists(partition_name)
 
     # Act
     with freezegun.freeze_time("2024-04-01"):
@@ -300,4 +300,4 @@ async def test__maintainer__orphaned_partition__dropped_on_next_run(
     # Assert
     assert result.success
     assert result.dropped_count >= 1
-    assert not await repo.partition_exists(partition_name)
+    assert not await metadata.partition_exists(partition_name)

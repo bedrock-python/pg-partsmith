@@ -19,6 +19,8 @@ Usage::
 
 from __future__ import annotations
 
+from datetime import UTC, tzinfo
+
 try:
     from pydantic_settings import BaseSettings
 except ImportError as _err:
@@ -32,8 +34,7 @@ from pydantic import Field
 
 from .constants import DEFAULT_CREATE_AHEAD_COUNT, DEFAULT_RETENTION_COUNT
 from .entities import PartitionGranularity, PartitionStrategy, PartitionType, TablePartitionConfig
-from .strategies import BasePeriodCalculator
-from .strategies.selector import get_period_calculator
+from .strategies import BasePeriodCalculator, get_period_calculator
 
 
 class PartitionTableSettings(BaseSettings):
@@ -73,12 +74,12 @@ class PartitionTableSettings(BaseSettings):
     create_ahead_count: int = Field(
         default=DEFAULT_CREATE_AHEAD_COUNT,
         ge=1,
-        description="Number of future periods to keep created",
+        description="Number of periods to ensure exist, including the current period",
     )
     retention_count: int = Field(
         default=DEFAULT_RETENTION_COUNT,
         ge=1,
-        description="Number of past partitions to retain before pruning",
+        description="Number of newest periods to keep, current one included",
     )
     auto_attach_after_create: bool = Field(
         default=True,
@@ -99,16 +100,21 @@ class PartitionTableSettings(BaseSettings):
             auto_attach_after_create=self.auto_attach_after_create,
         )
 
-    def get_period_calculator(self) -> BasePeriodCalculator:
+    def get_period_calculator(self, tz: tzinfo = UTC) -> BasePeriodCalculator:
         """Return the period calculator matching :attr:`granularity`.
 
+        Args:
+            tz: Timezone the calculator works in (``datetime.UTC`` or a keyed
+                :class:`zoneinfo.ZoneInfo`). HOUR accepts only UTC.
+
         Raises:
-            ValueError: If ``granularity`` is ``None`` or has no registered calculator.
+            ValueError: If ``granularity`` is ``None`` or has no registered
+                calculator, or ``tz`` is unsupported for it.
         """
         if self.granularity is None:
             msg = "Cannot resolve a period calculator: granularity is not set"
             raise ValueError(msg)
-        return get_period_calculator(self.granularity)
+        return get_period_calculator(self.granularity, tz=tz)
 
 
 __all__ = ["PartitionTableSettings"]

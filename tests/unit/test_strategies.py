@@ -13,8 +13,8 @@ from pg_partsmith.strategies import (
     QuarterPeriodCalculator,
     WeekPeriodCalculator,
     YearPeriodCalculator,
+    get_period_calculator,
 )
-from pg_partsmith.strategies.selector import get_period_calculator
 
 # ── MonthPeriodCalculator ───────────────────────────────────────────────────────
 

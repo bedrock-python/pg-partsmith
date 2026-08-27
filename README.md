@@ -310,11 +310,11 @@ scheduler.add_job(
 
 **Enums** — `PartitionType`, `PartitionGranularity`, `PartitionStrategy`
 
-**Exceptions** — `PartitionError`, `PartitionAlreadyExistsError`, `PartitionNotFoundError`, `PartitionAttachedError`, `PartitionDetachInProgressError`, `InvalidPartitionConfigError`, `LockAcquisitionError`
+**Exceptions** — `PartitionError`, `PartitionAlreadyExistsError`, `PartitionNotFoundError`, `PartitionAttachedError`, `PartitionDetachInProgressError`, `InvalidPartitionConfigError`, `LockAcquisitionError`, `DropRetryExhaustedError`, `UnmanagedPartitionDropError`
 
-**Protocols** — `PeriodCalculator`
+**Protocols** — `PeriodCalculator`, `TimezoneAwareCalculator`, `DdlTimezoneAware`
 
-**Strategies** — `BasePeriodCalculator`, `HourPeriodCalculator`, `DayPeriodCalculator`, `WeekPeriodCalculator`, `MonthPeriodCalculator`, `QuarterPeriodCalculator`, `YearPeriodCalculator`
+**Strategies** — `BasePeriodCalculator`, `HourPeriodCalculator`, `DayPeriodCalculator`, `WeekPeriodCalculator`, `MonthPeriodCalculator`, `QuarterPeriodCalculator`, `YearPeriodCalculator`, `get_period_calculator`
 
 ### `pg_partsmith.aio`
 

@@ -53,22 +53,12 @@ def config(partitioned_table: str) -> TablePartitionConfig:
 
 
 @pytest.mark.integration
-async def test__repository__partition_not_created__exists_returns_false(
-    db_engine: AsyncEngine, partitioned_table: str
-) -> None:
-    # Arrange
-    repo = PostgresPartitionRepository(db_engine)
-
-    # Act / Assert
-    assert not await repo.partition_exists(f"{partitioned_table}__2024_01")
-
-
-@pytest.mark.integration
 async def test__repository__create_partition__creates_table_and_returns_info(
     db_engine: AsyncEngine, config: TablePartitionConfig
 ) -> None:
     # Arrange
     repo = PostgresPartitionRepository(db_engine)
+    metadata = PostgresMetadataProvider(db_engine)
 
     # Act
     info = await repo.create_partition(config, f"{config.table_name}__2024_01", "2024-01-01", "2024-02-01")
@@ -78,7 +68,7 @@ async def test__repository__create_partition__creates_table_and_returns_info(
     assert info.from_value == "2024-01-01"
     assert info.to_value == "2024-02-01"
     assert info.is_attached is False
-    assert await repo.partition_exists(info.name)
+    assert await metadata.partition_exists(info.name)
 
 
 @pytest.mark.integration
@@ -114,23 +104,24 @@ async def test__repository__detach_and_drop__removes_partition_from_catalog(
 ) -> None:
     # Arrange
     repo = PostgresPartitionRepository(db_engine)
+    metadata = PostgresMetadataProvider(db_engine)
     partition_name = f"{config.table_name}__2024_03"
     info = await repo.create_partition(config, partition_name, "2024-03-01", "2024-04-01")
     await repo.attach_partition(config.table_name, info.name, "2024-03-01", "2024-04-01")
-    assert await repo.is_partition_attached(config.table_name, partition_name)
+    assert await metadata.is_partition_attached(config.table_name, partition_name)
 
     # Act
     await repo.detach_partition(config.table_name, partition_name, concurrent=True)
 
     # Assert — detached but still exists
-    assert not await repo.is_partition_attached(config.table_name, partition_name)
-    assert await repo.partition_exists(partition_name)
+    assert not await metadata.is_partition_attached(config.table_name, partition_name)
+    assert await metadata.partition_exists(partition_name)
 
     # Act — drop
     await repo.drop_partition(partition_name)
 
     # Assert — gone
-    assert not await repo.partition_exists(partition_name)
+    assert not await metadata.partition_exists(partition_name)
 
 
 @pytest.mark.integration
@@ -148,9 +139,10 @@ async def test__repository__drop_unattached_without_orphan_marker__raises_unmana
 ) -> None:
     # Arrange
     repo = PostgresPartitionRepository(db_engine)
+    metadata = PostgresMetadataProvider(db_engine)
     partition_name = f"{config.table_name}__2024_04"
     await repo.create_partition(config, partition_name, "2024-04-01", "2024-05-01")
-    assert not await repo.is_partition_attached(config.table_name, partition_name)
+    assert not await metadata.is_partition_attached(config.table_name, partition_name)
 
     # Act / Assert — safe-by-default blocks the drop
     with pytest.raises(UnmanagedPartitionDropError):
@@ -217,6 +209,17 @@ async def test__repository__list_partitions__ignores_similarly_named_table_witho
 
 
 # ── PostgresMetadataProvider ──────────────────────────────────────────────────────
+
+
+@pytest.mark.integration
+async def test__metadata_provider__partition_not_created__exists_returns_false(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    # Arrange
+    metadata = PostgresMetadataProvider(db_engine)
+
+    # Act / Assert
+    assert not await metadata.partition_exists(f"{partitioned_table}__2024_01")
 
 
 @pytest.mark.integration

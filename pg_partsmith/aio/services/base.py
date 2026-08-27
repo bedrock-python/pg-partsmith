@@ -32,7 +32,7 @@ class BasePartitionService:
         """Execute a specific hook across all registered lifecycle hooks.
 
         Args:
-            hook_caller: A callable that takes a hook instance and returns an awaitable.
+            hook_caller: A callable that takes a hook instance and awaits one hook method.
             hook_name: Name of the hook for logging.
             partition_name: Name of the partition for logging context.
 
@@ -46,9 +46,8 @@ class BasePartitionService:
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except (ValueError, TypeError, RuntimeError) as e:
-                # Catch known recoverable errors from hooks
                 logger.warning(
-                    f"{hook_name} hook failed (recoverable error)",
+                    f"{hook_name} hook failed",
                     extra={
                         "partition_name": partition_name,
                         "hook_type": type(hook).__name__,

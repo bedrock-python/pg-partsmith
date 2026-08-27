@@ -5,6 +5,7 @@ from .day import DayPeriodCalculator
 from .hour import HourPeriodCalculator
 from .month import MonthPeriodCalculator
 from .quarter import QuarterPeriodCalculator
+from .selector import get_period_calculator
 from .week import WeekPeriodCalculator
 from .year import YearPeriodCalculator
 
@@ -16,4 +17,5 @@ __all__ = [
     "QuarterPeriodCalculator",
     "WeekPeriodCalculator",
     "YearPeriodCalculator",
+    "get_period_calculator",
 ]

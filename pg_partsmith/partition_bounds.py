@@ -1,0 +1,101 @@
+"""Pure parsing of partition bound expressions and relation-name safety checks.
+
+Shared by the aio and sync metadata providers: everything here is IO-free, so
+one implementation serves both mirrors.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+
+# Pre-compiled regex patterns for partition boundary parsing.
+_RANGE_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+FROM\s*\(", re.IGNORECASE)
+_BOUNDARY_SEP_PATTERN = re.compile(r"\)\s+TO\s+\(", re.IGNORECASE)
+_FROM_PREFIX_PATTERN = re.compile(r"^.*?FROM\s*\(", re.IGNORECASE | re.DOTALL)
+_TRAILING_PAREN_PATTERN = re.compile(r"\)\s*$", re.IGNORECASE | re.DOTALL)
+_CAST_PATTERN = re.compile(r"^CAST\((?P<inner>.*)\s+AS\s+.*\)$", re.IGNORECASE | re.DOTALL)
+_STR_LITERAL_PATTERN = re.compile(r"'(?P<s>(?:[^']|'')*)'")
+
+
+def parse_range_boundaries(boundaries_expr: str | None) -> tuple[str | None, str | None]:
+    """Parse boundary values from ``pg_get_expr(relpartbound, oid)`` output.
+
+    The rendered expression can include casts and varying whitespace depending
+    on the PostgreSQL version and the partition key type. This parser extracts
+    stable boundary values for the common cases without fully parsing SQL.
+
+    Examples:
+      FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')
+      FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)
+      FOR VALUES FROM (1::bigint) TO (5::bigint)
+      FOR VALUES FROM (MINVALUE) TO (MAXVALUE)
+    """
+    if not boundaries_expr:
+        return None, None
+
+    if boundaries_expr.strip().upper() == "DEFAULT":
+        return None, None
+
+    # Only RANGE bounds carry FROM/TO values; LIST/HASH expressions could
+    # contain a ") TO (" inside a string value and must not be mis-parsed.
+    if not _RANGE_BOUND_PATTERN.match(boundaries_expr):
+        return None, None
+
+    # Split into FROM and TO parts by finding ") TO (" which is the most
+    # reliable separator for range boundaries.
+    parts = _BOUNDARY_SEP_PATTERN.split(boundaries_expr)
+    if len(parts) != 2:
+        return None, None
+
+    from_part = _FROM_PREFIX_PATTERN.sub("", parts[0])
+    to_part = _TRAILING_PAREN_PATTERN.sub("", parts[1])
+
+    return _normalize(from_part), _normalize(to_part)
+
+
+def is_addressable(schema: str, relname: str) -> bool:
+    """Return False for relations whose schema or name contains a dot.
+
+    The library addresses relations as ``schema.relname`` strings, so a dot
+    inside either part would be re-split into a different relation by
+    ``quote_identifier`` — DDL could then target the wrong table.  Such
+    partitions are never created by this library; skip them with a warning.
+    """
+    if "." in schema or "." in relname:
+        logger.warning(
+            "Skipping partition with '.' in its schema or name; not addressable by qualified-name DDL",
+            extra={"partition_schema": schema, "partition_name": relname},
+        )
+        return False
+    return True
+
+
+def _strip_outer_parens(s: str) -> str:
+    s = s.strip()
+    # pg_get_expr sometimes wraps constants in extra parentheses
+    while s.startswith("(") and s.endswith(")") and len(s) > 1:
+        s = s[1:-1].strip()
+    return s
+
+
+def _normalize(expr: str) -> str:
+    expr = _strip_outer_parens(expr)
+
+    # CAST(x AS type) → x
+    cast_match = _CAST_PATTERN.match(expr)
+    if cast_match:
+        expr = _strip_outer_parens(cast_match.group("inner"))
+
+    # Prefer extracting a string literal if present.
+    str_match = _STR_LITERAL_PATTERN.search(expr)
+    if str_match:
+        return str_match.group("s").replace("''", "'")
+
+    # Strip ::type casts.
+    if "::" in expr:
+        expr = expr.split("::", 1)[0].strip()
+
+    return expr.strip()

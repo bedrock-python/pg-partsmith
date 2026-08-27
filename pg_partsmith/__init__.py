@@ -23,7 +23,7 @@ from .exceptions import (
     PartitionNotFoundError,
     UnmanagedPartitionDropError,
 )
-from .protocols import PeriodCalculator
+from .protocols import DdlTimezoneAware, PeriodCalculator, TimezoneAwareCalculator
 from .strategies import (
     BasePeriodCalculator,
     DayPeriodCalculator,
@@ -32,13 +32,14 @@ from .strategies import (
     QuarterPeriodCalculator,
     WeekPeriodCalculator,
     YearPeriodCalculator,
+    get_period_calculator,
 )
-from .strategies.selector import get_period_calculator
 from .utils import qualify, split_qualified_name
 
 __all__ = [
     "BasePeriodCalculator",
     "DayPeriodCalculator",
+    "DdlTimezoneAware",
     "DropRetryExhaustedError",
     "HourPeriodCalculator",
     "InvalidPartitionConfigError",
@@ -60,6 +61,7 @@ __all__ = [
     "PeriodCalculator",
     "QuarterPeriodCalculator",
     "TablePartitionConfig",
+    "TimezoneAwareCalculator",
     "UnmanagedPartitionDropError",
     "WeekPeriodCalculator",
     "YearPeriodCalculator",

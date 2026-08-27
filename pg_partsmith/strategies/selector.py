@@ -1,5 +1,7 @@
 """Factory for selecting a period calculator by granularity."""
 
+from __future__ import annotations
+
 from datetime import UTC, tzinfo
 
 from pg_partsmith.entities import PartitionGranularity
