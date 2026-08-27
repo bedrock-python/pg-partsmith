@@ -446,6 +446,49 @@ class PostgresMetadataProvider:
 
         return _normalize(from_part), _normalize(to_part)
 
+    def is_partition_closed(self, partition_name: str, *, settle_seconds: int = 0) -> bool:
+        """True when the partition's upper bound (+ settle buffer) has passed.
+
+        The comparison runs entirely server-side — ``now()`` and the bound come
+        from the same query — so it tolerates replica lag and app-clock skew.
+        Useful for export/archive pipelines that must only finalize partitions
+        that can no longer receive in-range rows.
+
+        Args:
+            partition_name: Attached partition table name.
+            settle_seconds: Extra buffer after the upper bound for late writers
+                still holding open transactions.
+
+        Returns:
+            True when ``now() >= upper_bound + settle_seconds``. False for the
+            DEFAULT partition, non-RANGE partitions, unbounded upper bounds
+            (MAXVALUE / infinity), detached tables, and unresolvable names.
+        """
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    SELECT now() >= b.upper_bound + make_interval(secs => :settle_seconds)
+                    FROM (
+                        SELECT (regexp_match(
+                                    pg_get_expr(c.relpartbound, c.oid),
+                                    'TO \\(''([^'']+)'''
+                               ))[1]::timestamptz AS upper_bound
+                        FROM pg_class c
+                        JOIN pg_inherits i ON i.inhrelid = c.oid
+                        JOIN pg_partitioned_table pt ON pt.partrelid = i.inhparent
+                        WHERE c.oid = to_regclass(:partition_name)
+                          AND pt.partstrat = 'r'
+                    ) AS b
+                    """
+                ),
+                {
+                    "partition_name": to_regclass_argument(partition_name),
+                    "settle_seconds": settle_seconds,
+                },
+            )
+            return bool(result.scalar())
+
     def get_default_partition(self, table_name: str) -> PartitionInfo | None:
         """Get DEFAULT partition for a table if it exists and is attached.
 

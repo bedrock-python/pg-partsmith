@@ -357,6 +357,53 @@ async def test__metadata_provider__is_partition_attached__uses_quoted_regclass_a
     assert params["partition_name"] == '"events__2024_W12"'
 
 
+# ── is_partition_closed ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("scalar,expected", [(True, True), (False, False), (None, False)])
+async def test__metadata_provider__is_partition_closed__maps_scalar_to_bool(
+    scalar: bool | None, expected: bool
+) -> None:
+    # Arrange — None covers the DEFAULT partition / detached / unresolvable-name cases
+    engine = _make_engine(scalar)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.is_partition_closed("events__2024_01") is expected
+
+
+async def test__metadata_provider__is_partition_closed__passes_settle_seconds_and_quoted_regclass_name() -> None:
+    # Arrange
+    engine = _make_engine(True)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    await provider.is_partition_closed("events__2024_W12", settle_seconds=900)
+
+    # Assert — the comparison runs fully server-side against the passed settle buffer
+    conn = engine.connect.return_value.__aenter__.return_value
+    sql = str(conn.execute.call_args.args[0])
+    params = conn.execute.call_args.args[1]
+    assert "make_interval(secs => :settle_seconds)" in sql
+    assert "to_regclass(:partition_name)" in sql
+    assert params["partition_name"] == '"events__2024_W12"'
+    assert params["settle_seconds"] == 900
+
+
+async def test__metadata_provider__is_partition_closed__defaults_to_zero_settle_seconds() -> None:
+    # Arrange
+    engine = _make_engine(True)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    await provider.is_partition_closed("events__2024_01")
+
+    # Assert
+    conn = engine.connect.return_value.__aenter__.return_value
+    params = conn.execute.call_args.args[1]
+    assert params["settle_seconds"] == 0
+
+
 # ── get_partition_boundaries ────────────────────────────────────────────────────
 
 

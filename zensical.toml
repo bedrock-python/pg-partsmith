@@ -18,6 +18,7 @@ nav = [
         { "Lifecycle hooks" = "guide/hooks.md" },
         { "Lock managers" = "guide/locks.md" },
         { "Advanced" = "guide/advanced.md" },
+        { "Migrating an existing partitioner" = "guide/migration.md" },
     ] },
     { "API Reference" = "reference/index.md" },
     { "Changelog" = "changelog.md" },

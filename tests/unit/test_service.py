@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks, PartitionLifecycleHooks
 from pg_partsmith.aio.service import PartitionLifecycleService
 from pg_partsmith.entities import (
+    MaintenanceIssueStep,
     MaintenanceResult,
     PartitionGranularity,
     PartitionInfo,
@@ -294,6 +295,89 @@ async def test__create_future_partitions__db_error__propagates(
     # Act / Assert
     with pytest.raises(SQLAlchemyError, match="create failed"):
         await service.create_future_partitions(config)
+
+
+# ── ensure_partition ─────────────────────────────────────────────────────────────
+
+
+async def test__ensure_partition__new_period__creates_attaches_and_returns_partition(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — no partition exists yet for the requested period
+    mock_repo.create_partition.return_value = partition_info
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    result = await service.ensure_partition(config, Period(year=2024, month=4))
+
+    # Assert
+    assert result is not None
+    assert result.name == "events__2024_04"
+    assert result.is_attached is True
+    mock_metadata.list_partitions.assert_called_once_with("events")
+    mock_repo.create_partition.assert_called_once_with(config, "events__2024_04", "2024-04-01", "2024-05-01")
+    mock_repo.attach_partition.assert_called_once_with("events", "events__2024_04", "2024-04-01", "2024-05-01")
+
+
+async def test__ensure_partition__existing_attached_partition__returns_none_without_create(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — the partition for the period is already attached (idempotent no-op)
+    mock_metadata.list_partitions.return_value = [
+        PartitionInfo(
+            name="events__2024_04",
+            partition_type=PartitionType.RANGE,
+            from_value="2024-04-01",
+            to_value="2024-05-01",
+            is_attached=True,
+            parent_table="events",
+        )
+    ]
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    result = await service.ensure_partition(config, Period(year=2024, month=4))
+
+    # Assert
+    assert result is None
+    mock_repo.create_partition.assert_not_called()
+    mock_repo.attach_partition.assert_not_called()
+
+
+async def test__ensure_partition__existing_detached_partition__reattaches_and_returns_none(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — the partition table exists but is detached; the reconcile path re-attaches it
+    mock_metadata.list_partitions.return_value = [
+        PartitionInfo(
+            name="events__2024_04",
+            partition_type=PartitionType.RANGE,
+            is_attached=False,
+            parent_table="events",
+        )
+    ]
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    result = await service.ensure_partition(config, Period(year=2024, month=4))
+
+    # Assert
+    assert result is None
+    mock_repo.create_partition.assert_not_called()
+    mock_repo.attach_partition.assert_called_once_with("events", "events__2024_04", "2024-04-01", "2024-05-01")
 
 
 # ── detach_old_partitions ────────────────────────────────────────────────────────
@@ -916,6 +1000,151 @@ async def test__maintain_lifecycle__orphan_drop__does_not_increment_detached_cou
     assert result.dropped_count == 1
     mock_repo.detach_partition.assert_not_called()
     mock_repo.drop_partition.assert_called_once_with("events__orphan")
+
+
+# ── maintain_lifecycle — continue_on_error ───────────────────────────────────────
+
+
+def _make_prunable_partitions() -> list[PartitionInfo]:
+    """One old attached partition plus one detached orphan, both due for pruning."""
+    return [
+        PartitionInfo(
+            name="events__2024_01",
+            partition_type=PartitionType.RANGE,
+            from_value="2024-01-01",
+            to_value="2024-02-01",
+            is_attached=True,
+        ),
+        PartitionInfo(
+            name="events__orphan",
+            partition_type=PartitionType.RANGE,
+            is_attached=False,
+        ),
+    ]
+
+
+async def test__maintain_lifecycle__continue_on_error_create_fails__records_issue_and_still_prunes(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — the create step blows up while old partitions are waiting for pruning
+    mock_metadata.list_partitions.return_value = _make_prunable_partitions()
+    mock_repo.create_partition.side_effect = SQLAlchemyError("create failed")
+    mock_calculator.parse_partition_name.return_value = None
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    result = await service.maintain_lifecycle(config, continue_on_error=True)
+
+    # Assert — the create failure is isolated as an issue; detach and drop still ran
+    assert result.success is True
+    assert result.created_count == 0
+    assert result.detached_count == 1
+    assert result.dropped_count == 2
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
+    assert "SQLAlchemyError" in result.issues[0].error
+    assert "create failed" in result.issues[0].error
+    mock_repo.detach_partition.assert_called_once_with("events", "events__2024_01", concurrent=True)
+    assert [call.args[0] for call in mock_repo.drop_partition.call_args_list] == ["events__orphan", "events__2024_01"]
+
+
+async def test__maintain_lifecycle__continue_on_error_detach_fails__still_drops_orphans_only(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — detach blows up; pre-existing orphans must still be dropped
+    mock_metadata.list_partitions.return_value = _make_prunable_partitions()
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.detach_partition.side_effect = SQLAlchemyError("detach failed")
+    mock_calculator.parse_partition_name.return_value = None
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    result = await service.maintain_lifecycle(config, continue_on_error=True)
+
+    # Assert — only the orphan is dropped, never the would-be-detached partition
+    assert result.success is True
+    assert result.created_count == 1
+    assert result.detached_count == 0
+    assert result.dropped_count == 1
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.DETACH]
+    mock_repo.drop_partition.assert_called_once_with("events__orphan")
+
+
+async def test__maintain_lifecycle__continue_on_error_drop_fails__returns_counts_with_drop_issue(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+    partition_info: PartitionInfo,
+) -> None:
+    # Arrange — create and detach succeed, the drop step blows up
+    mock_metadata.list_partitions.return_value = _make_prunable_partitions()
+    mock_repo.create_partition.return_value = partition_info
+    mock_repo.drop_partition.side_effect = SQLAlchemyError("drop failed")
+    mock_calculator.parse_partition_name.return_value = None
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act
+    result = await service.maintain_lifecycle(config, continue_on_error=True)
+
+    # Assert — earlier counts are preserved and the drop failure is the only issue
+    assert result.success is True
+    assert result.created_count == 1
+    assert result.detached_count == 1
+    assert result.dropped_count == 0
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.DROP]
+
+
+async def test__maintain_lifecycle__continue_on_error_false__create_failure_propagates(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — pins the default fail-fast behaviour when the flag is explicitly off
+    mock_metadata.list_partitions.return_value = _make_prunable_partitions()
+    mock_repo.create_partition.side_effect = SQLAlchemyError("create failed")
+    mock_calculator.parse_partition_name.return_value = None
+    mock_calculator.get_boundaries.return_value = ("2024-02-01", "2024-03-01")
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="create failed"):
+        await service.maintain_lifecycle(config, continue_on_error=False)
+
+    mock_repo.detach_partition.assert_not_called()
+    mock_repo.drop_partition.assert_not_called()
+
+
+async def test__maintain_lifecycle__continue_on_error_validation_failure__still_fatal(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — validation failures are never isolated, even with the flag on
+    mock_metadata.get_partition_type.return_value = None
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="not partitioned"):
+        await service.maintain_lifecycle(config, continue_on_error=True)
+
+    mock_repo.create_partition.assert_not_called()
 
 
 # ── validation service ───────────────────────────────────────────────────────────

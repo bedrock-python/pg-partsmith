@@ -298,7 +298,9 @@ scheduler.add_job(
 
 ### `pg_partsmith`
 
-**Entities** — `Period`, `PartitionInfo`, `TablePartitionConfig`, `MaintenanceResult`, `MaintenanceIssueStep`
+**Entities** — `Period`, `PartitionInfo`, `TablePartitionConfig`, `MaintenanceResult`, `MaintenanceIssue`, `MaintenanceIssueStep`
+
+**Helpers** — `qualify`, `split_qualified_name`
 
 **Enums** — `PartitionType`, `PartitionGranularity`, `PartitionStrategy`
 
@@ -326,6 +328,16 @@ scheduler.add_job(
 
 Synchronous mirror of `pg_partsmith.aio` — same names, same layout, plain methods
 built on the sync SQLAlchemy `Engine`.
+
+## Migrating from a hand-rolled partitioner
+
+The [migration guide](https://bedrock-python.github.io/pg-partsmith/guide/migration/)
+covers the traps: retention is a **count**, not a distance (`old_distance + 1`); legacy
+detached partitions are adopted with `repo.adopt_partition(...)` instead of disabling
+safe-drop via `drop_allow_unmanaged`; writers that need one specific partition use
+`service.ensure_partition(config, period)`; scheduled ticks isolate step failures with
+`maintain_lifecycle(..., continue_on_error=True)` → `result.issues`; export pipelines
+check `metadata.is_partition_closed(name, settle_seconds=...)` before finalizing.
 
 ## Development
 

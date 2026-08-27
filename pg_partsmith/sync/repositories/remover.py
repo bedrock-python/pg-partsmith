@@ -99,6 +99,30 @@ class PartitionRemover:
                     raise domain_exc from exc
                 raise
 
+    def adopt(self, table_name: str, partition_name: str) -> bool:
+        """Stamp the orphan marker on a detached table this library did not detach.
+
+        Legacy partitions detached before the library was introduced carry no
+        marker, so safe-drop refuses them. Adopting marks them as owned by the
+        library; the next maintenance run collects and drops them like any
+        other orphan. Idempotent.
+
+        Returns:
+            True when the marker is present after the call, False when the
+            table does not exist.
+
+        Raises:
+            PartitionAttachedError: If the table is currently attached —
+                attached partitions get their marker automatically at detach.
+        """
+        with self._engine.begin() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            if not self._resolver.exists_conn(conn, partition_name):
+                return False
+            self._ensure_not_attached(conn, partition_name)
+            self._mark_orphaned(conn, table_name, partition_name)
+            return True
+
     def _finalize_if_pending(self, table_name: str, partition_name: str) -> bool:
         """Complete a detach left pending by a cancelled DETACH CONCURRENTLY.
 

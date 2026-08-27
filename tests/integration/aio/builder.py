@@ -172,13 +172,21 @@ class PartitioningTestContext:
     maintainer: PartitionMaintainer
 
     async def run_maintenance(
-        self, at_time: str | datetime | None = None, *, skip_create: bool = False
+        self,
+        at_time: str | datetime | None = None,
+        *,
+        skip_create: bool = False,
+        continue_on_error: bool = False,
     ) -> MaintenanceResult:
         """Runs maintenance, optionally at a specific time."""
         if at_time:
             with freezegun.freeze_time(at_time):
-                return await self.maintainer.run_maintenance(self.config, skip_create=skip_create)
-        return await self.maintainer.run_maintenance(self.config, skip_create=skip_create)
+                return await self.maintainer.run_maintenance(
+                    self.config, skip_create=skip_create, continue_on_error=continue_on_error
+                )
+        return await self.maintainer.run_maintenance(
+            self.config, skip_create=skip_create, continue_on_error=continue_on_error
+        )
 
     async def assert_partition_exists(self, name: str) -> None:
         """Asserts that a partition table exists in the database."""

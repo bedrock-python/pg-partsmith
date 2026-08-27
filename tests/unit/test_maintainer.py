@@ -55,7 +55,9 @@ async def test__run_maintenance__service_succeeds__returns_result_with_counts(
     assert result.dropped_count == 1
     assert result.duration_ms >= 0
     mock_logger.info.assert_called()
-    service.maintain_lifecycle.assert_called_once_with(config, skip_create=False, skip_detach=False, skip_drop=False)
+    service.maintain_lifecycle.assert_called_once_with(
+        config, skip_create=False, skip_detach=False, skip_drop=False, continue_on_error=False
+    )
 
 
 async def test__run_maintenance__service_returns_failure_result__propagates_result(
@@ -197,7 +199,25 @@ async def test__run_maintenance__skip_flags__passed_through_to_service(
     await maintainer.run_maintenance(config, skip_create=True, skip_detach=True, skip_drop=True)
 
     # Assert
-    service.maintain_lifecycle.assert_called_once_with(config, skip_create=True, skip_detach=True, skip_drop=True)
+    service.maintain_lifecycle.assert_called_once_with(
+        config, skip_create=True, skip_detach=True, skip_drop=True, continue_on_error=False
+    )
+
+
+async def test__run_maintenance__continue_on_error__passed_through_to_service(
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    service = _make_service()
+    maintainer = PartitionMaintainer(service)
+
+    # Act
+    await maintainer.run_maintenance(config, continue_on_error=True)
+
+    # Assert
+    service.maintain_lifecycle.assert_called_once_with(
+        config, skip_create=False, skip_detach=False, skip_drop=False, continue_on_error=True
+    )
 
 
 async def test__run_maintenance__duration__is_non_negative(config: TablePartitionConfig) -> None:
@@ -261,4 +281,5 @@ async def test__maintain_partitions__delegates_to_run_maintenance_safe_with_kwar
         skip_create=True,
         skip_detach=False,
         skip_drop=False,
+        continue_on_error=False,
     )
