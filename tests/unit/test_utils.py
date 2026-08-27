@@ -1,3 +1,6 @@
+from datetime import UTC, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo
+
 import pytest
 from sqlalchemy.dialects import postgresql
 
@@ -9,6 +12,7 @@ from pg_partsmith.utils import (
     orphan_comment_prefix,
     quote_identifier,
     split_qualified_name,
+    timezone_name,
     to_regclass_argument,
 )
 
@@ -160,3 +164,32 @@ def test__resolve_marker_prefix__empty_string__raises_value_error() -> None:
     # Arrange / Act / Assert
     with pytest.raises(ValueError, match="marker_prefix must be a non-empty string or None"):
         _resolve_marker_prefix("")
+
+
+# ── timezone_name ───────────────────────────────────────────────────────────────
+
+
+class _KeylessTz(tzinfo):
+    """A tzinfo-like object carrying no IANA key."""
+
+
+def test__timezone_name__datetime_utc__returns_utc() -> None:
+    # Arrange / Act / Assert
+    assert timezone_name(UTC) == "UTC"
+
+
+def test__timezone_name__zoneinfo__returns_iana_key() -> None:
+    # Arrange / Act / Assert
+    assert timezone_name(ZoneInfo("Europe/Moscow")) == "Europe/Moscow"
+
+
+def test__timezone_name__fixed_offset__raises_value_error() -> None:
+    # Arrange / Act / Assert — timezone(timedelta(...)) has no name PostgreSQL understands
+    with pytest.raises(ValueError, match="Unsupported timezone"):
+        timezone_name(timezone(timedelta(hours=3)))
+
+
+def test__timezone_name__keyless_tzinfo_like_object__raises_value_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="Unsupported timezone"):
+        timezone_name(_KeylessTz())

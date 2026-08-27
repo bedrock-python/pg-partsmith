@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, tzinfo
 from typing import ClassVar
 
 from pg_partsmith.entities import Period
-from pg_partsmith.utils import utc_now
 
 from .base import BasePeriodCalculator
 
@@ -14,15 +14,32 @@ from .base import BasePeriodCalculator
 class HourPeriodCalculator(BasePeriodCalculator):
     """Calculator for hourly partitions.
 
-    Generates partitions with hour granularity.
+    Generates partitions with hour granularity. UTC only: in a zone with DST
+    a local hour can repeat or vanish, making ``{table}__YYYY_MM_DD_HH`` names
+    ambiguous, so non-UTC timezones are rejected.
     Partition naming: ``{table}__{YYYY}_{MM}_{DD}_{HH}``
     """
 
     _NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^(.+)__(\d{4})_(\d{2})_(\d{2})_(\d{2})$")
 
+    def __init__(self, tz: tzinfo = UTC) -> None:
+        """Initialize calculator; only ``tz=datetime.UTC`` is accepted.
+
+        Raises:
+            ValueError: If ``tz`` is not UTC — local-time hour partition names
+                are ambiguous under DST transitions.
+        """
+        super().__init__(tz=tz)
+        if self.timezone_name != "UTC":
+            msg = (
+                f"HourPeriodCalculator supports only UTC, got {self.timezone_name!r}: "
+                "local-time hour partition names are ambiguous under DST transitions"
+            )
+            raise ValueError(msg)
+
     def current_period(self) -> Period:
         """Get current hour period."""
-        now = utc_now()
+        now = self._now()
         return Period(year=now.year, month=now.month, day=now.day, hour=now.hour)
 
     def format_partition_name(self, table_name: str, period: Period) -> str:

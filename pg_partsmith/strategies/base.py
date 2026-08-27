@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime, tzinfo
 from typing import ClassVar
 
 from pg_partsmith.entities import Period
+from pg_partsmith.utils import timezone_name
 
 
 class BasePeriodCalculator(ABC):
@@ -16,6 +18,12 @@ class BasePeriodCalculator(ABC):
     the interface for granularity-specific strategies.
     Subclass and override any method to customise behaviour.
 
+    Periods are computed in the calculator's timezone (UTC by default): the
+    current period is derived from "now" in that zone, and naive boundary
+    literals mean period starts in that zone. Keep the repository's
+    ``ddl_timezone`` aligned with it — ``PartitionLifecycleService`` refuses a
+    mismatched pair.
+
     Subclasses must define ``_NAME_PATTERN`` (a compiled regex) and implement
     ``_period_from_match`` to construct a ``Period`` from regex groups.
     Group 1 is conventionally the table name; subsequent groups encode the period.
@@ -23,9 +31,37 @@ class BasePeriodCalculator(ABC):
 
     _NAME_PATTERN: ClassVar[re.Pattern[str]]
 
+    def __init__(self, tz: tzinfo = UTC) -> None:
+        """Initialize calculator.
+
+        Args:
+            tz: Timezone the calculator works in. Only ``datetime.UTC`` and
+                :class:`zoneinfo.ZoneInfo` instances are accepted — the zone
+                must have an IANA name usable in ``SET LOCAL TIME ZONE``.
+
+        Raises:
+            ValueError: If ``tz`` carries no IANA name.
+        """
+        self._tz = tz
+        self._tz_name = timezone_name(tz)
+
+    @property
+    def tz(self) -> tzinfo:
+        """Timezone the calculator works in."""
+        return self._tz
+
+    @property
+    def timezone_name(self) -> str:
+        """IANA name of :attr:`tz`, usable in ``SET LOCAL TIME ZONE``."""
+        return self._tz_name
+
+    def _now(self) -> datetime:
+        """Current time in the calculator's timezone."""
+        return datetime.now(self._tz)
+
     @abstractmethod
     def current_period(self) -> Period:
-        """Return the current period based on the current UTC time."""
+        """Return the current period based on the current time in :attr:`tz`."""
         ...
 
     @abstractmethod

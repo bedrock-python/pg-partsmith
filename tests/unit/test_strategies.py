@@ -1,8 +1,12 @@
+from datetime import UTC, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 import pytest
 from freezegun import freeze_time
 
 from pg_partsmith.entities import PartitionGranularity, Period
 from pg_partsmith.strategies import (
+    BasePeriodCalculator,
     DayPeriodCalculator,
     HourPeriodCalculator,
     MonthPeriodCalculator,
@@ -684,3 +688,144 @@ def test__get_period_calculator__unknown_granularity__raises_value_error() -> No
     # Arrange / Act / Assert
     with pytest.raises(ValueError, match="granularity"):
         get_period_calculator("invalid")  # type: ignore[arg-type]
+
+
+def test__get_period_calculator__default_tz__is_utc() -> None:
+    # Arrange / Act
+    calc = get_period_calculator(PartitionGranularity.DAY)
+
+    # Assert
+    assert calc.tz is UTC
+    assert calc.timezone_name == "UTC"
+
+
+def test__get_period_calculator__moscow_tz__returns_calculator_in_that_zone() -> None:
+    # Arrange
+    tz = ZoneInfo("Europe/Moscow")
+
+    # Act
+    calc = get_period_calculator(PartitionGranularity.MONTH, tz=tz)
+
+    # Assert
+    assert calc.tz is tz
+    assert calc.timezone_name == "Europe/Moscow"
+
+
+def test__get_period_calculator__hour_with_moscow_tz__raises_value_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="only UTC"):
+        get_period_calculator(PartitionGranularity.HOUR, tz=ZoneInfo("Europe/Moscow"))
+
+
+# ── timezone configuration ──────────────────────────────────────────────────────
+
+
+def test__calculator__default_tz__is_utc_named_utc() -> None:
+    # Arrange / Act
+    calc = MonthPeriodCalculator()
+
+    # Assert
+    assert calc.tz is UTC
+    assert calc.timezone_name == "UTC"
+
+
+def test__calculator__zoneinfo_tz__exposes_zone_and_iana_key() -> None:
+    # Arrange
+    tz = ZoneInfo("Europe/Moscow")
+
+    # Act
+    calc = MonthPeriodCalculator(tz=tz)
+
+    # Assert
+    assert calc.tz is tz
+    assert calc.timezone_name == "Europe/Moscow"
+
+
+@pytest.mark.parametrize(
+    "calculator_cls",
+    [
+        HourPeriodCalculator,
+        DayPeriodCalculator,
+        WeekPeriodCalculator,
+        MonthPeriodCalculator,
+        QuarterPeriodCalculator,
+        YearPeriodCalculator,
+    ],
+)
+def test__calculator__fixed_offset_tz__raises_value_error(calculator_cls: type[BasePeriodCalculator]) -> None:
+    # Arrange / Act / Assert — timezone(timedelta(...)) carries no IANA name usable in SET LOCAL TIME ZONE
+    with pytest.raises(ValueError, match="Unsupported timezone"):
+        calculator_cls(tz=timezone(timedelta(hours=3)))
+
+
+def test__hour_calculator__moscow_tz__raises_value_error() -> None:
+    # Arrange / Act / Assert — local-time hour names are ambiguous under DST
+    with pytest.raises(ValueError, match="only UTC"):
+        HourPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+
+
+def test__hour_calculator__explicit_utc_tz__constructs() -> None:
+    # Arrange / Act
+    calc = HourPeriodCalculator(tz=UTC)
+
+    # Assert
+    assert calc.tz is UTC
+    assert calc.timezone_name == "UTC"
+
+
+# ── timezone-aware current periods ──────────────────────────────────────────────
+
+
+@freeze_time("2024-03-31 23:30:00")
+def test__month_calculator__current_period_utc_vs_moscow__crosses_month_boundary() -> None:
+    # Arrange — 23:30 UTC on Mar 31 is already 02:30 Apr 1 in Moscow (UTC+3)
+    utc_calc = MonthPeriodCalculator()
+    moscow_calc = MonthPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+
+    # Act / Assert
+    assert utc_calc.current_period() == Period(year=2024, month=3)
+    assert moscow_calc.current_period() == Period(year=2024, month=4)
+
+
+@freeze_time("2024-03-15 23:30:00")
+def test__day_calculator__current_period_utc_vs_moscow__crosses_day_boundary() -> None:
+    # Arrange — 23:30 UTC on Mar 15 is already 02:30 Mar 16 in Moscow (UTC+3)
+    utc_calc = DayPeriodCalculator()
+    moscow_calc = DayPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+
+    # Act / Assert
+    assert utc_calc.current_period() == Period(year=2024, month=3, day=15)
+    assert moscow_calc.current_period() == Period(year=2024, month=3, day=16)
+
+
+@freeze_time("2024-03-17 23:30:00")  # Sunday of ISO week 11 in UTC
+def test__week_calculator__current_period_utc_vs_moscow__crosses_iso_week_boundary() -> None:
+    # Arrange — Moscow (UTC+3) is already on Monday of ISO week 12
+    utc_calc = WeekPeriodCalculator()
+    moscow_calc = WeekPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+
+    # Act / Assert
+    assert utc_calc.current_period() == Period(year=2024, week=11)
+    assert moscow_calc.current_period() == Period(year=2024, week=12)
+
+
+@freeze_time("2024-03-31 23:30:00")
+def test__quarter_calculator__current_period_utc_vs_moscow__crosses_quarter_boundary() -> None:
+    # Arrange — 23:30 UTC on Mar 31 is already 02:30 Apr 1 in Moscow (UTC+3)
+    utc_calc = QuarterPeriodCalculator()
+    moscow_calc = QuarterPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+
+    # Act / Assert
+    assert utc_calc.current_period() == Period(year=2024, quarter=1)
+    assert moscow_calc.current_period() == Period(year=2024, quarter=2)
+
+
+@freeze_time("2024-12-31 23:30:00")
+def test__year_calculator__current_period_utc_vs_moscow__crosses_year_boundary() -> None:
+    # Arrange — 23:30 UTC on Dec 31 is already 02:30 Jan 1 in Moscow (UTC+3)
+    utc_calc = YearPeriodCalculator()
+    moscow_calc = YearPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+
+    # Act / Assert
+    assert utc_calc.current_period() == Period(year=2024)
+    assert moscow_calc.current_period() == Period(year=2025)

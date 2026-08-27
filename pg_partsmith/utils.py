@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 
 from sqlalchemy import TextClause, text
 
@@ -269,6 +269,33 @@ def validate_timezone(tz: str | None) -> str | None:
     if not re.match(r"^[A-Za-z0-9/_+.\-]+$", tz):
         raise ValueError(f"Invalid characters in ddl_timezone: {tz!r}")
     return tz
+
+
+def timezone_name(tz: tzinfo) -> str:
+    """Return the IANA name of a timezone object, usable in ``SET LOCAL TIME ZONE``.
+
+    Only ``datetime.UTC`` and :class:`zoneinfo.ZoneInfo` instances carry a name
+    PostgreSQL understands; fixed-offset or third-party tzinfo objects do not
+    and are rejected.
+
+    Args:
+        tz: Timezone object.
+
+    Returns:
+        ``"UTC"`` or the ZoneInfo IANA key.
+
+    Raises:
+        ValueError: If ``tz`` is not ``datetime.UTC`` or a keyed ``ZoneInfo``.
+    """
+    if tz is UTC:
+        return "UTC"
+    key = getattr(tz, "key", None)
+    if isinstance(key, str) and key:
+        validated = validate_timezone(key)
+        if validated is not None:
+            return validated
+    msg = f"Unsupported timezone object {tz!r}: pass datetime.UTC or a zoneinfo.ZoneInfo instance with an IANA key"
+    raise ValueError(msg)
 
 
 def validate_int(val: int, name: str, min_val: int | None = None) -> int:

@@ -1223,6 +1223,33 @@ def test__repository__reconcile_default_rows__no_ddl_timezone__skips_set_time_zo
     assert not any("time zone" in stmt.lower() for stmt in statements)
 
 
+# ── ddl_timezone property ───────────────────────────────────────────────────────
+
+
+def test__repository__ddl_timezone_property__returns_constructor_value() -> None:
+    # Arrange / Act
+    repo = PostgresPartitionRepository(MagicMock(), ddl_timezone="Europe/Moscow")
+
+    # Assert
+    assert repo.ddl_timezone == "Europe/Moscow"
+
+
+def test__repository__ddl_timezone_property__defaults_to_utc() -> None:
+    # Arrange / Act
+    repo = PostgresPartitionRepository(MagicMock())
+
+    # Assert
+    assert repo.ddl_timezone == "UTC"
+
+
+def test__repository__ddl_timezone_property__none_when_disabled() -> None:
+    # Arrange / Act
+    repo = PostgresPartitionRepository(MagicMock(), ddl_timezone=None)
+
+    # Assert
+    assert repo.ddl_timezone is None
+
+
 # ── helper used by parametrize ──────────────────────────────────────────────────
 
 

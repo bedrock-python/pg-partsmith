@@ -84,6 +84,14 @@ class PostgresPartitionRepository:
             allow_unmanaged=self._drop_allow_unmanaged,
         )
 
+    @property
+    def ddl_timezone(self) -> str | None:
+        """Timezone applied via ``SET LOCAL TIME ZONE`` around boundary-sensitive DDL.
+
+        ``None`` means the session timezone is trusted as-is.
+        """
+        return self._ddl_timezone
+
     # Public API delegated to helpers
     def create_partition(
         self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str

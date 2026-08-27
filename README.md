@@ -90,6 +90,12 @@ async def run_maintenance(engine: AsyncEngine) -> None:
 > **Transaction semantics** — every DDL operation (CREATE, ATTACH, DETACH, DROP)
 > runs in its own connection and commits immediately. Use `AsyncEngine`, not `AsyncSession`.
 
+> **Timezones** — everything is UTC by default. For calendar partitions in a business
+> timezone pass the same zone to both sides: `MonthPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))`
+> and `PostgresPartitionRepository(engine, ddl_timezone="Europe/Moscow")` — the service
+> refuses a mismatched pair, so names and real bounds cannot silently drift apart.
+> Hourly granularity is UTC-only (DST makes local hour names ambiguous).
+
 > **Cancellation semantics** — `run_maintenance_safe()` (and `maintain_partitions()`)
 > always returns `MaintenanceResult`, including on `asyncio.CancelledError`.
 
