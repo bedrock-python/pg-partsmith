@@ -65,6 +65,11 @@ To override (not recommended):
 repo = PostgresPartitionRepository(engine, drop_allow_unmanaged=True)
 ```
 
+Legacy tables detached by a previous partitioner are better handled with
+`repo.adopt_partition(table_name, partition_name)` — it stamps the marker once so the
+normal safe path applies, instead of disabling the guard for every future drop. See
+[Migrating an existing partitioner](migration.md).
+
 An attempt to drop an unmanaged table raises `UnmanagedPartitionDropError`.
 Attempting to drop an attached partition raises `PartitionAttachedError` (which
 `PartitionLifecycleService` treats as a warning and skips).

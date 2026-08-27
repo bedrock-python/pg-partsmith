@@ -95,6 +95,14 @@ class PostgresPartitionRepository:
     async def drop_partition(self, partition_name: str) -> None:
         await self._remover.drop(partition_name)
 
+    async def adopt_partition(self, table_name: str, partition_name: str) -> bool:
+        """Mark a detached legacy table as owned by this library (orphan marker).
+
+        See :meth:`PartitionRemover.adopt`. Use once when migrating an existing
+        partitioner instead of enabling ``drop_allow_unmanaged``.
+        """
+        return await self._remover.adopt(table_name, partition_name)
+
     async def partition_exists(self, partition_name: str) -> bool:
         return await self._resolver.exists(partition_name)
 

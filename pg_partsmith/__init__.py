@@ -2,6 +2,7 @@
 
 from .__version__ import __version__
 from .entities import (
+    MaintenanceIssue,
     MaintenanceIssueStep,
     MaintenanceResult,
     PartitionGranularity,
@@ -33,6 +34,7 @@ from .strategies import (
     YearPeriodCalculator,
 )
 from .strategies.selector import get_period_calculator
+from .utils import qualify, split_qualified_name
 
 __all__ = [
     "BasePeriodCalculator",
@@ -41,6 +43,7 @@ __all__ = [
     "HourPeriodCalculator",
     "InvalidPartitionConfigError",
     "LockAcquisitionError",
+    "MaintenanceIssue",
     "MaintenanceIssueStep",
     "MaintenanceResult",
     "MonthPeriodCalculator",
@@ -62,4 +65,6 @@ __all__ = [
     "YearPeriodCalculator",
     "__version__",
     "get_period_calculator",
+    "qualify",
+    "split_qualified_name",
 ]

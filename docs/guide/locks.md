@@ -67,3 +67,18 @@ custom implementation satisfies the protocol with `isinstance()`.
 
 Each lock is scoped to `{prefix}:{schema}.{table_name}`, so multiple tables can be
 maintained in parallel without blocking each other.
+
+## Who takes the lock
+
+Only `maintain_lifecycle` (and the maintainer on top of it) acquires the lock itself.
+The granular service methods — `create_future_partitions`, `ensure_partition`,
+`detach_old_partitions`, `drop_detached_partitions` — do **not**: when orchestrating them
+directly, hold `locks.acquire_lock(table)` around the whole sequence yourself.
+
+Acquisition is non-blocking (`pg_try_advisory_lock` / Redis `SET NX`): a tick that
+collides with another replica raises `LockAcquisitionError` immediately instead of
+queueing. Scheduled jobs typically catch it and skip the tick.
+
+The PostgreSQL manager holds the lock on a dedicated AUTOCOMMIT connection, so it
+survives commits/rollbacks on the caller's session and can safely span
+`DETACH PARTITION CONCURRENTLY`.

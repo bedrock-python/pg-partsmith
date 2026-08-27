@@ -450,6 +450,14 @@ _SPECS: dict[str, _GranularitySpec] = {
 }
 
 
+def _split_name(name: str) -> tuple[str | None, str]:
+    """Split ``schema.relname`` into parts; unqualified names get a None schema."""
+    parts = name.split(".")
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0], parts[1]
+    return None, name
+
+
 class PartitionInfo(BaseModel):
     """Metadata about a partition.
 
@@ -502,6 +510,23 @@ class PartitionInfo(BaseModel):
 
     def _has_raw_boundaries(self) -> bool:
         return self.boundaries_expr is not None and self.boundaries_expr.strip() != ""
+
+    @property
+    def schema_name(self) -> str | None:
+        """Schema part of :attr:`name`, or None when the name is unqualified."""
+        schema, _ = _split_name(self.name)
+        return schema
+
+    @property
+    def relname(self) -> str:
+        """Bare relation name without the schema qualifier.
+
+        ``list_partitions`` always returns schema-qualified names; use this
+        when addressing the partition through code that works with bare names
+        (period parsing, export layouts, catalogue lookups).
+        """
+        _, relname = _split_name(self.name)
+        return relname
 
 
 def _validate_pg_identifier(v: str | None) -> str | None:
@@ -639,6 +664,20 @@ class MaintenanceIssueStep(StrEnum):
     HOOK_AFTER_DROP = "hook_after_drop"
 
 
+class MaintenanceIssue(BaseModel):
+    """A non-fatal error recorded during a ``continue_on_error`` maintenance run.
+
+    Attributes:
+        step: Lifecycle step the error occurred in.
+        error: Error message (``TypeName: message``).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    step: MaintenanceIssueStep
+    error: StrippedNonEmptyStr
+
+
 class MaintenanceResult(BaseModel):
     """Result of partition maintenance operation.
 
@@ -648,6 +687,8 @@ class MaintenanceResult(BaseModel):
         dropped_count: Number of partitions dropped.
         duration_ms: Duration of maintenance in milliseconds.
         error: Fatal error message (set when the whole maintenance run fails).
+        issues: Non-fatal step failures collected when the run was started with
+            ``continue_on_error=True``; the remaining steps still executed.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -657,8 +698,9 @@ class MaintenanceResult(BaseModel):
     dropped_count: NonNegativeInt = 0
     duration_ms: NonNegativeInt = 0
     error: str | None = None
+    issues: tuple[MaintenanceIssue, ...] = ()
 
     @property
     def success(self) -> bool:
-        """True only when there is no fatal error."""
+        """True only when there is no fatal error (non-fatal ``issues`` may exist)."""
         return self.error is None

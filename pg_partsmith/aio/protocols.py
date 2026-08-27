@@ -30,6 +30,7 @@ class PartitionLifecycle(Protocol):
         skip_create: bool = False,
         skip_detach: bool = False,
         skip_drop: bool = False,
+        continue_on_error: bool = False,
     ) -> MaintenanceResult: ...
 
 

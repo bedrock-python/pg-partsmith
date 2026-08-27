@@ -884,6 +884,72 @@ async def test__repository__drop_partition__marker_gone_after_lock__raises_unman
     assert not any("DROP TABLE" in s for s in statements)
 
 
+# ── adopt_partition ─────────────────────────────────────────────────────────────
+
+
+async def test__repository__adopt_partition__table_missing__returns_false_without_comment() -> None:
+    # Arrange — the exists check inside the transaction comes back False
+    engine = _make_engine([False])
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    adopted = await repo.adopt_partition("events", "events__2023_01")
+
+    # Assert
+    assert adopted is False
+    conn = engine.begin.return_value.__aenter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert not any("COMMENT ON TABLE" in stmt for stmt in statements)
+
+
+async def test__repository__adopt_partition__still_attached__raises_attached_error_without_comment() -> None:
+    # Arrange — exists; the attachment check resolves a parent → the table is attached
+    engine = _make_engine([True, "public.events"])
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionAttachedError):
+        await repo.adopt_partition("events", "events__2023_01")
+
+    conn = engine.begin.return_value.__aenter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert not any("COMMENT ON TABLE" in stmt for stmt in statements)
+
+
+async def test__repository__adopt_partition__detached_existing__writes_marker_in_transaction_and_returns_true() -> None:
+    # Arrange — exists, not attached, parent resolves to public.events, no existing comment, COMMENT
+    engine = _make_engine([True, None, "public.events", None, None])
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    adopted = await repo.adopt_partition("events", "events__2023_01")
+
+    # Assert — the marker COMMENT ran inside a single begin() transaction
+    assert adopted is True
+    engine.begin.assert_called_once()
+    engine.connect.assert_not_called()
+    conn = engine.begin.return_value.__aenter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    comment_stmts = [s for s in statements if "COMMENT ON TABLE" in s]
+    assert len(comment_stmts) == 1
+    assert orphan_table_comment("public.events") in comment_stmts[0]
+
+
+async def test__repository__adopt_partition__marker_already_present__returns_true_without_rewriting_comment() -> None:
+    # Arrange — the table already carries the orphan marker (idempotent re-adopt)
+    engine = _make_engine([True, None, "public.events", orphan_table_comment("public.events")])
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    adopted = await repo.adopt_partition("events", "events__2023_01")
+
+    # Assert
+    assert adopted is True
+    conn = engine.begin.return_value.__aenter__.return_value
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert not any("COMMENT ON TABLE" in stmt for stmt in statements)
+
+
 # ── fk_manager ──────────────────────────────────────────────────────────────────
 
 

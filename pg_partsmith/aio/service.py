@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from pg_partsmith.aio.protocols import LockManager, PartitionMetadataProvider, PartitionRepository
 from pg_partsmith.entities import (
+    MaintenanceIssue,
+    MaintenanceIssueStep,
     MaintenanceResult,
     PartitionInfo,
     Period,
@@ -80,6 +83,24 @@ class PartitionLifecycleService:
         """
         return await self._creation_service.create_future_partitions(config)
 
+    async def ensure_partition(self, config: TablePartitionConfig, period: Period) -> PartitionInfo | None:
+        """Create and attach the partition for one specific period (idempotent).
+
+        Unlike :meth:`create_future_partitions`, targets exactly ``period`` —
+        useful for writers that must guarantee a partition exists before an
+        insert (e.g. an hourly outbox buffer). Runs the same DEFAULT
+        reconciliation and attach-race handling as the create-ahead path.
+
+        Args:
+            config: Table partitioning configuration.
+            period: The period the partition must cover.
+
+        Returns:
+            The created partition, or None when it already existed (an existing
+            detached partition is re-attached when ``auto_attach_after_create``).
+        """
+        return await self._creation_service.ensure_partition(config, period)
+
     async def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Return partitions older than ``config.retention_count`` periods.
 
@@ -137,6 +158,7 @@ class PartitionLifecycleService:
         skip_create: bool = False,
         skip_detach: bool = False,
         skip_drop: bool = False,
+        continue_on_error: bool = False,
     ) -> MaintenanceResult:
         """Run create + detach + drop in a single locked maintenance window.
 
@@ -149,6 +171,11 @@ class PartitionLifecycleService:
             skip_create: Skip the create-ahead step.
             skip_detach: Skip detaching old partitions (orphans are still dropped).
             skip_drop: Skip dropping detached partitions.
+            continue_on_error: Isolate step failures instead of aborting the run:
+                a failed create still prunes (which may free the space create
+                needs), a failed detach still drops existing orphans. Failures
+                are collected into ``MaintenanceResult.issues``. Validation and
+                lock failures are always fatal.
 
         Returns:
             ``MaintenanceResult`` with the per-step counters; ``error`` is unset
@@ -164,6 +191,16 @@ class PartitionLifecycleService:
         created_count = 0
         detached_count = 0
         dropped_count = 0
+        issues: list[MaintenanceIssue] = []
+
+        def _record_issue(step: MaintenanceIssueStep, exc: Exception) -> None:
+            msg = str(exc)
+            error = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+            issues.append(MaintenanceIssue(step=step, error=error))
+            logger.warning(
+                "Maintenance step failed; continuing with the remaining steps",
+                extra={"table_name": qualified_parent, "step": step.value, "error": error},
+            )
 
         async with self._locks.acquire_lock(qualified_parent):
             await self._validation_service.validate_config(config)
@@ -172,38 +209,64 @@ class PartitionLifecycleService:
             all_partitions = await self._metadata.list_partitions(qualified_parent)
 
             if not skip_create:
-                created = await self._creation_service.create_future_partitions(
-                    config, existing_partitions=all_partitions
-                )
-                created_count = len(created)
-                if created:
-                    all_partitions.extend(created)
+                try:
+                    created = await self._creation_service.create_future_partitions(
+                        config, existing_partitions=all_partitions
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    if not continue_on_error:
+                        raise
+                    _record_issue(MaintenanceIssueStep.CREATE, e)
+                else:
+                    created_count = len(created)
+                    if created:
+                        all_partitions.extend(created)
 
             partitions_to_prune = await self._pruning_service.identify_partitions_to_prune(config, all_partitions)
 
             if not partitions_to_prune:
-                return MaintenanceResult(created_count=created_count)
+                return MaintenanceResult(created_count=created_count, issues=tuple(issues))
 
             attached_to_detach = [p for p in partitions_to_prune if p.is_attached]
             orphan_names = [p.name for p in partitions_to_prune if not p.is_attached]
 
             names_to_drop = orphan_names
             if not skip_detach:
-                detached_names = await self._detachment_service.detach_old_partitions(
-                    qualified_parent,
-                    attached_to_detach,
-                )
-                detached_count = len(detached_names)
-                names_to_drop = orphan_names + detached_names
+                try:
+                    detached_names = await self._detachment_service.detach_old_partitions(
+                        qualified_parent,
+                        attached_to_detach,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    if not continue_on_error:
+                        raise
+                    # Partially detached partitions carry the orphan marker and
+                    # are collected as orphans on the next run.
+                    _record_issue(MaintenanceIssueStep.DETACH, e)
+                else:
+                    detached_count = len(detached_names)
+                    names_to_drop = orphan_names + detached_names
 
             if not skip_drop and names_to_drop:
-                dropped_count = await self._deletion_service.drop_detached_partitions(
-                    qualified_parent,
-                    names_to_drop,
-                )
+                try:
+                    dropped_count = await self._deletion_service.drop_detached_partitions(
+                        qualified_parent,
+                        names_to_drop,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    if not continue_on_error:
+                        raise
+                    _record_issue(MaintenanceIssueStep.DROP, e)
 
         return MaintenanceResult(
             created_count=created_count,
             detached_count=detached_count,
             dropped_count=dropped_count,
+            issues=tuple(issues),
         )

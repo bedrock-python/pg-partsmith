@@ -38,6 +38,7 @@ class PartitionMaintainer:
         skip_create: bool = False,
         skip_detach: bool = False,
         skip_drop: bool = False,
+        continue_on_error: bool = False,
     ) -> MaintenanceResult:
         """Execute full partition lifecycle maintenance.
 
@@ -46,6 +47,8 @@ class PartitionMaintainer:
             skip_create: Skip creating future partitions.
             skip_detach: Skip detaching old partitions.
             skip_drop: Skip dropping detached partitions.
+            continue_on_error: Isolate step failures into ``result.issues``
+                instead of aborting the run (see ``maintain_lifecycle``).
 
         Returns:
             Maintenance result with counts and duration.
@@ -69,7 +72,11 @@ class PartitionMaintainer:
 
         try:
             result = self._service.maintain_lifecycle(
-                config, skip_create=skip_create, skip_detach=skip_detach, skip_drop=skip_drop
+                config,
+                skip_create=skip_create,
+                skip_detach=skip_detach,
+                skip_drop=skip_drop,
+                continue_on_error=continue_on_error,
             )
 
             duration_ms = int((time.perf_counter() - start_time) * 1000)
@@ -142,6 +149,7 @@ class PartitionMaintainer:
         skip_create: bool = False,
         skip_detach: bool = False,
         skip_drop: bool = False,
+        continue_on_error: bool = False,
     ) -> MaintenanceResult:
         """Run maintenance and always return ``MaintenanceResult``, never raise.
 
@@ -155,6 +163,8 @@ class PartitionMaintainer:
             skip_create: Skip creating future partitions.
             skip_detach: Skip detaching old partitions.
             skip_drop: Skip dropping detached partitions.
+            continue_on_error: Isolate step failures into ``result.issues``
+                instead of aborting the run (see ``maintain_lifecycle``).
 
         Returns:
             ``MaintenanceResult`` with counts on success or ``error`` set on failure.
@@ -166,6 +176,7 @@ class PartitionMaintainer:
                 skip_create=skip_create,
                 skip_detach=skip_detach,
                 skip_drop=skip_drop,
+                continue_on_error=continue_on_error,
             )
         except (KeyboardInterrupt, SystemExit) as e:
             duration_ms = int((time.perf_counter() - start_time) * 1000)
@@ -186,6 +197,7 @@ def maintain_partitions(
     skip_create: bool = False,
     skip_detach: bool = False,
     skip_drop: bool = False,
+    continue_on_error: bool = False,
 ) -> MaintenanceResult:
     """Convenience wrapper for scheduler integrations.
 
@@ -196,4 +208,5 @@ def maintain_partitions(
         skip_create=skip_create,
         skip_detach=skip_detach,
         skip_drop=skip_drop,
+        continue_on_error=continue_on_error,
     )

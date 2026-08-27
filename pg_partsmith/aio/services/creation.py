@@ -88,6 +88,23 @@ class PartitionCreationService(BasePartitionService):
 
         return created
 
+    async def ensure_partition(self, config: TablePartitionConfig, period: Period) -> PartitionInfo | None:
+        """Create and attach the partition for one specific period (idempotent).
+
+        Unlike :meth:`create_future_partitions`, targets exactly ``period`` —
+        useful for writers that must guarantee a partition exists before an
+        insert (e.g. an hourly outbox buffer). Runs the same DEFAULT
+        reconciliation and attach-race handling as the create-ahead path.
+
+        Returns:
+            The created partition, or None when it already existed (an existing
+            detached partition is re-attached when ``auto_attach_after_create``).
+        """
+        qualified_parent = qualify(config.db_schema, config.table_name)
+        existing_partitions = await self._metadata.list_partitions(qualified_parent)
+        existing = self._map_partitions_to_periods(qualified_parent, existing_partitions).get(period)
+        return await self._ensure_partition_for_period(config, period, existing)
+
     def _map_partitions_to_periods(
         self, qualified_parent: str, partitions: list[PartitionInfo]
     ) -> dict[Period, PartitionInfo]:

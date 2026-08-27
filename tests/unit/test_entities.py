@@ -2,7 +2,10 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+import pg_partsmith
 from pg_partsmith.entities import (
+    MaintenanceIssue,
+    MaintenanceIssueStep,
     MaintenanceResult,
     PartitionGranularity,
     PartitionInfo,
@@ -399,6 +402,34 @@ def test__partition_info__boundaries_expr__satisfies_range_constraint() -> None:
     )
 
 
+def test__partition_info__qualified_name__splits_into_schema_name_and_relname() -> None:
+    # Arrange
+    p = PartitionInfo(
+        name="public.events__2024_01",
+        partition_type=PartitionType.RANGE,
+        from_value="2024-01-01",
+        to_value="2024-02-01",
+    )
+
+    # Act / Assert
+    assert p.schema_name == "public"
+    assert p.relname == "events__2024_01"
+
+
+def test__partition_info__unqualified_name__schema_name_is_none_and_relname_is_full_name() -> None:
+    # Arrange
+    p = PartitionInfo(
+        name="events__2024_01",
+        partition_type=PartitionType.RANGE,
+        from_value="2024-01-01",
+        to_value="2024-02-01",
+    )
+
+    # Act / Assert
+    assert p.schema_name is None
+    assert p.relname == "events__2024_01"
+
+
 # ── TablePartitionConfig ────────────────────────────────────────────────────────
 
 
@@ -573,3 +604,47 @@ def test__maintenance_result__with_counts__stores_counts_and_duration() -> None:
     assert r.detached_count == 2
     assert r.dropped_count == 1
     assert r.duration_ms == 100
+
+
+def test__maintenance_result__no_issues__defaults_to_empty_tuple() -> None:
+    # Arrange / Act
+    r = MaintenanceResult()
+
+    # Assert
+    assert r.issues == ()
+
+
+def test__maintenance_result__issues_without_error__success_stays_true() -> None:
+    # Arrange
+    issue = MaintenanceIssue(step=MaintenanceIssueStep.DETACH, error="SQLAlchemyError: detach failed")
+
+    # Act
+    r = MaintenanceResult(created_count=1, issues=(issue,))
+
+    # Assert — non-fatal issues never flip success; only a fatal ``error`` does
+    assert r.success is True
+    assert r.issues == (issue,)
+
+
+# ── MaintenanceIssue ────────────────────────────────────────────────────────────
+
+
+def test__maintenance_issue__construction__stores_step_and_error() -> None:
+    # Arrange / Act
+    issue = MaintenanceIssue(step=MaintenanceIssueStep.CREATE, error="SQLAlchemyError: create failed")
+
+    # Assert
+    assert issue.step is MaintenanceIssueStep.CREATE
+    assert issue.error == "SQLAlchemyError: create failed"
+
+
+# ── package-root exports ────────────────────────────────────────────────────────
+
+
+def test__package_root__migration_ergonomics_exports__importable_and_functional() -> None:
+    # Arrange / Act / Assert
+    assert pg_partsmith.MaintenanceIssue is MaintenanceIssue
+    assert pg_partsmith.qualify("public", "events") == "public.events"
+    assert pg_partsmith.qualify(None, "events") == "events"
+    assert pg_partsmith.split_qualified_name("public.events") == ("public", "events")
+    assert pg_partsmith.split_qualified_name("events") == (None, "events")

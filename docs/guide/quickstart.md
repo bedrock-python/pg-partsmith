@@ -136,3 +136,5 @@ Each step runs only what is needed; idempotent re-runs are safe.
 - [Configuration](configuration.md) — full `TablePartitionConfig` reference
 - [Lifecycle hooks](hooks.md) — react to create / detach / drop events
 - [Advanced](advanced.md) — multi-schema, DEFAULT partition handling, timezone semantics
+- [Migrating an existing partitioner](migration.md) — retention semantics, adopting legacy
+  partitions, lock ownership, per-step error isolation

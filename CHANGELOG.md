@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Migration-ergonomics APIs (all mirrored in `aio` and `sync`), extracted from a real
+  migration of a hand-rolled partitioner:
+  - `service.ensure_partition(config, period)` — create and attach the partition for one
+    specific period (idempotent, with DEFAULT reconciliation and attach-race handling);
+    for writers that must guarantee a partition exists before an insert.
+  - `repository.adopt_partition(table_name, partition_name)` — stamp the orphan marker on
+    a legacy detached table so safe-drop accepts it, instead of disabling the guard with
+    `drop_allow_unmanaged`.
+  - `maintain_lifecycle(..., continue_on_error=True)` (also on the maintainer and
+    `maintain_partitions`) — isolate create/detach/drop failures into the new
+    `MaintenanceResult.issues` (`MaintenanceIssue`) instead of aborting the run.
+  - `metadata.is_partition_closed(partition_name, *, settle_seconds=0)` — server-side
+    "the partition's upper bound has passed (+ settle buffer)" check for export pipelines.
+  - `PartitionInfo.schema_name` / `PartitionInfo.relname` accessors; `qualify`,
+    `split_qualified_name`, and `MaintenanceIssue` are exported from the package root.
+- "Migrating an existing partitioner" documentation guide: retention count-vs-distance,
+  adopting legacy partitions, schema-qualified names, lock ownership of granular calls,
+  per-step error isolation, and export finalization.
+
 ## [0.2.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.1.0...pg-partsmith-v0.2.0) (2026-08-26)
 
 ### Added

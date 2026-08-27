@@ -1,9 +1,17 @@
 from datetime import UTC, datetime
 
 import pytest
+from dateutil.parser import isoparse
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.entities import PartitionGranularity, PartitionInfo, TablePartitionConfig
+from pg_partsmith.entities import (
+    MaintenanceIssueStep,
+    PartitionGranularity,
+    PartitionInfo,
+    Period,
+    TablePartitionConfig,
+)
 from pg_partsmith.exceptions import PartitionAttachedError
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from tests.integration.sync.builder import PartitioningScenarioBuilder
@@ -419,3 +427,143 @@ def test__scenario__attached_partition_with_reattached_race__drop_refused(
     with sync_db_engine.connect() as conn:
         count = conn.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
         assert count.scalar() == 1
+
+
+@pytest.mark.integration
+def test__scenario__ensure_partition__specific_past_period__created_and_attached(
+    sync_partition_builder: PartitioningScenarioBuilder,
+) -> None:
+    # Arrange
+    ctx = sync_partition_builder.build()
+    partition_name = f"{ctx.table_name}__2024_02"
+
+    # Act — target one specific past period, independent of "now"
+    created = ctx.service.ensure_partition(ctx.config, Period(year=2024, month=2))
+
+    # Assert — created, attached, with the period's exact boundaries
+    assert created is not None
+    assert created.is_attached
+    assert created.relname == partition_name
+    ctx.assert_partition_exists(partition_name)
+    ctx.assert_partition_attached(partition_name)
+
+    boundaries = ctx.metadata.get_partition_boundaries(partition_name)
+    assert boundaries is not None
+    from_value, to_value = boundaries
+    assert isoparse(from_value) == datetime(2024, 2, 1, tzinfo=UTC)
+    assert isoparse(to_value) == datetime(2024, 3, 1, tzinfo=UTC)
+
+    # Act — second call is a no-op
+    again = ctx.service.ensure_partition(ctx.config, Period(year=2024, month=2))
+
+    # Assert — nothing changed
+    assert again is None
+    ctx.assert_partition_count(1)
+    ctx.assert_partition_attached(partition_name)
+    assert ctx.metadata.get_partition_boundaries(partition_name) == boundaries
+
+
+@pytest.mark.integration
+def test__scenario__adopt_partition__legacy_detached_table__dropped_on_next_run(
+    sync_partition_builder: PartitioningScenarioBuilder,
+    sync_db_engine: Engine,
+) -> None:
+    # Arrange — a legacy-style detached table carrying no orphan marker
+    legacy_name = f"{sync_partition_builder._table_name}__2020_01"
+    ctx = sync_partition_builder.with_create_ahead(1).build()
+    with sync_db_engine.begin() as conn:
+        conn.execute(text(f'CREATE TABLE "{legacy_name}" (LIKE "{ctx.table_name}" INCLUDING ALL)'))
+
+    # Act — the unmarked table is invisible to marker-based discovery
+    result = ctx.run_maintenance(at_time="2024-06-01")
+
+    # Assert — nothing dropped, the legacy table survives untouched
+    assert result.success
+    assert result.dropped_count == 0
+    ctx.assert_partition_exists(legacy_name)
+
+    # Act — adopting stamps the orphan marker (idempotent)
+    assert ctx.repo.adopt_partition(ctx.table_name, legacy_name) is True
+    assert ctx.repo.adopt_partition(ctx.table_name, legacy_name) is True
+
+    # Adopting an attached partition is refused; a missing name reports False
+    with pytest.raises(PartitionAttachedError):
+        ctx.repo.adopt_partition(ctx.table_name, f"{ctx.table_name}__2024_06")
+    assert ctx.repo.adopt_partition(ctx.table_name, f"{ctx.table_name}__1999_01") is False
+
+    # Act — the next run collects the adopted table like any other orphan
+    result = ctx.run_maintenance(at_time="2024-06-01")
+
+    # Assert
+    assert result.success
+    assert result.dropped_count >= 1
+    ctx.assert_partition_not_exists(legacy_name)
+    ctx.assert_partition_attached(f"{ctx.table_name}__2024_06")
+
+
+@pytest.mark.integration
+def test__scenario__is_partition_closed__past_and_current_periods(
+    sync_partition_builder: PartitioningScenarioBuilder,
+) -> None:
+    # Arrange — a long-closed partition, one still open (upper bound in the
+    # future on the server clock, which is_partition_closed compares against),
+    # and a detached table (attach + detach leaves the orphan marker)
+    table = sync_partition_builder._table_name
+    past_name = f"{table}__2024_02"
+    open_name = f"{table}__2099_01"
+    detached_name = f"{table}__2020_01"
+    ctx = (
+        sync_partition_builder.with_attached_partition(past_name, "2024-02-01", "2024-03-01")
+        .with_attached_partition(open_name, "2099-01-01", "2099-02-01")
+        .with_detached_partition(detached_name, "2020-01-01", "2020-02-01")
+        .build()
+    )
+
+    # Assert — the past partition's upper bound has passed
+    assert ctx.metadata.is_partition_closed(f"public.{past_name}") is True
+
+    # An upper bound still in the future — not closed
+    assert ctx.metadata.is_partition_closed(f"public.{open_name}") is False
+
+    # A large settle buffer keeps even a long-past partition open
+    assert ctx.metadata.is_partition_closed(f"public.{past_name}", settle_seconds=10**9) is False
+
+    # Detached tables are never reported as closed
+    assert ctx.metadata.is_partition_closed(f"public.{detached_name}") is False
+
+
+@pytest.mark.integration
+def test__scenario__maintain_continue_on_error__create_failure_still_prunes(
+    sync_partition_builder: PartitioningScenarioBuilder,
+) -> None:
+    # Arrange — a manually attached wider partition covers June, so the create
+    # step's ATTACH of {table}__2024_06 must fail with a partition-overlap error
+    table = sync_partition_builder._table_name
+    old_name = f"{table}__2024_01"
+    wide_name = f"{table}__wide"
+    ctx = (
+        sync_partition_builder.with_attached_partition(old_name, "2024-01-01", "2024-02-01")
+        .with_attached_partition(wide_name, "2024-06-01", "2024-08-01")
+        .with_create_ahead(1)
+        .with_retention(1)
+        .build()
+    )
+
+    # Act / Assert — by default the create failure aborts the run: nothing pruned
+    with pytest.raises(SQLAlchemyError):
+        ctx.run_maintenance(at_time="2024-06-15")
+    ctx.assert_partition_attached(old_name)
+
+    # Act — with continue_on_error the failure is isolated and pruning still runs
+    result = ctx.run_maintenance(at_time="2024-06-15", continue_on_error=True)
+
+    # Assert — non-fatal issue recorded for the create step, prune completed
+    assert result.success
+    assert result.error is None
+    assert result.created_count == 0
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
+    assert "overlap" in result.issues[0].error.lower()
+    assert result.detached_count == 1
+    assert result.dropped_count >= 1
+    ctx.assert_partition_not_exists(old_name)
+    ctx.assert_partition_attached(wide_name)
