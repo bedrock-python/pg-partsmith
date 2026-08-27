@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.3.0...pg-partsmith-v0.4.0) (2026-08-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* library-wide quality pass — shared pure modules, honest surfaces ([#22](https://github.com/bedrock-python/pg-partsmith/issues/22))
+
+### Features
+
+* make the working timezone configurable end-to-end ([#20](https://github.com/bedrock-python/pg-partsmith/issues/20)) ([bce7a77](https://github.com/bedrock-python/pg-partsmith/commit/bce7a77a4c725635bb85ace1442dedc19a5af931))
+
+
+### Code Refactoring
+
+* library-wide quality pass — shared pure modules, honest surfaces ([#22](https://github.com/bedrock-python/pg-partsmith/issues/22)) ([0da1890](https://github.com/bedrock-python/pg-partsmith/commit/0da189089117dcd2ced681638bcc32d46a3f194d))
+
 ## [0.3.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.2.0...pg-partsmith-v0.3.0) (2026-08-27)
 
 ### Added
