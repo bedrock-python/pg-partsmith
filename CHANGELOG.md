@@ -7,19 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.3.0...pg-partsmith-v0.4.0) (2026-08-27)
 
-
 ### ⚠ BREAKING CHANGES
 
-* library-wide quality pass — shared pure modules, honest surfaces ([#22](https://github.com/bedrock-python/pg-partsmith/issues/22))
+- `PostgresPartitionRepository.partition_exists` / `.is_partition_attached` were removed —
+  use the identical methods on `PostgresMetadataProvider` (the repository protocol is
+  write-only by design; the metadata provider is the read API).
+  ([#22](https://github.com/bedrock-python/pg-partsmith/pull/22))
+- `MaintenanceIssueStep` now contains only the members that are actually produced:
+  `CREATE`, `DETACH`, `DROP` (the `ATTACH` and `HOOK_*` members were never emitted).
+- `Period.to_date()` no longer accepts a `day` argument.
 
-### Features
+### Added
 
-* make the working timezone configurable end-to-end ([#20](https://github.com/bedrock-python/pg-partsmith/issues/20)) ([bce7a77](https://github.com/bedrock-python/pg-partsmith/commit/bce7a77a4c725635bb85ace1442dedc19a5af931))
+- End-to-end configurable timezone: every calculator accepts
+  `tz` (``datetime.UTC`` default, or a keyed ``ZoneInfo``) — the current period, partition
+  names, and naive boundary literals all follow it; pruning interprets naive catalog
+  boundaries in the calculator's timezone; `PartitionLifecycleService` refuses a
+  calculator/`ddl_timezone` mismatch so names and real bounds cannot silently drift
+  apart; `ddl_timezone=None` with a non-UTC calculator logs a warning.
+  `HourPeriodCalculator` is UTC-only (local hour names are ambiguous under DST).
+  Defaults are bit-identical to the previous behavior.
+  ([#20](https://github.com/bedrock-python/pg-partsmith/pull/20))
+- Runtime-checkable `TimezoneAwareCalculator` / `DdlTimezoneAware` protocols; new shared
+  pure modules `pg_partsmith.partition_bounds`, `pg_partsmith.pruning_rules`,
+  `pg_partsmith.catalog_queries`; `PartitionType.from_partstrat`; utils helpers
+  `coerce_str`, `elapsed_ms`, `describe_exception`, `is_default_partition_conflict`,
+  `validate_timezone_alignment`; `get_period_calculator` is exported from
+  `pg_partsmith.strategies`; `PartitionTableSettings.get_period_calculator(tz=...)`
+  forwards the timezone. ([#22](https://github.com/bedrock-python/pg-partsmith/pull/22))
 
+### Changed
 
-### Code Refactoring
-
-* library-wide quality pass — shared pure modules, honest surfaces ([#22](https://github.com/bedrock-python/pg-partsmith/issues/22)) ([0da1890](https://github.com/bedrock-python/pg-partsmith/commit/0da189089117dcd2ced681638bcc32d46a3f194d))
+- Library-wide quality pass (behavior-preserving beyond the breaking items above): the
+  aio/sync mirrors share the pure parsing/pruning/SQL logic instead of hand-maintaining
+  two copies; repository defaults and SQLSTATE sets live in `pg_partsmith.constants`;
+  timezone metadata is discovered via protocols instead of `getattr` sniffing; error/log
+  wording no longer claims recovery where errors propagate;
+  `detach_single_partition` / `drop_single_partition` are documented extension points.
+  ([#22](https://github.com/bedrock-python/pg-partsmith/pull/22))
 
 ## [0.3.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.2.0...pg-partsmith-v0.3.0) (2026-08-27)
 
