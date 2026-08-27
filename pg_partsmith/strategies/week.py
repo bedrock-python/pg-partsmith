@@ -6,7 +6,6 @@ import re
 from typing import ClassVar
 
 from pg_partsmith.entities import Period
-from pg_partsmith.utils import utc_now
 
 from .base import BasePeriodCalculator
 
@@ -22,7 +21,7 @@ class WeekPeriodCalculator(BasePeriodCalculator):
 
     def current_period(self) -> Period:
         """Get current ISO-week period."""
-        now = utc_now()
+        now = self._now()
         iso_year, iso_week, _ = now.isocalendar()
         return Period(year=iso_year, week=iso_week)
 

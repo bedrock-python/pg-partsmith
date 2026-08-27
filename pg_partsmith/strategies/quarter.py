@@ -6,7 +6,6 @@ import re
 from typing import ClassVar
 
 from pg_partsmith.entities import Period
-from pg_partsmith.utils import utc_now
 
 from .base import BasePeriodCalculator
 
@@ -22,7 +21,7 @@ class QuarterPeriodCalculator(BasePeriodCalculator):
 
     def current_period(self) -> Period:
         """Get current quarter period."""
-        now = utc_now()
+        now = self._now()
         return Period(year=now.year, quarter=(now.month - 1) // 3 + 1)
 
     def format_partition_name(self, table_name: str, period: Period) -> str:

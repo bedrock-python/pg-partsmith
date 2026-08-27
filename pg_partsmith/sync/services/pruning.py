@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING
 
 from dateutil.parser import isoparse
@@ -30,6 +30,11 @@ class PartitionPruningService:
     def __init__(self, metadata: PartitionMetadataProvider, calculator: PeriodCalculator[Period]) -> None:
         self._metadata = metadata
         self._calculator = calculator
+        # Naive catalog boundaries mean period starts in the calculator's
+        # timezone; calculators without one (custom implementations) keep the
+        # historical UTC interpretation.
+        calc_tz = getattr(calculator, "tz", None)
+        self._boundary_tz: tzinfo = calc_tz if isinstance(calc_tz, tzinfo) else UTC
 
     def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Identify partitions that should be pruned based on retention policy."""
@@ -125,7 +130,12 @@ class PartitionPruningService:
         return partitions_to_prune
 
     def _parse_boundary_to_utc_dt(self, value: str | None) -> datetime | None:
-        """Parse PostgreSQL partition boundary string to UTC datetime."""
+        """Parse a PostgreSQL partition boundary string to a UTC instant.
+
+        Naive values (bare dates, timestamps without an offset) are interpreted
+        in the calculator's timezone; values carrying an offset are converted
+        as-is. Comparisons downstream always happen between UTC instants.
+        """
         if value is None:
             return None
         v = value.strip()
@@ -141,7 +151,7 @@ class PartitionPruningService:
 
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
             try:
-                return datetime.fromisoformat(v).replace(tzinfo=UTC)
+                return datetime.fromisoformat(v).replace(tzinfo=self._boundary_tz).astimezone(UTC)
             except ValueError:
                 return None
 
@@ -153,5 +163,5 @@ class PartitionPruningService:
             return None
 
         if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=UTC)  # type: ignore[no-any-return]
+            return parsed.replace(tzinfo=self._boundary_tz).astimezone(UTC)  # type: ignore[no-any-return]
         return parsed.astimezone(UTC)  # type: ignore[no-any-return]

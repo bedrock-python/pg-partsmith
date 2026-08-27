@@ -1,4 +1,6 @@
+from datetime import UTC, datetime, tzinfo
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
@@ -20,6 +22,7 @@ from pg_partsmith.exceptions import (
 )
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks, PartitionLifecycleHooks
 from pg_partsmith.sync.service import PartitionLifecycleService
+from pg_partsmith.sync.services.pruning import PartitionPruningService
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────
 
@@ -1782,3 +1785,177 @@ def test__create_future_partitions__interrupted_during_attach_after_reconcile__r
     restore_call = mock_repo.reconcile_default_rows.call_args_list[-1]
     assert restore_call.kwargs["default_partition_name"] == "events__2024_04"
     assert restore_call.kwargs["target_partition_name"] == "events_default"
+
+
+# ── timezone alignment guard ─────────────────────────────────────────────────────
+
+
+def test__service_init__calculator_and_ddl_timezone_mismatch__raises_value_error(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange
+    mock_repo.ddl_timezone = "UTC"
+    mock_calculator.timezone_name = "Europe/Moscow"
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="Timezone mismatch"):
+        _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+
+@pytest.mark.parametrize(
+    "ddl_tz,calc_tz",
+    [
+        ("utc", "UTC"),
+        ("Europe/Moscow", "europe/moscow"),
+    ],
+)
+def test__service_init__matching_timezones_case_insensitive__constructs(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    ddl_tz: str,
+    calc_tz: str,
+) -> None:
+    # Arrange
+    mock_repo.ddl_timezone = ddl_tz
+    mock_calculator.timezone_name = calc_tz
+
+    # Act
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Assert
+    assert isinstance(service, PartitionLifecycleService)
+
+
+def test__service_init__no_ddl_timezone_with_non_utc_calculator__warns_without_error(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange — ddl_timezone=None trusts the session timezone, so alignment cannot be verified
+    mock_repo.ddl_timezone = None
+    mock_calculator.timezone_name = "Europe/Moscow"
+    mock_logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.service.logger", mock_logger):
+        service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Assert
+    assert isinstance(service, PartitionLifecycleService)
+    mock_logger.warning.assert_called_once()
+
+
+def test__service_init__no_ddl_timezone_with_utc_calculator__no_warning(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange
+    mock_repo.ddl_timezone = None
+    mock_calculator.timezone_name = "UTC"
+    mock_logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.service.logger", mock_logger):
+        service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Assert
+    assert isinstance(service, PartitionLifecycleService)
+    mock_logger.warning.assert_not_called()
+
+
+def test__service_init__repo_without_ddl_timezone_attribute__skips_check(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange — custom repository implementations expose no ddl_timezone attribute
+    del mock_repo.ddl_timezone
+    mock_calculator.timezone_name = "Europe/Moscow"
+
+    # Act
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Assert
+    assert isinstance(service, PartitionLifecycleService)
+
+
+def test__service_init__calculator_without_timezone_name__skips_check(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange — custom calculator implementations expose no timezone metadata
+    mock_repo.ddl_timezone = "UTC"
+    del mock_calculator.timezone_name
+
+    # Act
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Assert
+    assert isinstance(service, PartitionLifecycleService)
+
+
+# ── pruning boundary timezone ────────────────────────────────────────────────────
+
+
+def _make_pruning_service(tz: tzinfo | None) -> PartitionPruningService:
+    calc = MagicMock()
+    if tz is None:
+        del calc.tz  # custom calculators without timezone metadata
+    else:
+        calc.tz = tz
+    return PartitionPruningService(MagicMock(), calc)
+
+
+def test__parse_boundary_to_utc_dt__naive_date_with_moscow_calculator__interpreted_as_moscow_midnight() -> None:
+    # Arrange
+    service = _make_pruning_service(ZoneInfo("Europe/Moscow"))
+
+    # Act
+    result = service._parse_boundary_to_utc_dt("2024-01-01")
+
+    # Assert — Moscow midnight (winter, UTC+3) is 21:00 UTC the previous day
+    assert result == datetime(2023, 12, 31, 21, 0, tzinfo=UTC)
+
+
+def test__parse_boundary_to_utc_dt__naive_timestamp_with_moscow_calculator__interpreted_in_moscow() -> None:
+    # Arrange
+    service = _make_pruning_service(ZoneInfo("Europe/Moscow"))
+
+    # Act
+    result = service._parse_boundary_to_utc_dt("2024-01-01 12:00:00")
+
+    # Assert
+    assert result == datetime(2024, 1, 1, 9, 0, tzinfo=UTC)
+
+
+def test__parse_boundary_to_utc_dt__aware_timestamp_with_moscow_calculator__offset_respected() -> None:
+    # Arrange
+    service = _make_pruning_service(ZoneInfo("Europe/Moscow"))
+
+    # Act
+    result = service._parse_boundary_to_utc_dt("2024-01-01 00:00:00+00")
+
+    # Assert — an explicit offset wins over the calculator's timezone
+    assert result == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+
+
+def test__parse_boundary_to_utc_dt__calculator_without_tz__naive_date_interpreted_as_utc() -> None:
+    # Arrange — backward compatibility: no tz attribute keeps the historical UTC interpretation
+    service = _make_pruning_service(None)
+
+    # Act
+    result = service._parse_boundary_to_utc_dt("2024-01-01")
+
+    # Assert
+    assert result == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)

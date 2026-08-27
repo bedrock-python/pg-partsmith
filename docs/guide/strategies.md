@@ -32,6 +32,22 @@ partitions to maintain consistency.
 (`2024-01-15 09:00:00+00`), so it is suitable for short-lived buffer tables
 (e.g. transactional outboxes) where retention is measured in hours.
 
+## Timezone
+
+Every calculator accepts `tz` (`datetime.UTC` by default, or a keyed
+`zoneinfo.ZoneInfo`): the current period is derived from "now" in that zone, and naive
+boundary literals mean period starts in that zone. Keep the repository's `ddl_timezone`
+aligned — `PartitionLifecycleService` refuses a mismatched pair. `HourPeriodCalculator`
+is UTC-only (local hour names are ambiguous under DST). See
+[Advanced → Timezone semantics](advanced.md#timezone-semantics).
+
+```python
+from zoneinfo import ZoneInfo
+
+calc = DayPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+calc = get_period_calculator(PartitionGranularity.MONTH, tz=ZoneInfo("Europe/Moscow"))
+```
+
 ## Passing a calculator to the service
 
 ```python

@@ -54,6 +54,8 @@ class PartitionLifecycleService:
             period_calculator: Strategy for determining partition names and boundaries.
             hooks: Optional list of lifecycle hooks called around each step.
         """
+        _validate_timezone_alignment(repo, period_calculator)
+
         self._locks = locks
         self._metadata = metadata
 
@@ -270,3 +272,36 @@ class PartitionLifecycleService:
             dropped_count=dropped_count,
             issues=tuple(issues),
         )
+
+
+_NO_DDL_TIMEZONE = object()
+
+
+def _validate_timezone_alignment(repo: PartitionRepository, calculator: PeriodCalculator[Period]) -> None:
+    """Refuse a wiring whose calculator and DDL timezones disagree.
+
+    Periods and partition names are computed in the calculator's timezone,
+    while naive boundary literals are materialized under the repository's
+    ``ddl_timezone`` — a silent mismatch would shift real partition bounds
+    relative to their names. Implementations without timezone metadata
+    (custom repositories/calculators) are not checked.
+    """
+    calc_tz = getattr(calculator, "timezone_name", None)
+    ddl_tz = getattr(repo, "ddl_timezone", _NO_DDL_TIMEZONE)
+    if not isinstance(calc_tz, str) or ddl_tz is _NO_DDL_TIMEZONE:
+        return
+    if ddl_tz is None:
+        if calc_tz.lower() != "utc":
+            logger.warning(
+                "ddl_timezone=None trusts the session timezone; alignment with the "
+                "calculator timezone cannot be guaranteed",
+                extra={"calculator_timezone": calc_tz},
+            )
+        return
+    if isinstance(ddl_tz, str) and ddl_tz.lower() != calc_tz.lower():
+        msg = (
+            f"Timezone mismatch: the period calculator works in {calc_tz!r} but repository "
+            f"DDL runs in {ddl_tz!r}. Pass ddl_timezone={calc_tz!r} to the repository, or "
+            "align the calculator's tz."
+        )
+        raise ValueError(msg)

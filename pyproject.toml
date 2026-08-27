@@ -44,6 +44,7 @@ test = [
     "testcontainers>=4.14.1",
     "asyncpg>=0.31.0",
     "freezegun>=1.5.5",
+    "tzdata>=2024.1",
     "psycopg2-binary>=2.9.11",
     "types-python-dateutil~=2.9.0",
 ]
