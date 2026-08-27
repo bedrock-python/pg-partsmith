@@ -24,6 +24,7 @@ from pg_partsmith.exceptions import (
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks, PartitionLifecycleHooks
 from pg_partsmith.sync.service import PartitionLifecycleService
 from pg_partsmith.sync.services.pruning import PartitionPruningService
+from pg_partsmith.utils import timezone_name
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────
 
@@ -1800,6 +1801,7 @@ def test__service_init__calculator_and_ddl_timezone_mismatch__raises_value_error
     # Arrange
     mock_repo.ddl_timezone = "UTC"
     mock_calculator.timezone_name = "Europe/Moscow"
+    mock_calculator.tz = UTC
 
     # Act / Assert
     with pytest.raises(ValueError, match="Timezone mismatch"):
@@ -1824,6 +1826,7 @@ def test__service_init__matching_timezones_case_insensitive__constructs(
     # Arrange
     mock_repo.ddl_timezone = ddl_tz
     mock_calculator.timezone_name = calc_tz
+    mock_calculator.tz = UTC
 
     # Act
     service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
@@ -1841,6 +1844,7 @@ def test__service_init__no_ddl_timezone_with_non_utc_calculator__warns_without_e
     # Arrange — ddl_timezone=None trusts the session timezone, so alignment cannot be verified
     mock_repo.ddl_timezone = None
     mock_calculator.timezone_name = "Europe/Moscow"
+    mock_calculator.tz = UTC
     mock_logger = MagicMock()
 
     # Act
@@ -1861,6 +1865,7 @@ def test__service_init__no_ddl_timezone_with_utc_calculator__no_warning(
     # Arrange
     mock_repo.ddl_timezone = None
     mock_calculator.timezone_name = "UTC"
+    mock_calculator.tz = UTC
     mock_logger = MagicMock()
 
     # Act
@@ -1881,6 +1886,7 @@ def test__service_init__repo_without_ddl_timezone_attribute__skips_check(
     # Arrange — custom repository implementations expose no ddl_timezone attribute
     del mock_repo.ddl_timezone
     mock_calculator.timezone_name = "Europe/Moscow"
+    mock_calculator.tz = UTC
 
     # Act
     service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
@@ -1915,6 +1921,7 @@ def _make_pruning_service(tz: tzinfo | None) -> PartitionPruningService:
         del calc.tz  # custom calculators without timezone metadata
     else:
         calc.tz = tz
+        calc.timezone_name = timezone_name(tz)
     return PartitionPruningService(MagicMock(), calc)
 
 
