@@ -386,17 +386,28 @@ async def test__reconcile__detached_branch__is_left_alone(repo: MagicMock, metad
 
 
 async def test__reconcile__default_partition__is_left_alone(repo: MagicMock, metadata: MagicMock) -> None:
-    # Arrange
-    default = PartitionNode(name="public.events_default", parent_name="public.events", level=1, bounds=DefaultBounds())
+    # Arrange -- a DEFAULT partition that IS hash-partitioned and one bucket
+    # short. A plain leaf would be skipped by the legacy-leaf rule instead, and
+    # would prove nothing about this one.
+    default = PartitionNode(
+        name="public.events_default",
+        parent_name="public.events",
+        level=1,
+        bounds=DefaultBounds(),
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        children=(PartitionNode(name="public.events_default__h0", bounds=HashBounds(modulus=2, remainder=0)),),
+    )
     metadata.get_partition_tree = AsyncMock(return_value=_root_with(default))
     service = PartitionSubpartitionService(repo, metadata)
 
     # Act
     result = await service.reconcile(_config(subpartition=_spec()))
 
-    # Assert -- it is a catch-all leaf by design; subpartitioning it would move
-    # where overflow rows land.
+    # Assert -- it is a catch-all by design. Subpartitioning it would move where
+    # overflow rows land, so it is skipped without even a finding.
     assert result.created_count == 0
+    assert result.findings == ()
     repo.create_subpartition_table.assert_not_called()
 
 

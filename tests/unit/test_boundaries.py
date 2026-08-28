@@ -1,6 +1,7 @@
 """Encoding periods into a partition key that is not a timestamp."""
 
 from datetime import UTC, datetime
+from uuid import UUID
 
 import pytest
 
@@ -9,6 +10,21 @@ from pg_partsmith.entities import Period
 from pg_partsmith.strategies import DayPeriodCalculator, WeekPeriodCalculator
 
 # ── UUIDv7 boundary codec ───────────────────────────────────────────────────────
+
+
+def _millis_of(value: UUID) -> int:
+    """Read the 48-bit Unix-millisecond prefix back out of a UUIDv7."""
+    return value.int >> 80
+
+
+def _instant_for_millis(millis: int) -> datetime:
+    """A stand-in instant carrying ``millis``, past what datetime can express."""
+
+    class _Beyond(datetime):
+        def timestamp(self) -> float:
+            return millis / 1000
+
+    return _Beyond(2026, 8, 24, tzinfo=UTC)
 
 
 def test__uuidv7_codec__encodes_an_instant__produces_a_valid_version_7_uuid() -> None:
@@ -77,14 +93,18 @@ def test__uuidv7_codec__uuid_of_another_version__decodes_to_none() -> None:
 
 
 def test__uuidv7_codec__far_future_instant__clamped_instead_of_raising() -> None:
-    # Arrange
+    # Arrange -- the 48-bit millisecond field runs out in the year 10889, well
+    # past datetime.max, so the clamp needs an instant no datetime can express.
     codec = UUIDv7BoundaryCodec()
+    beyond = _instant_for_millis(UUIDv7BoundaryCodec._MAX_TIMESTAMP_MS + 86_400_000)
 
     # Act
-    value = codec.min_uuid_for(datetime(9999, 12, 31, tzinfo=UTC))
+    value = codec.min_uuid_for(beyond)
 
-    # Assert
+    # Assert -- clamped to the largest representable millisecond. Letting it
+    # wrap would place the bound below most real rows instead of above them.
     assert value.version == 7
+    assert _millis_of(value) == UUIDv7BoundaryCodec._MAX_TIMESTAMP_MS
 
 
 # ── Calculators with a boundary codec ───────────────────────────────────────────
@@ -175,13 +195,31 @@ def test__uuid7_codec__instant_before_the_epoch__clamps_to_the_lowest_uuid() -> 
     assert encoded == codec.min_uuid_for(datetime(1970, 1, 1, tzinfo=UTC))
 
 
-def test__uuid7_codec__instant_past_the_representable_range__clamps_to_the_highest() -> None:
-    # Arrange
+def test__uuid7_codec__instant_inside_the_range__is_not_clamped() -> None:
+    # Arrange -- year 9999 looks extreme but is only 253e12 ms, comfortably
+    # inside the 281e12 the field holds. Nothing here should be clamped.
+    codec = UUIDv7BoundaryCodec()
+    instant = datetime(9999, 12, 31, tzinfo=UTC)
+
+    # Act
+    encoded = codec.min_uuid_for(instant)
+
+    # Assert -- the millisecond survives intact, and the bound still sorts
+    # above a present-day one.
+    assert _millis_of(encoded) == int(instant.timestamp() * 1000)
+    assert str(encoded) > str(codec.min_uuid_for(datetime(2026, 8, 24, tzinfo=UTC)))
+
+
+def test__uuid7_codec__min_uuid_for__fills_every_bit_below_the_timestamp_with_zero() -> None:
+    # Arrange -- "min" is what makes the bound safe: every real row in that
+    # millisecond has random bits at or above these, so none sorts below it and
+    # falls into the previous partition.
     codec = UUIDv7BoundaryCodec()
 
-    # Act -- 48 unsigned milliseconds run out in the year 10889.
-    encoded = codec.min_uuid_for(datetime(9999, 12, 31, tzinfo=UTC))
+    # Act
+    value = codec.min_uuid_for(datetime(2026, 8, 24, tzinfo=UTC))
 
     # Assert
-    assert encoded == codec.min_uuid_for(datetime(9999, 12, 31, tzinfo=UTC))
-    assert str(encoded) > str(codec.min_uuid_for(datetime(2026, 8, 24, tzinfo=UTC)))
+    assert value.int & ((1 << 76) - 1) == (0b10 << 62)
+    assert value.version == 7
+    assert value.variant == "specified in RFC 4122"

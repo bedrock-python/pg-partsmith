@@ -16,6 +16,7 @@ from pg_partsmith.entities import (
     MaintenanceResult,
     PartitionGranularity,
     PartitionInfo,
+    PartitionNode,
     PartitionStrategy,
     PartitionType,
     Period,
@@ -25,9 +26,10 @@ from pg_partsmith.exceptions import (
     InvalidPartitionConfigError,
     PartitionAlreadyExistsError,
     PartitionAttachedError,
+    UnsupportedCapabilityError,
 )
 from pg_partsmith.strategies import MonthPeriodCalculator
-from pg_partsmith.subpartition_plan import SubpartitionReconcileResult
+from pg_partsmith.subpartition_plan import SubpartitionReconcileResult, TopologyFinding, TopologyReason
 from pg_partsmith.utils import timezone_name
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────
@@ -2291,3 +2293,215 @@ async def test__service__static_root__reconcile_raises__without_the_flag_it_prop
     # Act / Assert
     with pytest.raises(SQLAlchemyError):
         await service.maintain_lifecycle(_static_config())
+
+
+def _flat_monthly_config() -> TablePartitionConfig:
+    """The same monthly config without any subpartitioning."""
+    return TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+        create_ahead_count=1,
+        retention_count=2,
+    )
+
+
+# ── The subpartition wiring on the creation path ────────────────────────────────
+
+
+def _nested_config() -> TablePartitionConfig:
+    """A monthly config whose periods are HASH-subpartitioned."""
+    return TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+        create_ahead_count=1,
+        retention_count=2,
+        subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+    )
+
+
+def _nested_repo(partition_info: PartitionInfo) -> MagicMock:
+    """A repository that satisfies SubpartitionRepository under getattr_static."""
+    repo = MagicMock()
+    repo.create_partition = AsyncMock(return_value=partition_info)
+    repo.create_branch = AsyncMock(return_value=partition_info)
+    repo.create_subpartition_table = AsyncMock(return_value=None)
+    repo.attach_subpartition = AsyncMock(return_value=None)
+    repo.attach_partition = AsyncMock(return_value=None)
+    repo.detach_partition = AsyncMock(return_value=None)
+    repo.drop_partition = AsyncMock(return_value=None)
+    repo.reconcile_default_rows = AsyncMock(return_value=0)
+    return repo
+
+
+def _nested_metadata() -> MagicMock:
+    """A metadata provider that satisfies NestedPartitionMetadata."""
+    metadata = MagicMock()
+    metadata.partition_exists = AsyncMock(return_value=False)
+    metadata.is_partition_attached = AsyncMock(return_value=False)
+    metadata.list_partitions = AsyncMock(return_value=[])
+    metadata.get_partition_type = AsyncMock(return_value=PartitionType.RANGE)
+    metadata.get_partition_column = AsyncMock(return_value="created_at")
+    metadata.get_partition_boundaries = AsyncMock(return_value=("2024-01-01", "2024-02-01"))
+    metadata.get_default_partition = AsyncMock(return_value=None)
+    metadata.get_partition_tree = AsyncMock(return_value=None)
+    metadata.get_unique_constraint_columns = AsyncMock(return_value=())
+    return metadata
+
+
+async def test__create_future_partitions__nested_config__builds_the_branch_before_attaching_it(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange
+    repo = _nested_repo(partition_info)
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+
+    # Act
+    await service.create_future_partitions(_nested_config())
+
+    # Assert -- a branch, not a plain leaf, and every bucket exists before the
+    # branch becomes reachable from the root.
+    repo.create_partition.assert_not_called()
+    repo.create_branch.assert_called_once()
+    assert repo.attach_subpartition.call_count == 2
+    assert repo.attach_partition.call_count == 1
+
+
+async def test__create_future_partitions__flat_config__creates_a_plain_partition(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange -- the same wiring without a spec must not take the branch path.
+    repo = _nested_repo(partition_info)
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+
+    # Act
+    await service.create_future_partitions(_flat_monthly_config())
+
+    # Assert
+    repo.create_branch.assert_not_called()
+    repo.create_partition.assert_called_once()
+    repo.create_subpartition_table.assert_not_called()
+
+
+async def test__create_future_partitions__branch_left_by_an_interrupted_run__is_converged_then_attached(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange -- the relation exists but list_partitions did not report it.
+    repo = _nested_repo(partition_info)
+    repo.create_branch = AsyncMock(side_effect=PartitionAlreadyExistsError("events__2024_04"))
+    metadata = _nested_metadata()
+    metadata.get_partition_tree = AsyncMock(
+        return_value=PartitionNode(
+            name="public.events__2024_04",
+            partition_type=PartitionType.HASH,
+            partition_columns=("tenant_id",),
+            is_attached=False,
+        )
+    )
+    service = PartitionLifecycleService(repo, metadata, mock_locks, mock_calculator)
+
+    # Act
+    await service.create_future_partitions(_nested_config())
+
+    # Assert -- the missing buckets are built *before* the branch is attached,
+    # or it goes live rejecting the rows they would have taken.
+    assert repo.attach_subpartition.call_count == 2
+    repo.attach_partition.assert_called_once()
+
+
+async def test__create_future_partitions__nested_config_on_a_flat_repository__refused_before_any_ddl(
+    mock_locks: MagicMock, mock_calculator: MagicMock
+) -> None:
+    # Arrange -- a repository predating subpartitioning.
+    repo = MagicMock(spec=["create_partition", "attach_partition", "detach_partition", "drop_partition"])
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+
+    # Act / Assert -- discovering this after the relation exists would leave an
+    # unmarked detached table behind on every tick.
+    with pytest.raises(UnsupportedCapabilityError):
+        await service.create_future_partitions(_nested_config())
+    repo.create_partition.assert_not_called()
+
+
+# ── The reconcile stage inside maintain_lifecycle ───────────────────────────────
+
+
+async def test__maintain_lifecycle__nested_config__reconciles_and_reports_what_it_repaired(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange
+    repo = _nested_repo(partition_info)
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+    actionable = TopologyFinding(
+        partition_name="public.events__2024_01",
+        reason=TopologyReason.STRATEGY_MISMATCH,
+        detail="events__2024_01 is LIST but the configuration asks for HASH.",
+    )
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        return_value=SubpartitionReconcileResult(created_count=3, findings=(actionable,))
+    )
+
+    # Act
+    result = await service.maintain_lifecycle(_nested_config())
+
+    # Assert -- repairs are counted apart from creations, and a divergence the
+    # planner refused to touch is reported rather than silently dropped.
+    assert result.repaired_count == 3
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.RECONCILE]
+    assert result.issues[0].partition_name == "public.events__2024_01"
+
+
+async def test__maintain_lifecycle__informational_finding__is_logged_not_reported(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange -- a legacy leaf is an expected steady state, not a problem.
+    repo = _nested_repo(partition_info)
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        return_value=SubpartitionReconcileResult(
+            findings=(
+                TopologyFinding(
+                    partition_name="public.events__2023_01",
+                    reason=TopologyReason.LEGACY_LEAF,
+                    detail="events__2023_01 is a plain leaf table.",
+                ),
+            )
+        )
+    )
+
+    # Act
+    result = await service.maintain_lifecycle(_nested_config())
+
+    # Assert -- paging on a non-empty issues list has to stay meaningful.
+    assert result.issues == ()
+
+
+async def test__maintain_lifecycle__partitions_about_to_be_pruned__are_excluded_from_reconciliation(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange -- one partition is past retention and will be dropped this run.
+    doomed = PartitionInfo(
+        name="events__2023_01",
+        partition_type=PartitionType.RANGE,
+        from_value="2023-01-01",
+        to_value="2023-02-01",
+        parent_table="events",
+    )
+    repo = _nested_repo(partition_info)
+    metadata = _nested_metadata()
+    metadata.list_partitions = AsyncMock(return_value=[doomed])
+    service = PartitionLifecycleService(repo, metadata, mock_locks, mock_calculator)
+    reconcile = AsyncMock(return_value=SubpartitionReconcileResult())
+    service._subpartition_service.reconcile = reconcile  # type: ignore[method-assign]
+
+    # Act
+    await service.maintain_lifecycle(_nested_config())
+
+    # Assert -- repairing a branch on its way out costs DDL and locks on a
+    # relation that will not exist by the end of the same run.
+    assert reconcile.call_args.kwargs["exclude"] == {"events__2023_01"}

@@ -1025,21 +1025,22 @@ def test__config__dump_from_before_composite_keys__still_parses() -> None:
 
 
 def test__parse_partition_bounds__list_value_naming_modulus__stays_a_list_bound() -> None:
-    # Arrange / Act: an unanchored search would read this as HashBounds, and a
-    # partition whose bounds are misread is invisible to the planner -- which
-    # then plans a duplicate that PostgreSQL refuses on every run.
-    parsed = parse_partition_bounds("FOR VALUES IN ('modulus 4, remainder 1')")
+    # Arrange / Act: the value spells out a whole hash bound, so an unanchored
+    # search finds one inside it. A partition whose bounds are misread is
+    # invisible to the planner, which then plans a duplicate PostgreSQL refuses
+    # on every run.
+    parsed = parse_partition_bounds("FOR VALUES IN ('FOR VALUES WITH (MODULUS 4, REMAINDER 1)')")
 
     # Assert
-    assert parsed == ListBounds(values=("modulus 4, remainder 1",))
+    assert parsed == ListBounds(values=("FOR VALUES WITH (MODULUS 4, REMAINDER 1)",))
 
 
 def test__parse_partition_bounds__range_literal_naming_modulus__stays_a_range_bound() -> None:
     # Arrange / Act
-    parsed = parse_partition_bounds("FOR VALUES FROM ('modulus 2, remainder 0') TO ('z')")
+    parsed = parse_partition_bounds("FOR VALUES FROM ('FOR VALUES WITH (MODULUS 2, REMAINDER 0)') TO ('z')")
 
     # Assert
-    assert parsed == RangeBounds(from_value="modulus 2, remainder 0", to_value="z")
+    assert parsed == RangeBounds(from_value="FOR VALUES WITH (MODULUS 2, REMAINDER 0)", to_value="z")
 
 
 # ── PartitionInfo bound derivation ──────────────────────────────────────────────
