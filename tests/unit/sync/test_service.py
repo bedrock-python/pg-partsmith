@@ -2227,6 +2227,10 @@ def test__service__static_root__skip_create__does_nothing_at_all(
     # only stage there is, and skipping it must skip everything.
     mock_metadata.get_partition_type.return_value = PartitionType.HASH
     mock_metadata.get_partition_column.return_value = "organization_id"
+    # Set explicitly rather than left to the mock's __getattr__: from Python
+    # 3.12 a runtime_checkable Protocol is matched with getattr_static, which
+    # does not see lazily created attributes.
+    mock_metadata.get_partition_tree = MagicMock(return_value=None)
     mock_metadata.get_unique_constraint_columns = MagicMock(return_value=())
     service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks)
     inner = MagicMock()
@@ -2247,6 +2251,10 @@ def test__service__static_root__reconcile_raises__continue_on_error_records_an_i
     # Arrange
     mock_metadata.get_partition_type.return_value = PartitionType.HASH
     mock_metadata.get_partition_column.return_value = "organization_id"
+    # Set explicitly rather than left to the mock's __getattr__: from Python
+    # 3.12 a runtime_checkable Protocol is matched with getattr_static, which
+    # does not see lazily created attributes.
+    mock_metadata.get_partition_tree = MagicMock(return_value=None)
     mock_metadata.get_unique_constraint_columns = MagicMock(return_value=())
     service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks)
     service._subpartition_service.reconcile = MagicMock(  # type: ignore[method-assign]
@@ -2269,6 +2277,10 @@ def test__service__static_root__reconcile_raises__without_the_flag_it_propagates
     # Arrange
     mock_metadata.get_partition_type.return_value = PartitionType.HASH
     mock_metadata.get_partition_column.return_value = "organization_id"
+    # Set explicitly rather than left to the mock's __getattr__: from Python
+    # 3.12 a runtime_checkable Protocol is matched with getattr_static, which
+    # does not see lazily created attributes.
+    mock_metadata.get_partition_tree = MagicMock(return_value=None)
     mock_metadata.get_unique_constraint_columns = MagicMock(return_value=())
     service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks)
     service._subpartition_service.reconcile = MagicMock(  # type: ignore[method-assign]
