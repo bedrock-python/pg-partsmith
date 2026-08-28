@@ -72,13 +72,10 @@ class PartitionTableSettings(BaseSettings):
         ...,
         description="Strategy: time_based, value_based, hash_based",
     )
-    partition_column: str | None = Field(
-        default=None,
-        description="Column used for partitioning; use PARTITION_COLUMNS for a composite key",
-    )
-    partition_columns: tuple[str, ...] | None = Field(
-        default=None,
-        description='Composite partition key in key order, as JSON: ["created_at", "tenant_id"]',
+    partition_column: str = Field(..., description="Leading column used for partitioning")
+    trailing_partition_columns: tuple[str, ...] = Field(
+        default=(),
+        description='Rest of a composite partition key, as JSON: ["tenant_id"]',
     )
     granularity: PartitionGranularity | None = Field(
         default=None,
@@ -113,16 +110,6 @@ class PartitionTableSettings(BaseSettings):
         ),
     )
 
-    @property
-    def resolved_partition_columns(self) -> tuple[str, ...]:
-        """The partition key, however it was spelled in the environment."""
-        if self.partition_columns:
-            return self.partition_columns
-        if self.partition_column:
-            return (self.partition_column,)
-        msg = "Set either partition_column or partition_columns"
-        raise ValueError(msg)
-
     def to_config(self) -> TablePartitionConfig:
         """Build a :class:`~pg_partsmith.TablePartitionConfig` from these settings."""
         return TablePartitionConfig(
@@ -130,7 +117,8 @@ class PartitionTableSettings(BaseSettings):
             table_name=self.table_name,
             partition_type=self.partition_type,
             partition_strategy=self.partition_strategy,
-            partition_columns=self.resolved_partition_columns,
+            partition_column=self.partition_column,
+            trailing_partition_columns=self.trailing_partition_columns,
             granularity=self.granularity,
             create_ahead_count=self.create_ahead_count,
             retention_count=self.retention_count,

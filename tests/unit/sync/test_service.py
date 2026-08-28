@@ -2148,7 +2148,8 @@ def test__validation_service__composite_config_on_a_flat_metadata_provider__refu
         table_name="events",
         partition_type=PartitionType.RANGE,
         partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_columns=("created_at", "tenant_id"),
+        partition_column="created_at",
+        trailing_partition_columns=("tenant_id",),
         granularity=PartitionGranularity.MONTH,
     )
     service = _make_service(mock_repo, metadata, mock_locks, mock_calculator)

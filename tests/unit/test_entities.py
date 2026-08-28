@@ -736,7 +736,7 @@ def test__config__non_range_root_with_subpartition__rejected() -> None:
 
 def test__config__composite_partition_key__exposes_columns_and_arity() -> None:
     # Arrange / Act
-    config = _config(partition_columns=("created_at", "tenant_id"))
+    config = _config(trailing_partition_columns=("tenant_id",))
 
     # Assert
     assert config.partition_columns == ("created_at", "tenant_id")
@@ -757,20 +757,29 @@ def test__config__single_partition_column__still_accepted_and_normalised() -> No
 def test__config__repeated_partition_key_column__rejected() -> None:
     # Arrange / Act / Assert
     with pytest.raises(ValidationError, match="distinct"):
-        _config(partition_columns=("created_at", "created_at"))
+        _config(trailing_partition_columns=("created_at",))
 
 
-def test__config__empty_partition_key__rejected() -> None:
-    # Arrange / Act / Assert
-    with pytest.raises(ValidationError, match="at least one partition column"):
-        _config(partition_columns=())
+def test__config__partition_column_is_a_real_field__so_it_type_checks_and_copies() -> None:
+    # Arrange
+    config = _config()
+
+    # Act
+    moved = config.model_copy(update={"partition_column": "occurred_at"})
+
+    # Assert: a derived value would have silently ignored the update and left
+    # `dict(model)` disagreeing with `model_dump()`.
+    assert moved.partition_column == "occurred_at"
+    assert dict(moved)["partition_column"] == "occurred_at"
+    assert moved.model_dump()["partition_column"] == "occurred_at"
+    assert "partition_column" in TablePartitionConfig.model_fields
 
 
 def test__config__composite_key_overlapping_a_subpartition_column__rejected() -> None:
     # Arrange / Act / Assert: the lower level would have nothing left to divide.
     with pytest.raises(ValidationError, match="distinct across levels"):
         _config(
-            partition_columns=("created_at", "tenant_id"),
+            trailing_partition_columns=("tenant_id",),
             subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
         )
 
@@ -782,32 +791,43 @@ def test__config__composite_list_root__rejected() -> None:
             table_name="events",
             partition_type=PartitionType.LIST,
             partition_strategy=PartitionStrategy.VALUE_BASED,
-            partition_columns=("region", "tier"),
+            partition_column="region",
+            trailing_partition_columns=("tier",),
             root_layout=ListSubpartitionSpec(column="region", groups=(ListGroup(name="eu", values=("de",)),)),
         )
 
 
 def test__hash_spec__composite_columns__accepted() -> None:
     # Arrange / Act
-    spec = HashSubpartitionSpec(columns=("tenant_id", "shard_id"), modulus=4)
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=4)
 
     # Assert
     assert spec.columns == ("tenant_id", "shard_id")
 
 
-def test__hash_spec__composite_columns__single_column_accessor_refuses() -> None:
+def test__hash_spec__composite_columns__leading_column_still_readable() -> None:
     # Arrange
-    spec = HashSubpartitionSpec(columns=("tenant_id", "shard_id"), modulus=4)
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=4)
 
-    # Act / Assert: no single column describes a composite key.
-    with pytest.raises(ValueError, match="use `columns`"):
-        _ = spec.column
+    # Act / Assert: reading it must never raise — validation and diagnostics do
+    # exactly this, and `hasattr` only swallows AttributeError.
+    assert spec.column == "tenant_id"
+    assert hasattr(spec, "column")
+    assert spec.model_copy(update={"column": "account_id"}).column == "account_id"
+
+
+def test__hash_spec__repeated_key_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="distinct"):
+        HashSubpartitionSpec(column="tenant_id", trailing_columns=("tenant_id",), modulus=4)
 
 
 def test__list_spec__composite_columns__rejected() -> None:
     # Arrange / Act / Assert
     with pytest.raises(ValidationError, match="exactly one column"):
-        ListSubpartitionSpec(columns=("region", "tier"), groups=(ListGroup(name="eu", values=("de",)),))
+        ListSubpartitionSpec(
+            column="region", trailing_columns=("tier",), groups=(ListGroup(name="eu", values=("de",)),)
+        )
 
 
 def test__parse_partition_bounds__composite_range__returns_the_leading_value() -> None:
@@ -952,9 +972,11 @@ def test__config__dump__still_carries_partition_column() -> None:
     # Act
     dumped = config.model_dump()
 
-    # Assert: a consumer written against the pre-composite shape still finds it.
+    # Assert: the dump is 0.4.0's shape plus one new key, so a consumer written
+    # against the old one still finds what it reads.
     assert dumped["partition_column"] == "created_at"
-    assert dumped["partition_columns"] == ("created_at",)
+    assert dumped["trailing_partition_columns"] == ()
+    assert "partition_columns" not in dumped
 
 
 def test__config__dump__round_trips() -> None:
@@ -975,7 +997,7 @@ def test__config__json_dump__round_trips() -> None:
 
 def test__config__composite_dump__round_trips_without_collapsing_the_key() -> None:
     # Arrange: the dump names both the whole key and its leading column.
-    config = _config(partition_columns=("created_at", "tenant_id"))
+    config = _config(trailing_partition_columns=("tenant_id",))
 
     # Act
     restored = TablePartitionConfig(**config.model_dump())
