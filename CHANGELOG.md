@@ -5,6 +5,92 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 1.0.0
+
+Version 1.0 rebuilds the core around four separated concerns — partition scheme, range
+boundaries, lifecycle policy, and a maintenance plan — after reading how ten production
+systems (GlitchTip, GitLab, Centrifugo, PGMQ, Hatchet, pg-trx-outbox, Hookdeck Outpost,
+ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
+[RFC 0001](https://bedrock-python.github.io/pg-partsmith/design/rfc-0001-partition-schemes/), the
+[OSS research](https://bedrock-python.github.io/pg-partsmith/design/oss-research/) and the
+[verified PostgreSQL semantics](https://bedrock-python.github.io/pg-partsmith/design/postgresql-semantics/).
+
+### ⚠ BREAKING CHANGES
+
+- `PartitionLifecycleService(repo, metadata, locks, hooks=...)` no longer takes a
+  `period_calculator`; the calendar, timezone and codec live in the config's
+  `TimeBoundaries`. `PostgresMetadataProvider(boundary_codec=...)` is only needed for
+  `is_partition_closed`.
+- Nested and static topologies are spelled as a scheme: `subpartition=HashSubpartitionSpec(...)`
+  → `subpartition=HashPartitioning(key=..., modulus=...)` or `scheme=RangePartitioning(..., child=...)`;
+  `root_layout=...` + `HASH_BASED`/`VALUE_BASED` → `scheme=HashPartitioning(...)` /
+  `ListPartitioning(...)`. `HashSubpartitionSpec`, `ListSubpartitionSpec`, `SubpartitionSpec`,
+  `root_layout` and `auto_attach_after_create` are removed (a partition is always attached
+  last, after its subtree).
+- Hooks: `before_create(config, partition: PartitionInfo)` replaces
+  `before_create(config, partition_name, from_value, to_value)`. Hooks fire once per partition
+  directly under the root (also for root `HASH`/`LIST` members).
+- Repository protocol: `create_table_like(template, name, partition_by)`,
+  `attach_partition(parent, name, bounds, *, key_arity=1)`, `detach_partition(parent, name,
+  *, mode=DetachMode.AUTO)`, `drop_partition(name, *, expected_oid=None)`,
+  `reconcile_default_rows(..., key_columns=...)` replace `create_partition`, `create_branch`,
+  `create_subpartition_table`, `attach_subpartition`, `attach_composite_partition` and the
+  `concurrent=` flag. Metadata protocol: `get_actual_tree`, `measure`, `get_partition_tree`,
+  `get_relation_oid`, `get_key_high_water_mark` replace the `NestedPartitionMetadata` /
+  `CompositeKeyMetadata` capability protocols.
+- `pg_partsmith.subpartition_plan` and `pg_partsmith.pruning_rules` are removed;
+  `SubpartitionPlan` / `TopologyFinding` / `TopologyReason` / `plan_subpartitions` become
+  `MaintenancePlan` / `Finding` / `FindingReason` / `plan_maintenance`.
+  `service.reconcile_subpartitions()` is `service.reconcile()`.
+- `Period` and `PartitionGranularity` moved to `pg_partsmith.periods` (still re-exported from
+  `pg_partsmith` and `pg_partsmith.entities`). Custom calculators implement `period_at(instant)`
+  (`current_period()` is derived from it; a calculator without it still works, slower).
+- `ensure_partitions` returns the created `PartitionInfo`s built with their whole subtree;
+  `get_partitions_for_pruning` also lists detached orphans past their grace.
+- Ownership: an attached partition whose bounds are not a window of the scheme's grid (nor
+  inside one) is reported as `unmanaged_partition` and never detached or dropped. In 0.x any
+  attached partition with an old upper bound was pruned.
+- `PartitionStrategy` gains `NUMERIC_BASED`; `MaintenanceIssueStep` gains `PLAN` and `ATTACH`.
+
+### Added
+
+- `scheme=` composition: `RangePartitioning`, `HashPartitioning`, `ListPartitioning`
+  nest to any depth (`RANGE → LIST → HASH`, `LIST → RANGE`, root `HASH`/`LIST`), with composite
+  keys, per-level naming and 63-byte name budgets.
+- `NumericBoundaries(step, origin)`: integer `RANGE` windows with the cursor read from
+  `max(key)` or the serial/identity sequence (`CursorSource`).
+- `LifecyclePolicy`: creation `CreateAhead`, `CreateUntil(position)`, `CreateNextIf(predicate)`;
+  retention `KeepNewest`, `KeepFor(age)`, `KeepBehind(distance)`, `ExpireIf(predicate)` with
+  `AllOf`/`AnyOf`/`Not`; predicates `SizeAbove`, `RowsAbove`, `WindowAgeAbove`, `SqlPredicate`,
+  `Callback`; `DetachMode.AUTO/CONCURRENT/BLOCKING`; `DropAfter(grace, when)`, `DropNever`.
+  Facts (sizes, row estimates, SQL answers) are gathered only when a policy asks.
+- `service.plan()` (read-only, lock-free), `service.apply(plan)`, `service.maintain()`;
+  `MaintenancePlan` with typed operations (`CreatePartition`, `AttachPartition`,
+  `DetachPartition`, `DropPartition`), reasons, sizes, findings with severities,
+  `without()`/`only()` filters, `describe()` and JSON round-trip; `MaintenanceResult.plan`,
+  `attached_count`.
+- Destructive revalidation: detach and drop check the relation's OID (and attachment /
+  marker) at apply time; a recreated table raises `PlanStaleError`.
+- The orphan marker records the detach instant (`pg-partsmith:detached-at=`), which grace
+  periods are measured from; orphans whose window is wanted again are re-attached.
+- `ActualTree` / `PartitionNode` carry `oid`, `relkind` (foreign tables are inspected and
+  never touched), `detach_pending`, `facts`; `DetachedPartition` carries `detached_at`.
+- `EpochBoundaryCodec`; codecs and boundaries addressable by name in serialized configs;
+  `PartitionTableSettings` accepts `scheme` / `lifecycle` JSON, `tz`, `boundary_codec`.
+- `scripts/sync_mirror.py` regenerates `pg_partsmith.sync` from `pg_partsmith.aio`.
+- Design docs: RFC 0001, OSS research with migration verdicts per project, PostgreSQL
+  semantics verified on 15 and 17.
+
+### Changed
+
+- Existing partitions are matched to windows by their catalog bounds, never by name; names
+  are parsed only to recognise a detached orphan.
+- Topology conflicts discovered while applying (`PartitionTopologyError`) are recorded as
+  issues and never abort the run; other errors abort unless `continue_on_error`.
+- `is_partition_closed`, DEFAULT reconciliation, attach-last subtree creation, hash
+  convergence rules, fail-closed pruning of unreadable bounds, timezone alignment and the
+  orphan marker keep their 0.5 semantics.
+
 ## [0.5.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.4.0...pg-partsmith-v0.5.0) (2026-08-28)
 
 
@@ -225,3 +311,4 @@ First public release of `pg-partsmith`.
 - Python 3.11, 3.12, and 3.13 support.
 
 [0.1.0]: https://github.com/bedrock-python/pg-partsmith/releases/tag/v0.1.0
+[Unreleased]: https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...HEAD

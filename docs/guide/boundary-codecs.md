@@ -1,127 +1,121 @@
-# Boundary codecs
+# Boundaries and codecs
 
-A time-based partition has two independent notions of "when":
+A `RANGE` level needs one rule — its **boundaries** — that turns a position on the axis
+into the window holding it, steps between adjacent windows, renders a window as the two
+literals PostgreSQL compares the key against, reads such a literal back, and names the
+partition for a window.
 
-- the **semantic period** — a week, a month — which decides the partition's name, its
-  place in the create-ahead window, and when retention drops it; and
-- the **physical boundary** — the literal PostgreSQL compares the partition key against.
-
-For a `timestamptz` key the two coincide, and there is nothing to configure. They come
-apart whenever the partition key is a **time-sortable identifier** rather than a
-timestamp: a UUIDv7, a ULID, a Snowflake id, an epoch bigint, an encoded day bucket. Such
-a table is still partitioned by time — the ordering of the key *is* the ordering of time —
-but its `FOR VALUES FROM … TO …` literals are identifiers, not dates.
-
-A `RangeBoundaryCodec` bridges the two, so the lifecycle keeps reasoning in periods while
-the DDL speaks the key's own language.
+## Time: `TimeBoundaries`
 
 ```python
-from pg_partsmith import WeekPeriodCalculator
-from pg_partsmith.boundaries import UUIDv7BoundaryCodec
-
-calculator = WeekPeriodCalculator(boundary_codec=UUIDv7BoundaryCodec())
+TimeBoundaries(granularity=PartitionGranularity.MONTH)
+TimeBoundaries(granularity=PartitionGranularity.DAY, tz="Europe/Helsinki")
+TimeBoundaries(granularity=PartitionGranularity.WEEK, codec=UUIDv7BoundaryCodec())
+TimeBoundaries(calculator=FiscalYearPeriodCalculator())      # any PeriodCalculator
 ```
 
-Everything else is unchanged. Periods, partition names, create-ahead and retention all
-keep working in calendar terms:
+The period arithmetic is a [period calculator](strategies.md): a built-in granularity
+(hour, day, ISO week, month, quarter, year) or a custom one. Names are the calculator's
+(`events__2026_w35`); the cursor is the clock in the calendar's timezone.
+
+**Timezones.** The calendar is computed in `tz` (`UTC` by default; a `ZoneInfo` or an IANA
+name). Keep the repository's `ddl_timezone` aligned with it — the service refuses a
+mismatched pair, so names and real bounds cannot silently drift apart. `HOUR` is UTC-only
+(a local hour can repeat or vanish under DST).
+
+## Integers: `NumericBoundaries`
 
 ```python
-calculator.format_partition_name("events", Period(year=2026, week=35))
-# 'events__2026_w35'
-
-calculator.get_boundaries(Period(year=2026, week=35))
-# ('01a03111-1c00-7000-8000-000000000000',
-#  '01a0551d-a000-7000-8000-000000000000')
+NumericBoundaries(step=100_000)                       # [0, 100000), [100000, 200000), …
+NumericBoundaries(step=1_000, origin=500)             # windows anchored on 500
+NumericBoundaries(step=100_000, cursor_source=CursorSource.SEQUENCE)
 ```
 
-## Wiring
+Windows are `[origin + k·step, origin + (k+1)·step)`, named after their start
+(`queue__100000`; a negative start is spelled `m100`). The cursor is `max(key)` over the
+table — one index probe per leaf when the key is indexed — or the key's serial/identity
+sequence with `CursorSource.SEQUENCE`, which is one catalog read and right only for a key
+fed by that sequence. Retention on this axis is `KeepNewest(count)` or
+`KeepBehind(distance)`.
 
-Pass the same codec to the metadata provider, so it can read boundaries back:
+## Codecs: partitioning by time over an encoded key
+
+A time-partitioned table has two notions of "when": the **semantic period** — a week, a
+month — which decides names, the create-ahead window and retention; and the **physical
+boundary** — the literal PostgreSQL compares the key against. For a `timestamptz` key they
+coincide. They come apart when the key is a *time-sortable identifier*: a UUIDv7, a ULID,
+an epoch bigint. A `RangeBoundaryCodec` bridges the two:
 
 ```python
-codec = UUIDv7BoundaryCodec()
-
-service = PartitionLifecycleService(
-    repo=PostgresPartitionRepository(engine),
-    metadata=PostgresMetadataProvider(engine, boundary_codec=codec),
-    locks=PostgresAdvisoryLockManager(engine),
-    period_calculator=WeekPeriodCalculator(boundary_codec=codec),
-)
+TimeBoundaries(granularity=PartitionGranularity.WEEK, codec="uuidv7")
+TimeBoundaries(granularity=PartitionGranularity.DAY, codec=EpochBoundaryCodec("milliseconds"))
 ```
 
-Codecs are **bidirectional on purpose**. Retention selects partitions by comparing a
-partition's *catalog* upper bound against the cutoff instant, and `is_partition_closed`
-does the same. A codec that could only encode would create partitions the library could
-never prune or finalize.
-
-Without a codec, the metadata provider will not try to read a non-timestamp bound: it
-reports `is_partition_closed` as `False` rather than raising, and retention skips the
-partition with a warning rather than guessing.
-
-## UUIDv7
-
-`UUIDv7BoundaryCodec` implements RFC 9562: a 48-bit big-endian Unix-milliseconds
-timestamp in the leading bits, so UUIDv7 values sort chronologically.
-
-Both boundaries use the **minimum** UUID for their instant — every random bit zero. Using
-the minimum on both ends is what makes adjacent periods exactly contiguous:
-
-```text
-week 35:  [min_uuid(2026-08-24), min_uuid(2026-08-31))
-week 36:  [min_uuid(2026-08-31), min_uuid(2026-09-07))
-                ^^^^^^^^^^^^^^^^ the same value
+```python
+config.scheme.range_boundaries.literals(window)
+# ('01a03111-1c00-7000-8000-000000000000', '01a0551d-a000-7000-8000-000000000000')
 ```
 
-No identifier can fall between two partitions, so nothing silently lands in `DEFAULT`.
-Encoding is deterministic — the same instant always yields the same boundary — which is
-what makes the create path idempotent.
+Built-in codecs, addressable by name in serialized configs: `uuidv7`, `epoch_seconds`,
+`epoch_milliseconds`.
+
+`UUIDv7BoundaryCodec` implements RFC 9562 — a 48-bit big-endian Unix-milliseconds
+timestamp in the leading bits. Both boundaries use the **minimum** UUID for their instant
+(every random bit zero), which is what makes adjacent periods exactly contiguous: one
+period's upper bound is the next one's lower bound, and no identifier can fall between two
+partitions. The encoding is deterministic, so the create path stays idempotent.
+`min_uuid_for(instant)` is exposed for the query side — turning a time filter into a UUID
+range so the planner can prune.
+
+Codecs are **bidirectional on purpose**: retention compares a partition's *catalog* upper
+bound against the cutoff, and ownership compares it against the grid, so a codec that could
+only encode would create partitions the library could never recognise again.
+
+`PostgresMetadataProvider(engine, boundary_codec=...)` needs the same codec only for
+`is_partition_closed`; planning decodes through the config.
 
 ## Writing your own
 
-The protocol is two methods:
+A codec is two methods:
 
 ```python
-from datetime import UTC, datetime
-
-
-class EpochMillisBoundaryCodec:
-    """Partition key is a bigint of milliseconds since the Unix epoch."""
+class SnowflakeBoundaryCodec:
+    EPOCH_MS = 1_288_834_974_657          # Twitter epoch
 
     def encode(self, start: datetime, end: datetime) -> tuple[str, str]:
-        return str(int(start.timestamp() * 1000)), str(int(end.timestamp() * 1000))
+        return str(self._id_at(start)), str(self._id_at(end))
 
     def decode(self, literal: str) -> datetime | None:
         try:
-            return datetime.fromtimestamp(int(literal) / 1000, tz=UTC)
-        except (TypeError, ValueError):
+            ms = (int(literal) >> 22) + self.EPOCH_MS
+        except ValueError:
             return None
+        return datetime.fromtimestamp(ms / 1000, tz=UTC)
+
+    def _id_at(self, instant: datetime) -> int:
+        return (int(instant.timestamp() * 1000) - self.EPOCH_MS) << 22
 ```
 
-Two rules make a codec correct:
+Two rules make a codec correct: `encode` is monotonic in its argument, and adjacent periods
+are contiguous — no gap, no overlap. `decode` returns `None` for anything carrying no
+instant (`MINVALUE`, `MAXVALUE`, a literal of another type) rather than raising, so a table
+with a mixed history can still be introspected.
 
-1. **`encode` is monotonic** in its argument — later instants must produce later literals
-   in the key type's own ordering, or PostgreSQL's range bounds are meaningless.
-2. **Adjacent periods are contiguous** — one period's upper bound is the next period's
-   lower bound, with no gap and no overlap.
+A whole axis is a `RangeBoundaries` implementation (`window_at`, `shift`, `literals`,
+`decode`, `child_name`, `parse_child_name`, `describe`, `axis`, `cursor_source`) — the same
+protocol `TimeBoundaries` and `NumericBoundaries` implement.
 
-`decode` should return `None` for anything carrying no instant (`MINVALUE`, `MAXVALUE`, a
-literal from a differently-typed key) rather than raising, so a table whose history mixes
-key types can still be introspected.
+## Combining with nesting
 
-## Combining with subpartitioning
-
-Boundary encoding and [subpartitioning](subpartitioning.md) are orthogonal, and compose:
+Boundaries and nesting are orthogonal:
 
 ```python
-config = TablePartitionConfig(
-    table_name="events",
-    partition_type=PartitionType.RANGE,
-    partition_strategy=PartitionStrategy.TIME_BASED,
-    partition_column="id",              # a UUIDv7 column
-    granularity=PartitionGranularity.WEEK,
-    subpartition=HashSubpartitionSpec(column="tenant_id", modulus=4),
+RangePartitioning(
+    key="id",
+    boundaries=TimeBoundaries(granularity=PartitionGranularity.WEEK, codec="uuidv7"),
+    child=HashPartitioning(key="organization_id", modulus=4),
 )
 ```
 
-That is `RANGE(id UUIDv7)` weekly → `HASH(tenant_id)`: the time dimension picks the
-branch, the hash dimension picks the leaf.
+`RANGE(id UUIDv7)` weekly → `HASH(organization_id)`: the time dimension picks the branch,
+the hash dimension picks the leaf.

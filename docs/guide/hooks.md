@@ -1,84 +1,75 @@
 # Lifecycle hooks
 
 Hooks let you inject logic at every step of the partition lifecycle — export data before a
-partition is dropped, publish events to Kafka after creation, archive rows before detachment.
+partition is dropped, publish events after creation, verify an archive before the drop.
+
+Hooks fire once per **lifecycle unit** — the partition directly under the root — never per
+leaf of its subtree: a cold-storage export wants the whole week, not one call per hash
+bucket. For a root `HASH` or `LIST` table they fire per member.
 
 ## Hook policy
 
 | Hook type | On exception |
 |-----------|--------------|
-| `before_*` | **Failure** — the maintenance operation is aborted and the error appears in `MaintenanceResult.error` |
-| `after_*`  | **Warning** — logged, but `result.success` remains `True` |
+| `before_*` | the operation is aborted; with `continue_on_error` the error lands in `MaintenanceResult.issues`, otherwise it propagates. A detach or drop refused this way comes back on the next run. |
+| `after_*`  | logged; the operation already happened |
 
-## Available hook points
+## Hook points
 
 | Method | When it fires |
 |--------|---------------|
-| `before_create(config, partition_name, from_value, to_value)` | Before the partition table is created |
-| `after_create(config, partition)` | After creation and optional auto-attach |
-| `before_detach(table_name, partition)` | Before detaching from the parent table |
-| `after_detach(table_name, partition_name)` | After successful detach |
-| `before_drop(table_name, partition_name)` | Before the table is dropped — last chance to read data |
-| `after_drop(table_name, partition_name)` | After the table has been permanently removed |
+| `before_create(config, partition: PartitionInfo)` | before the partition (name, bounds, `subpartition_type`) is created |
+| `after_create(config, partition)` | after it is created, its subtree built, and attached |
+| `before_detach(table_name, partition: PartitionInfo)` | before detaching — the data is still reachable through the parent |
+| `after_detach(table_name, partition_name)` | after a successful detach |
+| `before_drop(table_name, partition_name)` | before the table is dropped — the last chance to read the data |
+| `after_drop(table_name, partition_name)` | after the table is gone |
 
-## Example: Kafka notifications
+`partition.from_value` / `partition.to_value` carry a RANGE window; `partition.bounds` the
+structured form for every method.
 
-Subclass `BasePartitionLifecycleHooks` and override only the methods you need:
+## Example: archive, verify, then drop
 
 ```python
 from pg_partsmith.aio import BasePartitionLifecycleHooks, PartitionLifecycleService
-from pg_partsmith.entities import PartitionInfo, TablePartitionConfig
 
 
-class KafkaNotifyHooks(BasePartitionLifecycleHooks):
-    def __init__(self, producer: KafkaProducer) -> None:
-        self._producer = producer
+class ArchiveHooks(BasePartitionLifecycleHooks):
+    def __init__(self, archive: Archive) -> None:
+        self._archive = archive
 
-    async def after_create(
-        self, config: TablePartitionConfig, partition: PartitionInfo
-    ) -> None:
-        await self._producer.send("partition.created", {"name": partition.name})
+    async def after_detach(self, table_name: str, partition_name: str) -> None:
+        await self._archive.export(partition_name)
 
     async def before_drop(self, table_name: str, partition_name: str) -> None:
-        await export_to_cold_storage(table_name, partition_name)
-        await self._producer.send("partition.expiring", {"name": partition_name})
+        if not await self._archive.verified(partition_name):
+            raise RuntimeError(f"{partition_name} is not archived yet")   # dropped on a later run
 
 
-service = PartitionLifecycleService(
-    repo=repo,
-    metadata=metadata,
-    locks=locks,
-    period_calculator=calculator,
-    hooks=[KafkaNotifyHooks(producer)],  # multiple hooks supported
-)
+service = PartitionLifecycleService(repo, metadata, locks, hooks=[ArchiveHooks(archive)])
 ```
+
+Combine with `DropAfter(grace=...)` so the export has a window, or with `DropNever` when
+the archive pipeline owns the drop entirely.
 
 ## Multiple hooks
 
 Pass a list — hooks are called in order:
 
 ```python
-service = PartitionLifecycleService(
-    ...,
-    hooks=[
-        KafkaNotifyHooks(producer),
-        MetricsHooks(statsd_client),
-        AuditLogHooks(db_session),
-    ],
-)
+hooks=[KafkaNotifyHooks(producer), MetricsHooks(statsd), AuditLogHooks(session)]
 ```
 
-## Custom repository
+## What hooks are not for
 
-Hooks are the idiomatic way to extend behaviour. For lower-level control, you can also
-subclass `PostgresPartitionRepository` directly:
+A hook decides nothing about *which* partitions are created or expire — that is the
+[lifecycle policy](lifecycle-policies.md), evaluated by the planner, with the plan
+inspectable before anything runs. Keeping DDL out of hooks is what preserves the ownership,
+safety and locking guarantees. For lower-level control subclass the repository:
 
 ```python
-from pg_partsmith.aio import PostgresPartitionRepository
-
-
 class AuditedPartitionRepository(PostgresPartitionRepository):
-    async def drop_partition(self, partition_name: str) -> None:
+    async def drop_partition(self, partition_name: str, *, expected_oid: int | None = None) -> None:
         await self._audit_log.record("drop", partition_name)
-        await super().drop_partition(partition_name)
+        await super().drop_partition(partition_name, expected_oid=expected_oid)
 ```

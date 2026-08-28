@@ -1,23 +1,17 @@
 # Configuration
 
-`TablePartitionConfig` controls how pg-partsmith manages a single table's partitions.
+`TablePartitionConfig` describes one partitioned table: its **scheme** (which levels exist,
+by which method, on which key, with which boundaries) and its **lifecycle policy** (when
+partitions of the progression level are created, detached and dropped).
 
-## Full example
+## The flat spelling
 
 ```python
-from pg_partsmith import (
-    MonthPeriodCalculator,
-    PartitionGranularity,
-    PartitionStrategy,
-    PartitionType,
-    TablePartitionConfig,
-)
+from pg_partsmith import PartitionGranularity, TablePartitionConfig
 
 config = TablePartitionConfig(
     schema="public",
     table_name="events",
-    partition_type=PartitionType.RANGE,
-    partition_strategy=PartitionStrategy.TIME_BASED,
     partition_column="created_at",
     granularity=PartitionGranularity.MONTH,
     create_ahead_count=3,
@@ -25,115 +19,87 @@ config = TablePartitionConfig(
 )
 ```
 
-## Fields
+| Field | Meaning |
+|---|---|
+| `schema` | Schema of the parent table. Optional, strongly recommended: everything is then schema-qualified and independent of `search_path`. Read back as `config.db_schema`. |
+| `table_name` | The parent (partitioned) table, lowercase. |
+| `partition_column` | Leading column of the partition key — the time dimension. |
+| `trailing_partition_columns` | The rest of a composite key, in key order (bounded with `MINVALUE`). |
+| `granularity` | `HOUR`, `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`. |
+| `tz` | Timezone the calendar is computed in (IANA name or `ZoneInfo`); `UTC` by default. |
+| `boundary_codec` | Physical encoding of the key: `"uuidv7"`, `"epoch_seconds"`, `"epoch_milliseconds"`, or a codec instance. |
+| `subpartition` | A level below the root (`HashPartitioning(...)` / `ListPartitioning(...)`). |
+| `create_ahead_count` | Periods that must exist, the current one included. `3` in June means June, July, August. |
+| `retention_count` | Newest periods kept, the current one included; older ones are detached and dropped. A *count*, not a distance. |
+| `partition_type`, `partition_strategy` | Optional; checked against the scheme (`RANGE` / `TIME_BASED` for this spelling). |
 
-### `table_name`
+The flat spelling covers a time-partitioned `RANGE` root. Everything else uses `scheme`.
 
-The name of the parent (partitioned) table. Must match the PostgreSQL table name exactly.
-
-### `schema`
-
-The PostgreSQL schema that contains the table. Optional, but **strongly recommended** in
-multi-schema databases. When set, all catalog queries and DDL are schema-qualified and
-independent of `search_path`.
-
-```python
-schema="public"      # default schema
-schema="analytics"   # custom schema
-schema=None          # relies on search_path (not recommended)
-```
-
-### `partition_type`
+## The composed spelling
 
 ```python
-class PartitionType(StrEnum):
-    RANGE = "range"
-    LIST  = "list"
-    HASH  = "hash"
+config = TablePartitionConfig(
+    schema="public",
+    table_name="events",
+    scheme=RangePartitioning(
+        key="created_at",
+        boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH, tz="Europe/Helsinki"),
+        child=HashPartitioning(key="tenant_id", modulus=4),
+    ),
+    lifecycle=LifecyclePolicy(creation=CreateAhead(count=3), retention=KeepNewest(count=12)),
+)
 ```
 
-Use `RANGE` for time-based partitioning.
+| Field | See |
+|---|---|
+| `scheme` | [Partition schemes](partition-schemes.md) — `RangePartitioning`, `ListPartitioning`, `HashPartitioning`, nesting, composite keys |
+| `lifecycle` | [Lifecycle policies](lifecycle-policies.md) — creation, retention, detach mode, drop policy |
 
-### `partition_strategy`
+Passing `scheme` together with the flat scheme fields, or `lifecycle` together with
+`create_ahead_count` / `retention_count`, is an error: one spelling per config.
+
+## Derived views
+
+Whichever spelling you use, the config exposes both:
 
 ```python
-class PartitionStrategy(StrEnum):
-    TIME_BASED  = "time_based"
-    VALUE_BASED = "value_based"
-    HASH_BASED  = "hash_based"
+config.scheme                 # the root level
+config.lifecycle              # the policy
+config.partition_type         # PartitionType.RANGE / LIST / HASH — the root's method
+config.partition_strategy     # TIME_BASED / NUMERIC_BASED / VALUE_BASED / HASH_BASED
+config.partition_columns      # the root's whole key
+config.granularity            # for a time-based root using a built-in granularity
+config.create_ahead_count     # when the creation policy is CreateAhead, else None
+config.retention_count        # when the retention policy is KeepNewest, else None
+config.levels                 # every level, root first
+config.qualified_name         # "public.events"
 ```
 
-The values matter when the config comes from the environment: a
-`PartitionTableSettings` subclass reads `…_PARTITION_STRATEGY=time_based`, not
-the member name.
+## Serialization
 
-Use `TIME_BASED` for automatic period calculation via a `PeriodCalculator`.
+Configs are frozen Pydantic models. `config.model_dump(mode="json")` produces a JSON
+document (`tz` as an IANA name, built-in codecs by name, policies discriminated on `kind`)
+and `TablePartitionConfig.model_validate(...)` reads it back — including nested schemes,
+numeric boundaries and combinator policies. Custom calculators, custom codecs and
+`Callback` predicates are objects and are excluded.
 
-### `partition_column`
-
-Column used as the partition key. For `TIME_BASED` this is typically a `TIMESTAMP` or
-`TIMESTAMPTZ` column.
+`PartitionTableSettings` (`pip install pg-partsmith[pydantic-settings]`) loads the flat
+fields from the environment and accepts `SCHEME` / `LIFECYCLE` as JSON for the composed
+form:
 
 ```python
-partition_column="created_at"
-partition_column="event_date"
+class OutboxSettings(PartitionTableSettings):
+    model_config = SettingsConfigDict(env_prefix="OUTBOX_")
+
+config = OutboxSettings().to_config()   # OUTBOX_TABLE_NAME, OUTBOX_PARTITION_COLUMN, OUTBOX_GRANULARITY, …
 ```
 
-### `trailing_partition_columns`
+## Validation
 
-The rest of a composite partition key, in key order, when the table partitions on
-more than one column. Empty by default, which is the single-column case.
+At construction: identifiers are lowercased and checked, LIST keys are single-column, every
+level partitions on a fresh column, generated names fit 63 bytes at every level.
 
-```python
-partition_column="created_at"
-trailing_partition_columns=("tenant_id",)   # PARTITION BY RANGE (created_at, tenant_id)
-```
-
-Only the leading column carries the period; the trailing ones are bounded with
-`MINVALUE`. Read the whole key back with `config.partition_columns` and its length
-with `config.key_arity`. See [Composite partition keys](subpartitioning.md#composite-partition-keys)
-for what a nullable trailing column does to row routing.
-
-### `granularity`
-
-Controls which built-in period calculator to use when one is not passed explicitly.
-
-```python
-class PartitionGranularity(StrEnum):
-    HOUR    = "hour"
-    DAY     = "day"
-    WEEK    = "week"
-    MONTH   = "month"
-    QUARTER = "quarter"
-    YEAR    = "year"
-```
-
-See [Period strategies](strategies.md) for details.
-
-### `create_ahead_count`
-
-Number of partitions to ensure exist, counting from the current period inclusive.
-
-| Value | Effect (MONTH granularity, current = 2024-06) |
-|-------|-----------------------------------------------|
-| `1`   | Only `events__2024_06` |
-| `3`   | `events__2024_06`, `events__2024_07`, `events__2024_08` |
-
-### `retention_count`
-
-Number of **most recent** periods to keep attached. Partitions older than this are detached.
-
-```python
-retention_count=12   # keep 12 months; detach everything older
-retention_count=90   # keep 90 days (with DAY granularity)
-```
-
-Detached partitions are tagged with a marker comment and become orphans eligible for dropping.
-
-## Enums reference
-
-```python
-from pg_partsmith import PartitionType, PartitionGranularity, PartitionStrategy
-```
-
-All three enums are `str` subclasses and serialise cleanly to/from JSON.
+At plan time, against the catalog: the parent is partitioned by the root's method on the
+root's key (composite keys compared in key order; mixed-case and expression keys refused),
+and every nested level's key columns appear in every `UNIQUE` / `PRIMARY KEY` constraint —
+PostgreSQL would otherwise reject the first branch mid-run.

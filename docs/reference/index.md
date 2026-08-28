@@ -4,19 +4,16 @@ Auto-generated from source using [mkdocstrings](https://mkdocstrings.github.io/)
 
 ## pg_partsmith
 
-Top-level public API: entities, enums, exceptions, and period calculators.
+Top-level public API: configuration, schemes, boundaries, lifecycle policies, the plan,
+entities, exceptions and period calculators.
 
-### Entities
+### Configuration and entities
 
-::: pg_partsmith.entities.Period
+::: pg_partsmith.entities.TablePartitionConfig
     options:
       heading_level: 4
 
 ::: pg_partsmith.entities.PartitionInfo
-    options:
-      heading_level: 4
-
-::: pg_partsmith.entities.TablePartitionConfig
     options:
       heading_level: 4
 
@@ -28,90 +25,49 @@ Top-level public API: entities, enums, exceptions, and period calculators.
     options:
       heading_level: 4
 
-### Partition topology
-
-Bounds, subpartition specs, and the introspected tree.
-
-`PartitionBounds` is the discriminated union of every bound below
-(`RangeBounds | ListBounds | HashBounds | DefaultBounds`); `SubpartitionBounds`
-is the narrower one a subpartition can be attached with
-(`HashBounds | ListBounds | DefaultBounds`), which excludes RANGE because that
-belongs to the time dimension at the root.
-
-::: pg_partsmith.topology.HashSubpartitionSpec
+::: pg_partsmith.periods.Period
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.ListSubpartitionSpec
+### Partition schemes
+
+::: pg_partsmith.scheme.RangePartitioning
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.ListGroup
+::: pg_partsmith.scheme.HashPartitioning
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.SubpartitionSpecBase
+::: pg_partsmith.scheme.ListPartitioning
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.PartitionNode
+::: pg_partsmith.scheme.ListGroup
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.RangeBounds
+::: pg_partsmith.scheme.SchemeBase
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.HashBounds
+### Boundaries and codecs
+
+::: pg_partsmith.boundaries.TimeBoundaries
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.ListBounds
+::: pg_partsmith.boundaries.NumericBoundaries
     options:
       heading_level: 4
 
-::: pg_partsmith.topology.DefaultBounds
+::: pg_partsmith.boundaries.RangeBoundaries
     options:
       heading_level: 4
 
-::: pg_partsmith.topology
+::: pg_partsmith.boundaries.Window
     options:
       heading_level: 4
-      members:
-        - uniform_modulus
-        - hash_keyspace_covered
-        - missing_remainders
-
-### Subpartition reconciliation
-
-::: pg_partsmith.subpartition_plan.SubpartitionPlan
-    options:
-      heading_level: 4
-
-::: pg_partsmith.subpartition_plan.SubpartitionAction
-    options:
-      heading_level: 4
-
-::: pg_partsmith.subpartition_plan.SubpartitionReconcileResult
-    options:
-      heading_level: 4
-
-::: pg_partsmith.subpartition_plan.TopologyFinding
-    options:
-      heading_level: 4
-
-::: pg_partsmith.subpartition_plan.TopologyReason
-    options:
-      heading_level: 4
-
-::: pg_partsmith.subpartition_plan
-    options:
-      heading_level: 4
-      members:
-        - plan_subpartitions
-        - plan_new_subtree
-
-### Boundary codecs
 
 ::: pg_partsmith.boundaries.RangeBoundaryCodec
     options:
@@ -121,9 +77,91 @@ belongs to the time dimension at the root.
     options:
       heading_level: 4
 
-::: pg_partsmith.protocols.BoundaryDecoder
+::: pg_partsmith.boundaries.EpochBoundaryCodec
     options:
       heading_level: 4
+
+### Lifecycle policies
+
+::: pg_partsmith.lifecycle.LifecyclePolicy
+    options:
+      heading_level: 4
+
+::: pg_partsmith.lifecycle
+    options:
+      heading_level: 4
+      members:
+        - CreateAhead
+        - CreateUntil
+        - CreateNextIf
+        - KeepNewest
+        - KeepFor
+        - KeepBehind
+        - ExpireIf
+        - DetachMode
+        - DropAfter
+        - DropNever
+        - SizeAbove
+        - RowsAbove
+        - WindowAgeAbove
+        - SqlPredicate
+        - Callback
+        - AllOf
+        - AnyOf
+        - Not
+        - Candidate
+
+### The plan
+
+::: pg_partsmith.plan.MaintenancePlan
+    options:
+      heading_level: 4
+
+::: pg_partsmith.plan
+    options:
+      heading_level: 4
+      members:
+        - CreatePartition
+        - AttachPartition
+        - DetachPartition
+        - DropPartition
+        - Finding
+        - FindingReason
+        - Reason
+        - Severity
+        - OperationKind
+        - OperationCapabilities
+        - PartitionBy
+
+::: pg_partsmith.planner
+    options:
+      heading_level: 4
+      members:
+        - plan_maintenance
+        - PlanningContext
+        - PlanMode
+        - fact_targets
+
+### The actual tree
+
+::: pg_partsmith.topology
+    options:
+      heading_level: 4
+      members:
+        - ActualTree
+        - PartitionNode
+        - DetachedPartition
+        - PartitionFacts
+        - FactKind
+        - RelationKind
+        - PartitionType
+        - RangeBounds
+        - HashBounds
+        - ListBounds
+        - DefaultBounds
+        - uniform_modulus
+        - hash_keyspace_covered
+        - missing_remainders
 
 ### Exceptions
 
@@ -141,6 +179,7 @@ belongs to the time dimension at the root.
         - DropRetryExhaustedError
         - UnmanagedPartitionDropError
         - PartitionTopologyError
+        - PlanStaleError
         - UnsupportedCapabilityError
 
 ### Period strategies
@@ -149,39 +188,23 @@ belongs to the time dimension at the root.
     options:
       heading_level: 4
 
-::: pg_partsmith.strategies.hour.HourPeriodCalculator
+::: pg_partsmith.strategies
     options:
       heading_level: 4
-
-::: pg_partsmith.strategies.day.DayPeriodCalculator
-    options:
-      heading_level: 4
-
-::: pg_partsmith.strategies.week.WeekPeriodCalculator
-    options:
-      heading_level: 4
-
-::: pg_partsmith.strategies.month.MonthPeriodCalculator
-    options:
-      heading_level: 4
-
-::: pg_partsmith.strategies.quarter.QuarterPeriodCalculator
-    options:
-      heading_level: 4
-
-::: pg_partsmith.strategies.year.YearPeriodCalculator
-    options:
-      heading_level: 4
-
-::: pg_partsmith.strategies.selector.get_period_calculator
-    options:
-      heading_level: 4
+      members:
+        - HourPeriodCalculator
+        - DayPeriodCalculator
+        - WeekPeriodCalculator
+        - MonthPeriodCalculator
+        - QuarterPeriodCalculator
+        - YearPeriodCalculator
+        - get_period_calculator
 
 ---
 
 ## pg_partsmith.aio
 
-Async implementations: service, maintainer, repositories, lock managers, and hooks.
+Async implementations: service, executor, inspector, repositories, lock managers, and hooks.
 
 ### Service and maintainer
 
@@ -196,11 +219,15 @@ Async implementations: service, maintainer, repositories, lock managers, and hoo
         - run_maintenance
         - run_maintenance_safe
 
-### Protocols
+::: pg_partsmith.aio.services.execution.PlanExecutor
+    options:
+      heading_level: 4
 
-Implement these to swap in your own storage or locking. The flat pair is all a
-single-column, unnested config needs; the rest are opt-in and only required when a
-config actually asks for what they add.
+::: pg_partsmith.aio.services.inspection.PartitionInspector
+    options:
+      heading_level: 4
+
+### Protocols
 
 ::: pg_partsmith.aio.protocols.PartitionRepository
     options:
@@ -210,25 +237,10 @@ config actually asks for what they add.
     options:
       heading_level: 4
 
-::: pg_partsmith.aio.protocols.SubpartitionRepository
-    options:
-      heading_level: 4
-
-::: pg_partsmith.aio.protocols.NestedPartitionMetadata
-    options:
-      heading_level: 4
-
-::: pg_partsmith.aio.protocols.CompositeKeyRepository
-    options:
-      heading_level: 4
-
-::: pg_partsmith.aio.protocols.CompositeKeyMetadata
-    options:
-      heading_level: 4
-
 ::: pg_partsmith.aio.protocols.LockManager
     options:
       heading_level: 4
+
 ### PostgreSQL implementations
 
 ::: pg_partsmith.aio.repositories.repository.PostgresPartitionRepository
@@ -262,8 +274,6 @@ config actually asks for what they add.
 Synchronous mirror of `pg_partsmith.aio`: same class names and API, plain methods
 built on the sync SQLAlchemy `Engine`.
 
-### Service and maintainer
-
 ::: pg_partsmith.sync.service.PartitionLifecycleService
     options:
       heading_level: 4
@@ -275,12 +285,6 @@ built on the sync SQLAlchemy `Engine`.
         - run_maintenance
         - run_maintenance_safe
 
-### Protocols
-
-Implement these to swap in your own storage or locking. The flat pair is all a
-single-column, unnested config needs; the rest are opt-in and only required when a
-config actually asks for what they add.
-
 ::: pg_partsmith.sync.protocols.PartitionRepository
     options:
       heading_level: 4
@@ -289,26 +293,9 @@ config actually asks for what they add.
     options:
       heading_level: 4
 
-::: pg_partsmith.sync.protocols.SubpartitionRepository
-    options:
-      heading_level: 4
-
-::: pg_partsmith.sync.protocols.NestedPartitionMetadata
-    options:
-      heading_level: 4
-
-::: pg_partsmith.sync.protocols.CompositeKeyRepository
-    options:
-      heading_level: 4
-
-::: pg_partsmith.sync.protocols.CompositeKeyMetadata
-    options:
-      heading_level: 4
-
 ::: pg_partsmith.sync.protocols.LockManager
     options:
       heading_level: 4
-### PostgreSQL implementations
 
 ::: pg_partsmith.sync.repositories.repository.PostgresPartitionRepository
     options:
@@ -318,8 +305,6 @@ config actually asks for what they add.
     options:
       heading_level: 4
 
-### Lock managers
-
 ::: pg_partsmith.sync.lock.postgres.PostgresAdvisoryLockManager
     options:
       heading_level: 4
@@ -327,8 +312,6 @@ config actually asks for what they add.
 ::: pg_partsmith.sync.lock.redis.RedisDistributedLockManager
     options:
       heading_level: 4
-
-### Hooks
 
 ::: pg_partsmith.sync.hooks.BasePartitionLifecycleHooks
     options:
@@ -340,8 +323,6 @@ config actually asks for what they add.
 
 Env-driven configuration via [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/).
 Requires the `pydantic-settings` extra: `pip install pg-partsmith[pydantic-settings]`.
-
-### Settings
 
 ::: pg_partsmith.settings.PartitionTableSettings
     options:

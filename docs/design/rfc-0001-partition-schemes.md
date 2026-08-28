@@ -390,11 +390,14 @@ lifecycle=LifecyclePolicy(
 | `subpartition=HashSubpartitionSpec(column=, modulus=, subpartition=)` | `scheme=RangePartitioning(..., child=HashPartitioning(key=, modulus=, child=))` | rename (released 0.5.0 the same day; no known users) |
 | `root_layout=HashSubpartitionSpec(...)` + `HASH_BASED` | `scheme=HashPartitioning(...)` | rename |
 | `PartitionLifecycleService(period_calculator=...)` | calculator lives in `TimeBoundaries(calculator=...)`; the service no longer takes one | move one argument |
-| `PostgresMetadataProvider(boundary_codec=...)` | codec lives in `TimeBoundaries(codec=...)`; the provider reads it from the config | remove one argument |
+| `PostgresMetadataProvider(boundary_codec=...)` | still accepted, needed only by `is_partition_closed`; planning decodes through `TimeBoundaries(codec=...)` | none |
+| `auto_attach_after_create=False` | removed — a partition is always attached last, after its subtree | drop the flag |
 | hooks `before_create(config, partition_name, from_value, to_value)` | `before_create(config, partition: PartitionInfo)` | `partition.name`, `.from_value`, `.to_value` |
 | `plan_subpartitions`, `pruning_rules`, `SubpartitionPlan`, `TopologyReason` | `plan_maintenance`, `MaintenancePlan`, `FindingReason` | new names |
 | `MaintenanceResult` | same counters; gains `plan` | additive |
-| orphan `COMMENT` marker | first line unchanged; a `detached-at` line is added | old orphans are read as "grace unknown → eligible" |
+| orphan `COMMENT` marker | first line unchanged; a `pg-partsmith:detached-at=` line is added | old orphans are read as "grace unknown → eligible" |
+| `reconcile_subpartitions()` | `reconcile()` | rename |
+| `MaintenanceIssueStep` | gains `PLAN`, `ATTACH` | additive |
 
 `PartitionTableSettings` keeps its flat fields and still produces a valid config.
 
@@ -451,7 +454,8 @@ Each phase is one mergeable PR keeping the whole suite green.
   detached-at stamp, `DetachMode`, `PartitionFacts` and `SizeAbove`/`RowsAbove`,
   `SqlPredicate`, `CreateNextIf` / `ExpireIf`.
 - **P2.5 — sliding LIST:** `ListPartitioning(sequence=IntegerSequence(...))` as a
-  progression level.
+  progression level. Not in 1.0.0: the same rotation is available today on an integer
+  RANGE axis (`NumericBoundaries(step=1)` + `CreateNextIf` / `ExpireIf`), see the recipes.
 - **P3 — adoption and migration:** inspection report for an existing tree, batch data
   movement out of a monolithic table, `undo`.
 - **P4 — physical realisation:** partition initializer (tablespace, storage parameters,

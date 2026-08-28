@@ -22,12 +22,10 @@ locks = PostgresAdvisoryLockManager(engine, prefix="myapp")
 
 For multi-process deployments or when you want an external lock store.
 
-**Install:**
 ```bash
 pip install "pg-partsmith[redis-locks]"
 ```
 
-**Usage:**
 ```python
 from redis.asyncio import Redis
 from pg_partsmith.aio import RedisDistributedLockManager
@@ -42,7 +40,7 @@ locks = RedisDistributedLockManager(
 ## Custom lock manager
 
 Implement the `LockManager` protocol to use any other locking backend (Zookeeper,
-etcd, etc.):
+etcd, a lease table):
 
 ```python
 from contextlib import asynccontextmanager
@@ -70,15 +68,26 @@ maintained in parallel without blocking each other.
 
 ## Who takes the lock
 
-Only `maintain_lifecycle` (and the maintainer on top of it) acquires the lock itself.
-The granular service methods — `create_future_partitions`, `ensure_partition`,
-`detach_old_partitions`, `drop_detached_partitions` — do **not**: when orchestrating them
-directly, hold `locks.acquire_lock(table)` around the whole sequence yourself.
+| Call | Lock |
+|---|---|
+| `service.plan()`, `service.inspect()` | none — read-only |
+| `service.apply()` | the table's lock, for the duration of the apply |
+| `service.maintain()` / `maintain_lifecycle()` / the maintainer | one lock around plan **and** apply |
+| `service.reconcile()`, `ensure_partition(s)`, `create_future_partitions`, `detach_old_partitions`, `drop_detached_partitions` | none — hold `locks.acquire_lock(table)` yourself when orchestrating by hand |
 
 Acquisition is non-blocking (`pg_try_advisory_lock` / Redis `SET NX`): a tick that
 collides with another replica raises `LockAcquisitionError` immediately instead of
-queueing. Scheduled jobs typically catch it and skip the tick.
+queueing. Scheduled jobs typically catch it and skip the tick; the plan is recomputed from
+the catalog on the next one, so nothing is lost.
 
 The PostgreSQL manager holds the lock on a dedicated AUTOCOMMIT connection, so it
 survives commits/rollbacks on the caller's session and can safely span
-`DETACH PARTITION CONCURRENTLY`.
+`DETACH PARTITION CONCURRENTLY`, which cannot run inside a transaction block.
+
+## Two maintainers, one table
+
+Two processes running `maintain()` on the same config either serialize (Redis lease
+expiry, retried ticks) or one loses the lock and skips. Without a lock manager that
+actually excludes them, the library still does not corrupt the tree: a partition created by
+the other worker is recognised by its bounds as a lost race, not treated as a conflict, and
+every destructive operation is revalidated against the catalog before it runs.

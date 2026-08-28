@@ -14,8 +14,7 @@ events                                 PARTITION BY RANGE (id)        ← id is 
 
 Three things make it awkward for generic tooling, and all three are covered:
 
-1. the partition key is a **UUIDv7**, not a timestamp, though partitions are still
-   weekly;
+1. the partition key is a **UUIDv7**, not a timestamp, though partitions are still weekly;
 2. each time partition is **itself partitioned** by hash, for tenant distribution and
    query pruning; and
 3. the bucket count has **changed over time**, so history is not uniform.
@@ -24,7 +23,7 @@ Three things make it awkward for generic tooling, and all three are covered:
 
 The root is `RANGE`-partitioned on a UUIDv7. Because a hash dimension is added below it,
 `tenant_id` must appear in the primary key
-(see [Subpartitioning](subpartitioning.md#required-unique-constraints)):
+(see [Partition schemes](partition-schemes.md#required-unique-constraints)):
 
 ```sql
 CREATE TABLE events (
@@ -37,54 +36,45 @@ CREATE TABLE events (
 ```
 
 > **Generating the key.** PostgreSQL gains `uuidv7()` in **18**; there is no built-in
-> UUIDv7 before that, and `uuid-ossp` stops at v5. On 17 and earlier, generate the value
-> in the application — Python's `uuid6` package, or any RFC 9562 implementation — or
-> install a UUIDv7 function of your own and default the column to it. Everything measured
-> on this page was measured against PostgreSQL 17.
+> UUIDv7 before that. On 17 and earlier, generate the value in the application (Python's
+> `uuid6` package, or any RFC 9562 implementation) or install a UUIDv7 function of your own.
 
 ## The configuration
 
 ```python
+from datetime import timedelta
+
 from pg_partsmith import (
-    HashSubpartitionSpec,
-    PartitionGranularity,
-    PartitionStrategy,
-    PartitionType,
-    TablePartitionConfig,
-    WeekPeriodCalculator,
+    CreateAhead, DropAfter, HashPartitioning, KeepNewest, LifecyclePolicy,
+    PartitionGranularity, RangePartitioning, TablePartitionConfig, TimeBoundaries, UUIDv7BoundaryCodec,
 )
 from pg_partsmith.aio import (
-    PartitionLifecycleService,
-    PartitionMaintainer,
-    PostgresAdvisoryLockManager,
-    PostgresMetadataProvider,
-    PostgresPartitionRepository,
+    PartitionLifecycleService, PartitionMaintainer,
+    PostgresAdvisoryLockManager, PostgresMetadataProvider, PostgresPartitionRepository,
 )
-from pg_partsmith.boundaries import UUIDv7BoundaryCodec
 
 config = TablePartitionConfig(
     schema="public",
     table_name="events",
-    partition_type=PartitionType.RANGE,
-    partition_strategy=PartitionStrategy.TIME_BASED,
-    partition_column="id",                       # the UUIDv7 column
-    granularity=PartitionGranularity.WEEK,       # semantic period
-    create_ahead_count=3,
-    retention_count=12,                          # 12 weeks, not 12 leaves
-    subpartition=HashSubpartitionSpec(           # distribution dimension
-        column="tenant_id",
-        modulus=2,
-        name_suffix="_h{remainder}",             # match the existing naming
+    scheme=RangePartitioning(
+        key="id",                                                        # the UUIDv7 column
+        boundaries=TimeBoundaries(
+            granularity=PartitionGranularity.WEEK,                       # semantic period
+            codec="uuidv7",                                              # physical encoding
+        ),
+        child=HashPartitioning(key="tenant_id", modulus=2, name_suffix="_h{remainder}"),
+    ),
+    lifecycle=LifecyclePolicy(
+        creation=CreateAhead(count=3),
+        retention=KeepNewest(count=12),               # 12 weeks, not 12 leaves
+        drop=DropAfter(grace=timedelta(days=7)),      # a week between detach and drop
     ),
 )
 
-codec = UUIDv7BoundaryCodec()                    # physical boundary encoding
-
 service = PartitionLifecycleService(
     repo=PostgresPartitionRepository(engine),
-    metadata=PostgresMetadataProvider(engine, boundary_codec=codec),
+    metadata=PostgresMetadataProvider(engine, boundary_codec=UUIDv7BoundaryCodec()),  # for is_partition_closed
     locks=PostgresAdvisoryLockManager(engine),
-    period_calculator=WeekPeriodCalculator(boundary_codec=codec),
 )
 maintainer = PartitionMaintainer(service)
 
@@ -96,15 +86,14 @@ existence pre-checks, and the retention pruner.
 
 ## Naming and adoption
 
-Existing partitions are almost certainly named by a different convention. Two independent
-questions:
+Two independent questions:
 
 - **Existing partitions** are discovered by reading `pg_catalog`, not by parsing names, so
-  a tree built by another tool is introspected and reconciled as-is. Nothing needs
-  renaming, nothing needs recreating.
-- **New partitions** are named by the period calculator. If your existing names are
-  `events_20260824` rather than pg-partsmith's `events__2026_w35`, subclass the calculator
-  so old and new partitions stay consistent:
+  a tree built by another tool is introspected and reconciled as-is — provided its bounds
+  are windows of the weekly grid (they are: both managers use the minimum UUID of each
+  Monday). Nothing needs renaming, nothing needs recreating.
+- **New partitions** are named by the calendar. If existing names are `events_20260824`
+  rather than `events__2026_w35`, subclass the calculator so old and new stay consistent:
 
   ```python
   import re
@@ -125,9 +114,12 @@ questions:
           monday = date(int(match.group(2)), int(match.group(3)), int(match.group(4)))
           iso_year, iso_week, _ = monday.isocalendar()
           return Period(year=iso_year, week=iso_week)
+
+
+  boundaries = TimeBoundaries(calculator=LegacyNamedWeekCalculator(boundary_codec=UUIDv7BoundaryCodec()))
   ```
 
-  Set `name_suffix="_h{remainder}"` on the spec so buckets match too.
+  and set `name_suffix="_h{remainder}"` on the hash level so buckets match too.
 
 Detached-but-never-dropped tables left by the old manager carry no ownership marker and
 are adopted once with `repo.adopt_partition(...)` — see
@@ -135,11 +127,11 @@ are adopted once with `repo.adopt_partition(...)` — see
 
 ## Backfilling the periods your data already occupies
 
-The events already in the table predate the create-ahead window, so give them partitions
+Events already in the table predate the create-ahead window, so give them partitions
 explicitly before the first scheduled tick:
 
 ```python
-calculator = WeekPeriodCalculator(boundary_codec=codec)
+calculator = config.scheme.time_boundaries.period_calculator
 current = calculator.current_period()
 past = [calculator.period_before(current, n) for n in reversed(range(1, 13))]
 
@@ -147,73 +139,45 @@ await service.ensure_partitions(config, past)
 ```
 
 Idempotent, one catalogue read for the whole batch, and each week is built with its full
-bucket set before being attached. Weeks that already exist — under whatever naming the
-previous manager used — are recognised and skipped rather than duplicated.
+bucket set before being attached.
 
 ## What happens on the first run
 
 Against a database with a non-uniform history, one tick converges everything it safely
-can and reports the rest:
+can and reports the rest — see it first with `print((await service.plan(config)).describe())`:
 
 ```text
-events_20260810   MODULUS 4, complete     → untouched (a preserved older bucket count)
-events_20260817   MODULUS 4, missing h2   → h2 created at MODULUS 4, not 2
-events_20260824   plain leaf, no buckets  → left as a valid legacy leaf
+events_20260810   MODULUS 4, complete     → untouched (modulus_preserved, info)
+events_20260817   MODULUS 4, missing h2   → h2 created at MODULUS 4 (hash_gap_historical_modulus)
+events_20260824   plain leaf, no buckets  → left as a valid legacy leaf (legacy_leaf, info)
 events_20260831   absent                  → created with MODULUS 2 and both buckets
 ```
 
-Only the second and fourth lines involve DDL on the live tree, and none of it rewrites
-data. The third issues none at all: a legacy leaf is left exactly as it is. Re-running the tick is a no-op.
-
-### What reaches `issues`, and what only reaches the log
-
-None of the four lines above appears in `MaintenanceResult.issues`. A preserved older
-modulus and a legacy leaf are *expected steady states* — the run recognised them and
-chose correctly — so they are logged and marked non-actionable. Repairing a branch at its
-own modulus is likewise a success, not a complaint.
-
-What does reach `issues` is a divergence the planner refused to touch and you may want to
-act on: a branch partitioned by the wrong strategy or the wrong column, a LIST value
-another partition already owns, a name it cannot use, a DEFAULT partition holding rows
-that block an attach. Those carry `MaintenanceIssueStep.RECONCILE`.
-
-So `issues` stays a meaningful thing to alert on, with one change from 0.4.0 worth
-knowing: it used to be populated *only* by a step that had failed under
-`continue_on_error`. It can now also carry a reconciliation finding, which is not a
-failure — the run around it succeeded. `MaintenanceResult.success` is unchanged and still
-reports a fatal error and nothing else. To keep alerting only on failures:
-
-```python
-failures = [i for i in result.issues if i.step is not MaintenanceIssueStep.RECONCILE]
-```
+Re-running the tick is a no-op. None of the informational findings reaches
+`MaintenanceResult.issues`; a branch partitioned by the wrong column, a LIST value owned
+elsewhere, or a DEFAULT partition blocking an attach would.
 
 ## Cold storage before drop
 
-Export hooks fire once per **time slice**, not once per bucket — which is what an archival
-pipeline wants:
+Export hooks fire once per **time slice**, not once per bucket:
 
 ```python
 class ColdStorageHooks(BasePartitionLifecycleHooks):
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        # partition_name is "public.events_20260810" — the whole week,
-        # readable as one relation across all of its buckets.
+    async def after_detach(self, table_name: str, partition_name: str) -> None:
+        # "public.events_20260810" — the whole week, readable as one relation across its buckets
         await export_to_object_storage(partition_name)
 ```
 
-To finalize only partitions that can no longer receive rows, check
-`metadata.is_partition_closed(name, settle_seconds=...)`. With a codec configured this
-works on UUIDv7 bounds too.
+With `DropAfter(grace=timedelta(days=7))` the export has a week before the drop; a
+`before_drop` hook that raises defers the drop to a later run.
 
 ## What stays in your application
 
-pg-partsmith manages the partition tree. Query-side concerns remain yours — in
-particular, turning a time filter into a UUIDv7 range so the planner can prune
-partitions. The codec exposes the same encoding the DDL uses, so the two cannot drift:
+Query-side concerns — in particular, turning a time filter into a UUIDv7 range so the
+planner can prune partitions. The codec exposes the same encoding the DDL uses:
 
 ```python
 codec = UUIDv7BoundaryCodec()
-lower = codec.min_uuid_for(window_start)
-upper = codec.min_uuid_for(window_end)
-
-# WHERE id >= :lower AND id < :upper
+lower, upper = codec.min_uuid_for(window_start), codec.min_uuid_for(window_end)
+# WHERE id >= :lower AND id < :upper AND tenant_id = :tenant
 ```

@@ -6,112 +6,98 @@ Set `schema` in `TablePartitionConfig` to make all operations schema-qualified. 
 prevents cross-schema ambiguity and makes behaviour independent of `search_path`.
 
 ```python
-config = TablePartitionConfig(
-    schema="analytics",
-    table_name="events",
-    ...
-)
+config = TablePartitionConfig(schema="analytics", table_name="events", ...)
 ```
 
-When `schema` is set, the library schema-qualifies all catalog queries, DDL statements,
-and lock namespaces.
-
 Set `marker_prefix` consistently across `PostgresPartitionRepository` and
-`PostgresMetadataProvider` when working with multiple schemas or deployments:
+`PostgresMetadataProvider` when working with multiple deployments in one database:
 
 ```python
 repo = PostgresPartitionRepository(engine, marker_prefix="myapp")
 metadata = PostgresMetadataProvider(engine, marker_prefix="myapp")
 ```
 
-## Orphan partitions
+## Orphan partitions and the ownership marker
 
-When a partition is detached, the repository writes a `COMMENT` marker on the detached
-table. Only marker-tagged tables are treated as orphan partitions eligible for dropping.
-This makes retention cleanup safe even if the database contains similarly named tables
-not managed by pg-partsmith.
+When a partition is detached, the repository writes a `COMMENT` on the detached table
+*before* the `DETACH`:
+
+```text
+pg-partsmith:orphan-parent=public.events
+pg-partsmith:detached-at=2026-08-28T10:00:00+00:00
+<any comment the table already carried>
+```
+
+Only marker-tagged tables are ever dropped, which makes cleanup safe even if the database
+contains similarly named tables not managed by pg-partsmith. The instant on the second line
+is what a grace period is measured from; a marker written by an older version, or by
+`repo.adopt_partition(...)`, has none and counts as past its grace.
+
+The marker survives `pg_dump`/restore (comments are dumped by default), so a restored copy
+of a marked table is again eligible for dropping. When repurposing such a table, clear its
+comment (`COMMENT ON TABLE ... IS NULL`) or restore with `--no-comments`.
 
 ## DEFAULT partition reconciliation
 
-When creating a new partition, if the DEFAULT partition contains rows belonging to the
-new partition's range, pg-partsmith automatically:
+When attaching a RANGE partition, if the parent's DEFAULT partition contains rows belonging
+to the new window, pg-partsmith:
 
-1. Detects the conflict (`CheckViolationError 23514`)
-2. Moves conflicting rows from DEFAULT to the new partition
-3. Retries the `ATTACH PARTITION`
+1. detects the conflict (`23514`),
+2. moves the conflicting rows from DEFAULT into the new partition (naming columns on both
+   sides, honouring `IS NOT NULL` on trailing key columns),
+3. retries the `ATTACH PARTITION`.
 
-The reconciliation runs in a single transaction and is logged at `INFO` level.
+If the attach still fails, the rows are returned to DEFAULT (best effort) rather than left in
+a table no query can see. For a nested branch the moved rows are routed onward into its
+leaves by PostgreSQL; a DEFAULT sibling holding rows for a hash or list member is reported
+(`default_holds_rows`) rather than moved, because only a RANGE window can be selected by
+its key.
 
 ## Timezone semantics
 
-By default everything happens in UTC: partition names encode UTC periods, boundaries are
-**UTC period starts**, and pruning compares UTC instants. Three layers are involved, and
-they stay aligned through one knob:
+Three layers stay aligned through one knob:
 
-1. **Period computation** — each calculator works in a timezone (`tz=datetime.UTC` by
-   default): "now" for the current period, and the meaning of naive boundary literals.
-2. **DDL** — for `TIMESTAMP WITH TIME ZONE` partition keys PostgreSQL interprets naive
-   boundary literals (e.g. `'2024-01-01'`) in the session `TimeZone`, so
-   `PostgresPartitionRepository` runs `SET LOCAL TIME ZONE '<ddl_timezone>'` in the same
-   transaction as `ATTACH PARTITION` and DEFAULT reconciliation (`ddl_timezone="UTC"` by
-   default).
-3. **Pruning** — naive boundaries read back from the catalog are interpreted in the
-   calculator's timezone before being compared as UTC instants.
-
-### Local-time partitions
-
-For calendar partitions in a business timezone, pass a `ZoneInfo` to the calculator and
-the **same** zone name to the repository:
+1. **Period computation** — `TimeBoundaries(tz=...)`: "now" for the current period and the
+   meaning of naive boundary literals.
+2. **DDL** — for `TIMESTAMP WITH TIME ZONE` keys PostgreSQL interprets naive literals in
+   the session `TimeZone`, so `PostgresPartitionRepository` runs `SET LOCAL TIME ZONE
+   '<ddl_timezone>'` in the same transaction as `ATTACH PARTITION` and DEFAULT reconciliation
+   (`ddl_timezone="UTC"` by default).
+3. **Planning** — naive boundaries read back from the catalog are interpreted in the
+   calendar's timezone before being compared as UTC instants.
 
 ```python
 from zoneinfo import ZoneInfo
 
-calc = MonthPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))
+config = TablePartitionConfig(..., granularity=PartitionGranularity.MONTH, tz="Europe/Moscow")
 repo = PostgresPartitionRepository(engine, ddl_timezone="Europe/Moscow")
-service = PartitionLifecycleService(repo=repo, ..., period_calculator=calc)
 ```
 
 `events__2024_01` then means January in Moscow time and its real bounds are Moscow
-midnights. Only `datetime.UTC` and keyed `ZoneInfo` objects are accepted — the zone must
-have an IANA name usable in `SET LOCAL TIME ZONE`.
+midnights. The service **refuses a mismatched pair** at plan time. `ddl_timezone=None`
+trusts the session timezone and logs a warning with a non-UTC calendar.
 
-`PartitionLifecycleService` **refuses a mismatched pair**: a calculator in one zone with
-`ddl_timezone` in another raises `ValueError` at construction — the silent failure mode
-where names and real bounds drift apart cannot happen.
-
-### Caveats
-
-- **Hourly granularity is UTC-only.** In a DST zone a local hour can repeat or vanish,
-  making `table__YYYY_MM_DD_HH` names ambiguous; `HourPeriodCalculator` raises for any
-  `tz` other than UTC.
-- **Zones whose midnight can be skipped by DST** (e.g. `America/Santiago`): the naive
-  literal is resolved by PostgreSQL under `SET LOCAL TIME ZONE`, which shifts a
-  non-existent midnight forward — boundaries stay well-defined and contiguous.
-- **`ddl_timezone=None`** trusts the session timezone as-is. In this mode the library
-  cannot guarantee that names and real bounds agree (a pooled connection may carry any
-  `TimeZone`); pruning still interprets naive boundaries in the calculator's zone. The
-  service logs a warning when a non-UTC calculator is combined with it.
-- Existing partitions are not reinterpreted: boundaries stored with explicit offsets
-  (the normal case for `timestamptz` keys) are converted exactly as before.
+Caveats: hourly granularity is UTC-only; zones whose midnight can be skipped by DST are
+resolved by PostgreSQL under `SET LOCAL TIME ZONE`; existing partitions are never
+reinterpreted.
 
 ## Safe drops
 
-`drop_partition()` refuses to drop any table that is not a marker-tagged orphan. This
-prevents accidental drops of tables not managed by pg-partsmith.
+`drop_partition()` refuses any table that is not a marker-tagged orphan
+(`UnmanagedPartitionDropError`), any table that is still attached (`PartitionAttachedError`,
+skipped with a warning by the executor), and any table whose OID differs from the one the
+plan decided about (`PlanStaleError`). The checks run under `ACCESS EXCLUSIVE` in the same
+transaction as `DROP TABLE`, closing the window where a concurrently reattached or replaced
+relation could be dropped. Foreign keys on the partition are dropped first.
 
-To override (not recommended):
+To override the marker check (not recommended):
+
 ```python
 repo = PostgresPartitionRepository(engine, drop_allow_unmanaged=True)
 ```
 
 Legacy tables detached by a previous partitioner are better handled with
-`repo.adopt_partition(table_name, partition_name)` — it stamps the marker once so the
-normal safe path applies, instead of disabling the guard for every future drop. See
-[Migrating an existing partitioner](migration.md).
-
-An attempt to drop an unmanaged table raises `UnmanagedPartitionDropError`.
-Attempting to drop an attached partition raises `PartitionAttachedError` (which
-`PartitionLifecycleService` treats as a warning and skips).
+`repo.adopt_partition(table_name, partition_name)`.
 
 ## Scheduler integration
 
@@ -120,30 +106,44 @@ Attempting to drop an attached partition raises `PartitionAttachedError` (which
 ```python
 from pg_partsmith.aio import maintain_partitions
 
-# APScheduler
-scheduler.add_job(
-    maintain_partitions,
-    "cron",
-    hour=2,
-    kwargs={"maintainer": maintainer, "config": config},
-)
-
-# Celery Beat
-@app.task
-async def run_partition_maintenance():
-    await maintain_partitions(maintainer=maintainer, config=config)
+scheduler.add_job(maintain_partitions, "cron", hour=2, kwargs={"maintainer": maintainer, "config": config})
 ```
 
-`maintain_partitions` always returns `MaintenanceResult` — it never raises, including
-on `asyncio.CancelledError`.
+It always returns `MaintenanceResult` — it never raises, including on
+`asyncio.CancelledError`. Run it as often as you like: a converged table costs one catalog
+read and zero DDL. pg-partsmith is not a scheduler; cron, Celery, APScheduler, a Kubernetes
+CronJob or an application start-up hook are all fine, and replicas that lose the lock skip
+the tick (`LockAcquisitionError`).
 
 ## Cancellation semantics
 
 | Method | On exception |
 |--------|-------------|
-| `PartitionMaintainer.run_maintenance()` | Logs and re-raises (including `CancelledError`) |
-| `PartitionMaintainer.run_maintenance_safe()` | Always returns `MaintenanceResult`; cancellation reported via `result.error` |
-| `maintain_partitions()` | Same as `run_maintenance_safe()` |
+| `PartitionMaintainer.run_maintenance()` | logs and re-raises (including `CancelledError`) |
+| `PartitionMaintainer.run_maintenance_safe()` | always returns `MaintenanceResult`; cancellation reported via `result.error` |
+| `maintain_partitions()` | same as `run_maintenance_safe()` |
 
-Use `run_maintenance_safe()` / `maintain_partitions()` in schedulers; use
-`run_maintenance()` when you want to propagate exceptions to the caller.
+A cancellation that lands mid-run leaves at most a detached, unattached table (attach is
+last) or a marked, half-detached partition; the next run converges both.
+
+## Query pruning
+
+A good partition lifecycle does not make queries fast by itself. PostgreSQL prunes
+partitions only when the query constrains the **partition key** of every level it should
+skip:
+
+```sql
+WHERE created_at >= '2026-08-01' AND created_at < '2026-09-01'   -- prunes RANGE(created_at)
+  AND tenant_id = 42                                             -- prunes HASH(tenant_id)
+```
+
+For an encoded key (UUIDv7), translate the time filter with the codec:
+`WHERE id >= :lower AND id < :upper` with `UUIDv7BoundaryCodec().min_uuid_for(...)`.
+That is an application concern; pg-partsmith never rewrites queries.
+
+## Foreign partitions
+
+A `pg_partition_tree` may contain foreign tables (`pg_clickhouse`, `postgres_fdw`). They are
+introspected with `relkind == RelationKind.FOREIGN`, reported as `foreign_partition`, and
+never created, detached or dropped by the library — `DROP TABLE` cannot even remove one.
+Creating foreign leaves is a planned extension point, not a 1.0 feature.

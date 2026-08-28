@@ -80,10 +80,17 @@ make test-integration
 
 ## Keeping aio and sync in sync
 
-`pg_partsmith/sync` is a hand-maintained mirror of `pg_partsmith/aio` (same files, same
-class names, plain methods instead of coroutines). Any behavioural change to one package
-must be applied to the other, along with the mirrored tests in `tests/unit/sync/` and
-`tests/integration/sync/`.
+`pg_partsmith/sync` is a mirror of `pg_partsmith/aio` (same files, same class names, plain
+methods instead of coroutines, server-side statement timeouts instead of `asyncio.timeout`).
+Edit the aio package, then regenerate the mirror and review the diff:
+
+```bash
+uv run python scripts/sync_mirror.py
+uv run ruff check --fix pg_partsmith/sync && uv run ruff format pg_partsmith/sync
+```
+
+The lock managers, `maintainer.py`, `repositories/{resolver,fk_manager,timeouts}.py` are
+maintained by hand. Mirror the tests too: `tests/unit/sync/` and `tests/integration/sync/`.
 
 ## Releasing (maintainers only)
 

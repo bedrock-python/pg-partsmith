@@ -1,6 +1,6 @@
 [project]
 site_name = "pg-partsmith"
-site_description = "PostgreSQL partition lifecycle management with extensible hooks"
+site_description = "PostgreSQL partition lifecycle management with a plan you can read before it runs"
 site_author = "Alex Shalaev"
 repo_name = "bedrock-python/pg-partsmith"
 repo_url = "https://github.com/bedrock-python/pg-partsmith"
@@ -14,14 +14,23 @@ nav = [
     { "Guide" = [
         { "Quick start" = "guide/quickstart.md" },
         { "Configuration" = "guide/configuration.md" },
+        { "Partition schemes" = "guide/partition-schemes.md" },
+        { "Boundaries and codecs" = "guide/boundary-codecs.md" },
+        { "Lifecycle policies" = "guide/lifecycle-policies.md" },
+        { "Planning and dry runs" = "guide/planning.md" },
         { "Period strategies" = "guide/strategies.md" },
-        { "Subpartitioning" = "guide/subpartitioning.md" },
-        { "Boundary codecs" = "guide/boundary-codecs.md" },
         { "Lifecycle hooks" = "guide/hooks.md" },
         { "Lock managers" = "guide/locks.md" },
         { "Advanced" = "guide/advanced.md" },
+        { "Recipes" = "guide/recipes.md" },
         { "Migrating an existing partitioner" = "guide/migration.md" },
         { "Example: an event store with TIME -> HASH" = "guide/nested-migration.md" },
+    ] },
+    { "Design" = [
+        { "RFC 0001: partition schemes" = "design/rfc-0001-partition-schemes.md" },
+        { "OSS research" = "design/oss-research.md" },
+        { "PostgreSQL semantics" = "design/postgresql-semantics.md" },
+        { "1.0 API cheat sheet" = "design/api-cheatsheet-1.0.md" },
     ] },
     { "API Reference" = "reference/index.md" },
     { "Changelog" = "changelog.md" },
