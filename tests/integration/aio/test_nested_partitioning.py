@@ -25,18 +25,23 @@ from pg_partsmith.entities import MaintenanceIssueStep, PartitionType, Period, T
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.strategies import WeekPeriodCalculator
 from pg_partsmith.subpartition_plan import TopologyReason
+from pg_partsmith.topology import ListBounds
 from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
     COMPOSITE_TABLE_DDL,
+    EXPRESSION_TABLE_DDL,
     FROZEN_WEEK,
     HASH_ROOT_TABLE_DDL,
     IDENTITY_TABLE_DDL,
     LIST_ROOT_TABLE_DDL,
     LIST_TABLE_DDL,
     NEXT_WEEK_SUFFIX,
+    NULLABLE_COMPOSITE_TABLE_DDL,
+    NULLABLE_LIST_TABLE_DDL,
     PREVIOUS_WEEK_BOUNDS,
     PREVIOUS_WEEK_SUFFIX,
     RELKIND_SQL,
+    SORTABLE_ID_TABLE_DDL,
     TIMESTAMP_TABLE_DDL,
     TWO_LEVEL_TABLE_DDL,
     UNCONSTRAINED_TABLE_DDL,
@@ -53,6 +58,7 @@ from tests.integration.nested_support import (
     list_config,
     list_root_config,
     nested_config,
+    nullable_composite_config,
     uuid7_codec,
 )
 
@@ -127,6 +133,30 @@ async def list_root_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
 @pytest_asyncio.fixture
 async def composite_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
     async for name in _make_table(db_engine, COMPOSITE_TABLE_DDL):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def nullable_composite_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, NULLABLE_COMPOSITE_TABLE_DDL):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def expression_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, EXPRESSION_TABLE_DDL):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def sortable_id_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, SORTABLE_ID_TABLE_DDL):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def nullable_list_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, NULLABLE_LIST_TABLE_DDL):
         yield name
 
 
@@ -1670,3 +1700,108 @@ async def test__composite_key__config_disagreeing_with_the_table__refused(
     # Act / Assert
     with freezegun.freeze_time(FROZEN_WEEK), pytest.raises(InvalidPartitionConfigError, match="key mismatch"):
         await _maintainer(db_engine).run_maintenance(config)
+
+
+# ── Keys and bounds the catalog spells differently from the config ──────────────
+
+
+async def test__nullable_trailing_key__null_row_in_default__attach_still_succeeds(
+    db_engine: AsyncEngine, nullable_composite_table: str
+) -> None:
+    # Arrange: a DEFAULT partition holding one row that belongs to the upcoming
+    # week and one whose NULL tenant keeps it in DEFAULT whatever its week.
+    async with db_engine.begin() as conn:
+        await conn.execute(
+            text(f'CREATE TABLE "{nullable_composite_table}_default" PARTITION OF "{nullable_composite_table}" DEFAULT')
+        )
+        await conn.execute(
+            text(f'INSERT INTO "{nullable_composite_table}" (tenant_id, created_at) VALUES (7, :d), (NULL, :d)'),  # noqa: S608
+            {"d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
+        )
+
+    # Act
+    result = await _run(db_engine, nullable_composite_config(nullable_composite_table))
+
+    # Assert: moving the NULL row out would be rejected with the very error the
+    # move exists to clear, and the retry would never converge.
+    assert result.success
+    assert await _relkind(db_engine, f"{nullable_composite_table}{WEEK_SUFFIX}") == "r"
+
+    async with db_engine.begin() as conn:
+        rows = await conn.execute(
+            text(
+                f'SELECT tableoid::regclass::text, tenant_id FROM "{nullable_composite_table}" '  # noqa: S608
+                f"ORDER BY tenant_id NULLS LAST"
+            )
+        )
+        placed = [(str(r[0]), r[1]) for r in rows.fetchall()]
+
+    assert placed == [
+        (f"{nullable_composite_table}{WEEK_SUFFIX}", 7),
+        (f"{nullable_composite_table}_default", None),
+    ]
+
+
+async def test__expression_partition_key__is_refused_rather_than_silently_shortened(
+    db_engine: AsyncEngine, expression_table: str
+) -> None:
+    # Arrange
+    metadata = PostgresMetadataProvider(db_engine)
+
+    # Act / Assert: an expression key is recorded as attnum 0, and dropping that
+    # position would report a shorter key than the table really has.
+    with pytest.raises(InvalidPartitionConfigError, match="expression"):
+        await metadata.get_partition_columns(expression_table)
+
+
+async def test__date_shaped_bound_that_is_not_a_date__reports_not_closed(
+    db_engine: AsyncEngine, sortable_id_table: str
+) -> None:
+    # Arrange: a sortable identifier whose prefix gets past any regex guard
+    # worth writing and still fails the cast.
+    partition = f"{sortable_id_table}__early"
+    async with db_engine.begin() as conn:
+        await conn.execute(
+            text(
+                f'CREATE TABLE "{partition}" PARTITION OF "{sortable_id_table}" '
+                f"FOR VALUES FROM ('2020-01-01-aaaa') TO ('2026-08-28-a1b2c3')"
+            )
+        )
+    metadata = PostgresMetadataProvider(db_engine)
+
+    # Act
+    closed = await metadata.is_partition_closed(partition)
+
+    # Assert: "not closed" is the documented answer for a bound this provider
+    # cannot read. Raising out of a predicate is not.
+    assert closed is False
+
+
+async def test__list_partition_holding_null__is_not_read_as_the_string_null(
+    db_engine: AsyncEngine, nullable_list_table: str
+) -> None:
+    # Arrange
+    async with db_engine.begin() as conn:
+        await conn.execute(
+            text(
+                f'CREATE TABLE "{nullable_list_table}__unknown" '
+                f'PARTITION OF "{nullable_list_table}" FOR VALUES IN (NULL)'
+            )
+        )
+        await conn.execute(
+            text(
+                f'CREATE TABLE "{nullable_list_table}__literal" '
+                f"""PARTITION OF "{nullable_list_table}" FOR VALUES IN ('NULL')"""
+            )
+        )
+    metadata = PostgresMetadataProvider(db_engine)
+
+    # Act
+    tree = await metadata.get_partition_tree(nullable_list_table)
+
+    # Assert: reading NULL as the three-character string would make the planner
+    # propose a partition PostgreSQL already has, on every run.
+    assert tree is not None
+    by_name = {c.name: c.bounds for c in tree.children}
+    assert by_name[f"public.{nullable_list_table}__unknown"] == ListBounds(values=(), includes_null=True)
+    assert by_name[f"public.{nullable_list_table}__literal"] == ListBounds(values=("NULL",))

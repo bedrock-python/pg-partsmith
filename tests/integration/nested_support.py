@@ -147,6 +147,45 @@ COMPOSITE_TABLE_DDL = """
 """
 
 
+# The same composite key with a *nullable* trailing column. PostgreSQL adds an
+# IS NOT NULL test for every key column to a range partition's constraint, so a
+# row with a NULL tenant belongs in DEFAULT whatever its timestamp says. No
+# primary key here: one would have to include tenant_id, which would make it
+# NOT NULL and remove the very case under test.
+NULLABLE_COMPOSITE_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        tenant_id BIGINT,
+        created_at TIMESTAMPTZ NOT NULL
+    ) PARTITION BY RANGE (created_at, tenant_id)
+"""
+
+# A root keyed on an expression rather than a column. Nothing this library does
+# can address it: it builds bounds out of column values.
+EXPRESSION_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        created_at TIMESTAMPTZ NOT NULL
+    ) PARTITION BY RANGE ((created_at AT TIME ZONE 'UTC'))
+"""
+
+# A text-keyed root whose bounds look like dates without being them.
+SORTABLE_ID_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id TEXT NOT NULL,
+        payload TEXT
+    ) PARTITION BY RANGE (id)
+"""
+
+# A LIST root whose key accepts NULL, so a partition can be declared for it.
+NULLABLE_LIST_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        region TEXT
+    ) PARTITION BY LIST (region)
+"""
+
+
 def nested_config(
     table_name: str,
     *,
@@ -243,6 +282,25 @@ def composite_config(
     retention: int = 12,
 ) -> TablePartitionConfig:
     """Build a weekly configuration over a composite RANGE key."""
+    return TablePartitionConfig(
+        table_name=table_name,
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        trailing_partition_columns=("tenant_id",),
+        granularity=PartitionGranularity.WEEK,
+        create_ahead_count=create_ahead,
+        retention_count=retention,
+    )
+
+
+def nullable_composite_config(
+    table_name: str,
+    *,
+    create_ahead: int = 1,
+    retention: int = 12,
+) -> TablePartitionConfig:
+    """Build a weekly configuration over a composite key whose tail is nullable."""
     return TablePartitionConfig(
         table_name=table_name,
         partition_type=PartitionType.RANGE,
