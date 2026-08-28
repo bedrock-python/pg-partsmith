@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, date, datetime
 
 import pytest
@@ -939,3 +940,63 @@ def test__parse_partition_bounds__doubled_quote_inside_a_value__preserved() -> N
 def test__parse_partition_bounds__hash_bounds_with_an_unreadable_number__returns_none() -> None:
     # Arrange / Act / Assert
     assert parse_partition_bounds("FOR VALUES WITH (modulus x, remainder y)") is None
+
+
+# ── Serialization compatibility ─────────────────────────────────────────────────
+
+
+def test__config__dump__still_carries_partition_column() -> None:
+    # Arrange
+    config = _config()
+
+    # Act
+    dumped = config.model_dump()
+
+    # Assert: a consumer written against the pre-composite shape still finds it.
+    assert dumped["partition_column"] == "created_at"
+    assert dumped["partition_columns"] == ("created_at",)
+
+
+def test__config__dump__round_trips() -> None:
+    # Arrange
+    config = _config()
+
+    # Act / Assert: the dump carries both spellings, and reading it back is a no-op.
+    assert TablePartitionConfig(**config.model_dump()) == config
+
+
+def test__config__json_dump__round_trips() -> None:
+    # Arrange
+    config = _config()
+
+    # Act / Assert
+    assert TablePartitionConfig(**json.loads(config.model_dump_json())) == config
+
+
+def test__config__composite_dump__round_trips_without_collapsing_the_key() -> None:
+    # Arrange: the dump names both the whole key and its leading column.
+    config = _config(partition_columns=("created_at", "tenant_id"))
+
+    # Act
+    restored = TablePartitionConfig(**config.model_dump())
+
+    # Assert: the explicit key wins over the derived single column.
+    assert restored.partition_columns == ("created_at", "tenant_id")
+
+
+def test__config__dump_from_before_composite_keys__still_parses() -> None:
+    # Arrange: exactly what 0.4.0 would have written.
+    legacy = {
+        "schema_name": None,
+        "table_name": "events",
+        "partition_type": "range",
+        "partition_strategy": "time_based",
+        "partition_column": "created_at",
+        "granularity": "month",
+        "create_ahead_count": 6,
+        "retention_count": 12,
+        "auto_attach_after_create": True,
+    }
+
+    # Act / Assert
+    assert TablePartitionConfig(**legacy).partition_columns == ("created_at",)

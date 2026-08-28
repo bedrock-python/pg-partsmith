@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from .constants import (
     DEFAULT_CREATE_AHEAD_COUNT,
@@ -658,12 +658,19 @@ class TablePartitionConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def accept_single_partition_column(cls, data: object) -> object:
-        """Accept ``partition_column="x"`` as the one-column spelling."""
-        if isinstance(data, dict) and "partition_column" in data and "partition_columns" not in data:
-            data = {**data, "partition_columns": (data["partition_column"],)}
-            data.pop("partition_column")
+        """Accept ``partition_column="x"`` as the one-column spelling.
+
+        ``partition_column`` is also serialized, so a round-tripped dump carries
+        both spellings; the explicit key wins and the derived one is dropped
+        rather than being rejected as an unknown field.
+        """
+        if isinstance(data, dict) and "partition_column" in data:
+            data = dict(data)
+            single = data.pop("partition_column")
+            data.setdefault("partition_columns", (single,))
         return data
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def partition_column(self) -> str:
         """The leading partition key column.
@@ -672,6 +679,10 @@ class TablePartitionConfig(BaseModel):
         meaningful under a composite key: trailing columns are bounded with
         MINVALUE at both ends, so the partition holds exactly the rows whose
         leading column falls in the range.
+
+        Serialized alongside :attr:`partition_columns` rather than replaced by
+        it: a config persisted before composite keys existed reads this key
+        back, and a dump taken now still carries it.
         """
         return self.partition_columns[0]
 
