@@ -109,6 +109,8 @@ A codec turns period instants into the literals of an encoded key and back. Two 
 ```python
 from datetime import UTC, datetime
 
+from pg_partsmith import PartitionGranularity, TimeBoundaries
+
 
 class SnowflakeBoundaryCodec:
     EPOCH_MS = 1_288_834_974_657          # Twitter epoch

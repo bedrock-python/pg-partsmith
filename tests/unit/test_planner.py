@@ -1643,20 +1643,37 @@ def test__plan_maintenance__foreign_group_under_a_nested_level__reported_not_pla
     assert "cannot hold HASH (tenant_id) partitions" in plan.findings[0].detail
 
 
-def test__plan_maintenance__detach_pending_child__reported_and_excluded() -> None:
-    # Arrange
+def test__plan_maintenance__detach_pending_child__finalized_and_reported() -> None:
+    # Arrange: an interrupted DETACH CONCURRENTLY left April half-detached
     config = _config(lifecycle=_policy(retention=KeepNewest(count=1)))
     root = _root(_month(2026, 4, oid=4, detach_pending=True), _month(2026, 8, oid=8))
 
     # Act
     plan = _plan(config, root)
 
+    # Assert -- the detach is completed; nothing else is planned for the window
+    assert [op.target for op in plan.detaches] == [f"{ROOT}__2026_04"]
+    assert plan.detaches[0].reason is Reason.DETACH_FINALIZE
+    assert plan.detaches[0].oid == 4
+    assert plan.creates == ()
+    assert plan.drops == ()
+    assert _reasons(plan) == [FindingReason.DETACH_PENDING]
+    assert plan.findings[0].severity is Severity.INFO
+    assert plan.findings[0].partition_name == f"{ROOT}__2026_04"
+    assert "completed with FINALIZE" in plan.findings[0].detail
+
+
+def test__plan_maintenance__detach_pending_child__not_finalized_outside_maintain_mode() -> None:
+    # Arrange
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=1)))
+    root = _root(_month(2026, 4, oid=4, detach_pending=True), _month(2026, 8, oid=8))
+
+    # Act
+    plan = _plan(config, root, context=_context(mode=PlanMode.RECONCILE))
+
     # Assert
     assert plan.is_noop
     assert _reasons(plan) == [FindingReason.DETACH_PENDING]
-    assert plan.findings[0].is_actionable
-    assert plan.findings[0].partition_name == f"{ROOT}__2026_04"
-    assert "DETACH PARTITION ... FINALIZE" in plan.findings[0].detail
 
 
 def test__plan_maintenance__default_partition__ignored_for_windows() -> None:

@@ -44,7 +44,6 @@ from .exceptions import (
     PartitionTopologyError,
     PlanStaleError,
     UnmanagedPartitionDropError,
-    UnsupportedCapabilityError,
 )
 from .leaves import ForeignLeaves, LeafBackend, LocalLeaves
 from .lifecycle import (
@@ -212,7 +211,6 @@ __all__ = [
     "UUIDv7BoundaryCodec",
     "UnmanagedPartitionDropError",
     "Unreferenced",
-    "UnsupportedCapabilityError",
     "WeekPeriodCalculator",
     "Window",
     "WindowAgeAbove",

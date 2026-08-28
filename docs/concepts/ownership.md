@@ -19,7 +19,7 @@ is **unmanaged**: inspected, reported, never touched.
 | cannot be read on the level's axis | `unreadable_bound` (WARNING) | never prune — guessing risks dropping live data |
 | own several values, a non-integer value or `NULL`, on a sliding list | `unmanaged_partition` (INFO) | inspect and report only |
 | belong to a foreign table, under a `LocalLeaves` configuration | `foreign_partition` (INFO) | nothing — it is someone else's; under `ForeignLeaves` a foreign partition is managed like any other |
-| are pending an interrupted `DETACH CONCURRENTLY` | `detach_pending` (WARNING) | nothing until `DETACH … FINALIZE` |
+| are pending an interrupted `DETACH CONCURRENTLY` | `detach_pending` (INFO) | complete the detach with `FINALIZE`; the drop follows the policy |
 
 Alignment is the safe generalisation of "did we create it". A partition whose bounds are
 exactly the window the scheme would have produced is indistinguishable from ours and is
@@ -33,7 +33,9 @@ Names play no part. Existing partitions are matched to windows by
 ## Detached tables: the marker
 
 A partition that is detached stays in the database. What makes it the library's to drop
-is a `COMMENT` written on it **before** the detach, in the same transaction:
+is a `COMMENT` written on it **before** the detach — in the same transaction for the
+blocking form; committed just ahead of it for `CONCURRENTLY`, which cannot run inside a
+transaction block:
 
 ```text
 pg-partsmith:orphan-parent=public.events
@@ -82,8 +84,8 @@ A plan is made from a snapshot; the database moves on. Before a detach or a drop
 the executor checks that the relation is still the one the plan decided about:
 
 - its **OID** is the one the plan saw — a table dropped and recreated under the same
-  name between plan and apply has another OID and is left alone (`PlanStaleError`,
-  recorded as an issue);
+  name between plan and apply has another OID and is left alone (`PlanStaleError`:
+  raised, or recorded as an issue under `continue_on_error`);
 - for a detach, it is **still attached** to that parent;
 - for a drop, it is **not attached** to anything and **still carries the marker**.
 

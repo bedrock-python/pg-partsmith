@@ -593,13 +593,14 @@ def test__plan__foreign_single_value_partition__satisfies_its_value_but_is_never
     assert _reasons(plan) == [FindingReason.FOREIGN_PARTITION]
 
 
-def test__plan__pending_detach__reported_and_skipped() -> None:
+def test__plan__pending_detach__finalized_and_reported() -> None:
     pending = _value(100, detach_pending=True)
 
     plan = _plan(_config(), _root(pending, _value(101, rows=1)))
 
     assert _reasons(plan) == [FindingReason.DETACH_PENDING]
-    assert plan.is_noop
+    assert [op.reason for op in plan.detaches] == [Reason.DETACH_FINALIZE]
+    assert plan.creates == ()
 
 
 def test__plan__root_partitioned_otherwise__strategy_mismatch() -> None:

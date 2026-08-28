@@ -244,8 +244,10 @@ stay with the core, which is what keeps a user predicate from turning into an ac
 
 ### 4.5 Actual tree and ownership
 
-`PostgresMetadataProvider.get_actual_tree(table)` returns the tree from `pg_partition_tree`
-plus the marker-tagged detached orphans, in one round-trip. Every node carries its
+`PostgresMetadataProvider.get_actual_tree(table)` returns the tree from a recursive walk
+over `pg_inherits` (`pg_partition_tree` omits a partition whose `DETACH CONCURRENTLY` was
+interrupted, and locks every member) plus the marker-tagged detached orphans, in one
+round-trip. Every node carries its
 `oid`, `relkind` (table / partitioned / foreign), bounds parsed into the discriminated
 union, its own partition key, and — on demand — `PartitionFacts`.
 

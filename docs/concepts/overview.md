@@ -7,7 +7,7 @@ documentation uses.
 
 ```text
         config                          catalog
-   scheme + policy                pg_partition_tree + markers
+   scheme + policy                pg_inherits + markers
           │                                │
           ▼                                ▼
    TablePartitionConfig               ActualTree

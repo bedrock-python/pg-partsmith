@@ -37,7 +37,8 @@ detaches, then drops. Every operation records:
 
 - its **reason** — why it is in the plan: `create_ahead`, `create_until`, `create_next`,
   `explicit`, `subtree`, `hash_gap`, `hash_gap_historical_modulus`, `list_group_missing`,
-  `list_default_missing`, `reattach`, `retention_expired`, `follows_detach`, `grace_elapsed`;
+  `list_default_missing`, `reattach`, `retention_expired`, `detach_finalize`,
+  `follows_detach`, `grace_elapsed`;
 - a human **detail** (`"2026_08 under 'create 3 ahead'"`);
 - the relation's **OID** when it exists — what a destructive operation is revalidated
   against at execution time;
@@ -121,7 +122,7 @@ What the planner does with each state it can meet, in one table:
 | a partition whose bounds are not on the grid | leave it (`unmanaged_partition`, INFO); a wanted window it overlaps is `range_overlap` (WARNING) and not created |
 | a partition with an unreadable or open-ended bound | leave it, never prune it |
 | a foreign partition under a local-leaves configuration | leave it (`foreign_partition`, INFO) |
-| a partition pending an interrupted `DETACH CONCURRENTLY` | leave it (`detach_pending`, WARNING) until `FINALIZE` |
+| a partition pending an interrupted `DETACH CONCURRENTLY` | complete the detach with `FINALIZE` (`detach_finalize`); report it (`detach_pending`, INFO) |
 | a wanted name held by a relation with other bounds, or over 63 bytes | report (`name_unusable`) |
 
 A converged tree produces no operation at all, so a tick against it costs one catalog

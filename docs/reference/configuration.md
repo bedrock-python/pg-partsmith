@@ -10,7 +10,7 @@ Types are the accepted inputs; defaults are what you get when the field is omitt
 | `schema` | `str` | `None` | Schema of the parent table; read back as `db_schema`. Recommended. |
 | `table_name` | `str` | required | The parent table, lowercase, at most 63 bytes minus the scheme's longest suffix. |
 | `scheme` | `RangePartitioning \| ListPartitioning \| HashPartitioning` | from the flat fields | The root level and everything below it. |
-| `lifecycle` | `LifecyclePolicy` | `CreateAhead(6)`, `KeepNewest(12)`, `DetachMode.AUTO`, `DropAfter()` | When partitions of the progression level are created, detached and dropped. |
+| `lifecycle` | `LifecyclePolicy` | `CreateAhead(count=6)`, `KeepNewest(count=12)`, `DetachMode.AUTO`, `DropAfter()` | When partitions of the progression level are created, detached and dropped. |
 | `leaves` | `LocalLeaves \| ForeignLeaves` | `LocalLeaves()` | What kind of relation the leaves are. |
 
 Flat fields, accepted instead of `scheme` / `lifecycle` for a time-partitioned RANGE root:
@@ -145,7 +145,7 @@ drop_max_retries=3, drop_retry_delay=0.5, drop_max_backoff=300)`.
 ddl_timezone=None)`.
 
 `PostgresAdvisoryLockManager(engine, prefix="partitioner", acquire_min_interval_seconds=0)`;
-`RedisDistributedLockManager(redis_client, prefix="partitioner", ttl_seconds=300,
+`RedisDistributedLockManager(redis_client, prefix="partitioner:lock", ttl_seconds=300,
 acquire_min_interval_seconds=0)`.
 
 ## Serialization

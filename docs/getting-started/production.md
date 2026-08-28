@@ -142,7 +142,7 @@ Three fields carry the signal.
 the table, the lock, a connection error. Alert on it.
 
 **`result.issues`** are per-partition problems in a run that otherwise went through.
-Each has a `step` (`plan`, `create`, `reconcile`, `attach`, `detach`, `drop`, `move`), the
+Each has a `step` (`create`, `reconcile`, `attach`, `detach`, `drop`, `move`), the
 `partition_name`, and an `error` string. Two kinds land here:
 
 - what the planner *refused* to do and thinks you should know about — a wanted window

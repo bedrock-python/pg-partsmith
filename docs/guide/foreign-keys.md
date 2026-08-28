@@ -56,11 +56,11 @@ the issue repeats every tick until the referencing rows are gone. Safe, but nois
 the calendar rules:
 
 ```python
-from pg_partsmith import AllOf, ExpireIf, KeepNewest, LifecyclePolicy, Unreferenced
+from pg_partsmith import AllOf, CreateAhead, ExpireIf, KeepNewest, LifecyclePolicy, Unreferenced
 
 lifecycle = LifecyclePolicy(
     creation=CreateAhead(count=1),
-    retention=ExpireIf(AllOf((KeepNewest(count=12), Unreferenced()))),
+    retention=ExpireIf(when=AllOf(members=(KeepNewest(count=12), Unreferenced()))),
 )
 ```
 

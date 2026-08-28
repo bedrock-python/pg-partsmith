@@ -110,7 +110,7 @@ plan for public.events at 2026-08-28T10:00:00+00:00
 
 Three creations, each tagged with the *reason* it is in the plan: `create_ahead`, because
 the policy asked for three months starting with the current one. The plan is a plain
-Pydantic model — `plan.operations` is the typed list, `plan.model_dump(mode="json")` is
+Pydantic model — `plan.operations` is the typed sequence, `plan.model_dump(mode="json")` is
 what you would put in a log or hand to a dashboard:
 
 ```json

@@ -162,7 +162,7 @@ LIST key is one column, every level partitions on a fresh column, a sliding list
 
 ```text
 table_name 'a_very_long_table_name_for_an_events_store_that_goes_on_and_on' is too long for
-this scheme: table_name (58) + the longest generated suffix (15) = 73 > 63 bytes. PostgreSQL
+this scheme: table_name (62) + the longest generated suffix (9) = 71 > 63 bytes. PostgreSQL
 truncates identifiers silently, which would collapse two partitions onto one name.
 ```
 
@@ -171,4 +171,5 @@ method on the root's key (composite keys compared in key order; mixed-case and e
 keys refused); the calendar's timezone and the repository's `ddl_timezone` agree; every
 nested level's key columns appear in every `UNIQUE` / `PRIMARY KEY` constraint; foreign
 leaves are not asked of a parent with a unique index. Each failure is an
-`InvalidPartitionConfigError` naming the fix, raised before any DDL.
+`InvalidPartitionConfigError` naming the fix — the timezone mismatch a `ValueError` —
+raised before any DDL.

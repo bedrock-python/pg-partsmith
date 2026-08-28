@@ -37,9 +37,10 @@ A monthly partition is **not on a weekly grid** — it spans several weeks — s
 created (`range_overlap`, WARNING) until the month ends. The weekly lifecycle starts with
 the first week that lies entirely after the last monthly partition.
 
-The other direction works better: a weekly partition lies *inside* a monthly cell, so
-under a monthly configuration it stays managed and retention retires it by its own upper
-bound. The first tick under the new configuration creates monthly partitions from the
+The other direction works better: a week that lies wholly *inside* a month is inside a
+cell of the monthly grid, so under a monthly configuration it stays managed and retention
+retires it by its own upper bound (a week straddling two months is unmanaged, like any
+partition that crosses a cell boundary). The first tick under the new configuration creates monthly partitions from the
 current month onward; weeks already created ahead overlap the current month and are
 reported until they are behind the cursor.
 

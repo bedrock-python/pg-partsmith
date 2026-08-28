@@ -19,7 +19,7 @@ result = await maintainer.run_maintenance_safe(config)
 
 ## Issues
 
-An issue has a `step` — `plan`, `create`, `reconcile`, `attach`, `detach`, `drop`, `move` —
+An issue has a `step` — `create`, `reconcile`, `attach`, `detach`, `drop`, `move` —
 a `partition_name` and an `error` string that starts with the exception type:
 
 ```text

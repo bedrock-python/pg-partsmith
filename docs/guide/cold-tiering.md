@@ -58,9 +58,10 @@ shape; `postgres_fdw` to an archive database works the same way.
   otherwise, and so does the service, before any DDL:
 
 ```text
-InvalidPartitionConfigError: Table 'public.events' has unique constraint(s) (id, created_at),
-and PostgreSQL refuses a foreign table as a partition of a table with a unique index or
-primary key. Use local leaves, or drop the constraint before enabling foreign leaves.
+InvalidPartitionConfigError: Invalid partition configuration: Table 'public.events' has unique
+constraint(s) (id, created_at), and PostgreSQL refuses a foreign table as a partition of a
+table with a unique index or primary key. Use local leaves, or drop the constraint before
+enabling foreign leaves.
 ```
 
 ### Option templates

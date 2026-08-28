@@ -401,13 +401,7 @@ class _Planner:
                 continue
 
             if child.detach_pending:
-                self._record(
-                    child.name,
-                    FindingReason.DETACH_PENDING,
-                    f"{child.name} is pending detach: a DETACH CONCURRENTLY was interrupted, so it rejects its own "
-                    "rows and is invisible through the parent until `ALTER TABLE ... DETACH PARTITION ... FINALIZE` "
-                    "completes it.",
-                )
+                self._finalize_pending(node, child)
                 continue
 
             if isinstance(child.bounds, RangeBounds):
@@ -417,6 +411,34 @@ class _Planner:
                 members.append(self._sequence_member(boundaries, child, child.bounds))
 
         return members
+
+    def _finalize_pending(self, node: PartitionNode, child: PartitionNode) -> None:
+        """Complete a detach an interrupted ``DETACH CONCURRENTLY`` left half-done.
+
+        The partition is still in the catalog but invisible through the parent
+        and rejecting its own rows; the decision to detach it was already
+        taken, so the maintenance tick finishes it rather than waiting for a
+        human. Its drop follows the drop policy like any other orphan's.
+        """
+        self._record(
+            child.name,
+            FindingReason.DETACH_PENDING,
+            f"{child.name} is pending detach: a DETACH CONCURRENTLY was interrupted, so it rejects its own rows "
+            "and is invisible through the parent; the detach is completed with FINALIZE.",
+        )
+        if self.ctx.mode is not PlanMode.MAINTAIN:
+            return
+        self.detaches.append(
+            DetachPartition(
+                target=child.name,
+                oid=child.oid,
+                parent_name=node.name,
+                mode=self.policy.detach,
+                bounds=child.bounds,
+                reason=Reason.DETACH_FINALIZE,
+                detail="an interrupted DETACH CONCURRENTLY is completed with FINALIZE",
+            )
+        )
 
     def _range_member(self, boundaries: RangeBoundaries, child: PartitionNode, bounds: RangeBounds) -> _Member:
         lower_unbounded = bounds.from_value.strip().upper() in _UNBOUNDED_LOWER

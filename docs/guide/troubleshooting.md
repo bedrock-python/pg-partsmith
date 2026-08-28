@@ -65,15 +65,35 @@ The name the scheme produces is either taken by a relation with *other* bounds, 
 PostgreSQL's 63-byte limit (which truncates silently and would make two partitions
 collide). Rename the stray relation, or shorten the table name / `name_suffix`.
 
-## `detach_pending`
+## `detach_pending` (INFO)
 
 An earlier `DETACH … CONCURRENTLY` was interrupted. The partition is still attached in the
-catalog, invisible through the parent, and rejects its own rows. The next detach of it
-runs `DETACH … FINALIZE`; to finish it by hand:
+catalog, invisible through the parent, and rejects its own rows. The same plan completes
+it (`DETACH … FINALIZE`, reason `detach_finalize`) and its drop follows the drop policy.
+To finish it by hand instead:
 
 ```sql
 ALTER TABLE events DETACH PARTITION events__2026_08 FINALIZE;
 ```
+
+## `strategy_mismatch`, `column_mismatch`
+
+A branch is partitioned by another method, or on another key, than the scheme asks for —
+`RANGE (created_at) → LIST (region)` where the configuration says `HASH (tenant_id)`.
+Repartitioning an existing branch is a rewrite, so it is left alone and reported; new
+branches follow the scheme. Fix the scheme if the tree is right, or migrate the branch by
+hand.
+
+## `non_uniform_complete` (INFO)
+
+Hash siblings use different moduli (2 and 4, say) but together still tile the keyspace.
+Legal, and left as it is.
+
+## `unconvergeable`
+
+A partition was not created because part of its subtree could not be planned — a name
+refused, a group in conflict. Attaching a branch with a hole in its child set would reject
+rows, so the whole partition waits. The findings for the subtree say why.
 
 ## `grace_pending`, `drop_deferred` (INFO)
 
@@ -99,9 +119,10 @@ exactly one partition; detach the other partition first, or change the group.
 
 ## `coverage_unknown`
 
-A child's name cannot be addressed by qualified-name DDL (it contains a dot), so the
-child set cannot be read completely and nothing is planned for that branch. Rename the
-child.
+Either a child's name contains a dot and cannot be addressed by qualified-name DDL, so
+the child set cannot be read completely; or hash siblings use moduli whose least common
+multiple is too large to check coverage. Nothing is planned for that branch. Rename the
+child, or simplify the moduli.
 
 ## `PartitionReferencedError` — a detach was refused by a foreign key
 
@@ -159,6 +180,19 @@ dropped and recreated between plan and apply, or re-attached. The operation is s
 `drop_partition` refused a table without the marker, or one that is still attached. Both
 guards are the point of safe drops; adopt legacy tables with `adopt_partition`, and
 detach before dropping.
+
+## `PartitionTopologyError`
+
+The execution-time twin of a warning finding: a DEFAULT sibling holding rows for a hash
+or list member, a name taken by a relation with other bounds. Recorded as an issue with
+the finding's reason; the run goes on. The remedy is the finding's.
+
+## `PartitionAlreadyExistsError`, `PartitionNotFoundError`, `PartitionDetachInProgressError`
+
+Repository-level errors the executor normally absorbs: a name already taken is a lost
+race (benign) or a conflict (`name_unusable`); a relation that vanished between plan and
+apply is skipped; a detach already pending on another connection is retried next tick.
+Seen directly only when calling the repository yourself.
 
 ## `DropRetryExhaustedError`
 

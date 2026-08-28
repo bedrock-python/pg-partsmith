@@ -1027,3 +1027,50 @@ def test__unreferenced__survives_json() -> None:
     policy = LifecyclePolicy(retention=ExpireIf(when=Unreferenced()))
 
     assert LifecyclePolicy.model_validate(policy.model_dump(mode="json")) == policy
+
+
+# ── one positional argument per rule ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("positional", "keyword"),
+    [
+        (CreateAhead(3), CreateAhead(count=3)),
+        (CreateUntil(5), CreateUntil(position=5)),
+        (CreateNextIf(RowsAbove(1)), CreateNextIf(when=RowsAbove(rows=1))),
+        (KeepNewest(4), KeepNewest(count=4)),
+        (KeepFor(timedelta(days=2)), KeepFor(age=timedelta(days=2))),
+        (KeepBehind(10), KeepBehind(distance=10)),
+        (ExpireIf(SizeAbove(9)), ExpireIf(when=SizeAbove(bytes=9))),
+        (WindowAgeAbove(timedelta(hours=1)), WindowAgeAbove(age=timedelta(hours=1))),
+        (SqlPredicate(SQL), SqlPredicate(sql=SQL)),
+        (AllOf((KeepNewest(1), RowsAbove(0))), AllOf(members=(KeepNewest(count=1), RowsAbove(rows=0)))),
+        (AnyOf((KeepNewest(1),)), AnyOf(members=(KeepNewest(count=1),))),
+        (Not(RowsAbove(2)), Not(member=RowsAbove(rows=2))),
+        (DropAfter(timedelta(days=7)), DropAfter(grace=timedelta(days=7))),
+    ],
+)
+def test__rules__one_positional_argument__same_as_the_keyword(positional: Any, keyword: Any) -> None:
+    assert positional == keyword
+
+
+def test__callback__function_positionally() -> None:
+    def always(candidate: Candidate) -> bool:
+        return True
+
+    assert Callback(always).fn is always
+
+
+def test__rules__two_positional_arguments__refused() -> None:
+    with pytest.raises(TypeError, match="at most one positional argument"):
+        CreateAhead(3, 4)  # type: ignore[call-arg]
+
+
+def test__rules__value_given_twice__refused() -> None:
+    with pytest.raises(TypeError, match="both positionally and by keyword"):
+        KeepNewest(3, count=3)
+
+
+def test__rules__without_a_defining_value__refuse_a_positional_argument() -> None:
+    with pytest.raises(TypeError, match="at most one positional argument"):
+        Unreferenced(True)  # type: ignore[call-arg]

@@ -41,15 +41,30 @@ PARTITION_IS_ATTACHED_SQL = """
 
 # Whole partition tree below one relation, in a single round-trip.
 #
-# ``pg_partition_tree`` walks the hierarchy for us, so nested trees cost one
-# query no matter how deep they go. Each row carries both halves of a node's
-# identity: ``relpartbound`` says how it sits inside its parent, while
-# ``partstrat``/``partattrs`` say how it partitions its own children — a
-# branch has both, a leaf only the first. ``relkind`` tells a foreign leaf
-# from a local one, ``oid`` is what a destructive operation is revalidated
-# against, and ``inhdetachpending`` flags a partition an interrupted
-# ``DETACH CONCURRENTLY`` left invisible.
+# The hierarchy is walked over ``pg_inherits`` rather than with
+# ``pg_partition_tree``: once the first transaction of a ``DETACH CONCURRENTLY``
+# has committed, the function omits the half-detached partition -- the same
+# rule that hides it from queries through the parent -- and the planner would
+# never learn that it needs finalizing. A recursive walk over the catalog sees
+# it, with ``inhdetachpending`` set. The root is a partitioned table or a
+# partition, as for ``pg_partition_tree``; a plain table yields no rows.
+#
+# Each row carries both halves of a node's identity: ``relpartbound`` says how
+# it sits inside its parent, while ``partstrat``/``partattrs`` say how it
+# partitions its own children -- a branch has both, a leaf only the first.
+# ``relkind`` tells a foreign leaf from a local one, and ``oid`` is what a
+# destructive operation is revalidated against.
 PARTITION_TREE_SQL = """
+    WITH RECURSIVE t AS (
+        SELECT root.oid AS relid, CAST(NULL AS oid) AS parentrelid, 0 AS level
+        FROM pg_class root
+        WHERE root.oid = to_regclass(:table_name)
+          AND (root.relkind = 'p' OR root.relispartition)
+        UNION ALL
+        SELECT child.inhrelid, child.inhparent, t.level + 1
+        FROM pg_inherits child
+        JOIN t ON child.inhparent = t.relid
+    )
     SELECT
         t.level AS level,
         cl.oid AS oid,
@@ -72,14 +87,13 @@ PARTITION_TREE_SQL = """
         -- than the relation has, and a shortened key compares *equal* to a
         -- one-column spec -- so the mismatch guard would never fire.
         pt.partnatts AS key_arity
-    FROM pg_partition_tree(to_regclass(:table_name)) t
+    FROM t
     JOIN pg_class cl ON cl.oid = t.relid
     JOIN pg_namespace ns ON ns.oid = cl.relnamespace
     LEFT JOIN pg_class p ON p.oid = t.parentrelid
     LEFT JOIN pg_namespace pns ON pns.oid = p.relnamespace
     LEFT JOIN pg_inherits inh ON inh.inhrelid = cl.oid AND inh.inhparent = t.parentrelid
     LEFT JOIN pg_partitioned_table pt ON pt.partrelid = cl.oid
-    WHERE t.relid IS NOT NULL
     ORDER BY t.level, ns.nspname, cl.relname
 """
 

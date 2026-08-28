@@ -3,7 +3,8 @@
 Configurations for the shapes production systems build for themselves. Each was checked
 against the source of a project that hand-rolls it (see the
 [OSS research](../design/oss-research.md)); each is a complete `TablePartitionConfig` you
-can start from. The names used below are all importable from `pg_partsmith`.
+can start from. The names used below are importable from `pg_partsmith`, except
+`BasePartitionLifecycleHooks`, which comes from `pg_partsmith.aio` (or `pg_partsmith.sync`).
 
 ## Error monitoring: weekly UUIDv7 events split by organisation
 
@@ -67,7 +68,7 @@ next to partitions an operator attached by hand.
 config = TablePartitionConfig(
     table_name="cf_stream_history",
     scheme=RangePartitioning(key="created_at", boundaries=TimeBoundaries(granularity=PartitionGranularity.DAY)),
-    lifecycle=LifecyclePolicy(creation=CreateAhead(count=3), retention=KeepFor(timedelta(days=7))),
+    lifecycle=LifecyclePolicy(creation=CreateAhead(count=3), retention=KeepFor(age=timedelta(days=7))),
 )
 ```
 
@@ -83,8 +84,8 @@ config = TablePartitionConfig(
     table_name="events",
     scheme=RangePartitioning(key="time", boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH)),
     lifecycle=LifecyclePolicy(
-        creation=CreateUntil(datetime(date.today().year + 2, 1, 1, tzinfo=UTC)),
-        retention=KeepFor(timedelta(days=90)),
+        creation=CreateUntil(position=datetime(date.today().year + 2, 1, 1, tzinfo=UTC)),
+        retention=KeepFor(age=timedelta(days=90)),
     ),
 )
 
@@ -108,10 +109,10 @@ config = TablePartitionConfig(
     table_name="ci_builds",
     scheme=ListPartitioning(key="partition_id", sequence=IntegerSequence(start=100)),
     lifecycle=LifecyclePolicy(
-        creation=CreateNextIf(SqlPredicate(
-            "SELECT min(created_at) < now() - interval '1 day' FROM {partition}"
+        creation=CreateNextIf(when=SqlPredicate(
+            sql="SELECT min(created_at) < now() - interval '1 day' FROM {partition}"
         )),
-        retention=ExpireIf(AllOf((KeepNewest(count=3), Unreferenced()))),
+        retention=ExpireIf(when=AllOf(members=(KeepNewest(count=3), Unreferenced()))),
         drop=DropAfter(grace=timedelta(days=7)),
     ),
 )
@@ -143,7 +144,7 @@ config = TablePartitionConfig(
     granularity=PartitionGranularity.MONTH,
     lifecycle=LifecyclePolicy(
         creation=CreateAhead(count=2),
-        retention=KeepFor(timedelta(days=90)),
+        retention=KeepFor(age=timedelta(days=90)),
         detach=DetachMode.CONCURRENT,
         drop=DropAfter(grace=timedelta(days=7)),
     ),
@@ -196,10 +197,10 @@ def small_or_weekend(candidate: Candidate) -> bool:
 
 
 lifecycle = LifecyclePolicy(
-    retention=KeepFor(timedelta(days=30)),
+    retention=KeepFor(age=timedelta(days=30)),
     drop=DropAfter(
         grace=timedelta(days=7),
-        when=Callback(small_or_weekend, facts=frozenset({FactKind.SIZE}), label="<150GB or weekend"),
+        when=Callback(fn=small_or_weekend, facts=frozenset({FactKind.SIZE}), label="<150GB or weekend"),
     ),
 )
 ```

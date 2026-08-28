@@ -145,7 +145,7 @@ the creation rule: "create N ahead" would open another partition on every run, s
 application reads the current value from the catalog (`service.inspect`) and writes it.
 
 Windows are `[value, value + 1)`, so every retention rule written for an integer axis
-works: `KeepNewest(3)` keeps the three newest values. A hand-made partition owning several
+works: `KeepNewest(count=3)` keeps the three newest values. A hand-made partition owning several
 values, a non-integer value or `NULL` is `unmanaged_partition`: inspected, never touched,
 and a value it owns is never created. A sliding list has no DEFAULT partition.
 
@@ -214,10 +214,10 @@ and refuses a configuration PostgreSQL would reject, naming the column and the
 constraints that need it, before any DDL runs:
 
 ```text
-InvalidPartitionConfigError: Subpartition column(s) 'tenant_id' missing from unique
-constraint(s) (id, created_at) on table 'public.events'. PostgreSQL requires every
-UNIQUE/PRIMARY KEY on a partitioned table to include all partition key columns, so add
-'tenant_id' to them before enabling this partitioning.
+InvalidPartitionConfigError: Invalid partition configuration: Subpartition column(s)
+'tenant_id' missing from unique constraint(s) (id, created_at) on table 'public.events'.
+PostgreSQL requires every UNIQUE/PRIMARY KEY on a partitioned table to include all
+partition key columns, so add 'tenant_id' to them before enabling this partitioning.
 ```
 
 ## Names

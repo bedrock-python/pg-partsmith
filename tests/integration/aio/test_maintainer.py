@@ -9,7 +9,8 @@ from unittest.mock import patch
 import freezegun
 import pytest
 import pytest_asyncio
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.lock.postgres import PostgresAdvisoryLockManager
@@ -27,8 +28,9 @@ from pg_partsmith.entities import (
 )
 from pg_partsmith.exceptions import LockAcquisitionError
 from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.plan import FindingReason, Reason, Severity
 from pg_partsmith.topology import RangeBounds
-from tests.integration.aio.support import count_ddl, make_table
+from tests.integration.aio.support import count_ddl, exec_sql_autocommit, is_attached, make_table, relkind, scalar
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
 
 if TYPE_CHECKING:
@@ -308,3 +310,84 @@ async def test__maintainer__two_concurrent_runs_on_one_table__one_wins_the_lock_
     assert counter.statements == []
     names = {p.relname for p in await PostgresMetadataProvider(db_engine).list_partitions(partitioned_table)}
     assert names == {f"{partitioned_table}__2026_08", f"{partitioned_table}__2026_09", f"{partitioned_table}__2026_10"}
+
+
+# ── An interrupted DETACH CONCURRENTLY ──────────────────────────────────────────
+
+
+async def _leave_detach_pending(engine: AsyncEngine, parent: str, partition: str) -> None:
+    """Reproduce a cancelled ``DETACH CONCURRENTLY``.
+
+    Its first transaction commits ``inhdetachpending``; the second waits for
+    every transaction holding a lock on the parent. A reader that keeps its
+    transaction open makes it wait, and cancelling it there leaves the
+    partition half-detached, exactly as a DDL timeout would.
+    """
+    reader_ready = asyncio.Event()
+    release_reader = asyncio.Event()
+
+    async def read_and_hold() -> None:
+        async with engine.connect() as conn:
+            await conn.execute(text(f'SELECT 1 FROM "{parent}" LIMIT 0'))  # noqa: S608
+            reader_ready.set()
+            await release_reader.wait()
+            await conn.rollback()
+
+    async def detach() -> None:
+        await reader_ready.wait()
+        with pytest.raises(DBAPIError, match="canceling statement"):
+            await exec_sql_autocommit(engine, f'ALTER TABLE "{parent}" DETACH PARTITION "{partition}" CONCURRENTLY')
+
+    async def cancel_once_waiting() -> None:
+        await reader_ready.wait()
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            waiting = await scalar(
+                engine,
+                "SELECT pid FROM pg_stat_activity "
+                "WHERE query ILIKE :pattern AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()",
+                pattern=f'%DETACH PARTITION "{partition}" CONCURRENTLY%',
+            )
+            if waiting is not None:
+                await scalar(engine, "SELECT pg_cancel_backend(:pid)", pid=waiting)
+                break
+        release_reader.set()
+
+    await asyncio.gather(read_and_hold(), detach(), cancel_once_waiting())
+
+
+# sync-mirror: skip
+async def test__maintainer__interrupted_concurrent_detach__finalized_by_the_next_tick_and_then_dropped(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    # Arrange: April exists, and a cancelled DETACH CONCURRENTLY left it half-detached
+    config = monthly_config(partitioned_table, create_ahead=1, retention=2)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine)))
+    with freezegun.freeze_time("2026-04-15"):
+        await maintainer.run_maintenance(config)
+    april = f"{partitioned_table}__2026_04"
+    await _leave_detach_pending(db_engine, partitioned_table, april)
+    assert await scalar(
+        db_engine, "SELECT inhdetachpending FROM pg_inherits WHERE inhrelid = to_regclass(:name)", name=april
+    )
+
+    # Act: the next tick finds April pending
+    with freezegun.freeze_time("2026-08-26"):
+        result = await maintainer.run_maintenance(config)
+
+    # Assert: the detach was completed with FINALIZE, reported as informational
+    assert [op.reason for op in result.plan.detaches] == [Reason.DETACH_FINALIZE]
+    assert result.detached_count == 1
+    assert result.dropped_count == 0
+    assert result.issues == ()
+    pending = [f for f in result.plan.findings if f.reason is FindingReason.DETACH_PENDING]
+    assert len(pending) == 1
+    assert pending[0].severity is Severity.INFO
+    assert not await is_attached(db_engine, april)
+    assert await relkind(db_engine, april) == "r"
+
+    # And the orphan follows the drop policy on the tick after
+    with freezegun.freeze_time("2026-08-26"):
+        again = await maintainer.run_maintenance(config)
+    assert again.dropped_count == 1
+    assert await relkind(db_engine, april) is None

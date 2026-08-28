@@ -199,7 +199,6 @@ entities, exceptions and period calculators.
         - PartitionTopologyError
         - PartitionReferencedError
         - PlanStaleError
-        - UnsupportedCapabilityError
 
 ### Period strategies
 

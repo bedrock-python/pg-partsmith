@@ -20,7 +20,7 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -95,12 +95,21 @@ class Candidate(BaseModel):
 class PredicateBase(BaseModel):
     """A yes/no question about a candidate.
 
+    A rule with one defining value takes it positionally as well as by name:
+    ``KeepNewest(12)`` and ``KeepNewest(count=12)`` are the same rule.
+
     Attributes:
         required_facts: What the introspector has to measure for this
             predicate to be answerable.
     """
 
     model_config = ConfigDict(frozen=True)
+
+    # The field a single positional argument fills; None for rules without one.
+    _positional: ClassVar[str | None] = None
+
+    def __init__(self, *args: Any, **data: Any) -> None:
+        super().__init__(**_positional_data(type(self), args, data))
 
     @property
     def required_facts(self) -> frozenset[FactKind]:
@@ -127,6 +136,8 @@ class SizeAbove(PredicateBase):
     A partition that does not exist yet has no size and never satisfies this.
     """
 
+    _positional: ClassVar[str | None] = "bytes"
+
     kind: Literal["size_above"] = "size_above"
     bytes: PositiveInt
 
@@ -152,6 +163,8 @@ class RowsAbove(PredicateBase):
     empty until the statistics collector catches up.
     """
 
+    _positional: ClassVar[str | None] = "rows"
+
     kind: Literal["rows_above"] = "rows_above"
     rows: NonNegativeInt
 
@@ -175,6 +188,8 @@ class WindowAgeAbove(PredicateBase):
 
     On an integer axis the window has no age and this is never true.
     """
+
+    _positional: ClassVar[str | None] = "age"
 
     kind: Literal["window_age_above"] = "window_age_above"
     age: timedelta
@@ -233,6 +248,8 @@ class SqlPredicate(PredicateBase):
         SqlPredicate("SELECT NOT EXISTS (SELECT 1 FROM {partition} WHERE status = 'pending')")
     """
 
+    _positional: ClassVar[str | None] = "sql"
+
     kind: Literal["sql"] = "sql"
     sql: str
 
@@ -280,6 +297,8 @@ class Callback(PredicateBase):
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
+    _positional: ClassVar[str | None] = "fn"
+
     kind: Literal["callback"] = "callback"
     fn: Callable[[Candidate], bool] = Field(exclude=True)
     facts: frozenset[FactKind] = frozenset()
@@ -301,6 +320,8 @@ class Callback(PredicateBase):
 
 class AllOf(PredicateBase):
     """True when every member is true."""
+
+    _positional: ClassVar[str | None] = "members"
 
     kind: Literal["all_of"] = "all_of"
     members: tuple[Predicate, ...]
@@ -327,6 +348,8 @@ class AllOf(PredicateBase):
 class AnyOf(PredicateBase):
     """True when at least one member is true."""
 
+    _positional: ClassVar[str | None] = "members"
+
     kind: Literal["any_of"] = "any_of"
     members: tuple[Predicate, ...]
 
@@ -351,6 +374,8 @@ class AnyOf(PredicateBase):
 
 class Not(PredicateBase):
     """True when the member is false."""
+
+    _positional: ClassVar[str | None] = "member"
 
     kind: Literal["not"] = "not"
     member: Predicate
@@ -383,6 +408,8 @@ class CreateAhead(PredicateBase):
     ``CreateAhead(3)`` on a monthly table in June means June, July and August.
     """
 
+    _positional: ClassVar[str | None] = "count"
+
     kind: Literal["create_ahead"] = "create_ahead"
     count: PositiveInt = DEFAULT_CREATE_AHEAD_COUNT
 
@@ -409,6 +436,8 @@ class CreateUntil(PredicateBase):
     "partitions for the first five million ids". A position behind the cursor
     yields the cursor's window alone.
     """
+
+    _positional: ClassVar[str | None] = "position"
 
     kind: Literal["create_until"] = "create_until"
     position: Any
@@ -463,6 +492,8 @@ class CreateNextIf(PredicateBase):
     the calendar.
     """
 
+    _positional: ClassVar[str | None] = "when"
+
     kind: Literal["create_next_if"] = "create_next_if"
     when: Predicate
 
@@ -509,6 +540,8 @@ class KeepNewest(PredicateBase):
     never expired.
     """
 
+    _positional: ClassVar[str | None] = "count"
+
     kind: Literal["keep_newest"] = "keep_newest"
     count: PositiveInt = DEFAULT_RETENTION_COUNT
 
@@ -531,6 +564,8 @@ class KeepFor(PredicateBase):
     last instant. On an integer axis nothing ever expires under this rule.
     """
 
+    _positional: ClassVar[str | None] = "age"
+
     kind: Literal["keep_for"] = "keep_for"
     age: timedelta
 
@@ -551,6 +586,8 @@ class KeepBehind(PredicateBase):
     rule ``pg_partman`` applies to id-based sets. On a time axis nothing ever
     expires under this rule.
     """
+
+    _positional: ClassVar[str | None] = "distance"
 
     kind: Literal["keep_behind"] = "keep_behind"
     distance: PositiveInt
@@ -574,6 +611,8 @@ class ExpireIf(PredicateBase):
 
         ExpireIf(AllOf((KeepNewest(12), SqlPredicate("... {partition} ..."))))
     """
+
+    _positional: ClassVar[str | None] = "when"
 
     kind: Literal["expire_if"] = "expire_if"
     when: Predicate
@@ -657,9 +696,14 @@ class DropAfter(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    _positional: ClassVar[str | None] = "grace"
+
     kind: Literal["drop_after"] = "drop_after"
     grace: timedelta = timedelta(0)
     when: Predicate | None = None
+
+    def __init__(self, *args: Any, **data: Any) -> None:
+        super().__init__(**_positional_data(type(self), args, data))
 
     @field_validator("grace")
     @classmethod
@@ -747,6 +791,20 @@ class LifecyclePolicy(BaseModel):
     def needs_facts(self) -> bool:
         """True when planning has to measure something beyond the catalog."""
         return bool(self.required_facts or self.sql_predicates)
+
+
+def _positional_data(cls: type, args: tuple[Any, ...], data: dict[str, Any]) -> dict[str, Any]:
+    """Fold a rule's single positional argument into its keyword data."""
+    if not args:
+        return data
+    name = getattr(cls, "_positional", None)
+    if name is None or len(args) > 1:
+        msg = f"{cls.__name__}() takes at most one positional argument ({len(args)} given)"
+        raise TypeError(msg)
+    if name in data:
+        msg = f"{cls.__name__}() got the value of {name!r} both positionally and by keyword"
+        raise TypeError(msg)
+    return {**data, name: args[0]}
 
 
 # Resolve the recursive combinator references now that every member exists.

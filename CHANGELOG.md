@@ -50,7 +50,8 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
 - Ownership: an attached partition whose bounds are not a window of the scheme's grid (nor
   inside one) is reported as `unmanaged_partition` and never detached or dropped. In 0.x any
   attached partition with an old upper bound was pruned.
-- `PartitionStrategy` gains `NUMERIC_BASED`; `MaintenanceIssueStep` gains `PLAN`, `ATTACH` and `MOVE`.
+- `PartitionStrategy` gains `NUMERIC_BASED`; `MaintenanceIssueStep` gains `ATTACH` and `MOVE`;
+  `UnsupportedCapabilityError` is removed with the capability protocols it served.
 - Repository protocol additions a custom implementation has to provide:
   `create_table_like(..., physical=)`, `create_foreign_table_like`, `move_rows`,
   `reconcile_default_rows(..., limit=)`; metadata protocol: `get_leading_key_minimum`.
@@ -81,6 +82,12 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   never touched), `detach_pending`, `facts`; `DetachedPartition` carries `detached_at`.
 - `EpochBoundaryCodec`; codecs and boundaries addressable by name in serialized configs;
   `PartitionTableSettings` accepts `scheme` / `lifecycle` JSON, `tz`, `boundary_codec`.
+- Every lifecycle rule with one defining value takes it positionally: `KeepNewest(12)`,
+  `CreateAhead(3)`, `DropAfter(timedelta(days=7))`, `ExpireIf(SqlPredicate(...))`.
+- An interrupted `DETACH CONCURRENTLY` is completed by the next tick (`detach_finalize`). The
+  tree is read with a recursive walk over `pg_inherits` instead of `pg_partition_tree`, which
+  omits such a partition and takes `ACCESS SHARE` on every member; inspection now takes no
+  relation lock.
 - Sliding `LIST`: `ListPartitioning(key, sequence=IntegerSequence(start))` is a progression
   level — one integer value per partition, the cursor read off the newest member
   (`CursorSource.NEWEST_MEMBER`), rotated with `CreateNextIf` or bounded with `CreateUntil`;

@@ -19,6 +19,9 @@ LifecyclePolicy(
 The flat fields `create_ahead_count` / `retention_count` are this policy with
 `CreateAhead` and `KeepNewest`; spell `lifecycle=` out for anything else.
 
+A rule with one defining value takes it positionally as well: `CreateAhead(3)`,
+`KeepNewest(12)`, `KeepFor(timedelta(days=90))`, `DropAfter(timedelta(days=7))`.
+
 ## The timeline of one partition
 
 ```text
@@ -43,8 +46,8 @@ partition is **detached** — it leaves the parent but keeps its data — and th
 
 | Rule | Windows that must exist |
 |---|---|
-| `CreateAhead(count)` | the cursor's window and the `count − 1` after it. `CreateAhead(3)` in June: June, July, August |
-| `CreateUntil(position)` | every window from the cursor's up to the one holding `position` — a `datetime` on a time axis, an `int` on an integer one. "Partitions through the end of next year" is `CreateUntil(datetime(2028, 1, 1, tzinfo=UTC))` |
+| `CreateAhead(count)` | the cursor's window and the `count − 1` after it. `CreateAhead(count=3)` in June: June, July, August |
+| `CreateUntil(position)` | every window from the cursor's up to the one holding `position` — a `datetime` on a time axis, an `int` on an integer one. "Partitions through the end of next year" is `CreateUntil(position=datetime(2028, 1, 1, tzinfo=UTC))` |
 | `CreateNextIf(when)` | the cursor's window always; the window after the newest existing partition only once `when` holds for that partition — rotation by application state, not by the calendar |
 
 `CreateNextIf` is what a [sliding list](schemes.md#list-with-a-sequence-the-sliding-list)
@@ -57,7 +60,7 @@ id-partitioned queue can use to size windows by volume. A sliding list refuses
 | Rule | A window is expired when |
 |---|---|
 | `KeepNewest(count)` | it ends at or before the start of the window `count − 1` steps behind the cursor's. A *count* of windows, current one included — the `retention_count` semantics |
-| `KeepFor(age)` | it ended more than `age` ago (time axis only) |
+| `KeepFor(age)` | it ended at least `age` ago (time axis only) |
 | `KeepBehind(distance)` | the cursor is `distance` or more past its end (integer axis only; pg_partman's rule for id sets) |
 | `ExpireIf(predicate)` | the predicate holds |
 | `AllOf(…)`, `AnyOf(…)`, `Not(…)` | combinations |
@@ -68,15 +71,15 @@ twelve months *and* nothing pending in it":
 ```python
 from pg_partsmith import AllOf, ExpireIf, KeepNewest, SqlPredicate
 
-retention=ExpireIf(AllOf((
+retention=ExpireIf(when=AllOf(members=(
     KeepNewest(count=12),
-    SqlPredicate("SELECT NOT EXISTS (SELECT 1 FROM {partition} WHERE status = 'pending')"),
+    SqlPredicate(sql="SELECT NOT EXISTS (SELECT 1 FROM {partition} WHERE status = 'pending')"),
 )))
 ```
 
 !!! warning "Count, not distance"
     Hand-rolled pruners usually say "drop everything older than N months", which keeps
-    `N + 1` partitions on disk. `KeepNewest(N)` keeps exactly `N`. Coming from a distance,
+    `N + 1` partitions on disk. `KeepNewest(count=N)` keeps exactly `N`. Coming from a distance,
     pass `N + 1`, or express the age directly with `KeepFor`.
 
 ## Predicates and facts
@@ -90,7 +93,7 @@ with `KeepNewest` never pays for `pg_total_relation_size`.
 |---|---|---|
 | `SizeAbove(bytes)` | size | the partition and its subtree exceed `bytes` on disk |
 | `RowsAbove(rows)` | rows | the planner's row estimate exceeds `rows` — never `COUNT(*)`; a fresh partition reads as empty until statistics catch up |
-| `WindowAgeAbove(age)` | — | the window ended more than `age` ago |
+| `WindowAgeAbove(age)` | — | the window ended at least `age` ago |
 | `Unreferenced()` | references | no row of another table references a row of the partition through a foreign key — the condition PostgreSQL itself imposes on `DETACH`. An unmeasured partition reads as referenced, so it is kept |
 | `SqlPredicate(sql)` | one query per candidate | the statement yields true. `{partition}` is replaced with the quoted name; nothing else is interpolated. A partition that does not exist yet reads as false |
 | `Callback(fn, facts=…, label=…)` | what it declares | `fn(candidate)` returns true — plain Python over the gathered facts, usable from both mirrors |

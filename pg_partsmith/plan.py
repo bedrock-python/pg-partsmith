@@ -65,6 +65,8 @@ class Reason(StrEnum):
         LIST_DEFAULT_MISSING: The configured LIST catch-all with no partition.
         REATTACH: A detached orphan whose window is wanted again.
         RETENTION_EXPIRED: The retention policy declared the window expired.
+        DETACH_FINALIZE: An interrupted ``DETACH CONCURRENTLY`` is completed
+            with ``FINALIZE``; the partition was already leaving.
         FOLLOWS_DETACH: Dropped in the same run as its detach (no grace).
         GRACE_ELAPSED: An orphan past its grace period.
     """
@@ -80,6 +82,7 @@ class Reason(StrEnum):
     LIST_DEFAULT_MISSING = "list_default_missing"
     REATTACH = "reattach"
     RETENTION_EXPIRED = "retention_expired"
+    DETACH_FINALIZE = "detach_finalize"
     FOLLOWS_DETACH = "follows_detach"
     GRACE_ELAPSED = "grace_elapsed"
 
@@ -147,12 +150,11 @@ class FindingReason(StrEnum):
             not realise its leaves as foreign tables. It is inspected and
             never created, detached or dropped.
         DETACH_PENDING: A ``DETACH CONCURRENTLY`` was interrupted; the
-            partition rejects its rows until ``DETACH … FINALIZE`` runs.
+            partition rejects its rows until ``DETACH … FINALIZE`` runs, which
+            the same plan does.
         GRACE_PENDING: A detached orphan still within its grace period.
         DROP_DEFERRED: A detached orphan past its grace whose drop condition
             does not hold yet.
-        CURSOR_UNKNOWN: The level's cursor could not be read, so nothing is
-            created ahead of it this run.
     """
 
     LEGACY_LEAF = "legacy_leaf"
@@ -175,7 +177,6 @@ class FindingReason(StrEnum):
     DETACH_PENDING = "detach_pending"
     GRACE_PENDING = "grace_pending"
     DROP_DEFERRED = "drop_deferred"
-    CURSOR_UNKNOWN = "cursor_unknown"
 
 
 # Reasons that describe a healthy, deliberate state (policy evolution, a
@@ -190,6 +191,7 @@ _INFORMATIONAL_REASONS = frozenset(
         FindingReason.UNMANAGED_PARTITION,
         FindingReason.UNBOUNDED_PARTITION,
         FindingReason.FOREIGN_PARTITION,
+        FindingReason.DETACH_PENDING,
         FindingReason.GRACE_PENDING,
         FindingReason.DROP_DEFERRED,
     }

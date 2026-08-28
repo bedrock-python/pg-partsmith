@@ -38,7 +38,7 @@ Hand-rolled pruners usually express retention as a distance: "drop everything ol
 the flat `retention_count` — is a *count*: "keep exactly the `N` newest periods, the
 current one included". Passing a distance straight in drops one extra period on the first
 tick. Convert once at the boundary (`old_distance + 1`), or express the age directly with
-`KeepFor(timedelta(...))`.
+`KeepFor(age=timedelta(...))`.
 
 ## 4. Adopt the tables the old manager detached
 

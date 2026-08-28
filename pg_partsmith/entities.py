@@ -516,7 +516,6 @@ def _scheme_from_flat(fields: dict[str, Any], checks: dict[str, Any]) -> SchemeB
 class MaintenanceIssueStep(StrEnum):
     """Lifecycle step in which a non-fatal maintenance issue occurred."""
 
-    PLAN = "plan"
     CREATE = "create"
     RECONCILE = "reconcile"
     ATTACH = "attach"

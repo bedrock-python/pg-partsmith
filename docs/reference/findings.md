@@ -17,7 +17,7 @@ issues too, with the exception's name in front of the message.
 | `modulus_repaired` | INFO | An incomplete hash set at another modulus is being filled at its own modulus. | Nothing. |
 | `non_uniform_complete` | INFO | Hash siblings at mixed moduli that still tile the keyspace. | Nothing. |
 | `non_uniform_incomplete` | WARNING | Hash siblings at mixed moduli leaving a gap; rows hashing into it are rejected. | Add the missing buckets by hand. |
-| `coverage_unknown` | WARNING | The child set could not be read completely (a name with a dot), so nothing is planned for the branch. | Rename the child. |
+| `coverage_unknown` | WARNING | The branch cannot be reasoned about: a child's name contains a dot and cannot be addressed by qualified-name DDL, or the hash moduli's least common multiple is too large to check coverage. | Rename the child; simplify the moduli. |
 | `list_values_conflict` | WARNING | A configured LIST group claims a value another partition owns. | Detach the other, or change the group. |
 | `name_unusable` | WARNING | The name the scheme produces is taken by a relation with other bounds, or over 63 bytes. | Rename the stray relation; shorten names. |
 | `default_holds_rows` | WARNING | A DEFAULT sibling holds rows belonging to a hash or list member being attached. | Move the rows out by hand. |
@@ -27,10 +27,9 @@ issues too, with the exception's name in front of the message.
 | `unreadable_bound` | WARNING | A bound the level's axis cannot read; never pruned. | Check the codec and the key. |
 | `unbounded_partition` | INFO | A partition open on one side (`MINVALUE`/`MAXVALUE`); never pruned. | Nothing. |
 | `foreign_partition` | INFO | A foreign table under a local-leaves configuration; never touched. | Configure `ForeignLeaves` if it should be managed. |
-| `detach_pending` | WARNING | An interrupted `DETACH CONCURRENTLY`; the partition rejects its rows until finalized. | Let the next detach finalize it, or run `DETACH … FINALIZE`. |
+| `detach_pending` | INFO | An interrupted `DETACH CONCURRENTLY`; the partition rejects its rows until finalized. The same plan completes it with `DETACH … FINALIZE`. | Nothing; check that the run went through. |
 | `grace_pending` | INFO | A detached orphan still within its grace period. | Nothing. |
 | `drop_deferred` | INFO | An orphan past its grace whose drop condition does not hold yet. | Nothing. |
-| `cursor_unknown` | WARNING | The level's cursor could not be read; nothing is created ahead this run. | Check the key's sequence or the table. |
 
 ## Operation reasons
 
@@ -39,22 +38,23 @@ issues too, with the exception's name in front of the message.
 | `create_ahead` | create | a window the creation policy wants ahead of the cursor |
 | `create_until` | create | a window before the configured horizon |
 | `create_next` | create | the window after the newest, because its predicate held |
-| `explicit` | create, detach, drop | a window the caller named (`ensure_partitions`), or a granular call |
+| `explicit` | create, detach, drop | a window the caller named (`ensure_partitions`); a partition emptied by `unpartition(drop_emptied=True)` |
 | `subtree` | create | a member of the subtree of a partition being created |
 | `hash_gap` | create | a missing bucket at the configured modulus |
 | `hash_gap_historical_modulus` | create | a missing bucket at the modulus the set was built with |
 | `list_group_missing` | create | a configured LIST group with no partition |
 | `list_default_missing` | create | the configured LIST catch-all with no partition |
 | `reattach` | attach | a detached orphan whose window is wanted again |
-| `retention_expired` | detach | the retention policy declared the window expired |
+| `retention_expired` | detach | the retention policy declared the window expired (also `detach_old_partitions`) |
+| `detach_finalize` | detach | an interrupted `DETACH CONCURRENTLY` is completed with `FINALIZE` |
 | `follows_detach` | drop | dropped in the same run as its detach |
-| `grace_elapsed` | drop | an orphan past its grace period |
+| `grace_elapsed` | drop | an orphan past its grace period (also `drop_detached_partitions`) |
 
 ## Issue steps
 
-`MaintenanceIssue.step` says where a problem occurred: `plan`, `create`, `reconcile`
-(a planner finding, or a gap filled inside an existing branch), `attach`, `detach`,
-`drop`, `move` (the batch movers).
+`MaintenanceIssue.step` says where a problem occurred: `create`, `reconcile` (a planner
+finding, or a gap filled inside an existing branch), `attach`, `detach`, `drop`, `move`
+(the batch movers).
 
 ## Exceptions
 
@@ -71,7 +71,6 @@ issues too, with the exception's name in front of the message.
 | `PartitionDetachInProgressError` | detach | another detach of the partition is pending |
 | `UnmanagedPartitionDropError` | `drop_partition` | the table carries no marker |
 | `DropRetryExhaustedError` | `drop_partition` | lock contention outlasted the retries |
-| `UnsupportedCapabilityError` | service wiring | a component cannot serve the configuration |
 
 All derive from `PartitionError`. `PartitionMaintainer.run_maintenance_safe()` reports any
 of them on `result.error` as `"<Name>: <message>"`.

@@ -22,8 +22,9 @@ root `HASH` or `LIST`:
 
 A `before_*` hook that raises **aborts that operation**: the partition stays as it was and
 comes back on the next tick. With `continue_on_error` the error lands in
-`result.issues`; otherwise it propagates. An `after_*` hook that raises is logged; the
-operation already happened.
+`result.issues`; otherwise it propagates. An `after_*` hook that raises is logged and
+re-raised the same way — the operation already happened, but the run aborts (or records
+the issue under `continue_on_error`).
 
 ```python
 from pg_partsmith.aio import BasePartitionLifecycleHooks, PartitionLifecycleService
@@ -82,7 +83,7 @@ def small_or_weekend(candidate: Candidate) -> bool:
 
 drop=DropAfter(
     grace=timedelta(days=7),
-    when=Callback(small_or_weekend, facts=frozenset({FactKind.SIZE}), label="<150GB or weekend"),
+    when=Callback(fn=small_or_weekend, facts=frozenset({FactKind.SIZE}), label="<150GB or weekend"),
 )
 ```
 

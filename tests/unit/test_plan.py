@@ -38,6 +38,7 @@ INFORMATIONAL = {
     FindingReason.UNMANAGED_PARTITION,
     FindingReason.UNBOUNDED_PARTITION,
     FindingReason.FOREIGN_PARTITION,
+    FindingReason.DETACH_PENDING,
     FindingReason.GRACE_PENDING,
     FindingReason.DROP_DEFERRED,
 }

@@ -27,10 +27,14 @@ open transaction holding the partition) leaves `pg_inherits.inhdetachpending = t
 - rows that belong to it are **rejected** with `23514 no partition of relation … found for row`;
 - a second `DETACH … CONCURRENTLY` fails with `55000 partition … already pending detach`;
 - a plain `DETACH` blocks on the lock;
-- only `ALTER TABLE … DETACH PARTITION … FINALIZE` completes it (`relispartition` → false).
+- only `ALTER TABLE … DETACH PARTITION … FINALIZE` completes it (`relispartition` → false);
+- `pg_partition_tree(parent)` and queries through the parent **omit** the pending partition
+  once the first transaction has committed (verified on 15–17); `pg_inherits` still lists it
+  with `inhdetachpending = true`, which is why the tree is read from `pg_inherits`.
 
 `PartitionRemover.detach` checks `inhdetachpending` first and finalizes; the planner reports
-such a partition as `DETACH_PENDING` (WARNING) and excludes it from every decision.
+such a partition as `DETACH_PENDING` (INFO), plans its detach (`DETACH_FINALIZE`) and
+otherwise treats its window as absent.
 
 While the concurrent detach waits for an open transaction it holds no relation lock of its
 own (`wait_event = Lock/virtualxid`), but `inhdetachpending` is already set — so a long

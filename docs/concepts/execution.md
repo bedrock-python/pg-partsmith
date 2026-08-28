@@ -67,9 +67,9 @@ partition exists. The marker is written *before* the detach.
 
 A `DETACH CONCURRENTLY` interrupted mid-way (a statement timeout, a killed connection)
 leaves the partition in a **pending** state: still attached in the catalog, invisible
-through the parent, rejecting its own rows. The remover finishes it with
-`DETACH … FINALIZE` on the next attempt, and the planner reports it as `detach_pending`
-until then.
+through the parent, rejecting its own rows. The next tick's plan reports it as
+`detach_pending` and completes it with `DETACH … FINALIZE` (reason `detach_finalize`);
+its drop then follows the drop policy.
 
 Detaching a branch keeps its subtree intact and readable through the branch.
 
@@ -93,7 +93,7 @@ repository).
 | `DETACH PARTITION … CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` on the parent; `ACCESS EXCLUSIVE` on the partition and, in its second transaction, on referencing tables |
 | `DROP TABLE` of a detached table | `ACCESS EXCLUSIVE` on that table only |
 | `COMMENT ON` | `SHARE UPDATE EXCLUSIVE` on the table |
-| `pg_partition_tree()`, the catalog reads | `ACCESS SHARE` on every member; sizes and estimates take no relation lock |
+| the catalog reads (tree, orphans, sizes, estimates) | no relation lock: the tree is walked over `pg_inherits`, not with `pg_partition_tree()`, which would take `ACCESS SHARE` on every member — and omit a partition whose `DETACH CONCURRENTLY` was interrupted |
 
 `CREATE TABLE … PARTITION OF` — `ACCESS EXCLUSIVE` on the parent — is the one statement
 the library never issues against a live parent. Each operation reports the heaviest lock
@@ -127,5 +127,6 @@ one of a small number of states, each of which the next run converges:
 Six hooks fire around create, detach and drop, once per **lifecycle unit** — the partition
 under the root, never per leaf of its subtree — and once per member of a root `HASH` or
 `LIST`. A `before_*` hook that raises aborts that operation (the partition comes back on
-the next run); an `after_*` hook that raises is logged. Hooks decide nothing about *which*
+the next run); an `after_*` hook that raises is logged and re-raised — the operation has
+already happened, but the run aborts unless `continue_on_error`. Hooks decide nothing about *which*
 partitions come and go; they react. See [Archive before dropping](../guide/archiving.md).

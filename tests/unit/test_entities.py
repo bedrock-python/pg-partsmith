@@ -965,10 +965,8 @@ def test__maintenance_issue__blank_error__rejected() -> None:
 
 def test__maintenance_issue_step__covers_planning_and_attaching() -> None:
     # Arrange / Act / Assert
-    assert MaintenanceIssueStep.PLAN.value == "plan"
     assert MaintenanceIssueStep.ATTACH.value == "attach"
     assert {step.value for step in MaintenanceIssueStep} == {
-        "plan",
         "create",
         "reconcile",
         "attach",
