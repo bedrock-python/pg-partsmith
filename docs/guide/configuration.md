@@ -75,6 +75,21 @@ partition_column="created_at"
 partition_column="event_date"
 ```
 
+### `trailing_partition_columns`
+
+The rest of a composite partition key, in key order, when the table partitions on
+more than one column. Empty by default, which is the single-column case.
+
+```python
+partition_column="created_at"
+trailing_partition_columns=("tenant_id",)   # PARTITION BY RANGE (created_at, tenant_id)
+```
+
+Only the leading column carries the period; the trailing ones are bounded with
+`MINVALUE`. Read the whole key back with `config.partition_columns` and its length
+with `config.key_arity`. See [Composite partition keys](subpartitioning.md#composite-partition-keys)
+for what a nullable trailing column does to row routing.
+
 ### `granularity`
 
 Controls which built-in period calculator to use when one is not passed explicitly.

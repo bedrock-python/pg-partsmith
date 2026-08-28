@@ -174,18 +174,24 @@ because it is the same planner, just pointed at the root.
 
 ## Composite partition keys
 
-A partition key may span several columns. Pass `partition_columns` instead of
-`partition_column`:
+A partition key may span several columns. `partition_column` keeps naming the
+leading one; the rest go in `trailing_partition_columns`, in key order:
 
 ```python
 config = TablePartitionConfig(
     table_name="events",
     partition_type=PartitionType.RANGE,
     partition_strategy=PartitionStrategy.TIME_BASED,
-    partition_columns=("created_at", "tenant_id"),
+    partition_column="created_at",
+    trailing_partition_columns=("tenant_id",),
     granularity=PartitionGranularity.WEEK,
 )
 ```
+
+`config.partition_columns` reads the whole key back as a tuple, and
+`config.key_arity` is its length. Splitting the field this way is what keeps a
+single-column config — and every metadata provider and repository written
+against one — working unchanged.
 
 Only the **leading** column carries the period. The trailing ones are bounded
 with `MINVALUE` at both ends:
@@ -194,29 +200,61 @@ with `MINVALUE` at both ends:
 FOR VALUES FROM ('2026-08-24', MINVALUE) TO ('2026-08-31', MINVALUE)
 ```
 
-which selects exactly the rows whose `created_at` falls in the week, whatever
-their `tenant_id` — the same set a single-column bound would. Retention reads
-the leading value back out, so pruning behaves identically.
+Retention reads the leading value back out, so pruning behaves identically.
 
-Subpartition levels take composite keys the same way, via `columns`:
+Subpartition levels take composite keys the same way — `column` plus
+`trailing_columns`:
 
 ```python
-HashSubpartitionSpec(columns=("tenant_id", "shard_id"), modulus=8)
+HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=8)
 ```
 
-Two limits, both PostgreSQL's rather than this library's:
+### NULLs in a trailing column
+
+A composite bound does **not** select the same rows a single-column bound would.
+PostgreSQL adds an `IS NOT NULL` test for *every* key column to a range
+partition's constraint:
+
+```sql
+-- pg_get_partition_constraintdef('events__2026_w35')
+(created_at IS NOT NULL) AND (tenant_id IS NOT NULL)
+  AND (created_at >= '2026-08-24…') AND (created_at < '2026-08-31…')
+```
+
+So a row whose `tenant_id` is NULL is routed to the DEFAULT partition whatever
+its `created_at` says. Two consequences worth knowing before you make a trailing
+key column nullable:
+
+- **Those rows never age out.** Retention drops period partitions; the DEFAULT
+  partition is not one, and is never pruned.
+- **They stay in DEFAULT during reconciliation.** When a DEFAULT conflict blocks
+  an attach, the rows moved out are only those the new partition can actually
+  accept — the NULL-keyed ones are left where they belong. Moving them would be
+  rejected with the very error the move exists to clear.
+
+Declaring every trailing key column `NOT NULL` avoids both.
+
+### Limits
+
+Two of them, both PostgreSQL's rather than this library's:
 
 - **LIST takes exactly one column.** A composite LIST key is rejected outright
   by PostgreSQL, and the config refuses it up front.
 - **Every key column must appear in every UNIQUE/PRIMARY KEY**, which now means
   all of them, not just the leading one.
 
-`partition_column` remains available and returns the leading column, so existing
-code and single-column configs are unaffected.
-
 > Key order is not column order. `pg_partsmith` reads it from `partattrs`'
 > own ordering — sorting by column position would silently transpose a
 > composite key.
+
+### Expression keys are refused
+
+`PARTITION BY RANGE ((created_at AT TIME ZONE 'UTC'))` is a valid PostgreSQL
+table and not one this library can manage: it builds bounds out of column
+values, and an expression's value is not one. The catalog records such a key
+position as `attnum 0`, so reading only the columns would report a shorter key
+than the table has and every bound built from it would be the wrong arity.
+Introspecting one raises `InvalidPartitionConfigError` naming the position.
 
 ## Required unique constraints
 
@@ -294,6 +332,12 @@ attachment is used rather than `CREATE TABLE … PARTITION OF`. Measured on Post
 
 Filling a gap therefore does not interrupt ingestion for the tenants already served by the
 branch.
+
+**One exception, also measured:** if the branch has a `DEFAULT` partition, `ATTACH` takes
+`ACCESS EXCLUSIVE` on *that* partition while it scans it for rows the new one would claim.
+Reads and writes routed to the other buckets continue; anything touching the DEFAULT
+partition waits. A branch whose keyspace is fully tiled has no DEFAULT partition and pays
+nothing for this.
 
 ## Reconciliation
 
