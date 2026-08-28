@@ -40,6 +40,7 @@ from .exceptions import (
     PartitionDetachInProgressError,
     PartitionError,
     PartitionNotFoundError,
+    PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
     UnmanagedPartitionDropError,
@@ -70,6 +71,7 @@ from .lifecycle import (
     RowsAbove,
     SizeAbove,
     SqlPredicate,
+    Unreferenced,
     WindowAgeAbove,
 )
 from .plan import (
@@ -180,6 +182,7 @@ __all__ = [
     "PartitionInfo",
     "PartitionNode",
     "PartitionNotFoundError",
+    "PartitionReferencedError",
     "PartitionScheme",
     "PartitionStrategy",
     "PartitionTopologyError",
@@ -208,6 +211,7 @@ __all__ = [
     "TimezoneAwareCalculator",
     "UUIDv7BoundaryCodec",
     "UnmanagedPartitionDropError",
+    "Unreferenced",
     "UnsupportedCapabilityError",
     "WeekPeriodCalculator",
     "Window",

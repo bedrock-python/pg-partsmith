@@ -192,10 +192,14 @@ class FactKind(StrEnum):
     Attributes:
         SIZE: Total on-disk size of the relation and its subtree, in bytes.
         ROWS: Estimated live rows (planner statistics, never ``COUNT(*)``).
+        REFERENCES: Whether a row of another table references a row of the
+            relation through a foreign key -- the condition PostgreSQL itself
+            imposes on ``DETACH PARTITION``.
     """
 
     SIZE = "size"
     ROWS = "rows"
+    REFERENCES = "references"
 
 
 class PartitionFacts(BaseModel):
@@ -208,6 +212,9 @@ class PartitionFacts(BaseModel):
         size_bytes: Total size of the relation and its subtree.
         row_estimate: Estimated live rows across the subtree, from planner
             statistics. ``0`` before the first ``ANALYZE`` / stats flush.
+        referenced: Whether any row of another table references a row of the
+            relation through a foreign key on the relation or on its parent.
+            None when not measured.
         predicates: Result of each :class:`~pg_partsmith.lifecycle.SqlPredicate`
             evaluated against the relation, keyed by the predicate's id.
     """
@@ -216,6 +223,7 @@ class PartitionFacts(BaseModel):
 
     size_bytes: NonNegativeInt | None = None
     row_estimate: NonNegativeInt | None = None
+    referenced: bool | None = None
     predicates: dict[str, bool] = Field(default_factory=dict)
 
 

@@ -16,6 +16,7 @@ from pg_partsmith.exceptions import (
     PartitionAttachedError,
     PartitionDetachInProgressError,
     PartitionNotFoundError,
+    PartitionReferencedError,
     PlanStaleError,
     UnmanagedPartitionDropError,
 )
@@ -200,7 +201,7 @@ class PartitionRemover:
                 await conn.execute(stmt)
             except (SQLAlchemyError, OSError, TimeoutError) as exc:
                 sqlstate = pg_sqlstate(exc)
-                if sqlstate in {"42P01", "55006"}:
+                if sqlstate in {"42P01", "55006", "23503"}:
                     domain_exc = self._translate_detach_error(exc, partition_name)
                     assert domain_exc is not None  # guaranteed by sqlstate match above
                     raise domain_exc from exc
@@ -275,6 +276,12 @@ class PartitionRemover:
             return PartitionNotFoundError(partition_name)
         if sqlstate == "55006":
             return PartitionDetachInProgressError(partition_name)
+        if sqlstate == "23503":
+            # "removing partition ... violates foreign key constraint": rows of
+            # another table reference rows of this partition through a foreign
+            # key on the parent. Verified identical on PostgreSQL 15 and 17,
+            # for the plain and the CONCURRENTLY form alike.
+            return PartitionReferencedError(partition_name, str(exc).strip().splitlines()[0])
         return None
 
     async def drop(self, partition_name: str, *, expected_oid: int | None = None) -> None:

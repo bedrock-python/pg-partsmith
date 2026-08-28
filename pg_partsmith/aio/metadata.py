@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from pg_partsmith.catalog_queries import (
+    INCOMING_FOREIGN_KEYS_SQL,
     INSTANT_HAS_PASSED_SQL,
     ORPHANS_SQL,
     PARTITION_COLUMNS_SQL,
@@ -326,11 +328,17 @@ class PostgresMetadataProvider:
             return {}
 
         sizes: dict[int, tuple[int, int]] = {}
-        if facts:
+        if FactKind.SIZE in facts or FactKind.ROWS in facts:
             async with self._engine.connect() as conn:
                 result = await conn.execute(text(PARTITION_FACTS_SQL), {"oids": list(oids.values())})
                 for row in result.fetchall():
                     sizes[int(row.oid)] = (int(row.size_bytes or 0), int(row.row_estimate or 0))
+
+        foreign_keys: list[_ForeignKey] = []
+        if FactKind.REFERENCES in facts:
+            referenced = [*oids.values()] + ([root.oid] if root.oid is not None else [])
+            foreign_keys = await self._incoming_foreign_keys(referenced)
+        attached = {node.name for node in root.walk()}
 
         measured: dict[str, PartitionFacts] = {}
         for name, oid in oids.items():
@@ -338,12 +346,59 @@ class PostgresMetadataProvider:
             answers: dict[str, bool] = {}
             for predicate in sql_predicates:
                 answers[predicate.id] = await self.evaluate_sql_predicate(predicate, name)
+            referenced_here: bool | None = None
+            if FactKind.REFERENCES in facts:
+                # A foreign key on the parent reaches an attached partition's
+                # rows; a detached table is invisible to it, so only keys
+                # pointing at the table itself can hold its rows.
+                through = {oid, root.oid} if name in attached else {oid}
+                referenced_here = await self._is_referenced(
+                    name, [fk for fk in foreign_keys if fk.referenced_oid in through]
+                )
             measured[name] = PartitionFacts(
                 size_bytes=size if FactKind.SIZE in facts else None,
                 row_estimate=rows if FactKind.ROWS in facts else None,
+                referenced=referenced_here,
                 predicates=answers,
             )
         return measured
+
+    async def _incoming_foreign_keys(self, oids: list[int]) -> list[_ForeignKey]:
+        """Foreign keys of other tables pointing at any of ``oids``."""
+        async with self._engine.connect() as conn:
+            result = await conn.execute(text(INCOMING_FOREIGN_KEYS_SQL), {"oids": oids})
+            rows = result.fetchall()
+        return [
+            _ForeignKey(
+                referenced_oid=int(row.referenced_oid),
+                referencing=coerce_str(row.referencing) or "",
+                referencing_columns=tuple(str(c) for c in (row.referencing_columns or ())),
+                referenced_columns=tuple(str(c) for c in (row.referenced_columns or ())),
+            )
+            for row in rows
+        ]
+
+    async def _is_referenced(self, partition_name: str, foreign_keys: list[_ForeignKey]) -> bool:
+        """True when a row of a referencing table points at a row of ``partition_name``.
+
+        One ``EXISTS`` per foreign key, joining the referencing table to the
+        partition on the key columns; it stops at the first match, and the
+        referencing side is usually indexed on its foreign key.
+        """
+        partition = quote_identifier(partition_name)
+        for fk in foreign_keys:
+            if not fk.referencing_columns or len(fk.referencing_columns) != len(fk.referenced_columns):
+                continue
+            join = " AND ".join(
+                f"r.{quote_identifier(a)} = p.{quote_identifier(b)}"
+                for a, b in zip(fk.referencing_columns, fk.referenced_columns, strict=True)
+            )
+            statement = f"SELECT EXISTS (SELECT 1 FROM {fk.referencing} r JOIN {partition} p ON {join})"  # noqa: S608
+            async with self._engine.connect() as conn:
+                result = await conn.execute(text(statement))
+                if bool(result.scalar()):
+                    return True
+        return False
 
     async def evaluate_sql_predicate(self, predicate: SqlPredicate, partition_name: str) -> bool:
         """Ask one :class:`~pg_partsmith.lifecycle.SqlPredicate` about one relation.
@@ -618,6 +673,16 @@ class PostgresMetadataProvider:
             rows = result.fetchall()
 
         return tuple(tuple(str(c) for c in (row.columns or ())) for row in rows)
+
+
+@dataclass(frozen=True)
+class _ForeignKey:
+    """One foreign key of another table, pointing at a relation of the tree."""
+
+    referenced_oid: int
+    referencing: str
+    referencing_columns: tuple[str, ...]
+    referenced_columns: tuple[str, ...]
 
 
 def _with_facts(node: PartitionNode, measured: dict[str, PartitionFacts]) -> PartitionNode:

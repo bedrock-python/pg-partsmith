@@ -30,6 +30,7 @@ from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, Mainte
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionAttachedError,
+    PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
 )
@@ -90,11 +91,12 @@ class PlanExecutor:
         """Execute every operation of ``plan`` in order.
 
         A topology conflict discovered while executing -- a DEFAULT sibling
-        holding rows, a name held by a relation with other bounds -- is
-        recorded as an issue and never aborts the run: one odd partition must
-        not stop every other one from being maintained. Any other failure
-        aborts the run unless ``continue_on_error`` is set, in which case it
-        is recorded and the next operation runs.
+        holding rows, a name held by a relation with other bounds, a detach
+        PostgreSQL refuses because rows of another table still reference the
+        partition -- is recorded as an issue and never aborts the run: one odd
+        partition must not stop every other one from being maintained. Any
+        other failure aborts the run unless ``continue_on_error`` is set, in
+        which case it is recorded and the next operation runs.
 
         Args:
             config: The configuration the plan was made from.
@@ -134,6 +136,16 @@ class PlanExecutor:
             except PartitionTopologyError as exc:
                 issues.append(MaintenanceIssue(step=step, error=describe_exception(exc), partition_name=op.target))
                 logger.warning(exc.detail, extra={"partition_name": op.target, "reason": exc.reason})
+            except PartitionReferencedError as exc:
+                # PostgreSQL will not detach a partition whose rows other
+                # tables still reference; the partition stays in service and
+                # the run goes on. ``Unreferenced()`` in the retention rule
+                # keeps such partitions out of the plan altogether.
+                issues.append(MaintenanceIssue(step=step, error=describe_exception(exc), partition_name=op.target))
+                logger.warning(
+                    "Detach refused: rows of another table still reference the partition",
+                    extra={"partition_name": op.target, "detail": exc.detail},
+                )
             except Exception as exc:
                 if not continue_on_error:
                     raise

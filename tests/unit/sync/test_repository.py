@@ -16,6 +16,7 @@ from pg_partsmith.exceptions import (
     PartitionAttachedError,
     PartitionDetachInProgressError,
     PartitionNotFoundError,
+    PartitionReferencedError,
     PlanStaleError,
     UnmanagedPartitionDropError,
 )
@@ -1627,3 +1628,21 @@ def test__move_rows__source_without_columns__raises_not_found() -> None:
     # Act / Assert
     with pytest.raises(PartitionNotFoundError):
         repo.move_rows("gone", "b")
+
+
+# ── detach refused by a foreign key ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", [DetachMode.BLOCKING, DetachMode.CONCURRENT, DetachMode.AUTO])
+def test__detach_partition__rows_still_referenced__raises_partition_referenced(mode: DetachMode) -> None:
+    # Arrange
+    message = 'removing partition "events__2024_01" violates foreign key constraint "refs_fk1"'
+    engine, _ = _engine(_Catalog(failures={"DETACH PARTITION": _sqlstate_error("23503", message)}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionReferencedError) as excinfo:
+        repo.detach_partition("events", "events__2024_01", mode=mode)
+
+    assert excinfo.value.partition_name == "events__2024_01"
+    assert "violates foreign key constraint" in excinfo.value.detail

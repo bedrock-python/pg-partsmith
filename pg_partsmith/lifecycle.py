@@ -55,6 +55,7 @@ __all__ = [
     "RowsAbove",
     "SizeAbove",
     "SqlPredicate",
+    "Unreferenced",
     "WindowAgeAbove",
 ]
 
@@ -188,6 +189,36 @@ class WindowAgeAbove(PredicateBase):
     def describe(self) -> str:
         """Render the rule."""
         return f"window ended more than {self.age} ago"
+
+
+class Unreferenced(PredicateBase):
+    """True when no row of another table references a row of the partition.
+
+    The condition PostgreSQL enforces on ``DETACH PARTITION`` when a foreign
+    key points at the parent: a partition whose rows are still referenced
+    cannot be taken out of service, and the statement fails with ``23503``.
+    Putting this in the retention rule keeps such partitions attached until
+    the referencing rows are gone -- the GitLab rule for ``ci_builds`` --
+    instead of failing the run.
+
+    Foreign keys on the parent and on the partition itself are both checked.
+    A partition that was not measured reads as referenced, so it is kept.
+    """
+
+    kind: Literal["unreferenced"] = "unreferenced"
+
+    @property
+    def required_facts(self) -> frozenset[FactKind]:
+        """References."""
+        return frozenset({FactKind.REFERENCES})
+
+    def evaluate(self, candidate: Candidate) -> bool:
+        """True only when the introspector found nothing referencing the partition."""
+        return candidate.facts.referenced is False
+
+    def describe(self) -> str:
+        """Render the rule."""
+        return "no row of another table references it"
 
 
 class SqlPredicate(PredicateBase):
@@ -570,6 +601,7 @@ Predicate = Annotated[
     SizeAbove
     | RowsAbove
     | WindowAgeAbove
+    | Unreferenced
     | SqlPredicate
     | Callback
     | KeepNewest

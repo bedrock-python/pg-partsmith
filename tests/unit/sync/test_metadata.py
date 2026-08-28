@@ -1196,3 +1196,90 @@ def test__get_leading_key_minimum__no_key__refused() -> None:
     # Act / Assert
     with pytest.raises(ValueError, match="partition key"):
         provider.get_leading_key_minimum("d", ())
+
+
+# ── measure: references ─────────────────────────────────────────────────────────
+
+
+def _fk_row(referenced_oid: int, referencing: str = '"public"."refs"') -> SimpleNamespace:
+    return SimpleNamespace(
+        constraint_name="refs_fk",
+        referenced_oid=referenced_oid,
+        referencing=referencing,
+        referencing_columns=["event_id", "created_at"],
+        referenced_columns=["id", "created_at"],
+    )
+
+
+def test__measure__references_requested__joins_each_foreign_key_to_the_partition() -> None:
+    # Arrange -- one FK on the parent; January's rows are referenced, the orphan is checked against nothing
+    engine = _make_engine([_fk_row(100)], True)
+    provider = PostgresMetadataProvider(engine)
+    tree = _sample_tree()
+
+    # Act
+    measured = provider.measure(
+        tree,
+        targets=("public.events__2024_01", "public.events__2023_12"),
+        facts=frozenset({FactKind.REFERENCES}),
+    )
+
+    # Assert
+    statements = _statements(engine)
+    assert "confrelid = ANY" in statements[0]
+    assert _conn(engine).execute.call_args_list[0].args[1] == {"oids": [101, 500, 100]}
+    assert statements[1] == (
+        'SELECT EXISTS (SELECT 1 FROM "public"."refs" r JOIN "public"."events__2024_01" p '
+        'ON r."event_id" = p."id" AND r."created_at" = p."created_at")'
+    )
+    assert len(statements) == 2
+    january = measured.root.children[0]
+    assert january.facts == PartitionFacts(referenced=True)
+    assert measured.orphans[0].facts == PartitionFacts(referenced=False)
+
+
+def test__measure__references__foreign_key_on_the_orphan_itself_is_checked() -> None:
+    # Arrange
+    engine = _make_engine([_fk_row(500)], False)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = provider.measure(
+        _sample_tree(), targets=("public.events__2023_12",), facts=frozenset({FactKind.REFERENCES})
+    )
+
+    # Assert
+    assert measured.orphans[0].facts == PartitionFacts(referenced=False)
+    assert 'JOIN "public"."events__2023_12" p' in _statements(engine)[1]
+
+
+def test__measure__references__no_foreign_keys__no_join_is_run() -> None:
+    # Arrange
+    engine = _make_engine([])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = provider.measure(
+        _sample_tree(), targets=("public.events__2024_01",), facts=frozenset({FactKind.REFERENCES})
+    )
+
+    # Assert
+    assert _conn(engine).execute.call_count == 1
+    assert measured.root.children[0].facts == PartitionFacts(referenced=False)
+
+
+def test__measure__references_and_sizes__both_queries_run() -> None:
+    # Arrange
+    engine = _make_engine(
+        [_facts_row(101, 10, 1)],
+        [],
+    )
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = provider.measure(
+        _sample_tree(), targets=("public.events__2024_01",), facts=frozenset({FactKind.SIZE, FactKind.REFERENCES})
+    )
+
+    # Assert
+    assert measured.root.children[0].facts == PartitionFacts(size_bytes=10, referenced=False)

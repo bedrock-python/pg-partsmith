@@ -471,7 +471,9 @@ def test__detach_partition__blocking_mode__transactional_under_access_exclusive(
 
     # Assert
     assert capabilities == OperationCapabilities(
-        transactional=True, lock="ACCESS EXCLUSIVE on the parent and the partition"
+        transactional=True,
+        lock="ACCESS EXCLUSIVE on the parent and the partition, and on every table referencing the parent through "
+        "a foreign key",
     )
     assert _detach().kind is OperationKind.DETACH
     assert _detach().is_destructive is True

@@ -38,6 +38,23 @@ class PartitionDetachInProgressError(PartitionError):
         self.partition_name = partition_name
 
 
+class PartitionReferencedError(PartitionError):
+    """Raised when PostgreSQL refuses to detach a partition whose rows are still referenced.
+
+    A foreign key on another table points at the parent, and rows of that
+    table reference rows of this partition; detaching it would orphan them,
+    so the statement fails (``23503``). The partition stays attached until
+    the referencing rows are gone -- see
+    :class:`~pg_partsmith.lifecycle.Unreferenced` for keeping it out of the
+    plan until then.
+    """
+
+    def __init__(self, partition_name: str, detail: str) -> None:
+        super().__init__(f"Partition {partition_name} is still referenced by rows of another table: {detail}")
+        self.partition_name = partition_name
+        self.detail = detail
+
+
 class PartitionTopologyError(PartitionError):
     """Raised when an existing partition tree diverges from the configured one.
 

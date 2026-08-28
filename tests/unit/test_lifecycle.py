@@ -37,6 +37,7 @@ from pg_partsmith.lifecycle import (
     RowsAbove,
     SizeAbove,
     SqlPredicate,
+    Unreferenced,
     WindowAgeAbove,
 )
 from pg_partsmith.periods import PartitionGranularity
@@ -994,3 +995,35 @@ def test__predicates__frozen__cannot_be_mutated() -> None:
     # Act / Assert
     with pytest.raises(ValidationError):
         predicate.bytes = 2  # type: ignore[misc]
+
+
+# ── Unreferenced ────────────────────────────────────────────────────────────────
+
+
+def test__unreferenced__asks_for_the_references_fact() -> None:
+    assert Unreferenced().required_facts == {FactKind.REFERENCES}
+    assert Unreferenced().sql_predicates == ()
+    assert Unreferenced().describe() == "no row of another table references it"
+
+
+@pytest.mark.parametrize(("referenced", "expected"), [(False, True), (True, False), (None, False)])
+def test__unreferenced__true_only_when_measured_unreferenced(referenced: bool | None, expected: bool) -> None:
+    candidate = _candidate(_month(2026, 5), facts=_facts(referenced=referenced))
+
+    assert Unreferenced().evaluate(candidate) is expected
+
+
+def test__unreferenced__combines_with_the_calendar_rules() -> None:
+    rule = ExpireIf(when=AllOf(members=(KeepNewest(count=1), Unreferenced())))
+    old_and_free = _candidate(_month(2026, 5), facts=_facts(referenced=False))
+    old_but_held = _candidate(_month(2026, 5), facts=_facts(referenced=True))
+
+    assert rule.required_facts == {FactKind.REFERENCES}
+    assert rule.evaluate(old_and_free)
+    assert not rule.evaluate(old_but_held)
+
+
+def test__unreferenced__survives_json() -> None:
+    policy = LifecyclePolicy(retention=ExpireIf(when=Unreferenced()))
+
+    assert LifecyclePolicy.model_validate(policy.model_dump(mode="json")) == policy

@@ -419,11 +419,16 @@ class DetachPartition(OperationBase):
     def capabilities(self) -> OperationCapabilities:
         """Concurrent detach cannot run in a transaction block."""
         if self.mode is DetachMode.BLOCKING:
-            return OperationCapabilities(transactional=True, lock="ACCESS EXCLUSIVE on the parent and the partition")
+            return OperationCapabilities(
+                transactional=True,
+                lock="ACCESS EXCLUSIVE on the parent and the partition, and on every table referencing the parent "
+                "through a foreign key",
+            )
         return OperationCapabilities(
             transactional=False,
-            lock="SHARE UPDATE EXCLUSIVE on the parent (CONCURRENTLY); ACCESS EXCLUSIVE when a DEFAULT partition "
-            "forces the blocking form",
+            lock="SHARE UPDATE EXCLUSIVE on the parent (CONCURRENTLY), ACCESS EXCLUSIVE on the partition and, in "
+            "the second transaction, on every table referencing the parent through a foreign key; ACCESS EXCLUSIVE "
+            "on the parent when a DEFAULT partition forces the blocking form",
         )
 
     @property

@@ -29,6 +29,7 @@ from pg_partsmith.entities import (
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionAttachedError,
+    PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
 )
@@ -1695,3 +1696,31 @@ async def test__create_partition__relation_exists_detached__fill_runs_before_it_
     assert attached
     assert filled == ["events__2024_04"]
     repo.attach_partition.assert_awaited_once()
+
+
+# ── detach refused by a foreign key ─────────────────────────────────────────────
+
+
+async def test__apply__detach_refused_by_a_foreign_key__recorded_and_the_run_goes_on(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock, hooks: _RecordingHooks
+) -> None:
+    # Arrange -- June is still referenced; July is not
+    metadata.is_partition_attached.return_value = True
+    repo.detach_partition.side_effect = [
+        PartitionReferencedError("events__2024_06", "violates foreign key constraint refs_fk"),
+        None,
+    ]
+    june = DetachPartition(target="events__2024_06", parent_name="events", reason=Reason.RETENTION_EXPIRED)
+    july = DetachPartition(target="events__2024_07", parent_name="events", reason=Reason.RETENTION_EXPIRED)
+    june_drop = DropPartition(target="events__2024_06", reason=Reason.FOLLOWS_DETACH, follows_detach=True)
+
+    # Act
+    result = await executor.apply(_config(), _plan(june, july, june_drop))
+
+    # Assert -- June's drop is skipped with its detach; nothing else is affected
+    assert result.detached_count == 1
+    assert result.dropped_count == 0
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.DETACH]
+    assert result.issues[0].partition_name == "events__2024_06"
+    assert "still referenced by rows of another table" in result.issues[0].error
+    assert hooks.names().count("after_detach") == 1

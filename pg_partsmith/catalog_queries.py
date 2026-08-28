@@ -138,6 +138,37 @@ PARTITION_FACTS_SQL = """
     GROUP BY root.oid
 """
 
+# Foreign keys pointing at any of ``:oids`` -- a partitioned parent or a
+# partition itself -- with the referencing relation spelled ready to splice
+# into SQL and both column lists in constraint order.
+#
+# Only top-level constraints (``conparentid = 0``): the clone PostgreSQL keeps
+# on every partition for a foreign key that references the parent has the same
+# referencing side, and would be counted twice.
+INCOMING_FOREIGN_KEYS_SQL = """
+    SELECT
+        con.conname AS constraint_name,
+        con.confrelid AS referenced_oid,
+        quote_ident(ns.nspname) || '.' || quote_ident(c.relname) AS referencing,
+        (
+            SELECT array_agg(a.attname ORDER BY k.ord)
+            FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+        ) AS referencing_columns,
+        (
+            SELECT array_agg(a.attname ORDER BY k.ord)
+            FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+        ) AS referenced_columns
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    WHERE con.contype = 'f'
+      AND con.conparentid = 0
+      AND con.confrelid = ANY(CAST(:oids AS oid[]))
+    ORDER BY con.conname
+"""
+
 # A relation's live column names, in its own physical order.
 #
 # Two partitions of the same table always share column *names*, but not
