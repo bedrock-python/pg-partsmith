@@ -157,6 +157,21 @@ events_20260831   absent                  → created with MODULUS 2 and both bu
 Only the third and fourth lines involve DDL on the live tree, and none of it rewrites
 data. Re-running the tick is a no-op.
 
+### `issues` now fills up on a successful run
+
+The first two lines above are reported on `MaintenanceResult.issues`, and the run is
+still a success. Before subpartitioning existed, `issues` was only ever populated by a
+step that had *failed* under `continue_on_error`, so treating a non-empty `issues` as an
+alarm was reasonable. It no longer is: a topology finding is a description of something
+the run deliberately left alone, not a failure.
+
+`MaintenanceResult.success` is unchanged — it reports a fatal error and nothing else. If
+you page on `issues`, filter by `MaintenanceIssue.step`:
+
+```python
+failures = [i for i in result.issues if i.step is not MaintenanceIssueStep.RECONCILE]
+```
+
 ## Cold storage before drop
 
 Export hooks fire once per **time slice**, not once per bucket — which is what an archival
