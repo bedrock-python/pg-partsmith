@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import UTC, datetime, tzinfo
+
+from dateutil.parser import isoparse
+
+from .topology import DefaultBounds, HashBounds, ListBounds, PartitionBounds, RangeBounds
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +23,12 @@ _FROM_PREFIX_PATTERN = re.compile(r"^.*?FROM\s*\(", re.IGNORECASE | re.DOTALL)
 _TRAILING_PAREN_PATTERN = re.compile(r"\)\s*$", re.IGNORECASE | re.DOTALL)
 _CAST_PATTERN = re.compile(r"^CAST\((?P<inner>.*)\s+AS\s+.*\)$", re.IGNORECASE | re.DOTALL)
 _STR_LITERAL_PATTERN = re.compile(r"'(?P<s>(?:[^']|'')*)'")
+_HASH_BOUND_PATTERN = re.compile(r"MODULUS\s+(?P<modulus>\d+)\s*,\s*REMAINDER\s+(?P<remainder>\d+)", re.IGNORECASE)
+_LIST_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+IN\s*\((?P<values>.*)\)\s*$", re.IGNORECASE | re.DOTALL)
+_DATE_ONLY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# Bound spellings that carry no instant at all.
+_UNBOUNDED_LITERALS = frozenset({"MINVALUE", "MAXVALUE"})
 
 
 def parse_range_boundaries(boundaries_expr: str | None) -> tuple[str | None, str | None]:
@@ -99,3 +110,112 @@ def _normalize(expr: str) -> str:
         expr = expr.split("::", 1)[0].strip()
 
     return expr.strip()
+
+
+def parse_partition_bounds(boundaries_expr: str | None) -> PartitionBounds | None:
+    """Parse ``pg_get_expr(relpartbound, oid)`` into a structured bound.
+
+    Recognises every spelling PostgreSQL emits for a partition bound; returns
+    ``None`` when the expression is absent or in a shape this parser does not
+    understand, so callers can fall back to the raw text rather than acting on
+    a guess.
+
+    Examples:
+      FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')
+      FOR VALUES WITH (modulus 4, remainder 1)
+      FOR VALUES IN ('eu', 'us')
+      DEFAULT
+    """
+    if not boundaries_expr:
+        return None
+
+    expr = boundaries_expr.strip()
+    if expr.upper() == "DEFAULT":
+        return DefaultBounds()
+
+    hash_match = _HASH_BOUND_PATTERN.search(expr)
+    if hash_match:
+        try:
+            return HashBounds(
+                modulus=int(hash_match.group("modulus")),
+                remainder=int(hash_match.group("remainder")),
+            )
+        except ValueError:
+            logger.warning("Unparseable hash bounds", extra={"boundaries_expr": expr})
+            return None
+
+    list_match = _LIST_BOUND_PATTERN.match(expr)
+    if list_match:
+        inner = _TRAILING_PAREN_PATTERN.sub("", list_match.group("values"))
+        values = tuple(_normalize(part) for part in _split_top_level(inner))
+        return ListBounds(values=values)
+
+    from_value, to_value = parse_range_boundaries(expr)
+    if from_value is not None and to_value is not None:
+        return RangeBounds(from_value=from_value, to_value=to_value)
+
+    return None
+
+
+def _split_top_level(values: str) -> list[str]:
+    """Split a comma-separated bound list, ignoring commas inside quotes."""
+    parts: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+
+    for index, char in enumerate(values):
+        if char == "'":
+            # Doubled quotes escape a literal quote and must not toggle state.
+            if in_quotes and index + 1 < len(values) and values[index + 1] == "'":
+                current.append(char)
+                continue
+            in_quotes = not in_quotes
+        if char == "," and not in_quotes:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+
+    parts.append("".join(current))
+    return [p for p in (part.strip() for part in parts) if p]
+
+
+def parse_boundary_literal(value: str | None, boundary_tz: tzinfo) -> datetime | None:
+    """Parse a timestamp partition boundary into a UTC instant.
+
+    Naive values (bare dates, timestamps without an offset) are interpreted in
+    ``boundary_tz``; values carrying an offset are converted as-is. Comparisons
+    downstream always happen between UTC instants.
+
+    This is the decoder for the default, timestamp-keyed case. Tables keyed by
+    an encoded identifier decode through their
+    :class:`~pg_partsmith.boundaries.RangeBoundaryCodec` instead.
+    """
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+
+    if v.upper() in _UNBOUNDED_LITERALS:
+        return None
+
+    if "-" not in v and ":" not in v:
+        return None
+
+    if _DATE_ONLY_PATTERN.fullmatch(v):
+        try:
+            return datetime.fromisoformat(v).replace(tzinfo=boundary_tz).astimezone(UTC)
+        except ValueError:
+            return None
+
+    try:
+        parsed = isoparse(v)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except (ValueError, TypeError):
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=boundary_tz).astimezone(UTC)
+    return parsed.astimezone(UTC)

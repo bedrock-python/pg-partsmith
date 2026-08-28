@@ -1,0 +1,455 @@
+"""Shape of a PostgreSQL partition tree: bounds, subpartition specs, and nodes.
+
+Everything here is IO-free and shared by the aio and sync mirrors:
+
+* :class:`PartitionType` — how a relation partitions its children.
+* ``*Bounds`` — how a relation is bound *inside* its parent, as PostgreSQL
+  renders it (``FOR VALUES FROM … TO …`` / ``WITH (MODULUS … REMAINDER …)`` /
+  ``IN (…)`` / ``DEFAULT``).
+* :class:`HashSubpartitionSpec` — the subpartitioning a user *asks for*.
+* :class:`PartitionNode` — the tree that actually *exists*, as introspected
+  from ``pg_partition_tree`` and friends.
+
+The planner that turns the difference between the last two into DDL intentions
+lives in :mod:`pg_partsmith.subpartition_plan`.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Sequence
+from enum import StrEnum
+from typing import Annotated, ClassVar, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .constants import (
+    DEFAULT_SUBPARTITION_NAME_SUFFIX,
+    MAX_HASH_KEYSPACE_LCM,
+    MAX_IDENTIFIER_LENGTH,
+    MAX_SUBPARTITION_DEPTH,
+)
+from .types import NonNegativeInt, PositiveInt, StrippedNonEmptyStr
+
+
+class PartitionType(StrEnum):
+    """PostgreSQL partition type.
+
+    Attributes:
+        RANGE: Range partitioning (e.g., by date ranges).
+        LIST: List partitioning (e.g., by specific values).
+        HASH: Hash partitioning (e.g., by hash of key).
+    """
+
+    RANGE = "range"
+    LIST = "list"
+    HASH = "hash"
+
+    @classmethod
+    def from_partstrat(cls, strat: str | None) -> PartitionType | None:
+        """Map a ``pg_partitioned_table.partstrat`` code to a partition type."""
+        return {"r": cls.RANGE, "l": cls.LIST, "h": cls.HASH}.get(strat or "")
+
+
+# ── Partition bounds ────────────────────────────────────────────────────────────
+#
+# One model per PostgreSQL bound spelling, discriminated on ``kind`` so a
+# partition's bounds can be pattern-matched instead of string-parsed twice.
+
+
+class RangeBounds(BaseModel):
+    """``FOR VALUES FROM (from_value) TO (to_value)``.
+
+    Attributes:
+        from_value: Lower bound, inclusive.
+        to_value: Upper bound, exclusive.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["range"] = "range"
+    from_value: StrippedNonEmptyStr
+    to_value: StrippedNonEmptyStr
+
+
+class ListBounds(BaseModel):
+    """``FOR VALUES IN (values…)``.
+
+    Attributes:
+        values: The literal values routed to this partition.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["list"] = "list"
+    values: tuple[str, ...]
+
+
+class HashBounds(BaseModel):
+    """``FOR VALUES WITH (MODULUS modulus, REMAINDER remainder)``.
+
+    A hash partition owns the rows whose key hash is congruent to
+    ``remainder`` modulo ``modulus``; a set of them is complete only when the
+    owned residue classes tile the whole keyspace (see
+    :func:`hash_keyspace_covered`).
+
+    Attributes:
+        modulus: Number of buckets this partition's residue class is taken from.
+        remainder: Residue this partition owns; always ``< modulus``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["hash"] = "hash"
+    modulus: PositiveInt
+    remainder: NonNegativeInt
+
+    @model_validator(mode="after")
+    def validate_remainder_in_range(self) -> HashBounds:
+        """Reject a remainder outside ``[0, modulus)`` — PostgreSQL would too."""
+        if self.remainder >= self.modulus:
+            msg = f"remainder must be < modulus, got remainder={self.remainder} modulus={self.modulus}"
+            raise ValueError(msg)
+        return self
+
+
+class DefaultBounds(BaseModel):
+    """``DEFAULT`` — the catch-all partition of a RANGE or LIST parent."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["default"] = "default"
+
+
+PartitionBounds = Annotated[
+    RangeBounds | ListBounds | HashBounds | DefaultBounds,
+    Field(discriminator="kind"),
+]
+"""Any partition bound description, discriminated on ``kind``."""
+
+
+# ── Desired subpartitioning ─────────────────────────────────────────────────────
+
+
+class HashSubpartitionSpec(BaseModel):
+    """Sub-partition each partition of the level above by HASH.
+
+    The spec is declarative: it says what the tree *should* look like, and
+    :func:`pg_partsmith.subpartition_plan.plan_subpartitions` works out which
+    nodes are missing.
+
+    ``modulus`` is the bucket count for *newly created* branches only. Existing
+    branches keep the modulus they were built with — a hash set cannot change
+    modulus without a rewrite — so lowering or raising it changes future
+    periods and leaves history alone. See the reconciliation guide.
+
+    Attributes:
+        strategy: Discriminator; always ``"hash"``.
+        column: Column to hash on. Must be part of every UNIQUE/PRIMARY KEY
+            constraint on the root table, or PostgreSQL refuses the subtree.
+        modulus: Number of hash buckets to create per branch.
+        name_suffix: Template appended to the parent's name to name each
+            bucket. Must contain ``{remainder}`` and otherwise only lowercase
+            identifier characters.
+        subpartition: Optional further level of subpartitioning.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{remainder\}[a-z0-9_]*$")
+
+    strategy: Literal["hash"] = "hash"
+    column: StrippedNonEmptyStr
+    modulus: PositiveInt
+    name_suffix: str = DEFAULT_SUBPARTITION_NAME_SUFFIX
+    subpartition: SubpartitionSpec | None = None
+
+    @property
+    def partition_type(self) -> PartitionType:
+        """PostgreSQL partition type this spec describes."""
+        return PartitionType.HASH
+
+    @field_validator("column")
+    @classmethod
+    def validate_column(cls, v: str) -> str:
+        """Validate and normalise the hash column identifier."""
+        return validate_pg_identifier(v)
+
+    @field_validator("name_suffix")
+    @classmethod
+    def validate_name_suffix(cls, v: str) -> str:
+        """Reject templates that could not produce a safe, unique identifier."""
+        if not cls._NAME_SUFFIX_PATTERN.match(v):
+            msg = (
+                f"name_suffix {v!r} must contain '{{remainder}}' and otherwise only "
+                "lowercase letters, digits, and underscores"
+            )
+            raise ValueError(msg)
+        return v
+
+    def child_name(self, parent_relname: str, remainder: int) -> str:
+        """Return the bare relation name of one bucket under ``parent_relname``."""
+        return f"{parent_relname}{self.name_suffix.format(remainder=remainder)}"
+
+    def bounds_for(self, remainder: int) -> HashBounds:
+        """Return the bounds of bucket ``remainder`` at this spec's modulus."""
+        return HashBounds(modulus=self.modulus, remainder=remainder)
+
+    def name_length_budget(self) -> int:
+        """Bytes this level and everything below it add to a partition name.
+
+        Used to keep generated names inside PostgreSQL's 63-byte identifier
+        limit, which truncates silently — two buckets could otherwise collapse
+        onto one name.
+        """
+        widest = len(str(self.modulus - 1))
+        own = len(self.name_suffix) - len("{remainder}") + widest
+        below = self.subpartition.name_length_budget() if self.subpartition is not None else 0
+        return own + below
+
+    def depth(self) -> int:
+        """Number of subpartition levels this spec describes, including itself."""
+        return 1 + (self.subpartition.depth() if self.subpartition is not None else 0)
+
+    def walk(self) -> list[SubpartitionSpec]:
+        """Return this spec and every spec below it, outermost first."""
+        specs: list[SubpartitionSpec] = [self]
+        if self.subpartition is not None:
+            specs.extend(self.subpartition.walk())
+        return specs
+
+    @model_validator(mode="after")
+    def validate_depth(self) -> HashSubpartitionSpec:
+        """Bound the tree depth so a typo cannot fan out into thousands of tables."""
+        if self.depth() > MAX_SUBPARTITION_DEPTH:
+            msg = f"Subpartitioning is limited to {MAX_SUBPARTITION_DEPTH} levels, got {self.depth()}"
+            raise ValueError(msg)
+        return self
+
+
+SubpartitionSpec = HashSubpartitionSpec
+"""The subpartitioning of one level.
+
+HASH is the only strategy implemented today. When LIST/RANGE subpartitioning
+lands this becomes a union discriminated on ``strategy`` — which every spec
+already serialises — so stored configs keep parsing unchanged.
+"""
+
+
+# ── Introspected tree ───────────────────────────────────────────────────────────
+
+
+class PartitionNode(BaseModel):
+    """One relation in an introspected partition tree.
+
+    A node describes both how it sits in its parent (:attr:`bounds`) and how it
+    partitions its own children (:attr:`partition_type`) — the two are
+    independent, which is exactly what makes a nested tree expressible: a
+    branch is a partition *and* a partitioned table at once.
+
+    Attributes:
+        name: Schema-qualified relation name.
+        parent_name: Schema-qualified parent name; None for the queried root.
+        level: Depth below the queried root (0 for the root itself).
+        partition_type: How this relation partitions its children; None when it
+            is a plain (leaf) table.
+        partition_columns: This relation's own partition key columns.
+        bounds: How this relation is bound inside its parent; None for the root.
+        is_attached: ``pg_class.relispartition``. Descendants reached through a
+            parent are attached by construction — a detached relation is not in
+            anyone's tree — so this is informative mainly for the root itself.
+        children: Direct children, ordered by name.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: StrippedNonEmptyStr
+    parent_name: StrippedNonEmptyStr | None = None
+    level: NonNegativeInt = 0
+    partition_type: PartitionType | None = None
+    partition_columns: tuple[str, ...] = ()
+    bounds: PartitionBounds | None = None
+    is_attached: bool = True
+    children: tuple[PartitionNode, ...] = ()
+
+    @property
+    def is_leaf(self) -> bool:
+        """True when this relation is a plain table that cannot hold partitions."""
+        return self.partition_type is None
+
+    @property
+    def relname(self) -> str:
+        """Bare relation name without the schema qualifier."""
+        _, _, relname = self.name.rpartition(".")
+        return relname or self.name
+
+    @property
+    def hash_children(self) -> tuple[PartitionNode, ...]:
+        """Children bound by ``MODULUS``/``REMAINDER``."""
+        return tuple(c for c in self.children if isinstance(c.bounds, HashBounds))
+
+    def walk(self) -> list[PartitionNode]:
+        """Return this node and every node below it, depth-first."""
+        nodes = [self]
+        for child in self.children:
+            nodes.extend(child.walk())
+        return nodes
+
+    def find(self, name: str) -> PartitionNode | None:
+        """Return the node with schema-qualified ``name``, or None."""
+        return next((n for n in self.walk() if n.name == name), None)
+
+    def describe_topology(self) -> str:
+        """Render a one-line summary used in topology diagnostics."""
+        if self.is_leaf:
+            return "a plain leaf table"
+        columns = ", ".join(self.partition_columns) or "?"
+        assert self.partition_type is not None  # guarded by is_leaf above
+        return f"partitioned by {self.partition_type.value.upper()} ({columns})"
+
+
+def uniform_modulus(bounds: tuple[HashBounds, ...]) -> int | None:
+    """Return the single modulus shared by ``bounds``, or None when they differ.
+
+    An empty set has no modulus and also returns None; callers distinguish the
+    two cases by checking ``bounds`` themselves.
+    """
+    moduli = {b.modulus for b in bounds}
+    return moduli.pop() if len(moduli) == 1 else None
+
+
+def hash_keyspace_covered(bounds: tuple[HashBounds, ...]) -> bool | None:
+    """True when ``bounds`` tile the whole hash keyspace.
+
+    PostgreSQL allows hash siblings at *different* moduli as long as their
+    residue classes do not overlap — ``(2, 1)`` and ``(4, 0)`` coexist happily.
+    Such a set is complete only if every residue modulo the least common
+    multiple of the moduli is owned by someone; a gap means rows hashing there
+    are rejected outright with a check violation, so it must be detected rather
+    than assumed.
+
+    Returns:
+        True/False, or None when the moduli are too coarse to enumerate within
+        :data:`~pg_partsmith.constants.MAX_HASH_KEYSPACE_LCM` (coverage is then
+        unknown and must not be guessed at).
+    """
+    if not bounds:
+        return False
+
+    span = math.lcm(*(b.modulus for b in bounds))
+    if span > MAX_HASH_KEYSPACE_LCM:
+        return None
+
+    covered: set[int] = set()
+    for b in bounds:
+        covered.update(range(b.remainder, span, b.modulus))
+    return len(covered) == span
+
+
+def missing_remainders(modulus: int, bounds: tuple[HashBounds, ...]) -> tuple[int, ...]:
+    """Return the remainders at ``modulus`` that ``bounds`` do not already own."""
+    present = {b.remainder for b in bounds if b.modulus == modulus}
+    return tuple(r for r in range(modulus) if r not in present)
+
+
+def validate_pg_identifier(v: str) -> str:
+    """Validate and normalise a PostgreSQL identifier to lowercase.
+
+    PostgreSQL folds unquoted identifiers to lower-case; normalising here
+    ensures that metadata catalogue queries and quoted DDL identifiers always
+    refer to the same object.
+
+    Raises:
+        ValueError: If ``v`` is not a plain identifier or exceeds the 63-byte
+            limit PostgreSQL truncates at.
+    """
+    v = v.lower()
+    if not _IDENTIFIER_PATTERN.match(v):
+        msg = f"Invalid SQL identifier: {v!r}"
+        raise ValueError(msg)
+    if len(v) > MAX_IDENTIFIER_LENGTH:
+        msg = f"SQL identifier too long (max {MAX_IDENTIFIER_LENGTH} chars): {v!r}"
+        raise ValueError(msg)
+    return v
+
+
+_IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+class PartitionTreeRow(BaseModel):
+    """One flat catalog row on its way to becoming a :class:`PartitionNode`.
+
+    The metadata providers parse bounds and strategy codes; assembling the rows
+    into a tree is pure, so both the aio and sync mirrors share one
+    implementation via :func:`build_partition_tree`.
+
+    Attributes:
+        level: Depth below the queried root, as ``pg_partition_tree`` reports it.
+        name: Schema-qualified relation name.
+        parent_name: Schema-qualified parent name; None for the queried root.
+        bounds: How this relation is bound inside its parent.
+        is_attached: ``pg_class.relispartition``.
+        partition_type: How this relation partitions its own children.
+        partition_columns: This relation's own partition key columns.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    level: NonNegativeInt
+    name: StrippedNonEmptyStr
+    parent_name: StrippedNonEmptyStr | None = None
+    bounds: PartitionBounds | None = None
+    is_attached: bool = True
+    partition_type: PartitionType | None = None
+    partition_columns: tuple[str, ...] = ()
+
+
+def build_partition_tree(rows: Sequence[PartitionTreeRow]) -> PartitionNode | None:
+    """Assemble flat catalog rows into a tree, rooted at the level-0 row.
+
+    Rows whose parent is missing from the input are dropped rather than
+    re-parented: a partial tree would silently misreport a branch's child set,
+    and reconciliation reads that set to decide what to create.
+
+    Args:
+        rows: Catalog rows for one tree, in any order.
+
+    Returns:
+        The root node with its descendants attached, or None when ``rows``
+        contains no level-0 row.
+    """
+    children_by_parent: dict[str, list[PartitionTreeRow]] = {}
+    root: PartitionTreeRow | None = None
+
+    for row in rows:
+        if row.level == 0:
+            root = row
+        elif row.parent_name is not None:
+            children_by_parent.setdefault(row.parent_name, []).append(row)
+
+    if root is None:
+        return None
+
+    return _to_node(root, children_by_parent)
+
+
+def _to_node(row: PartitionTreeRow, children_by_parent: dict[str, list[PartitionTreeRow]]) -> PartitionNode:
+    """Build one node and, recursively, everything below it."""
+    children = tuple(
+        _to_node(child, children_by_parent) for child in sorted(children_by_parent.get(row.name, ()), key=_row_name)
+    )
+    return PartitionNode(
+        name=row.name,
+        parent_name=row.parent_name,
+        level=row.level,
+        partition_type=row.partition_type,
+        partition_columns=row.partition_columns,
+        bounds=row.bounds,
+        is_attached=row.is_attached,
+        children=children,
+    )
+
+
+def _row_name(row: PartitionTreeRow) -> str:
+    return row.name

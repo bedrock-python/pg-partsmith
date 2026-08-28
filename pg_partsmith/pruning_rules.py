@@ -8,15 +8,16 @@ fetched — so one implementation serves both mirrors.
 from __future__ import annotations
 
 import logging
-import re
-from datetime import UTC, datetime, tzinfo
+from datetime import datetime, tzinfo
 from typing import TYPE_CHECKING
 
-from dateutil.parser import isoparse
-
+from pg_partsmith.partition_bounds import parse_boundary_literal
+from pg_partsmith.protocols import BoundaryDecoder
 from pg_partsmith.utils import split_qualified_name
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pg_partsmith.entities import PartitionInfo, Period, TablePartitionConfig
     from pg_partsmith.protocols import PeriodCalculator
 
@@ -25,8 +26,6 @@ logger = logging.getLogger(__name__)
 # Upper-bound spellings that mean "no upper limit" — such partitions hold
 # current data and must never be pruned.
 _UNBOUNDED_UPPER = frozenset({"MAXVALUE", "INFINITY", "+INFINITY"})
-
-_DATE_ONLY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def select_partitions_to_prune(
@@ -42,11 +41,18 @@ def select_partitions_to_prune(
     skipped — guessing by name risks dropping live data. Name-based fallback
     applies to detached orphans, and to everything when the cutoff itself is
     non-temporal (custom calculators).
+
+    Boundaries are read back through the calculator when it implements
+    :class:`~pg_partsmith.protocols.BoundaryDecoder`, so a table keyed by an
+    encoded identifier (a UUIDv7, a sortable id) is pruned by the same rules as
+    a timestamp-keyed one.
     """
+    decode = _boundary_decoder(calculator, boundary_tz)
+
     current_period = calculator.current_period()
     cutoff_period = calculator.period_before(current_period, config.retention_count - 1)
     cutoff_start_raw = calculator.get_boundaries(cutoff_period)[0]
-    cutoff_start_dt = parse_boundary_to_utc_dt(cutoff_start_raw, boundary_tz)
+    cutoff_start_dt = decode(cutoff_start_raw)
 
     partitions_to_prune: list[PartitionInfo] = []
     parsed_period_by_name: dict[str, Period] = {}
@@ -65,7 +71,7 @@ def select_partitions_to_prune(
             )
             continue
 
-        end_dt = parse_boundary_to_utc_dt(partition.to_value, boundary_tz)
+        end_dt = decode(partition.to_value)
         if cutoff_start_dt is not None and end_dt is not None:
             if end_dt <= cutoff_start_dt:
                 partitions_to_prune.append(partition)
@@ -122,38 +128,44 @@ def select_partitions_to_prune(
     return partitions_to_prune
 
 
-def parse_boundary_to_utc_dt(value: str | None, boundary_tz: tzinfo) -> datetime | None:
-    """Parse a PostgreSQL partition boundary string to a UTC instant.
+def _boundary_decoder(
+    calculator: PeriodCalculator[Period],
+    boundary_tz: tzinfo,
+) -> Callable[[str | None], datetime | None]:
+    """Return the function that turns a boundary literal into a UTC instant.
 
-    Naive values (bare dates, timestamps without an offset) are interpreted in
-    ``boundary_tz``; values carrying an offset are converted as-is.
-    Comparisons downstream always happen between UTC instants.
+    A calculator that encodes its own boundaries must also decode them, so it
+    is asked first. Runtime-checkable protocols only verify that an attribute
+    exists, so what comes back is checked too: a loose implementation returning
+    something that is not an instant falls back to timestamp parsing rather
+    than poisoning the retention comparison with a non-comparable value.
     """
-    if value is None:
-        return None
-    v = value.strip()
-    if not v:
-        return None
+    if not isinstance(calculator, BoundaryDecoder):
+        return lambda value: parse_boundary_literal(value, boundary_tz)
 
-    if v.upper() in ("MINVALUE", "MAXVALUE"):
-        return None
+    decode_boundary = calculator.decode_boundary
 
-    if "-" not in v and ":" not in v:
-        return None
-
-    if _DATE_ONLY_PATTERN.fullmatch(v):
-        try:
-            return datetime.fromisoformat(v).replace(tzinfo=boundary_tz).astimezone(UTC)
-        except ValueError:
+    def decode(value: str | None) -> datetime | None:
+        if value is None:
             return None
+        # Annotated as object so the type checker keeps the fallback branch:
+        # the guard exists precisely for implementations that do not honour the
+        # declared return type.
+        decoded: object = decode_boundary(value)
+        if decoded is None or isinstance(decoded, datetime):
+            return decoded
+        # Quiet by design, matching validate_timezone_alignment: a boundary that
+        # ends up uninterpretable is already reported where it affects a
+        # decision, and this path fires per partition.
+        logger.debug(
+            "Calculator returned a non-datetime boundary; falling back to timestamp parsing",
+            extra={"boundary": value, "calculator": type(calculator).__name__},
+        )
+        return parse_boundary_literal(value, boundary_tz)
 
-    try:
-        parsed = isoparse(v)
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except (ValueError, TypeError):
-        return None
+    return decode
 
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=boundary_tz).astimezone(UTC)
-    return parsed.astimezone(UTC)
+
+# Retained under its original name: ``pruning_rules.parse_boundary_to_utc_dt``
+# was importable before the parser moved next to the rest of the bound parsing.
+parse_boundary_to_utc_dt = parse_boundary_literal

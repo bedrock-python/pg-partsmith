@@ -1,9 +1,11 @@
 from datetime import UTC, date, datetime
 
 import pytest
+from pydantic import ValidationError
 
 import pg_partsmith
 from pg_partsmith.entities import (
+    HashSubpartitionSpec,
     MaintenanceIssue,
     MaintenanceIssueStep,
     MaintenanceResult,
@@ -648,3 +650,75 @@ def test__package_root__migration_ergonomics_exports__importable_and_functional(
     assert pg_partsmith.qualify(None, "events") == "events"
     assert pg_partsmith.split_qualified_name("public.events") == ("public", "events")
     assert pg_partsmith.split_qualified_name("events") == (None, "events")
+
+
+# ── Subpartitioned configuration ────────────────────────────────────────────────
+
+
+def _config(**overrides: object) -> TablePartitionConfig:
+    base: dict[str, object] = {
+        "table_name": "events",
+        "partition_type": PartitionType.RANGE,
+        "partition_strategy": PartitionStrategy.TIME_BASED,
+        "partition_column": "created_at",
+        "granularity": PartitionGranularity.WEEK,
+    }
+    base.update(overrides)
+    return TablePartitionConfig(**base)  # type: ignore[arg-type]
+
+
+def test__config__without_subpartition__stays_none() -> None:
+    # Arrange / Act
+    config = _config()
+
+    # Assert
+    assert config.subpartition is None
+
+
+def test__config__with_hash_subpartition__accepted() -> None:
+    # Arrange / Act
+    config = _config(subpartition=HashSubpartitionSpec(column="tenant_id", modulus=4))
+
+    # Assert
+    assert config.subpartition is not None
+    assert config.subpartition.modulus == 4
+
+
+def test__config__subpartition_on_the_root_partition_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="already the root partition column"):
+        _config(subpartition=HashSubpartitionSpec(column="created_at", modulus=2))
+
+
+def test__config__repeated_subpartition_column_across_levels__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="distinct across levels"):
+        _config(
+            subpartition=HashSubpartitionSpec(
+                column="tenant_id",
+                modulus=2,
+                subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+            )
+        )
+
+
+def test__config__subpartition_suffix_pushes_name_over_the_identifier_limit__rejected() -> None:
+    # Arrange: 55 + len("__0000_w00") == 65 would already fail, so pick a name
+    # that only overflows once the bucket suffix is added.
+    table_name = "e" * 51
+
+    # Act: no subpartition still fits (51 + 10 == 61).
+    _config(table_name=table_name)
+
+    # Assert
+    with pytest.raises(ValidationError, match="subpartition suffix"):
+        _config(table_name=table_name, subpartition=HashSubpartitionSpec(column="tenant_id", modulus=4))
+
+
+def test__config__non_range_root_with_subpartition__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError):
+        _config(
+            partition_type=PartitionType.LIST,
+            subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+        )

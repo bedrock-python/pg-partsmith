@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import tzinfo
+from datetime import datetime, tzinfo
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .entities import Period
 
-__all__ = ["DdlTimezoneAware", "PeriodCalculator", "TimezoneAwareCalculator"]
+__all__ = [
+    "BoundaryDecoder",
+    "DdlTimezoneAware",
+    "PeriodCalculator",
+    "TimezoneAwareCalculator",
+]
 
 PeriodT = TypeVar("PeriodT", bound=Period)
 
@@ -116,4 +121,20 @@ class DdlTimezoneAware(Protocol):
     @property
     def ddl_timezone(self) -> str | None:
         """Timezone applied via ``SET LOCAL TIME ZONE``; None trusts the session."""
+        ...
+
+
+@runtime_checkable
+class BoundaryDecoder(Protocol):
+    """Calculator that can read its own physical boundary literals back.
+
+    Retention selects partitions by comparing a partition's *catalog* upper
+    bound against the cutoff instant. When the partition key is not a timestamp
+    — a UUIDv7, a ULID, an epoch bigint — that comparison is only possible if
+    the component that encoded the boundary can also decode it. Calculators
+    without this capability keep the historical timestamp interpretation.
+    """
+
+    def decode_boundary(self, literal: str) -> datetime | None:
+        """Return the instant a boundary literal stands for, or None."""
         ...

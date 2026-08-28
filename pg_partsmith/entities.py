@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import functools
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -24,26 +23,42 @@ from .constants import (
     MIN_MONTH,
     MIN_QUARTER,
 )
+from .topology import (
+    DefaultBounds,
+    HashBounds,
+    HashSubpartitionSpec,
+    ListBounds,
+    PartitionBounds,
+    PartitionNode,
+    PartitionType,
+    RangeBounds,
+    SubpartitionSpec,
+    validate_pg_identifier,
+)
 from .types import NonNegativeInt, PositiveInt, StrippedNonEmptyStr
 
-
-class PartitionType(StrEnum):
-    """PostgreSQL partition type.
-
-    Attributes:
-        RANGE: Range partitioning (e.g., by date ranges).
-        LIST: List partitioning (e.g., by specific values).
-        HASH: Hash partitioning (e.g., by hash of key).
-    """
-
-    RANGE = "range"
-    LIST = "list"
-    HASH = "hash"
-
-    @classmethod
-    def from_partstrat(cls, strat: str | None) -> PartitionType | None:
-        """Map a ``pg_partitioned_table.partstrat`` code to a partition type."""
-        return {"r": cls.RANGE, "l": cls.LIST, "h": cls.HASH}.get(strat or "")
+# ``PartitionType`` and the partition-tree models live in ``topology`` so that
+# module can stay IO-free and importable from anywhere; they are re-exported
+# here because ``pg_partsmith.entities`` has always been their public home.
+__all__ = [
+    "DefaultBounds",
+    "HashBounds",
+    "HashSubpartitionSpec",
+    "ListBounds",
+    "MaintenanceIssue",
+    "MaintenanceIssueStep",
+    "MaintenanceResult",
+    "PartitionBounds",
+    "PartitionGranularity",
+    "PartitionInfo",
+    "PartitionNode",
+    "PartitionStrategy",
+    "PartitionType",
+    "Period",
+    "RangeBounds",
+    "SubpartitionSpec",
+    "TablePartitionConfig",
+]
 
 
 class PartitionGranularity(StrEnum):
@@ -455,8 +470,14 @@ class PartitionInfo(BaseModel):
         boundaries_expr: Raw boundary expression as reported by PostgreSQL
             (``pg_get_expr(relpartbound, oid)``). Useful when parsing boundaries
             fails but the partition is still attached.
+        bounds: Structured form of the same boundaries, discriminated on the
+            bound kind. Populated from ``from_value``/``to_value`` for RANGE
+            partitions when not supplied, so the two views never disagree.
         is_attached: Whether partition is currently attached to parent table.
         is_default: Whether this is the DEFAULT partition (no explicit boundaries).
+        subpartition_type: How this partition partitions its own children, when
+            it is itself a partitioned table. ``None`` for a leaf — which is
+            what distinguishes a legacy leaf from a subpartitioned branch.
         parent_table: Name of parent partitioned table.
     """
 
@@ -467,9 +488,47 @@ class PartitionInfo(BaseModel):
     from_value: str | None = None
     to_value: str | None = None
     boundaries_expr: str | None = None
+    bounds: PartitionBounds | None = None
     is_attached: bool = True
     is_default: bool = False
+    subpartition_type: PartitionType | None = None
     parent_table: StrippedNonEmptyStr | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_range_bounds(cls, data: object) -> object:
+        """Keep ``bounds`` and ``from_value``/``to_value`` in step.
+
+        Both spellings of a RANGE boundary are part of the public surface:
+        callers written before structured bounds existed pass the pair, newer
+        ones pass ``bounds``. Deriving the missing side here means neither kind
+        of caller can observe a half-populated model.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        bounds = data.get("bounds")
+        if bounds is None:
+            from_value, to_value = data.get("from_value"), data.get("to_value")
+            if not data.get("is_default") and from_value is not None and to_value is not None:
+                data["bounds"] = RangeBounds(from_value=from_value, to_value=to_value)
+            elif data.get("is_default"):
+                data["bounds"] = DefaultBounds()
+        elif isinstance(bounds, RangeBounds):
+            data.setdefault("from_value", bounds.from_value)
+            data.setdefault("to_value", bounds.to_value)
+
+        return data
+
+    @property
+    def is_subpartitioned(self) -> bool:
+        """True when this partition is itself a partitioned table (a branch)."""
+        return self.subpartition_type is not None
+
+    @property
+    def hash_bounds(self) -> HashBounds | None:
+        """This partition's ``MODULUS``/``REMAINDER`` bounds, when hash-bound."""
+        return self.bounds if isinstance(self.bounds, HashBounds) else None
 
     @model_validator(mode="after")
     def validate_range_boundaries(self) -> PartitionInfo:
@@ -526,9 +585,10 @@ def _split_name(name: str) -> tuple[str | None, str]:
 class TablePartitionConfig(BaseModel):
     """Configuration for table partitioning maintenance.
 
-    Only TIME_BASED (RANGE by date/time) partitioning is currently supported.
-    VALUE_BASED and HASH_BASED strategies are reserved for future use and will
-    raise a ValueError at construction time.
+    The root table must be TIME_BASED (RANGE by date/time); VALUE_BASED and
+    HASH_BASED *roots* are reserved for future use and raise a ValueError at
+    construction time. Each time partition may itself be subpartitioned via
+    :attr:`subpartition`.
 
     Attributes:
         schema: Optional schema name for the partitioned table. When set, all
@@ -541,8 +601,14 @@ class TablePartitionConfig(BaseModel):
         partition_column: Column used for partitioning.
         granularity: Time granularity (for TIME_BASED strategy).
         create_ahead_count: Number of periods to ensure exist, including the current period.
-        retention_count: Number of partitions to retain.
+        retention_count: Number of partitions to retain. Counted in top-level
+            time periods, never in subpartitions - the time dimension is the
+            lifecycle dimension.
         auto_attach_after_create: Whether to attach immediately after creation.
+        subpartition: Optional subpartitioning applied inside each time
+            partition, making it a partitioned table in its own right (for
+            example ``RANGE(created_at)`` weekly -> ``HASH(tenant_id)``). Leave
+            ``None`` for the classic one-leaf-per-period layout.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -562,6 +628,7 @@ class TablePartitionConfig(BaseModel):
     )
     retention_count: PositiveInt = Field(default=DEFAULT_RETENTION_COUNT, description="Number of partitions to retain")
     auto_attach_after_create: bool = True
+    subpartition: SubpartitionSpec | None = None
 
     @property
     def db_schema(self) -> StrippedNonEmptyStr | None:
@@ -603,16 +670,44 @@ class TablePartitionConfig(BaseModel):
                 raise ValueError(msg)
 
             # Validate that generated partition names will not exceed PostgreSQL's
-            # 63-byte identifier limit (max_identifier_length default).
+            # 63-byte identifier limit (max_identifier_length default). PostgreSQL
+            # truncates silently, so two hash buckets could otherwise collapse
+            # onto a single name.
             suffix_len = _NAME_SUFFIX_LEN[self.granularity]
-            if len(self.table_name) + suffix_len > MAX_IDENTIFIER_LENGTH:
+            subpartition_len = self.subpartition.name_length_budget() if self.subpartition is not None else 0
+            total = len(self.table_name) + suffix_len + subpartition_len
+            if total > MAX_IDENTIFIER_LENGTH:
+                subpartition_part = f" + subpartition suffix ({subpartition_len})" if subpartition_len else ""
                 msg = (
                     f"table_name {self.table_name!r} is too long for "
                     f"{self.granularity.value} granularity: "
-                    f"table_name ({len(self.table_name)}) + suffix ({suffix_len}) = "
-                    f"{len(self.table_name) + suffix_len} > {MAX_IDENTIFIER_LENGTH} bytes."
+                    f"table_name ({len(self.table_name)}) + suffix ({suffix_len})"
+                    f"{subpartition_part} = {total} > {MAX_IDENTIFIER_LENGTH} bytes."
                 )
                 raise ValueError(msg)
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_subpartitioning(self) -> TablePartitionConfig:
+        """Reject subpartitioning the library cannot manage on this root."""
+        if self.subpartition is None:
+            return self
+
+        if self.partition_type != PartitionType.RANGE:
+            msg = "Subpartitioning is only supported under a RANGE-partitioned root table"
+            raise ValueError(msg)
+
+        columns = [spec.column for spec in self.subpartition.walk()]
+        if self.partition_column in columns:
+            msg = (
+                f"Subpartition column {self.partition_column!r} is already the root partition column; "
+                "subpartitioning must use a different dimension"
+            )
+            raise ValueError(msg)
+        if len(set(columns)) != len(columns):
+            msg = f"Subpartition columns must be distinct across levels, got {columns!r}"
+            raise ValueError(msg)
 
         return self
 
@@ -630,62 +725,59 @@ _NAME_SUFFIX_LEN: dict[PartitionGranularity, int] = {
 
 
 def _validate_pg_identifier(v: str | None) -> str | None:
-    """Validate and normalise PostgreSQL identifier to lowercase.
-
-    PostgreSQL folds unquoted identifiers to lower-case; normalising here
-    ensures that metadata catalogue queries and quoted DDL identifiers
-    always refer to the same object.
-    """
-    if v is None:
-        return None
-    v = v.lower()
-    if not re.match(r"^[a-z_][a-z0-9_]*$", v):
-        msg = f"Invalid SQL identifier: {v!r}"
-        raise ValueError(msg)
-    if len(v) > MAX_IDENTIFIER_LENGTH:
-        msg = f"SQL identifier too long (max {MAX_IDENTIFIER_LENGTH} chars): {v!r}"
-        raise ValueError(msg)
-    return v
+    """Validate and normalise an optional PostgreSQL identifier to lowercase."""
+    return None if v is None else validate_pg_identifier(v)
 
 
 class MaintenanceIssueStep(StrEnum):
     """Lifecycle step in which a non-fatal maintenance issue occurred."""
 
     CREATE = "create"
+    RECONCILE = "reconcile"
     DETACH = "detach"
     DROP = "drop"
 
 
 class MaintenanceIssue(BaseModel):
-    """A non-fatal error recorded during a ``continue_on_error`` maintenance run.
+    """A non-fatal problem recorded during a maintenance run.
 
     Attributes:
-        step: Lifecycle step the error occurred in.
+        step: Lifecycle step the problem occurred in.
         error: Error message (``TypeName: message``).
+        partition_name: Partition the problem concerns, when it is specific to
+            one - subpartition reconciliation always sets it.
     """
 
     model_config = ConfigDict(frozen=True)
 
     step: MaintenanceIssueStep
     error: StrippedNonEmptyStr
+    partition_name: str | None = None
 
 
 class MaintenanceResult(BaseModel):
     """Result of partition maintenance operation.
 
     Attributes:
-        created_count: Number of partitions created.
+        created_count: Number of top-level partitions created. A subpartitioned
+            branch counts once, however many leaves it contains - the branch is
+            the lifecycle unit.
+        repaired_count: Number of subpartitions created inside *pre-existing*
+            branches to close gaps in their child sets.
         detached_count: Number of partitions detached in this run.
         dropped_count: Number of partitions dropped.
         duration_ms: Duration of maintenance in milliseconds.
         error: Fatal error message (set when the whole maintenance run fails).
-        issues: Non-fatal step failures collected when the run was started with
-            ``continue_on_error=True``; the remaining steps still executed.
+        issues: Non-fatal problems. Step failures land here when the run was
+            started with ``continue_on_error=True``; topology divergences that
+            reconciliation deliberately refused to repair are always recorded,
+            since leaving them unreported would hide rejected writes.
     """
 
     model_config = ConfigDict(frozen=True)
 
     created_count: NonNegativeInt = 0
+    repaired_count: NonNegativeInt = 0
     detached_count: NonNegativeInt = 0
     dropped_count: NonNegativeInt = 0
     duration_ms: NonNegativeInt = 0
