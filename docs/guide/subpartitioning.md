@@ -172,6 +172,52 @@ The same convergence rules apply as for a nested level — an existing hash set 
 another modulus is preserved, a LIST value another partition owns is reported —
 because it is the same planner, just pointed at the root.
 
+## Composite partition keys
+
+A partition key may span several columns. Pass `partition_columns` instead of
+`partition_column`:
+
+```python
+config = TablePartitionConfig(
+    table_name="events",
+    partition_type=PartitionType.RANGE,
+    partition_strategy=PartitionStrategy.TIME_BASED,
+    partition_columns=("created_at", "tenant_id"),
+    granularity=PartitionGranularity.WEEK,
+)
+```
+
+Only the **leading** column carries the period. The trailing ones are bounded
+with `MINVALUE` at both ends:
+
+```sql
+FOR VALUES FROM ('2026-08-24', MINVALUE) TO ('2026-08-31', MINVALUE)
+```
+
+which selects exactly the rows whose `created_at` falls in the week, whatever
+their `tenant_id` — the same set a single-column bound would. Retention reads
+the leading value back out, so pruning behaves identically.
+
+Subpartition levels take composite keys the same way, via `columns`:
+
+```python
+HashSubpartitionSpec(columns=("tenant_id", "shard_id"), modulus=8)
+```
+
+Two limits, both PostgreSQL's rather than this library's:
+
+- **LIST takes exactly one column.** A composite LIST key is rejected outright
+  by PostgreSQL, and the config refuses it up front.
+- **Every key column must appear in every UNIQUE/PRIMARY KEY**, which now means
+  all of them, not just the leading one.
+
+`partition_column` remains available and returns the leading column, so existing
+code and single-column configs are unaffected.
+
+> Key order is not column order. `pg_partsmith` reads it from `partattrs`'
+> own ordering — sorting by column position would silently transpose a
+> composite key.
+
 ## Required unique constraints
 
 PostgreSQL requires every `UNIQUE` / `PRIMARY KEY` constraint on a partitioned table to

@@ -38,11 +38,17 @@ def parse_range_boundaries(boundaries_expr: str | None) -> tuple[str | None, str
     on the PostgreSQL version and the partition key type. This parser extracts
     stable boundary values for the common cases without fully parsing SQL.
 
+    Under a composite key the leading element is returned: trailing columns are
+    bounded with MINVALUE at both ends, so the partition holds exactly the rows
+    whose leading column falls in that range, and that is the value retention
+    and pruning reason about.
+
     Examples:
       FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')
       FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)
       FOR VALUES FROM (1::bigint) TO (5::bigint)
       FOR VALUES FROM (MINVALUE) TO (MAXVALUE)
+      FOR VALUES FROM ('2024-01-01', MINVALUE) TO ('2024-02-01', MINVALUE)
     """
     if not boundaries_expr:
         return None, None
@@ -64,7 +70,7 @@ def parse_range_boundaries(boundaries_expr: str | None) -> tuple[str | None, str
     from_part = _FROM_PREFIX_PATTERN.sub("", parts[0])
     to_part = _TRAILING_PAREN_PATTERN.sub("", parts[1])
 
-    return _normalize(from_part), _normalize(to_part)
+    return _leading_value(from_part), _leading_value(to_part)
 
 
 def is_addressable(schema: str, relname: str) -> bool:
@@ -219,3 +225,9 @@ def parse_boundary_literal(value: str | None, boundary_tz: tzinfo) -> datetime |
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=boundary_tz).astimezone(UTC)
     return parsed.astimezone(UTC)
+
+
+def _leading_value(expr: str) -> str:
+    """Normalise a bound element, taking the leading one of a composite tuple."""
+    parts = _split_top_level(expr)
+    return _normalize(parts[0]) if parts else _normalize(expr)

@@ -16,6 +16,8 @@ from pg_partsmith.entities import (
 )
 
 __all__ = [
+    "CompositeKeyMetadata",
+    "CompositeKeyRepository",
     "LockManager",
     "NestedPartitionMetadata",
     "PartitionLifecycle",
@@ -383,5 +385,52 @@ class NestedPartitionMetadata(Protocol):
 
         Returns:
             True if the partition is attached via pg_inherits.
+        """
+        ...
+
+
+@runtime_checkable
+class CompositeKeyRepository(Protocol):
+    """DDL for a parent whose partition key spans several columns.
+
+    Separate from :class:`PartitionRepository` for the same reason as the
+    nested protocols: a repository written before composite keys keeps
+    satisfying the flat one, and is only required to grow this method once a
+    config actually declares a multi-column key.
+    """
+
+    async def attach_composite_partition(
+        self,
+        table_name: str,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+        *,
+        key_arity: int,
+    ) -> None:
+        """Attach a partition, padding the trailing key columns with MINVALUE.
+
+        Args:
+            table_name: Parent table name.
+            partition_name: Partition table name.
+            from_value: Start boundary for the leading column.
+            to_value: End boundary for the leading column.
+            key_arity: Number of columns in the parent's partition key.
+        """
+        ...
+
+
+@runtime_checkable
+class CompositeKeyMetadata(Protocol):
+    """Introspection of a partition key that spans several columns."""
+
+    async def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
+        """Return a table's own partition key columns, in key order.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            The key columns in order; empty when the table is not partitioned.
         """
         ...

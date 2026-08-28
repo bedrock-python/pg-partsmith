@@ -9,6 +9,7 @@ from sqlalchemy import text
 from pg_partsmith.catalog_queries import (
     INSTANT_HAS_PASSED_SQL,
     PARTITION_CLOSED_SQL,
+    PARTITION_COLUMNS_SQL,
     PARTITION_IS_ATTACHED_SQL,
     PARTITION_TREE_SQL,
     PARTITION_UPPER_BOUND_SQL,
@@ -116,6 +117,28 @@ class PostgresMetadataProvider:
             raise ValueError(msg)
 
         return coerce_str(rows[0][0])
+
+    async def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
+        """Return a table's own partition key columns, in key order.
+
+        Unlike :meth:`get_partition_column`, which predates composite keys and
+        refuses them, this reports the whole key. Key order is not column
+        order, so it comes from ``partattrs``' own ordering.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            The key columns in order; empty when the table is not partitioned.
+        """
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                text(PARTITION_COLUMNS_SQL),
+                {"table_name": to_regclass_argument(table_name)},
+            )
+            rows = result.fetchall()
+
+        return tuple(coerce_str(row[0]) or "" for row in rows)
 
     async def list_partitions(self, table_name: str) -> list[PartitionInfo]:
         """List all partitions for a table, including orphaned detached ones.

@@ -253,19 +253,20 @@ def _incompatibility(spec: SubpartitionSpec, node: PartitionNode) -> TopologyFin
             reason=TopologyReason.STRATEGY_MISMATCH,
             detail=(
                 f"{node.name} is {node.describe_topology()} but the configuration asks for "
-                f"{spec.partition_type.value.upper()} ({spec.column}); leaving it as-is. "
+                f"{spec.partition_type.value.upper()} ({', '.join(spec.columns)}); leaving it as-is. "
                 "Repartitioning an existing branch requires a rewrite and is not attempted."
             ),
         )
 
-    if node.partition_columns != (spec.column,):
+    if node.partition_columns != spec.columns:
         actual = ", ".join(node.partition_columns) or "?"
+        wanted = ", ".join(spec.columns)
         return TopologyFinding(
             partition_name=node.name,
             reason=TopologyReason.COLUMN_MISMATCH,
             detail=(
                 f"{node.name} is partitioned by {spec.partition_type.value.upper()} ({actual}) but the "
-                f"configuration asks for ({spec.column}); leaving it as-is."
+                f"configuration asks for ({wanted}); leaving it as-is."
             ),
         )
 

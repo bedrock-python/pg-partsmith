@@ -25,6 +25,7 @@ from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
 from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
+    COMPOSITE_TABLE_DDL,
     FROZEN_WEEK,
     HASH_ROOT_TABLE_DDL,
     IDENTITY_TABLE_DDL,
@@ -41,6 +42,7 @@ from tests.integration.nested_support import (
     WEEK_BOUNDS,
     WEEK_SUFFIX,
     DdlCounter,
+    composite_config,
     ddl_counter,
     flat_config,
     hash_children,
@@ -110,6 +112,11 @@ def hash_root_table(sync_db_engine: Engine) -> Generator[str, None, None]:
 @pytest.fixture
 def list_root_table(sync_db_engine: Engine) -> Generator[str, None, None]:
     yield from _make_table(sync_db_engine, LIST_ROOT_TABLE_DDL)
+
+
+@pytest.fixture
+def composite_table(sync_db_engine: Engine) -> Generator[str, None, None]:
+    yield from _make_table(sync_db_engine, COMPOSITE_TABLE_DDL)
 
 
 def _maintainer(engine: Engine, *, codec: RangeBoundaryCodec | None = None) -> PartitionMaintainer:
@@ -1513,3 +1520,114 @@ def test__static_root__time_based_api_without_a_calculator__refused_clearly(
     # Act / Assert: create-ahead is period arithmetic and there are no periods.
     with pytest.raises(InvalidPartitionConfigError, match="period_calculator"):
         service.create_future_partitions(flat_config(hash_root_table))
+
+
+# ── Composite partition keys ────────────────────────────────────────────────────
+
+
+def test__composite_key__fresh_table__creates_the_period_partition(
+    sync_db_engine: Engine, composite_table: str
+) -> None:
+    # Arrange / Act
+    result = _run(sync_db_engine, composite_config(composite_table))
+
+    # Assert
+    assert result.success
+    assert result.created_count == 1
+    assert _relkind(sync_db_engine, f"{composite_table}{WEEK_SUFFIX}") == "r"
+
+
+def test__composite_key__bounds_pad_trailing_columns_with_minvalue(
+    sync_db_engine: Engine, composite_table: str
+) -> None:
+    # Arrange
+    _run(sync_db_engine, composite_config(composite_table))
+
+    # Act
+    with sync_db_engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = to_regclass(:n)"),
+            {"n": f'"{composite_table}{WEEK_SUFFIX}"'},
+        )
+        bounds = str(result.scalar())
+
+    # Assert
+    assert bounds.count("MINVALUE") == 2
+    assert "2026-08-24" in bounds
+    assert "2026-08-31" in bounds
+
+
+def test__composite_key__rows_route_by_the_leading_column_alone(sync_db_engine: Engine, composite_table: str) -> None:
+    # Arrange
+    _run(sync_db_engine, composite_config(composite_table, create_ahead=2))
+    branch = f"{composite_table}{WEEK_SUFFIX}"
+
+    # Act: wildly different trailing values, same period.
+    with sync_db_engine.begin() as conn:
+        for tenant in (-9999, 0, 1, 999999):
+            conn.execute(
+                text(f'INSERT INTO "{composite_table}" (tenant_id, created_at) VALUES (:t, :d)'),  # noqa: S608
+                {"t": tenant, "d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
+            )
+        rows = conn.execute(
+            text(f'SELECT DISTINCT tableoid::regclass::text FROM "{composite_table}"')  # noqa: S608
+        )
+        leaves = {str(r[0]) for r in rows.fetchall()}
+
+    # Assert: the trailing column does not affect placement.
+    assert leaves == {branch}
+
+
+def test__composite_key__second_run__executes_zero_ddl(sync_db_engine: Engine, composite_table: str) -> None:
+    # Arrange
+    config = composite_config(composite_table)
+    _run(sync_db_engine, config)
+
+    # Act
+    with _count_ddl(sync_db_engine) as counter:
+        result = _run(sync_db_engine, config)
+
+    # Assert
+    assert result.created_count == 0
+    assert counter.statements == []
+
+
+def test__composite_key__retention__prunes_by_the_leading_bound(sync_db_engine: Engine, composite_table: str) -> None:
+    # Arrange
+    config = composite_config(composite_table, retention=1)
+    with freezegun.freeze_time("2026-08-10"):
+        _maintainer(sync_db_engine).run_maintenance(config)
+    old = f"{composite_table}__2026_w33"
+    assert _relkind(sync_db_engine, old) == "r"
+
+    # Act
+    result = _run(sync_db_engine, config)
+
+    # Assert: parsing a composite bound yields the leading value, so retention
+    # compares the same instant it would for a single-column key.
+    assert result.dropped_count == 1
+    assert _relkind(sync_db_engine, old) is None
+
+
+def test__composite_key__introspection__reports_the_key_in_key_order(
+    sync_db_engine: Engine, composite_table: str
+) -> None:
+    # Arrange
+    metadata = PostgresMetadataProvider(sync_db_engine)
+
+    # Act
+    columns = metadata.get_partition_columns(composite_table)
+
+    # Assert: key order, which is not column order.
+    assert columns == ("created_at", "tenant_id")
+
+
+def test__composite_key__config_disagreeing_with_the_table__refused(
+    sync_db_engine: Engine, composite_table: str
+) -> None:
+    # Arrange: the real key is (created_at, tenant_id).
+    config = composite_config(composite_table).model_copy(update={"partition_columns": ("created_at", "id")})
+
+    # Act / Assert
+    with freezegun.freeze_time(FROZEN_WEEK), pytest.raises(InvalidPartitionConfigError, match="key mismatch"):
+        _maintainer(sync_db_engine).run_maintenance(config)

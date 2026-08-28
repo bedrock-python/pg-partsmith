@@ -154,29 +154,59 @@ class SubpartitionSpecBase(BaseModel):
     """Fields and tree arithmetic shared by every subpartitioning strategy.
 
     Attributes:
-        column: Column this level partitions on. Must be part of every
-            UNIQUE/PRIMARY KEY constraint on the root table, or PostgreSQL
-            refuses the subtree.
+        columns: Columns this level partitions on, in key order. Every one must
+            be part of every UNIQUE/PRIMARY KEY constraint on the root table, or
+            PostgreSQL refuses the subtree. Pass ``column=`` instead for the
+            common single-column case.
         name_suffix: Template appended to the parent's name to name each child.
         subpartition: Optional further level of subpartitioning.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    column: StrippedNonEmptyStr
+    columns: tuple[StrippedNonEmptyStr, ...]
     name_suffix: str
     subpartition: SubpartitionSpec | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_single_column(cls, data: object) -> object:
+        """Accept ``column="x"`` as the one-column spelling of ``columns``."""
+        if isinstance(data, dict) and "column" in data and "columns" not in data:
+            data = {**data, "columns": (data["column"],)}
+            data.pop("column")
+        return data
+
+    @property
+    def column(self) -> str:
+        """The single column this level divides on.
+
+        Raises:
+            ValueError: If the level uses a composite key, where no single
+                column describes it.
+        """
+        if len(self.columns) != 1:
+            msg = f"{type(self).__name__} partitions on {self.columns!r}; use `columns`, not `column`"
+            raise ValueError(msg)
+        return self.columns[0]
 
     @property
     def partition_type(self) -> PartitionType:
         """PostgreSQL partition type this spec describes."""
         raise NotImplementedError
 
-    @field_validator("column")
+    @field_validator("columns")
     @classmethod
-    def validate_column(cls, v: str) -> str:
-        """Validate and normalise the partition column identifier."""
-        return validate_pg_identifier(v)
+    def validate_columns(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        """Validate and normalise the partition key identifiers."""
+        if not v:
+            msg = "A subpartition level must name at least one column"
+            raise ValueError(msg)
+        columns = tuple(validate_pg_identifier(column) for column in v)
+        if len(set(columns)) != len(columns):
+            msg = f"Partition key columns must be distinct, got {columns!r}"
+            raise ValueError(msg)
+        return columns
 
     def own_name_budget(self) -> int:
         """Bytes this level alone adds to a child's name."""
@@ -355,6 +385,12 @@ class ListSubpartitionSpec(SubpartitionSpecBase):
     @model_validator(mode="after")
     def validate_groups(self) -> ListSubpartitionSpec:
         """Reject a spec PostgreSQL would refuse or that names two partitions alike."""
+        if len(self.columns) != 1:
+            msg = (
+                f"LIST partitioning takes exactly one column, got {self.columns!r}. "
+                "PostgreSQL rejects a composite LIST key."
+            )
+            raise ValueError(msg)
         if not self.groups:
             msg = "LIST subpartitioning requires at least one group"
             raise ValueError(msg)

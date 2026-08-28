@@ -124,6 +124,23 @@ class PostgresPartitionRepository:
         """
         await self._creator.attach_subpartition(parent_name, child_name, bounds)
 
+    async def attach_composite_partition(
+        self,
+        table_name: str,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+        *,
+        key_arity: int,
+    ) -> None:
+        """Attach a partition to a parent with a composite partition key.
+
+        See :meth:`PartitionCreator.attach_composite_partition`.
+        """
+        await self._creator.attach_composite_partition(
+            table_name, partition_name, from_value, to_value, key_arity=key_arity
+        )
+
     async def detach_partition(self, table_name: str, partition_name: str, *, concurrent: bool = True) -> None:
         await self._remover.detach(table_name, partition_name, concurrent=concurrent)
 

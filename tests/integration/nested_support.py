@@ -135,6 +135,18 @@ LIST_ROOT_TABLE_DDL = """
 """
 
 
+# A root whose partition key spans two columns. Only the leading one carries
+# the period; the trailing one is bounded with MINVALUE at both ends.
+COMPOSITE_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        tenant_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (id, tenant_id, created_at)
+    ) PARTITION BY RANGE (created_at, tenant_id)
+"""
+
+
 def nested_config(
     table_name: str,
     *,
@@ -221,6 +233,24 @@ def list_root_config(
             groups=tuple(ListGroup(name=name, values=values) for name, values in groups),
             include_default=include_default,
         ),
+    )
+
+
+def composite_config(
+    table_name: str,
+    *,
+    create_ahead: int = 1,
+    retention: int = 12,
+) -> TablePartitionConfig:
+    """Build a weekly configuration over a composite RANGE key."""
+    return TablePartitionConfig(
+        table_name=table_name,
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_columns=("created_at", "tenant_id"),
+        granularity=PartitionGranularity.WEEK,
+        create_ahead_count=create_ahead,
+        retention_count=retention,
     )
 
 

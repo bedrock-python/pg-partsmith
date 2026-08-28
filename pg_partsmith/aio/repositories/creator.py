@@ -70,6 +70,43 @@ class PartitionCreator:
                 await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             await conn.execute(stmt)
 
+    async def attach_composite_partition(
+        self,
+        table_name: str,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+        *,
+        key_arity: int,
+    ) -> None:
+        """Attach a partition to a parent whose partition key has several columns.
+
+        Only the leading column carries the period; the trailing ones are
+        bounded with MINVALUE at both ends. That makes the partition hold
+        exactly the rows whose leading column falls in ``[from_value,
+        to_value)`` -- the same set a single-column bound would select.
+
+        Args:
+            table_name: Parent table name.
+            partition_name: Partition table name.
+            from_value: Start boundary for the leading column.
+            to_value: End boundary for the leading column.
+            key_arity: Number of columns in the parent's partition key.
+        """
+        padding = ", MINVALUE" * (key_arity - 1)
+        stmt = build_ddl_statement(
+            "ALTER TABLE {parent} ATTACH PARTITION {partition} "
+            f"FOR VALUES FROM ([from_val]{padding}) TO ([to_val]{padding})",
+            parent=table_name,
+            partition=partition_name,
+            from_val=from_value,
+            to_val=to_value,
+        )
+        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            if self._ddl_timezone is not None:
+                await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
+            await conn.execute(stmt)
+
     async def reconcile_default_rows(
         self,
         *,
@@ -153,11 +190,12 @@ class PartitionCreator:
         Raises:
             PartitionAlreadyExistsError: If a relation of that name exists.
         """
+        clause, columns = _partition_by_clause(spec)
         stmt = build_ddl_statement(
-            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY) " + _partition_by_clause(spec),
+            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY) " + clause,
             partition=branch_name,
             parent=qualify(config.db_schema, config.table_name),
-            column=spec.column,
+            **columns,
         )
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             try:
@@ -192,8 +230,9 @@ class PartitionCreator:
         template = "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY)"
         params = {"partition": child_name, "parent": parent_name}
         if spec is not None:
-            template = f"{template} {_partition_by_clause(spec)}"
-            params["column"] = spec.column
+            clause, columns = _partition_by_clause(spec)
+            template = f"{template} {clause}"
+            params.update(columns)
 
         stmt = build_ddl_statement(template, **params)
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
@@ -229,14 +268,19 @@ class PartitionCreator:
             await conn.execute(stmt)
 
 
-def _partition_by_clause(spec: SubpartitionSpec) -> str:
-    """Render the ``PARTITION BY`` clause for a spec.
+def _partition_by_clause(spec: SubpartitionSpec) -> tuple[str, dict[str, str]]:
+    """Render the ``PARTITION BY`` clause for a spec, plus the identifiers it needs.
 
-    The strategy comes from a closed enum and ``{column}`` is substituted by
+    The strategy comes from a closed enum and each column is substituted by
     :func:`~pg_partsmith.utils.build_ddl_statement` as a quoted identifier, so
-    neither half of the clause is unescaped caller text.
+    no part of the clause is unescaped caller text.
+
+    Returns:
+        The clause and the identifier parameters it references.
     """
-    return f"PARTITION BY {spec.partition_type.value.upper()} ({{column}})"
+    columns = {f"key_{index}": column for index, column in enumerate(spec.columns)}
+    rendered = ", ".join(f"{{{name}}}" for name in columns)
+    return f"PARTITION BY {spec.partition_type.value.upper()} ({rendered})", columns
 
 
 def _values_clause(bounds: SubpartitionBounds) -> tuple[str, dict[str, str]]:

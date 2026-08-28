@@ -118,3 +118,17 @@ PARTITION_CLOSED_SQL = r"""
 INSTANT_HAS_PASSED_SQL = """
     SELECT now() >= CAST(:upper_bound AS timestamptz) + make_interval(secs => :settle_seconds)
 """
+
+# The table's own partition key, in key order.
+#
+# ``partattrs`` is an ordered vector, and its order is the key order -- which is
+# not the column order. Unnesting WITH ORDINALITY preserves it; ordering by
+# attnum would silently transpose a composite key.
+PARTITION_COLUMNS_SQL = """
+    SELECT a.attname
+    FROM pg_partitioned_table t
+    CROSS JOIN LATERAL unnest(t.partattrs) WITH ORDINALITY AS k(attnum, ord)
+    JOIN pg_attribute a ON a.attrelid = t.partrelid AND a.attnum = k.attnum
+    WHERE t.partrelid = to_regclass(:table_name)
+    ORDER BY k.ord
+"""

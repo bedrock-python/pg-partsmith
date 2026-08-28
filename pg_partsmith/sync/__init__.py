@@ -5,6 +5,8 @@ from .lock import PostgresAdvisoryLockManager, RedisDistributedLockManager
 from .maintainer import PartitionMaintainer, maintain_partitions
 from .metadata import PostgresMetadataProvider
 from .protocols import (
+    CompositeKeyMetadata,
+    CompositeKeyRepository,
     LockManager,
     NestedPartitionMetadata,
     PartitionMetadataProvider,
@@ -16,6 +18,8 @@ from .service import PartitionLifecycleService
 
 __all__ = [
     "BasePartitionLifecycleHooks",
+    "CompositeKeyMetadata",
+    "CompositeKeyRepository",
     "LockManager",
     "NestedPartitionMetadata",
     "PartitionLifecycleHooks",

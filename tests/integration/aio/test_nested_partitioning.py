@@ -27,6 +27,7 @@ from pg_partsmith.strategies import WeekPeriodCalculator
 from pg_partsmith.subpartition_plan import TopologyReason
 from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
+    COMPOSITE_TABLE_DDL,
     FROZEN_WEEK,
     HASH_ROOT_TABLE_DDL,
     IDENTITY_TABLE_DDL,
@@ -43,6 +44,7 @@ from tests.integration.nested_support import (
     WEEK_BOUNDS,
     WEEK_SUFFIX,
     DdlCounter,
+    composite_config,
     ddl_counter,
     flat_config,
     hash_children,
@@ -119,6 +121,12 @@ async def hash_root_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
 @pytest_asyncio.fixture
 async def list_root_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
     async for name in _make_table(db_engine, LIST_ROOT_TABLE_DDL):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def composite_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, COMPOSITE_TABLE_DDL):
         yield name
 
 
@@ -1547,3 +1555,118 @@ async def test__static_root__time_based_api_without_a_calculator__refused_clearl
     # Act / Assert: create-ahead is period arithmetic and there are no periods.
     with pytest.raises(InvalidPartitionConfigError, match="period_calculator"):
         await service.create_future_partitions(flat_config(hash_root_table))
+
+
+# ── Composite partition keys ────────────────────────────────────────────────────
+
+
+async def test__composite_key__fresh_table__creates_the_period_partition(
+    db_engine: AsyncEngine, composite_table: str
+) -> None:
+    # Arrange / Act
+    result = await _run(db_engine, composite_config(composite_table))
+
+    # Assert
+    assert result.success
+    assert result.created_count == 1
+    assert await _relkind(db_engine, f"{composite_table}{WEEK_SUFFIX}") == "r"
+
+
+async def test__composite_key__bounds_pad_trailing_columns_with_minvalue(
+    db_engine: AsyncEngine, composite_table: str
+) -> None:
+    # Arrange
+    await _run(db_engine, composite_config(composite_table))
+
+    # Act
+    async with db_engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = to_regclass(:n)"),
+            {"n": f'"{composite_table}{WEEK_SUFFIX}"'},
+        )
+        bounds = str(result.scalar())
+
+    # Assert
+    assert bounds.count("MINVALUE") == 2
+    assert "2026-08-24" in bounds
+    assert "2026-08-31" in bounds
+
+
+async def test__composite_key__rows_route_by_the_leading_column_alone(
+    db_engine: AsyncEngine, composite_table: str
+) -> None:
+    # Arrange
+    await _run(db_engine, composite_config(composite_table, create_ahead=2))
+    branch = f"{composite_table}{WEEK_SUFFIX}"
+
+    # Act: wildly different trailing values, same period.
+    async with db_engine.begin() as conn:
+        for tenant in (-9999, 0, 1, 999999):
+            await conn.execute(
+                text(f'INSERT INTO "{composite_table}" (tenant_id, created_at) VALUES (:t, :d)'),  # noqa: S608
+                {"t": tenant, "d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
+            )
+        rows = await conn.execute(
+            text(f'SELECT DISTINCT tableoid::regclass::text FROM "{composite_table}"')  # noqa: S608
+        )
+        leaves = {str(r[0]) for r in rows.fetchall()}
+
+    # Assert: the trailing column does not affect placement.
+    assert leaves == {branch}
+
+
+async def test__composite_key__second_run__executes_zero_ddl(db_engine: AsyncEngine, composite_table: str) -> None:
+    # Arrange
+    config = composite_config(composite_table)
+    await _run(db_engine, config)
+
+    # Act
+    with _count_ddl(db_engine) as counter:
+        result = await _run(db_engine, config)
+
+    # Assert
+    assert result.created_count == 0
+    assert counter.statements == []
+
+
+async def test__composite_key__retention__prunes_by_the_leading_bound(
+    db_engine: AsyncEngine, composite_table: str
+) -> None:
+    # Arrange
+    config = composite_config(composite_table, retention=1)
+    with freezegun.freeze_time("2026-08-10"):
+        await _maintainer(db_engine).run_maintenance(config)
+    old = f"{composite_table}__2026_w33"
+    assert await _relkind(db_engine, old) == "r"
+
+    # Act
+    result = await _run(db_engine, config)
+
+    # Assert: parsing a composite bound yields the leading value, so retention
+    # compares the same instant it would for a single-column key.
+    assert result.dropped_count == 1
+    assert await _relkind(db_engine, old) is None
+
+
+async def test__composite_key__introspection__reports_the_key_in_key_order(
+    db_engine: AsyncEngine, composite_table: str
+) -> None:
+    # Arrange
+    metadata = PostgresMetadataProvider(db_engine)
+
+    # Act
+    columns = await metadata.get_partition_columns(composite_table)
+
+    # Assert: key order, which is not column order.
+    assert columns == ("created_at", "tenant_id")
+
+
+async def test__composite_key__config_disagreeing_with_the_table__refused(
+    db_engine: AsyncEngine, composite_table: str
+) -> None:
+    # Arrange: the real key is (created_at, tenant_id).
+    config = composite_config(composite_table).model_copy(update={"partition_columns": ("created_at", "id")})
+
+    # Act / Assert
+    with freezegun.freeze_time(FROZEN_WEEK), pytest.raises(InvalidPartitionConfigError, match="key mismatch"):
+        await _maintainer(db_engine).run_maintenance(config)

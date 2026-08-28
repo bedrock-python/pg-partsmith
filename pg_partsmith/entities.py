@@ -608,7 +608,11 @@ class TablePartitionConfig(BaseModel):
             the longest generated partition suffix).
         partition_type: Type of partitioning (RANGE, LIST, HASH).
         partition_strategy: Strategy for partitioning.
-        partition_column: Column used for partitioning.
+        partition_columns: Columns of the table's own partition key, in key
+            order. Pass ``partition_column=`` for the usual single-column case.
+            For a time-based table the leading column is the time dimension;
+            trailing columns are bounded with MINVALUE at both ends, so each
+            partition still holds exactly one period.
         granularity: Time granularity (for TIME_BASED strategy).
         create_ahead_count: Number of periods to ensure exist, including the current period.
         retention_count: Number of partitions to retain. Counted in top-level
@@ -635,7 +639,7 @@ class TablePartitionConfig(BaseModel):
     table_name: StrippedNonEmptyStr
     partition_type: PartitionType
     partition_strategy: PartitionStrategy
-    partition_column: StrippedNonEmptyStr
+    partition_columns: tuple[StrippedNonEmptyStr, ...]
     granularity: PartitionGranularity | None = None
     create_ahead_count: PositiveInt = Field(
         default=DEFAULT_CREATE_AHEAD_COUNT,
@@ -651,7 +655,32 @@ class TablePartitionConfig(BaseModel):
         """PostgreSQL schema name."""
         return self.schema_name
 
-    @field_validator("table_name", "partition_column")
+    @model_validator(mode="before")
+    @classmethod
+    def accept_single_partition_column(cls, data: object) -> object:
+        """Accept ``partition_column="x"`` as the one-column spelling."""
+        if isinstance(data, dict) and "partition_column" in data and "partition_columns" not in data:
+            data = {**data, "partition_columns": (data["partition_column"],)}
+            data.pop("partition_column")
+        return data
+
+    @property
+    def partition_column(self) -> str:
+        """The leading partition key column.
+
+        For a time-based table this is the time dimension, and it stays
+        meaningful under a composite key: trailing columns are bounded with
+        MINVALUE at both ends, so the partition holds exactly the rows whose
+        leading column falls in the range.
+        """
+        return self.partition_columns[0]
+
+    @property
+    def key_arity(self) -> int:
+        """Number of columns in the table's partition key."""
+        return len(self.partition_columns)
+
+    @field_validator("table_name")
     @classmethod
     def validate_identifier(cls, v: str) -> str:
         """Validate and normalise SQL identifiers."""
@@ -660,6 +689,19 @@ class TablePartitionConfig(BaseModel):
             msg = "SQL identifier cannot be empty"
             raise ValueError(msg)
         return result
+
+    @field_validator("partition_columns")
+    @classmethod
+    def validate_partition_columns(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        """Validate and normalise the partition key identifiers."""
+        if not v:
+            msg = "A partitioned table must name at least one partition column"
+            raise ValueError(msg)
+        columns = tuple(_require_pg_identifier(column) for column in v)
+        if len(set(columns)) != len(columns):
+            msg = f"Partition key columns must be distinct, got {columns!r}"
+            raise ValueError(msg)
+        return columns
 
     @field_validator("schema_name")
     @classmethod
@@ -735,16 +777,22 @@ class TablePartitionConfig(BaseModel):
                 f"{expected_type.value.upper()} partition type, got {self.partition_type.value.upper()}"
             )
             raise ValueError(msg)
+        if self.partition_type == PartitionType.LIST and self.key_arity != 1:
+            msg = (
+                f"LIST partitioning takes exactly one column, got {self.partition_columns!r}. "
+                "PostgreSQL rejects a composite LIST key."
+            )
+            raise ValueError(msg)
         if self.root_layout.partition_type != expected_type:
             msg = (
                 f"root_layout describes {self.root_layout.partition_type.value.upper()} partitions but "
                 f"{self.partition_strategy.value!r} needs {expected_type.value.upper()}"
             )
             raise ValueError(msg)
-        if self.root_layout.column != self.partition_column:
+        if self.root_layout.columns != self.partition_columns:
             msg = (
-                f"root_layout column {self.root_layout.column!r} must be the table's own partition "
-                f"column {self.partition_column!r}"
+                f"root_layout columns {self.root_layout.columns!r} must be the table's own partition "
+                f"key {self.partition_columns!r}"
             )
             raise ValueError(msg)
         if self.granularity is not None:
@@ -773,11 +821,13 @@ class TablePartitionConfig(BaseModel):
         # Every level must divide on a fresh dimension: reusing a column would
         # leave the lower level with nothing left to separate. The root counts,
         # and for a static root it is already the first declared spec.
-        columns = [self.partition_column]
+        columns = list(self.partition_columns)
         if self.root_layout is not None:
-            columns.extend(spec.column for spec in self.root_layout.walk()[1:])
+            for spec in self.root_layout.walk()[1:]:
+                columns.extend(spec.columns)
         elif self.subpartition is not None:
-            columns.extend(spec.column for spec in self.subpartition.walk())
+            for spec in self.subpartition.walk():
+                columns.extend(spec.columns)
 
         duplicates = sorted({column for column in columns if columns.count(column) > 1})
         if duplicates:
@@ -820,6 +870,11 @@ _NAME_SUFFIX_LEN: dict[PartitionGranularity, int] = {
 def _validate_pg_identifier(v: str | None) -> str | None:
     """Validate and normalise an optional PostgreSQL identifier to lowercase."""
     return None if v is None else validate_pg_identifier(v)
+
+
+def _require_pg_identifier(v: str) -> str:
+    """Validate and normalise a required PostgreSQL identifier to lowercase."""
+    return validate_pg_identifier(v)
 
 
 class MaintenanceIssueStep(StrEnum):

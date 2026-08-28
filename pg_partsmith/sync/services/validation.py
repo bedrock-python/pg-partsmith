@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pg_partsmith.exceptions import InvalidPartitionConfigError
-from pg_partsmith.sync.protocols import NestedPartitionMetadata
+from pg_partsmith.sync.protocols import CompositeKeyMetadata, NestedPartitionMetadata
 from pg_partsmith.utils import qualify
 
 if TYPE_CHECKING:
@@ -35,31 +35,67 @@ class PartitionValidationService:
             )
             raise InvalidPartitionConfigError(msg)
 
-        try:
-            actual_column = self._metadata.get_partition_column(qualified_parent)
-        except ValueError as exc:
-            raise InvalidPartitionConfigError(str(exc)) from exc
+        actual_columns = self._actual_partition_columns(config, qualified_parent)
 
-        if actual_column is None:
+        if not actual_columns:
             msg = f"Could not determine partition column for table {qualified_parent!r}"
             raise InvalidPartitionConfigError(msg)
 
         # A quoted mixed-case column would pass a lowercased comparison here but
         # later fail in reconcile SQL, which quotes the config's lowercase name.
-        if actual_column != actual_column.lower():
+        mixed_case = [column for column in actual_columns if column != column.lower()]
+        if mixed_case:
             msg = (
-                f"Partition column {actual_column!r} of table {qualified_parent!r} is mixed-case; "
+                f"Partition column(s) {mixed_case!r} of table {qualified_parent!r} are mixed-case; "
                 "only lowercase partition columns are supported"
             )
             raise InvalidPartitionConfigError(msg)
 
-        if actual_column != config.partition_column:
-            msg = (
-                f"Partition column mismatch for table {qualified_parent!r}: "
-                f"config={config.partition_column!r} actual={actual_column!r}"
-            )
+        if actual_columns != config.partition_columns:
+            # Single-column tables keep the wording they have always reported.
+            if config.key_arity == 1 and len(actual_columns) == 1:
+                msg = (
+                    f"Partition column mismatch for table {qualified_parent!r}: "
+                    f"config={config.partition_column!r} actual={actual_columns[0]!r}"
+                )
+            else:
+                msg = (
+                    f"Partition key mismatch for table {qualified_parent!r}: "
+                    f"config={config.partition_columns!r} actual={actual_columns!r}"
+                )
             raise InvalidPartitionConfigError(msg)
         self._validate_subpartitioning(config, qualified_parent)
+
+    def _actual_partition_columns(
+        self,
+        config: TablePartitionConfig,
+        qualified_parent: str,
+    ) -> tuple[str, ...]:
+        """Read the table's real partition key, in key order.
+
+        A single-column config goes through the original accessor unchanged, so
+        a metadata provider that predates composite keys keeps working; the
+        newer one is required only when the config declares a multi-column key.
+        """
+        metadata = self._metadata
+
+        if config.key_arity == 1:
+            # The long-standing accessor, untouched: a single-column config must
+            # keep working with a metadata provider that predates composite keys.
+            try:
+                actual_column = metadata.get_partition_column(qualified_parent)
+            except ValueError as exc:
+                raise InvalidPartitionConfigError(str(exc)) from exc
+            return (actual_column,) if actual_column is not None else ()
+
+        if not isinstance(metadata, CompositeKeyMetadata):
+            msg = (
+                f"Metadata provider {type(metadata).__name__} cannot introspect composite partition "
+                "keys; it must implement CompositeKeyMetadata."
+            )
+            raise InvalidPartitionConfigError(msg)
+
+        return metadata.get_partition_columns(qualified_parent)
 
     def _validate_subpartitioning(self, config: TablePartitionConfig, qualified_parent: str) -> None:
         """Refuse a partitioning layout the database could not accept.

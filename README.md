@@ -17,6 +17,7 @@ A single library that covers the full PostgreSQL partition lifecycle: creating p
 - **Full lifecycle** — create ahead, detach expired, drop orphans in one call
 - **Nested partitioning** — `RANGE(time) → HASH(column)` and `→ LIST(column)` trees, reconciled towards the configured shape on every run
 - **Time-free tables** — HASH or LIST roots with a fixed partition set, managed by the same reconciler
+- **Composite keys** — multi-column partition keys, with trailing columns bounded by `MINVALUE`
 - **Encoded partition keys** — partition by time even when the key is a UUIDv7 or another sortable id
 - **Extensible hooks** — 6 hook points (`before`/`after` create, detach, drop)
 - **Multiple strategies** — hourly, daily, weekly, monthly, quarterly, yearly + fully custom
@@ -417,7 +418,7 @@ scheduler.add_job(
 
 ### `pg_partsmith.aio`
 
-**Protocols** — `PartitionRepository`, `PartitionMetadataProvider`, `LockManager`, `SubpartitionRepository`, `NestedPartitionMetadata`
+**Protocols** — `PartitionRepository`, `PartitionMetadataProvider`, `LockManager`, `SubpartitionRepository`, `NestedPartitionMetadata`, `CompositeKeyRepository`, `CompositeKeyMetadata`
 
 **Hooks** — `BasePartitionLifecycleHooks`
 

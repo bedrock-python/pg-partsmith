@@ -14,7 +14,10 @@ from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     SubpartitioningNotSupportedError,
 )
-from pg_partsmith.sync.protocols import SubpartitionRepository
+from pg_partsmith.sync.protocols import (
+    CompositeKeyRepository,
+    SubpartitionRepository,
+)
 from pg_partsmith.utils import is_default_partition_conflict, pg_sqlstate, qualify, split_qualified_name
 
 from .base import BasePartitionService
@@ -275,7 +278,7 @@ class PartitionCreationService(BasePartitionService):
 
         for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
-                self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
+                self._attach(config, qualified_parent, partition_name, from_value, to_value)
             except (KeyboardInterrupt, SystemExit):
                 # Best-effort compensating move-back before the interrupt propagates.
                 self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
@@ -338,6 +341,31 @@ class PartitionCreationService(BasePartitionService):
                 )
             else:
                 return  # Success
+
+    def _attach(
+        self,
+        config: TablePartitionConfig,
+        qualified_parent: str,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+    ) -> None:
+        """Attach a partition, padding the bound when the key is composite.
+
+        A single-column key takes the long-standing path untouched; only a
+        multi-column one needs the trailing MINVALUE columns, and it is only
+        then that the repository has to support them.
+        """
+        if config.key_arity == 1:
+            self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
+            return
+
+        repo = self._repo
+        if not isinstance(repo, CompositeKeyRepository):
+            raise SubpartitioningNotSupportedError(f"Repository {type(repo).__name__}", "CompositeKeyRepository")
+        repo.attach_composite_partition(
+            qualified_parent, partition_name, from_value, to_value, key_arity=config.key_arity
+        )
 
     def _restore_reconciled_rows(
         self,

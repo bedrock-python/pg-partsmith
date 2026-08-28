@@ -6,6 +6,8 @@ from pydantic import ValidationError
 import pg_partsmith
 from pg_partsmith.entities import (
     HashSubpartitionSpec,
+    ListGroup,
+    ListSubpartitionSpec,
     MaintenanceIssue,
     MaintenanceIssueStep,
     MaintenanceResult,
@@ -14,8 +16,10 @@ from pg_partsmith.entities import (
     PartitionStrategy,
     PartitionType,
     Period,
+    RangeBounds,
     TablePartitionConfig,
 )
+from pg_partsmith.partition_bounds import parse_partition_bounds
 
 # ── Period ──────────────────────────────────────────────────────────────────────
 
@@ -723,3 +727,101 @@ def test__config__non_range_root_with_subpartition__rejected() -> None:
             partition_type=PartitionType.LIST,
             subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
         )
+
+
+# ── Composite partition keys ────────────────────────────────────────────────────
+
+
+def test__config__composite_partition_key__exposes_columns_and_arity() -> None:
+    # Arrange / Act
+    config = _config(partition_columns=("created_at", "tenant_id"))
+
+    # Assert
+    assert config.partition_columns == ("created_at", "tenant_id")
+    assert config.partition_column == "created_at"
+    assert config.key_arity == 2
+
+
+def test__config__single_partition_column__still_accepted_and_normalised() -> None:
+    # Arrange / Act
+    config = _config()
+
+    # Assert: the historical spelling keeps working.
+    assert config.partition_columns == ("created_at",)
+    assert config.partition_column == "created_at"
+    assert config.key_arity == 1
+
+
+def test__config__repeated_partition_key_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="distinct"):
+        _config(partition_columns=("created_at", "created_at"))
+
+
+def test__config__empty_partition_key__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="at least one partition column"):
+        _config(partition_columns=())
+
+
+def test__config__composite_key_overlapping_a_subpartition_column__rejected() -> None:
+    # Arrange / Act / Assert: the lower level would have nothing left to divide.
+    with pytest.raises(ValidationError, match="distinct across levels"):
+        _config(
+            partition_columns=("created_at", "tenant_id"),
+            subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+        )
+
+
+def test__config__composite_list_root__rejected() -> None:
+    # Arrange / Act / Assert: PostgreSQL has no composite LIST key.
+    with pytest.raises(ValidationError, match="exactly one column"):
+        TablePartitionConfig(
+            table_name="events",
+            partition_type=PartitionType.LIST,
+            partition_strategy=PartitionStrategy.VALUE_BASED,
+            partition_columns=("region", "tier"),
+            root_layout=ListSubpartitionSpec(column="region", groups=(ListGroup(name="eu", values=("de",)),)),
+        )
+
+
+def test__hash_spec__composite_columns__accepted() -> None:
+    # Arrange / Act
+    spec = HashSubpartitionSpec(columns=("tenant_id", "shard_id"), modulus=4)
+
+    # Assert
+    assert spec.columns == ("tenant_id", "shard_id")
+
+
+def test__hash_spec__composite_columns__single_column_accessor_refuses() -> None:
+    # Arrange
+    spec = HashSubpartitionSpec(columns=("tenant_id", "shard_id"), modulus=4)
+
+    # Act / Assert: no single column describes a composite key.
+    with pytest.raises(ValueError, match="use `columns`"):
+        _ = spec.column
+
+
+def test__list_spec__composite_columns__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="exactly one column"):
+        ListSubpartitionSpec(columns=("region", "tier"), groups=(ListGroup(name="eu", values=("de",)),))
+
+
+def test__parse_partition_bounds__composite_range__returns_the_leading_value() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds(
+        "FOR VALUES FROM ('2024-01-01 00:00:00+00', MINVALUE) TO ('2024-02-01 00:00:00+00', MINVALUE)"
+    )
+
+    # Assert: trailing columns are MINVALUE at both ends, so the leading value
+    # is what the partition actually selects on.
+    assert parsed == RangeBounds(from_value="2024-01-01 00:00:00+00", to_value="2024-02-01 00:00:00+00")
+
+
+def test__parse_partition_bounds__composite_numeric_range__returns_the_leading_value() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES FROM (100, MINVALUE) TO (200, MINVALUE)")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="100", to_value="200")
