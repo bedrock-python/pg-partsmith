@@ -1,91 +1,69 @@
+"""Safe drop: FK cleanup, idempotency, attachment guard and lock-contention retries (async)."""
+
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
-from pg_partsmith.entities import (
-    PartitionGranularity,
-    PartitionStrategy,
-    PartitionType,
-    TablePartitionConfig,
-)
-from pg_partsmith.exceptions import PartitionAttachedError
+from pg_partsmith.exceptions import PartitionAttachedError, PlanStaleError
+from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.topology import RangeBounds
+from tests.integration.aio.support import make_table
 
-_ORDERS_TABLE = "sd_orders"
-_EVENTS_TABLE = "sd_events"
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+pytestmark = pytest.mark.integration
+
+_ORDERS_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT ''
+    )
+"""
+
+_EVENTS_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id        BIGSERIAL,
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        order_id  BIGINT,
+        data      TEXT,
+        PRIMARY KEY (id, created_at)
+    ) PARTITION BY RANGE (created_at)
+"""
 
 
 @pytest_asyncio.fixture
 async def referenced_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
-    async with db_engine.begin() as conn:
-        await conn.execute(
-            text(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_ORDERS_TABLE} (
-                    id BIGSERIAL PRIMARY KEY,
-                    name TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-        )
-    yield _ORDERS_TABLE
-    async with db_engine.begin() as conn:
-        await conn.execute(text(f"DROP TABLE IF EXISTS {_ORDERS_TABLE} CASCADE"))
+    async for name in make_table(db_engine, _ORDERS_TABLE_DDL, prefix="sd_orders"):
+        yield name
 
 
 @pytest_asyncio.fixture
-async def partitioned_table(
-    db_engine: AsyncEngine,
-    referenced_table: str,
-) -> AsyncGenerator[str, None]:
-    async with db_engine.begin() as conn:
-        await conn.execute(
-            text(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_EVENTS_TABLE} (
-                    id        BIGSERIAL,
-                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                    order_id  BIGINT,
-                    data      TEXT,
-                    PRIMARY KEY (id, created_at)
-                ) PARTITION BY RANGE (created_at)
-                """
-            )
-        )
-    yield _EVENTS_TABLE
-    async with db_engine.begin() as conn:
-        await conn.execute(text(f"DROP TABLE IF EXISTS {_EVENTS_TABLE} CASCADE"))
-
-
-def _config(table_name: str) -> TablePartitionConfig:
-    return TablePartitionConfig(
-        table_name=table_name,
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-    )
+async def partitioned_table(db_engine: AsyncEngine, referenced_table: str) -> AsyncGenerator[str, None]:
+    async for name in make_table(db_engine, _EVENTS_TABLE_DDL, prefix="sd_events"):
+        yield name
 
 
 async def _create_detached(engine: AsyncEngine, parent: str, partition_name: str, from_val: str, to_val: str) -> None:
     repo = PostgresPartitionRepository(engine)
-    await repo.create_partition(_config(parent), partition_name, from_val, to_val)
-    await repo.attach_partition(parent, partition_name, from_val, to_val)
-    await repo.detach_partition(parent, partition_name, concurrent=False)
+    await repo.create_table_like(parent, partition_name, None)
+    await repo.attach_partition(parent, partition_name, RangeBounds(from_value=from_val, to_value=to_val))
+    await repo.detach_partition(parent, partition_name, mode=DetachMode.BLOCKING)
 
 
 # ── happy path ───────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.integration
 async def test__drop_partition__detached_no_fk__drops_cleanly(
     db_engine: AsyncEngine,
     partitioned_table: str,
@@ -105,7 +83,6 @@ async def test__drop_partition__detached_no_fk__drops_cleanly(
 # ── FK cleanup ────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.integration
 async def test__drop_partition__single_fk__removes_constraint_and_drops_table(
     db_engine: AsyncEngine,
     db_session: AsyncSession,
@@ -150,7 +127,6 @@ async def test__drop_partition__single_fk__removes_constraint_and_drops_table(
     assert result.scalar() is True
 
 
-@pytest.mark.integration
 async def test__drop_partition__multiple_fks__removes_all_constraints(
     db_engine: AsyncEngine,
     db_session: AsyncSession,
@@ -182,7 +158,6 @@ async def test__drop_partition__multiple_fks__removes_all_constraints(
 # ── idempotency ───────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.integration
 async def test__drop_partition__double_drop__second_call_is_noop(
     db_engine: AsyncEngine,
     partitioned_table: str,
@@ -200,7 +175,6 @@ async def test__drop_partition__double_drop__second_call_is_noop(
     assert not await PostgresMetadataProvider(db_engine).partition_exists(name)
 
 
-@pytest.mark.integration
 async def test__drop_partition__completely_nonexistent__is_noop(db_engine: AsyncEngine) -> None:
     # Arrange
     repo = PostgresPartitionRepository(db_engine)
@@ -212,7 +186,6 @@ async def test__drop_partition__completely_nonexistent__is_noop(db_engine: Async
 # ── safety ────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.integration
 async def test__drop_partition__still_attached__raises_partition_attached_error(
     db_engine: AsyncEngine,
     partitioned_table: str,
@@ -221,8 +194,8 @@ async def test__drop_partition__still_attached__raises_partition_attached_error(
     name = f"{partitioned_table}__2024_11"
     repo = PostgresPartitionRepository(db_engine)
     metadata = PostgresMetadataProvider(db_engine)
-    await repo.create_partition(_config(partitioned_table), name, "2024-11-01", "2024-12-01")
-    await repo.attach_partition(partitioned_table, name, "2024-11-01", "2024-12-01")
+    await repo.create_table_like(partitioned_table, name, None)
+    await repo.attach_partition(partitioned_table, name, RangeBounds(from_value="2024-11-01", to_value="2024-12-01"))
 
     try:
         # Act / Assert
@@ -233,21 +206,43 @@ async def test__drop_partition__still_attached__raises_partition_attached_error(
         assert await metadata.is_partition_attached(partitioned_table, name)
     finally:
         if await metadata.is_partition_attached(partitioned_table, name):
-            await repo.detach_partition(partitioned_table, name, concurrent=False)
+            await repo.detach_partition(partitioned_table, name, mode=DetachMode.BLOCKING)
         await repo.drop_partition(name)
+
+
+async def test__drop_partition__expected_oid_of_another_relation__refused_and_the_table_survives(
+    db_engine: AsyncEngine,
+    partitioned_table: str,
+) -> None:
+    # Arrange — the decision was made about a relation that has since been
+    # dropped and recreated under the same name
+    name = f"{partitioned_table}__2024_12"
+    await _create_detached(db_engine, partitioned_table, name, "2024-12-01", "2025-01-01")
+    metadata = PostgresMetadataProvider(db_engine)
+    real_oid = await metadata.get_relation_oid(name)
+    assert real_oid is not None
+    repo = PostgresPartitionRepository(db_engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError):
+        await repo.drop_partition(name, expected_oid=real_oid + 1)
+    assert await metadata.partition_exists(name)
+
+    # The right identity still drops it
+    await repo.drop_partition(name, expected_oid=real_oid)
+    assert not await metadata.partition_exists(name)
 
 
 # ── retry on lock contention ──────────────────────────────────────────────────────
 
 
-@pytest.mark.integration
 async def test__drop_partition__lock_contention__retries_and_succeeds_after_release(
     db_engine: AsyncEngine,
     partitioned_table: str,
 ) -> None:
     # Arrange
-    name = f"{partitioned_table}__2024_12"
-    await _create_detached(db_engine, partitioned_table, name, "2024-12-01", "2025-01-01")
+    name = f"{partitioned_table}__2025_01"
+    await _create_detached(db_engine, partitioned_table, name, "2025-01-01", "2025-02-01")
 
     lock_acquired = asyncio.Event()
 

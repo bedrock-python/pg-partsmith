@@ -1,12 +1,15 @@
-from collections.abc import AsyncGenerator
+"""The maintainer orchestrating the lifecycle service against a real PostgreSQL (async)."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import freezegun
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.lock.postgres import PostgresAdvisoryLockManager
@@ -15,61 +18,52 @@ from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.aio.service import PartitionLifecycleService
 from pg_partsmith.entities import (
+    MaintenanceResult,
     PartitionGranularity,
     PartitionInfo,
     PartitionStrategy,
     PartitionType,
     TablePartitionConfig,
 )
-from pg_partsmith.strategies import MonthPeriodCalculator
+from pg_partsmith.exceptions import LockAcquisitionError
+from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.topology import RangeBounds
+from tests.integration.aio.support import count_ddl, make_table
+from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+pytestmark = pytest.mark.integration
 
 
 @pytest_asyncio.fixture
-async def partitioned_table(db_session: AsyncSession) -> AsyncGenerator[str, None]:
-    await db_session.execute(
-        text(
-            """
-            CREATE TABLE IF NOT EXISTS maint_events (
-                id BIGSERIAL,
-                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                data TEXT,
-                PRIMARY KEY (id, created_at)
-            ) PARTITION BY RANGE (created_at)
-            """
-        )
-    )
-    await db_session.commit()
-    yield "maint_events"
-    await db_session.execute(text("DROP TABLE IF EXISTS maint_events CASCADE"))
-    await db_session.commit()
+async def partitioned_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in make_table(db_engine, MONTHLY_TABLE_DDL, prefix="maint"):
+        yield name
 
 
 def _make_components(
     engine: AsyncEngine,
-) -> tuple[
-    PostgresPartitionRepository,
-    PostgresMetadataProvider,
-    PostgresAdvisoryLockManager,
-    MonthPeriodCalculator,
-]:
+) -> tuple[PostgresPartitionRepository, PostgresMetadataProvider, PostgresAdvisoryLockManager]:
     return (
         PostgresPartitionRepository(engine),
         PostgresMetadataProvider(engine),
         PostgresAdvisoryLockManager(engine),
-        MonthPeriodCalculator(),
     )
 
 
 # ── PartitionMaintainer lifecycle ────────────────────────────────────────────────
 
 
-@pytest.mark.integration
 async def test__maintainer__initial_run__creates_partitions_ahead(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
-    # Arrange
-    repo, metadata, locks, calc = _make_components(db_engine)
-    service = PartitionLifecycleService(repo, metadata, locks, calc)
+    # Arrange — the 0.x spelling, type and strategy included, is still accepted
+    repo, metadata, locks = _make_components(db_engine)
+    service = PartitionLifecycleService(repo, metadata, locks)
     maintainer = PartitionMaintainer(service)
     config = TablePartitionConfig(
         table_name=partitioned_table,
@@ -95,51 +89,33 @@ async def test__maintainer__initial_run__creates_partitions_ahead(
     assert f"public.{partitioned_table}__2025_01" in names
 
 
-@pytest.mark.integration
 async def test__maintainer__second_run_same_month__creates_zero_partitions(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
     # Arrange
-    repo, metadata, locks, calc = _make_components(db_engine)
-    service = PartitionLifecycleService(repo, metadata, locks, calc)
-    maintainer = PartitionMaintainer(service)
-    config = TablePartitionConfig(
-        table_name=partitioned_table,
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-        create_ahead_count=1,
-        retention_count=12,
-    )
+    repo, metadata, locks = _make_components(db_engine)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(repo, metadata, locks))
+    config = monthly_config(partitioned_table, create_ahead=1, retention=12)
 
     # Act
     with freezegun.freeze_time("2024-06-01"):
         r1 = await maintainer.run_maintenance(config)
-        r2 = await maintainer.run_maintenance(config)
+        with count_ddl(db_engine) as counter:
+            r2 = await maintainer.run_maintenance(config)
 
     # Assert
     assert r1.created_count == 1
     assert r2.created_count == 0
+    assert counter.statements == []
 
 
-@pytest.mark.integration
 async def test__maintainer__partitions_beyond_retention__detaches_and_drops_them(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
     # Arrange
-    repo, metadata, locks, calc = _make_components(db_engine)
-    service = PartitionLifecycleService(repo, metadata, locks, calc)
-    maintainer = PartitionMaintainer(service)
-    config = TablePartitionConfig(
-        table_name=partitioned_table,
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-        create_ahead_count=2,
-        retention_count=3,
-    )
+    repo, metadata, locks = _make_components(db_engine)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(repo, metadata, locks))
+    config = monthly_config(partitioned_table, create_ahead=2, retention=3)
 
     with freezegun.freeze_time("2024-12-01"):
         await maintainer.run_maintenance(config)
@@ -150,61 +126,48 @@ async def test__maintainer__partitions_beyond_retention__detaches_and_drops_them
 
     # Assert
     assert result.success
-    assert result.dropped_count >= 2
+    assert result.detached_count == 2
+    assert result.dropped_count == 2
     partitions = await metadata.list_partitions(partitioned_table)
     names = {p.name for p in partitions}
     assert f"public.{partitioned_table}__2024_12" not in names
     assert f"public.{partitioned_table}__2025_01" not in names
+    assert f"public.{partitioned_table}__2025_05" in names
+    assert f"public.{partitioned_table}__2025_06" in names
 
 
-@pytest.mark.integration
 async def test__maintainer__still_attached_partition__skips_drop(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
     # Arrange
-    repo, metadata, locks, calc = _make_components(db_engine)
-    service = PartitionLifecycleService(repo, metadata, locks, calc)
-    config = TablePartitionConfig(
-        table_name=partitioned_table,
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-    )
+    repo, metadata, locks = _make_components(db_engine)
+    service = PartitionLifecycleService(repo, metadata, locks)
 
-    p1 = await repo.create_partition(config, f"{partitioned_table}__2024_01", "2024-01-01", "2024-02-01")
-    await repo.attach_partition(partitioned_table, p1.name, "2024-01-01", "2024-02-01")
-    p2 = await repo.create_partition(config, f"{partitioned_table}__2024_02", "2024-02-01", "2024-03-01")
-    await repo.attach_partition(partitioned_table, p2.name, "2024-02-01", "2024-03-01")
-    await repo.detach_partition(partitioned_table, p1.name, concurrent=False)
+    p1 = f"{partitioned_table}__2024_01"
+    p2 = f"{partitioned_table}__2024_02"
+    await repo.create_table_like(partitioned_table, p1, None)
+    await repo.attach_partition(partitioned_table, p1, RangeBounds(from_value="2024-01-01", to_value="2024-02-01"))
+    await repo.create_table_like(partitioned_table, p2, None)
+    await repo.attach_partition(partitioned_table, p2, RangeBounds(from_value="2024-02-01", to_value="2024-03-01"))
+    await repo.detach_partition(partitioned_table, p1, mode=DetachMode.BLOCKING)
 
     # Act — try to drop both; only p1 is an orphan
-    dropped = await service.drop_detached_partitions(partitioned_table, [p1.name, p2.name])
+    dropped = await service.drop_detached_partitions(partitioned_table, [p1, p2])
 
     # Assert
     assert dropped == 1
-    assert not await metadata.partition_exists(p1.name)
-    assert await metadata.partition_exists(p2.name)
-    assert await metadata.is_partition_attached(partitioned_table, p2.name)
+    assert not await metadata.partition_exists(p1)
+    assert await metadata.partition_exists(p2)
+    assert await metadata.is_partition_attached(partitioned_table, p2)
 
 
-@pytest.mark.integration
 async def test__maintainer__detach_fails_one_run__drops_orphan_on_next_run(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
     # Arrange
-    repo, metadata, locks, calc = _make_components(db_engine)
-    service = PartitionLifecycleService(repo, metadata, locks, calc)
-    maintainer = PartitionMaintainer(service)
-    config = TablePartitionConfig(
-        table_name=partitioned_table,
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-        create_ahead_count=1,
-        retention_count=1,
-    )
+    repo, metadata, locks = _make_components(db_engine)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(repo, metadata, locks))
+    config = monthly_config(partitioned_table, create_ahead=1, retention=1)
 
     with freezegun.freeze_time("2024-01-01"):
         await maintainer.run_maintenance(config)
@@ -222,13 +185,14 @@ async def test__maintainer__detach_fails_one_run__drops_orphan_on_next_run(
 
     # Assert
     assert result.success
-    assert result.dropped_count >= 1
+    assert result.detached_count == 1
+    assert result.dropped_count == 1
+    assert not await metadata.partition_exists(f"{partitioned_table}__2024_01")
 
 
-@pytest.mark.integration
 async def test__maintainer__hooks_called_at_lifecycle_points(db_engine: AsyncEngine, partitioned_table: str) -> None:
     # Arrange
-    repo, metadata, locks, calc = _make_components(db_engine)
+    repo, metadata, locks = _make_components(db_engine)
     hook_events: list[str] = []
 
     class AuditHooks(BasePartitionLifecycleHooks):
@@ -241,56 +205,45 @@ async def test__maintainer__hooks_called_at_lifecycle_points(db_engine: AsyncEng
         async def after_drop(self, table_name: str, partition_name: str) -> None:
             hook_events.append(f"dropped:{partition_name}")
 
-    service = PartitionLifecycleService(repo, metadata, locks, calc, hooks=[AuditHooks()])
+    service = PartitionLifecycleService(repo, metadata, locks, hooks=[AuditHooks()])
     maintainer = PartitionMaintainer(service)
-    config = TablePartitionConfig(
-        table_name=partitioned_table,
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-        create_ahead_count=1,
-        retention_count=1,
-    )
+    config = monthly_config(partitioned_table, create_ahead=1, retention=1)
 
     # Act — first run creates
     with freezegun.freeze_time("2024-01-01"):
         await maintainer.run_maintenance(config)
 
-    assert any(e.startswith("created:") for e in hook_events)
+    assert hook_events == [f"created:public.{partitioned_table}__2024_01"]
 
     # Act — second run drops old
     with freezegun.freeze_time("2024-04-01"):
         await maintainer.run_maintenance(config)
 
     # Assert
-    assert any(e.startswith("before_drop:") for e in hook_events)
-    assert any(e.startswith("dropped:") for e in hook_events)
+    assert hook_events == [
+        f"created:public.{partitioned_table}__2024_01",
+        f"created:public.{partitioned_table}__2024_04",
+        f"before_drop:public.{partitioned_table}__2024_01",
+        f"dropped:public.{partitioned_table}__2024_01",
+    ]
 
 
-@pytest.mark.integration
 async def test__maintainer__orphaned_partition__dropped_on_next_run(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
     # Arrange
-    repo, metadata, locks, calc = _make_components(db_engine)
-    service = PartitionLifecycleService(repo, metadata, locks, calc)
-    maintainer = PartitionMaintainer(service)
-    config = TablePartitionConfig(
-        table_name=partitioned_table,
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-        create_ahead_count=1,
-        retention_count=1,
-    )
+    repo, metadata, locks = _make_components(db_engine)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(repo, metadata, locks))
+    config = monthly_config(partitioned_table, create_ahead=1, retention=1)
 
     partition_name = f"{partitioned_table}__2024_01"
-    await repo.create_partition(config, partition_name, "2024-01-01", "2024-02-01")
-    await repo.attach_partition(partitioned_table, partition_name, "2024-01-01", "2024-02-01")
-    # Simulate interrupted previous run: detached but not dropped
-    await repo.detach_partition(partitioned_table, partition_name, concurrent=False)
+    await repo.create_table_like(partitioned_table, partition_name, None)
+    await repo.attach_partition(
+        partitioned_table, partition_name, RangeBounds(from_value="2024-01-01", to_value="2024-02-01")
+    )
+    # Simulate an interrupted previous run: detached (at the time) but not dropped
+    with freezegun.freeze_time("2024-02-01"):
+        await repo.detach_partition(partitioned_table, partition_name, mode=DetachMode.BLOCKING)
     assert await metadata.partition_exists(partition_name)
 
     # Act
@@ -299,5 +252,58 @@ async def test__maintainer__orphaned_partition__dropped_on_next_run(
 
     # Assert
     assert result.success
-    assert result.dropped_count >= 1
+    assert result.dropped_count == 1
     assert not await metadata.partition_exists(partition_name)
+
+
+async def test__maintainer__run_maintenance_safe__never_raises_and_reports_the_error(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    # Arrange — a config that does not match the table
+    repo, metadata, locks = _make_components(db_engine)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(repo, metadata, locks))
+    config = monthly_config(partitioned_table, column="payload")
+
+    # Act
+    result = await maintainer.run_maintenance_safe(config)
+
+    # Assert
+    assert not result.success
+    assert result.error is not None
+    assert "InvalidPartitionConfigError" in result.error
+    assert result.created_count == 0
+
+
+# ── Two maintainers on the same table ────────────────────────────────────────────
+
+
+async def test__maintainer__two_concurrent_runs_on_one_table__one_wins_the_lock_and_the_tree_converges(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    # Arrange — two independent wirings, as two workers would have
+    first = PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine)))
+    second = PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine)))
+    config = monthly_config(partitioned_table, create_ahead=3, retention=12)
+
+    # Act — both ticks at once
+    with freezegun.freeze_time("2026-08-26"):
+        outcomes = await asyncio.gather(
+            first.run_maintenance(config),
+            second.run_maintenance(config),
+            return_exceptions=True,
+        )
+
+    # Assert — each run either won the lock or lost it; nothing else may happen
+    results = [o for o in outcomes if isinstance(o, MaintenanceResult)]
+    losers = [o for o in outcomes if isinstance(o, LockAcquisitionError)]
+    assert len(results) + len(losers) == 2
+    assert len(results) >= 1
+    assert sum(r.created_count for r in results) == 3
+
+    # The tree ends converged either way: nothing left to do
+    with freezegun.freeze_time("2026-08-26"), count_ddl(db_engine) as counter:
+        again = await first.run_maintenance(config)
+    assert again.created_count == 0
+    assert counter.statements == []
+    names = {p.relname for p in await PostgresMetadataProvider(db_engine).list_partitions(partitioned_table)}
+    assert names == {f"{partitioned_table}__2026_08", f"{partitioned_table}__2026_09", f"{partitioned_table}__2026_10"}

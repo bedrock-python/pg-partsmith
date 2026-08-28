@@ -11,12 +11,12 @@ from uuid import uuid4
 
 import freezegun
 import pytest
+from pg_partsmith.subpartition_plan import TopologyReason
 from sqlalchemy import Engine, text
 
 from pg_partsmith.entities import MaintenanceIssueStep, PartitionType, Period, TablePartitionConfig
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.strategies import WeekPeriodCalculator
-from pg_partsmith.subpartition_plan import TopologyReason
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.maintainer import PartitionMaintainer

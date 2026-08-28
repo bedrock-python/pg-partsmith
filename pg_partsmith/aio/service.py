@@ -234,7 +234,8 @@ class PartitionLifecycleService:
                 the partition must cover.
 
         Returns:
-            The created partition, or None when it already existed.
+            The created partition, or None when it already existed -- also when
+            its subtree was completed for it.
         """
         created = await self.ensure_partitions(config, (period,))
         return created[0] if created else None
@@ -257,11 +258,12 @@ class PartitionLifecycleService:
         Args:
             config: Table partitioning configuration.
             periods: Periods (time axis) or windows that must have a partition.
-                Duplicates are ignored; order is preserved.
+                Duplicates are ignored.
 
         Returns:
-            The partitions created by this call; windows that already had one
-            are absent from the list.
+            The partitions created by this call, in chronological order;
+            windows that already had one are absent from the list, and so are
+            the members created to complete an existing partition's subtree.
 
         Raises:
             InvalidPartitionConfigError: If the root is not a RANGE level, or a
@@ -270,7 +272,7 @@ class PartitionLifecycleService:
         windows = self._windows_for(config, periods)
         plan = await self.plan(config, mode=PlanMode.EXPLICIT, windows=windows)
         result = await self._executor.apply(config, plan)
-        return [_created_info(config, op) for op in plan.creates if op.target not in _failed(result)]
+        return _created_partitions(config, plan, result)
 
     # ── Granular steps ──────────────────────────────────────────────────────────
 
@@ -284,7 +286,7 @@ class PartitionLifecycleService:
         """
         plan = (await self.plan(config)).only(OperationKind.CREATE, OperationKind.ATTACH)
         result = await self._executor.apply(config, plan)
-        return [_created_info(config, op) for op in plan.creates if op.target not in _failed(result)]
+        return _created_partitions(config, plan, result)
 
     async def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Return the partitions a maintenance run would detach or drop, oldest first.
@@ -395,6 +397,18 @@ class PartitionLifecycleService:
                 msg = f"{config.qualified_name!r} is not partitioned by time; pass Window objects, not periods"
                 raise InvalidPartitionConfigError(msg)
         return {root.leading_column: tuple(windows)}
+
+
+def _created_partitions(
+    config: TablePartitionConfig, plan: MaintenancePlan, result: MaintenanceResult
+) -> list[PartitionInfo]:
+    """The partitions a plan created directly under the root, in the order it made them.
+
+    Gaps filled inside a partition that already existed are repairs of that
+    partition, not partitions of their own, and are left out.
+    """
+    failed = _failed(result)
+    return [_created_info(config, op) for op in plan.creates if op.counts_as == "created" and op.target not in failed]
 
 
 def _created_info(config: TablePartitionConfig, op: CreatePartition) -> PartitionInfo:

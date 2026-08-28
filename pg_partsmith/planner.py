@@ -294,9 +294,17 @@ class _Planner:
                 if self._expire(level, node, member, cursor_window, boundaries):
                     continue
                 recurse_into.append(member.node)
+            occupied = {m.window for m in members if m.window is not None}
             for orphan in orphans:
-                if orphan.name not in consumed:
-                    self._plan_orphan_drop(orphan, cursor_window, boundaries)
+                if orphan.name in consumed:
+                    continue
+                wanted = self._reattachable_window(level, orphan, occupied, cursor_window, boundaries)
+                if wanted is not None:
+                    consumed.add(orphan.name)
+                    occupied.add(wanted)
+                    self.attaches.append(self._reattach(level, node, orphan, wanted))
+                    continue
+                self._plan_orphan_drop(orphan, cursor_window, boundaries)
         elif self.ctx.mode is PlanMode.RECONCILE:
             recurse_into.extend(m.node for m in managed.values() if m.window not in desired_set)
 
@@ -470,6 +478,40 @@ class _Planner:
                 )
             )
         return True
+
+    def _reattachable_window(
+        self,
+        level: RangePartitioning,
+        orphan: DetachedPartition,
+        occupied: set[Window],
+        cursor_window: Window,
+        boundaries: RangeBoundaries,
+    ) -> Window | None:
+        """The window an orphan should come back for, or None to leave it detached.
+
+        A partition is detached because retention expired it; a retention that
+        has since grown wants its window again, and re-attaching restores the
+        data instead of waiting out a grace period and dropping it. Under
+        ``DropNever`` detached tables belong to whatever process the policy hands
+        them to -- an archiver, say -- so they are never brought back.
+        """
+        if not isinstance(self.policy.drop, DropAfter) or not orphan.relkind.is_droppable_table:
+            return None
+        window = boundaries.parse_child_name(orphan.relname)
+        if window is None or window in occupied or not _on_grid(boundaries, window):
+            return None
+        candidate = Candidate(
+            window=window,
+            now=self.ctx.now,
+            cursor_window=cursor_window,
+            boundaries=boundaries,
+            facts=orphan.facts or PartitionFacts(),
+        )
+        if window.end > cursor_window.start:
+            # The cursor's window and everything ahead of it receive rows:
+            # a detached table for such a window is always wanted back.
+            return window
+        return None if self.policy.retention.evaluate(candidate) else window
 
     def _plan_orphan_drop(self, orphan: DetachedPartition, cursor_window: Window, boundaries: RangeBoundaries) -> None:
         drop = self.policy.drop

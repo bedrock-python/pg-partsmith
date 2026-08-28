@@ -85,8 +85,10 @@ Ownership is derived from the catalog against the scheme; there is no metadata t
 
 Detached tables are considered only when they carry the library's `COMMENT` marker; the
 marker is written at detach (with the instant) or by `repo.adopt_partition(...)` for legacy
-tables. An orphan whose window is wanted again (retention grew) is **re-attached**, not
-recreated.
+tables. An orphan whose window is wanted again — it is in the create-ahead set, or
+retention grew and no longer expires it — is **re-attached**, not recreated. Under
+`DropNever` detached tables belong to whatever process the policy hands them to and are
+never brought back.
 
 ## Convergence rules
 

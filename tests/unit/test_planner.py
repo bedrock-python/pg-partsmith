@@ -1756,12 +1756,90 @@ def test__plan_maintenance__orphan_reattached_under_a_nested_scheme__carries_how
     assert plan.attaches[0].partition_by == PartitionBy(method=PartitionType.HASH, columns=("tenant_id",))
 
 
+def test__plan_maintenance__orphan_inside_retention__reattached_instead_of_dropped() -> None:
+    # Arrange: retention grew from 3 to 12 months after May was detached.
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=12), drop=DropAfter(grace=timedelta(days=7))))
+    orphan = _orphan("events__2026_05", oid=5, detached_at=NOW - timedelta(days=30))
+
+    # Act
+    plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(orphan,))
+
+    # Assert
+    assert plan.operations == (
+        AttachPartition(
+            target=f"{ROOT}__2026_05",
+            oid=5,
+            parent_name=ROOT,
+            bounds=RangeBounds(from_value="2026-05-01", to_value="2026-06-01"),
+            key_columns=("created_at",),
+            partition_by=None,
+            reason=Reason.REATTACH,
+            detail="detached partition covers 2026_05, which is wanted again",
+        ),
+    )
+    assert plan.findings == ()
+
+
+def test__plan_maintenance__orphan_inside_retention__measured_by_a_retention_predicate() -> None:
+    # Arrange: size-based retention; the orphan is small enough to be wanted back.
+    config = _config(lifecycle=_policy(retention=SizeAbove(bytes=100), drop=DropAfter()))
+    small = _orphan("events__2025_01", oid=1, facts=PartitionFacts(size_bytes=10))
+    large = _orphan("events__2025_02", oid=2, facts=PartitionFacts(size_bytes=500))
+
+    # Act
+    plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(small, large))
+
+    # Assert
+    assert _targets(plan.attaches) == [f"{ROOT}__2025_01"]
+    assert _targets(plan.drops) == [f"{ROOT}__2025_02"]
+
+
+def test__plan_maintenance__orphan_inside_retention_under_drop_never__left_alone() -> None:
+    # Arrange
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=12), drop=DropNever()))
+    orphan = _orphan("events__2026_05", oid=5, detached_at=NOW - timedelta(days=30))
+
+    # Act
+    plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(orphan,))
+
+    # Assert
+    assert plan.is_noop
+    assert plan.findings == ()
+
+
+def test__plan_maintenance__orphan_whose_window_is_attached_already__not_reattached() -> None:
+    # Arrange: May is attached under a legacy name; the orphan spells the same window.
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=12), drop=DropAfter()))
+    may = _range_child("events_2026_may", "2026-05-01", "2026-06-01", oid=5)
+    orphan = _orphan("events__2026_05", oid=55, detached_at=NOW - timedelta(days=30))
+
+    # Act
+    plan = _plan(config, _root(may, _month(2026, 8, oid=8)), orphans=(orphan,))
+
+    # Assert
+    assert plan.attaches == ()
+    assert _targets(plan.drops) == [f"{ROOT}__2026_05"]
+
+
+def test__plan_maintenance__orphan_off_the_grid__never_reattached() -> None:
+    # Arrange: a daily orphan left by an earlier finer config, inside retention.
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=12), drop=DropAfter()))
+    orphan = _orphan("events__2026_05_10", oid=5, detached_at=NOW - timedelta(days=30))
+
+    # Act
+    plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(orphan,))
+
+    # Assert
+    assert plan.attaches == ()
+    assert _targets(plan.drops) == [f"{ROOT}__2026_05_10"]
+
+
 def test__plan_maintenance__orphan_past_its_grace__dropped_with_its_detach_instant() -> None:
     # Arrange
     detached_at = NOW - timedelta(days=30)
     config = _config(lifecycle=_policy(drop=DropAfter(grace=timedelta(days=7))))
     orphan = _orphan(
-        "events__2026_01", oid=11, detached_at=detached_at, facts=PartitionFacts(size_bytes=99, row_estimate=2)
+        "events__2025_01", oid=11, detached_at=detached_at, facts=PartitionFacts(size_bytes=99, row_estimate=2)
     )
 
     # Act
@@ -1770,7 +1848,7 @@ def test__plan_maintenance__orphan_past_its_grace__dropped_with_its_detach_insta
     # Assert
     assert plan.operations == (
         DropPartition(
-            target=f"{ROOT}__2026_01",
+            target=f"{ROOT}__2025_01",
             oid=11,
             reason=Reason.GRACE_ELAPSED,
             detail=f"detached at {detached_at.isoformat()}; grace of 7 days, 0:00:00 elapsed",
@@ -1786,7 +1864,7 @@ def test__plan_maintenance__orphan_past_its_grace__dropped_with_its_detach_insta
 def test__plan_maintenance__orphan_within_its_grace__reported_pending_not_dropped() -> None:
     # Arrange
     config = _config(lifecycle=_policy(drop=DropAfter(grace=timedelta(days=7))))
-    orphan = _orphan("events__2026_02", oid=12, detached_at=NOW - timedelta(days=1))
+    orphan = _orphan("events__2025_02", oid=12, detached_at=NOW - timedelta(days=1))
 
     # Act
     plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(orphan,))
@@ -1801,7 +1879,7 @@ def test__plan_maintenance__orphan_within_its_grace__reported_pending_not_droppe
 def test__plan_maintenance__orphan_with_an_unknown_detach_instant__treated_as_past_its_grace() -> None:
     # Arrange
     config = _config(lifecycle=_policy(drop=DropAfter(grace=timedelta(days=365))))
-    orphan = _orphan("events__2026_03", oid=13, detached_at=None)
+    orphan = _orphan("events__2025_03", oid=13, detached_at=None)
 
     # Act
     plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(orphan,))
@@ -1815,13 +1893,13 @@ def test__plan_maintenance__orphan_with_an_unknown_detach_instant__treated_as_pa
 
 def test__plan_maintenance__zero_grace__orphan_dropped_the_run_it_is_found() -> None:
     # Arrange
-    orphan = _orphan("events__2026_03", oid=13, detached_at=NOW - timedelta(minutes=1))
+    orphan = _orphan("events__2025_03", oid=13, detached_at=NOW - timedelta(minutes=1))
 
     # Act
     plan = _plan(_config(), _root(_month(2026, 8, oid=8)), orphans=(orphan,))
 
     # Assert
-    assert _targets(plan.drops) == [f"{ROOT}__2026_03"]
+    assert _targets(plan.drops) == [f"{ROOT}__2025_03"]
 
 
 @pytest.mark.parametrize(("size", "dropped"), [(10, False), (200, True)], ids=["deferred", "dropped"])
@@ -1829,14 +1907,14 @@ def test__plan_maintenance__orphan_drop_condition__deferred_until_it_holds(size:
     # Arrange
     config = _config(lifecycle=_policy(drop=DropAfter(when=SizeAbove(bytes=100))))
     orphan = _orphan(
-        "events__2026_03", oid=13, detached_at=NOW - timedelta(days=1), facts=PartitionFacts(size_bytes=size)
+        "events__2025_03", oid=13, detached_at=NOW - timedelta(days=1), facts=PartitionFacts(size_bytes=size)
     )
 
     # Act
     plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(orphan,))
 
     # Assert
-    assert _targets(plan.drops) == ([f"{ROOT}__2026_03"] if dropped else [])
+    assert _targets(plan.drops) == ([f"{ROOT}__2025_03"] if dropped else [])
     assert _reasons(plan) == ([] if dropped else [FindingReason.DROP_DEFERRED])
     if not dropped:
         assert plan.findings[0].severity is Severity.INFO

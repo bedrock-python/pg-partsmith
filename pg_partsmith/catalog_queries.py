@@ -107,6 +107,9 @@ ORPHANS_SQL = """
 #
 # ``pg_total_relation_size`` of a partitioned relation is 0 -- it has no
 # storage of its own -- so sizes are summed over the leaves of each subtree.
+# ``pg_partition_tree`` returns nothing for a relation that is neither
+# partitioned nor a partition -- a detached leaf, exactly the kind an orphan
+# usually is -- so such a relation is measured as its own single leaf.
 # Rows come from the statistics collector, never from ``COUNT(*)``: a plan
 # must not scan a 500 GB partition to decide what to do with it.
 PARTITION_FACTS_SQL = """
@@ -115,9 +118,15 @@ PARTITION_FACTS_SQL = """
         COALESCE(SUM(pg_total_relation_size(t.relid)), 0) AS size_bytes,
         COALESCE(SUM(COALESCE(s.n_live_tup, 0)), 0) AS row_estimate
     FROM unnest(CAST(:oids AS oid[])) AS root(oid)
-    CROSS JOIN LATERAL pg_partition_tree(root.oid) t
+    CROSS JOIN LATERAL (
+        SELECT pt.relid
+        FROM pg_partition_tree(root.oid) pt
+        WHERE pt.isleaf
+        UNION ALL
+        SELECT root.oid
+        WHERE NOT EXISTS (SELECT 1 FROM pg_partition_tree(root.oid))
+    ) t
     LEFT JOIN pg_stat_user_tables s ON s.relid = t.relid
-    WHERE t.isleaf
     GROUP BY root.oid
 """
 

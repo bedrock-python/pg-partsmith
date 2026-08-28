@@ -7,7 +7,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks

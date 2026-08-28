@@ -7,7 +7,6 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.boundaries import NumericBoundaries, Window
