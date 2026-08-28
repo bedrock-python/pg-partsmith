@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -28,9 +29,12 @@ from pg_partsmith.utils import (
 )
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
     from pg_partsmith.boundaries import RangeBoundaryCodec
+
+
+logger = logging.getLogger(__name__)
 
 
 class PostgresMetadataProvider:
@@ -384,7 +388,36 @@ class PostgresMetadataProvider:
                     "settle_seconds": settle_seconds,
                 },
             )
-            return bool(result.scalar())
+            closed = result.scalar()
+            if closed is not None:
+                return bool(closed)
+
+            await self._warn_if_bound_needs_a_codec(conn, partition_name)
+            return False
+
+    async def _warn_if_bound_needs_a_codec(self, conn: AsyncConnection, partition_name: str) -> None:
+        """Explain a partition that can never close for want of a codec.
+
+        Without one, an encoded upper bound is unreadable here and the answer is
+        always False — so an export pipeline gated on this would wait forever
+        with nothing to show for it. The bound is only re-read once the
+        timestamp path has already declined to answer, so a timestamp-keyed
+        table pays nothing for this.
+        """
+        result = await conn.execute(
+            text(PARTITION_UPPER_BOUND_SQL),
+            {"partition_name": to_regclass_argument(partition_name)},
+        )
+        raw_bound = coerce_str(result.scalar())
+        if raw_bound is None:
+            # No upper bound to read: DEFAULT, non-RANGE, detached, or unknown.
+            return
+
+        logger.warning(
+            "Partition has an upper bound this provider cannot read, so it never reports as closed; "
+            "pass the boundary_codec its partitions were created with",
+            extra={"partition_name": partition_name, "upper_bound": raw_bound},
+        )
 
     async def _is_encoded_partition_closed(self, partition_name: str, *, settle_seconds: int) -> bool:
         """Closure check for a partition whose upper bound is an encoded literal.

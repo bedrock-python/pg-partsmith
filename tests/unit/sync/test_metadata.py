@@ -362,8 +362,9 @@ def test__metadata_provider__is_partition_attached__uses_quoted_regclass_argumen
 
 @pytest.mark.parametrize("scalar,expected", [(True, True), (False, False), (None, False)])
 def test__metadata_provider__is_partition_closed__maps_scalar_to_bool(scalar: bool | None, expected: bool) -> None:
-    # Arrange — None covers the DEFAULT partition / detached / unresolvable-name cases
-    engine = _make_engine(scalar)
+    # Arrange — None covers the DEFAULT partition / detached / unresolvable-name
+    # cases, where the follow-up bound lookup also finds nothing to explain.
+    engine = _make_engine(scalar) if scalar is not None else _make_engine(None, None)
     provider = PostgresMetadataProvider(engine)
 
     # Act / Assert
@@ -499,3 +500,36 @@ def test__metadata_provider__get_default_partition__orphaned_default__returns_no
 
     # Act / Assert
     assert provider.get_default_partition("events") is None
+
+
+def test__metadata_provider__is_partition_closed__unreadable_bound__warns_instead_of_staying_silent() -> None:
+    # Arrange — a UUIDv7 bound and no codec to read it with: the timestamp path
+    # declines, and the follow-up lookup finds a bound worth explaining.
+    engine = _make_engine(None, "0198f0e0-0000-7000-8000-000000000000")
+    provider = PostgresMetadataProvider(engine)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.metadata.logger", logger):
+        result = provider.is_partition_closed("events__2026_w35")
+
+    # Assert — an export pipeline gated on this would otherwise wait forever
+    # with nothing in the log to say why.
+    assert result is False
+    logger.warning.assert_called_once()
+    assert "boundary_codec" in logger.warning.call_args.args[0]
+
+
+def test__metadata_provider__is_partition_closed__no_bound_at_all__stays_quiet() -> None:
+    # Arrange — DEFAULT, detached or non-RANGE: nothing to explain.
+    engine = _make_engine(None, None)
+    provider = PostgresMetadataProvider(engine)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.metadata.logger", logger):
+        result = provider.is_partition_closed("events_default")
+
+    # Assert
+    assert result is False
+    logger.warning.assert_not_called()
