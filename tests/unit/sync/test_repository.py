@@ -5,6 +5,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.entities import (
     DefaultBounds,
+    HashBounds,
     HashSubpartitionSpec,
     ListBounds,
     PartitionGranularity,
@@ -1364,3 +1365,30 @@ def test__repository__create_subpartition_table__name_already_taken__raises_alre
     # Act / Assert -- the planner reads this as a lost race rather than a fault.
     with pytest.raises(PartitionAlreadyExistsError):
         repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", None)
+
+
+def test__repository__attach_subpartition__hash_bounds__renders_modulus_then_remainder() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_subpartition("events__2026_w35", "events__2026_w35__h1", HashBounds(modulus=4, remainder=1))
+
+    # Assert -- swapping the two is accepted by PostgreSQL whenever remainder
+    # < modulus, so it produces a differently-shaped tree rather than an error.
+    assert "FOR VALUES WITH (MODULUS 4, REMAINDER 1)" in str(conn.execute.call_args.args[0])
+
+
+def test__repository__create_subpartition_table__copies_the_parent_but_not_its_identity() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", None)
+
+    # Assert -- INCLUDING ALL copies an identity column, and PostgreSQL then
+    # refuses to attach the result; the parent's identity propagates on ATTACH.
+    stmt = str(conn.execute.call_args.args[0])
+    assert "INCLUDING ALL EXCLUDING IDENTITY" in stmt

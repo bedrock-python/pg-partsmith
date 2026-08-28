@@ -218,3 +218,33 @@ def test__quote_literal__backslash_and_quote_together__escapes_both() -> None:
 
     # Assert
     assert quoted == "E'a\\\\''; DROP TABLE t; --'"
+
+
+def test__quote_literal__value_with_a_nul__is_refused() -> None:
+    # Arrange / Act / Assert -- the driver truncates at the NUL rather than
+    # escaping it, so what reaches the server is a prefix of what was built.
+    with pytest.raises(ValueError, match="NUL byte"):
+        quote_literal("a\x00b")
+
+
+def test__quote_identifier__name_with_a_nul__is_refused() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="NUL byte"):
+        quote_identifier("a\x00b")
+
+
+def test__build_ddl_statement__bracket_in_the_template_itself__is_left_alone() -> None:
+    # Arrange / Act -- rewriting every [word] made a template mentioning an
+    # array subscript fail on a format field that was never a placeholder.
+    stmt = build_ddl_statement("SELECT 1 -- array[0]")
+
+    # Assert
+    assert "array[0]" in str(stmt)
+
+
+def test__build_ddl_statement__named_literal_placeholder__is_still_substituted() -> None:
+    # Arrange / Act
+    stmt = build_ddl_statement("COMMENT ON TABLE {table} IS [note]", table="events", note="owner:pg-partsmith")
+
+    # Assert -- and the colon in the value is not read as a bind parameter.
+    assert str(stmt) == "COMMENT ON TABLE \"events\" IS 'owner:pg-partsmith'"

@@ -719,3 +719,34 @@ def test__plan_subpartitions__branch_partitioned_on_an_expression__reported_not_
     assert plan.is_noop
     assert [f.reason for f in plan.findings] == [TopologyReason.COLUMN_MISMATCH]
     assert "expression" in plan.findings[0].detail
+
+
+def test__plan_subpartitions__list_default_under_a_foreign_name__is_not_created_again() -> None:
+    # Arrange -- an existing DEFAULT whose name is not the one the config would
+    # generate. Matching it by name alone plans a duplicate that PostgreSQL
+    # refuses on every run, forever.
+    spec = _list_spec(groups=(ListGroup(name="eu", values=("eu",)),), include_default=True)
+    node = PartitionNode(
+        name=BRANCH,
+        partition_type=PartitionType.LIST,
+        partition_columns=("region",),
+        children=(
+            _list_child("eu", "eu"),
+            PartitionNode(name=f"{BRANCH}__catch_all", bounds=DefaultBounds()),
+        ),
+    )
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert
+    assert plan.is_noop
+
+
+def test__hash_subpartition_spec__name_budget__sized_for_the_widest_remainder() -> None:
+    # Arrange -- modulus 10 makes the widest remainder one digit shorter than
+    # the modulus itself, which is where an off-by-one shows.
+    spec = HashSubpartitionSpec(column="tenant_id", modulus=10)
+
+    # Act / Assert -- the widest child is "__h9", not "__h10".
+    assert spec.name_length_budget() == len("__h9")

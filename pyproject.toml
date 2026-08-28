@@ -125,6 +125,9 @@ markers = [
 
 [tool.coverage.run]
 source = ["pg_partsmith"]
+# Statement coverage counts a half-taken branch as covered, which is how a
+# guard can be at 100% with only one of its two outcomes ever exercised.
+branch = true
 omit = [
     "tests/*",
     "*/test_*.py",

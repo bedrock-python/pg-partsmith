@@ -21,7 +21,7 @@ from pg_partsmith.entities import (
     RangeBounds,
     TablePartitionConfig,
 )
-from pg_partsmith.partition_bounds import parse_partition_bounds
+from pg_partsmith.partition_bounds import parse_boundary_literal, parse_partition_bounds
 
 # ── Period ──────────────────────────────────────────────────────────────────────
 
@@ -723,11 +723,27 @@ def test__config__subpartition_suffix_pushes_name_over_the_identifier_limit__rej
 
 
 def test__config__non_range_root_with_subpartition__rejected() -> None:
-    # Arrange / Act / Assert
-    with pytest.raises(ValidationError):
+    # Arrange / Act / Assert -- a bare `raises` passed here on a different
+    # rule's message. TIME_BASED already requires RANGE, so that is the one
+    # that fires first and the one worth asserting.
+    with pytest.raises(ValidationError, match="TIME_BASED strategy requires RANGE"):
         _config(
             partition_type=PartitionType.LIST,
             subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+        )
+
+
+def test__config__static_root_with_a_subpartition_field__points_at_root_layout() -> None:
+    # Arrange / Act / Assert -- the other way a non-RANGE root can name a
+    # subpartition. Nesting belongs inside root_layout, not beside it.
+    with pytest.raises(ValidationError, match="root_layout"):
+        TablePartitionConfig(
+            table_name="events",
+            partition_type=PartitionType.HASH,
+            partition_strategy=PartitionStrategy.HASH_BASED,
+            partition_column="tenant_id",
+            root_layout=HashSubpartitionSpec(column="tenant_id", modulus=2),
+            subpartition=HashSubpartitionSpec(column="shard_id", modulus=2),
         )
 
 
@@ -1107,3 +1123,40 @@ def test__parse_partition_bounds__cast_null__is_still_the_keyword() -> None:
 
     # Assert
     assert parsed == ListBounds(values=(), includes_null=True)
+
+
+def test__parse_boundary_literal__unquoted_cast__reads_the_value_before_it() -> None:
+    # Arrange / Act -- the docstring lists FROM (1::bigint) TO (5::bigint), and
+    # nothing exercised the cast-stripping branch.
+    parsed = parse_partition_bounds("FOR VALUES FROM (1::bigint) TO (5::bigint)")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="1", to_value="5")
+
+
+def test__parse_partition_bounds__cast_function_form__reads_the_inner_value() -> None:
+    # Arrange / Act -- older servers render some bounds as CAST(x AS type).
+    parsed = parse_partition_bounds("FOR VALUES FROM (CAST(1 AS bigint)) TO (CAST(5 AS bigint))")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="1", to_value="5")
+
+
+def test__parse_partition_bounds__extra_parentheses__are_stripped() -> None:
+    # Arrange / Act -- pg_get_expr sometimes wraps constants in extra parens.
+    parsed = parse_partition_bounds("FOR VALUES IN ((('eu')))")
+
+    # Assert
+    assert parsed == ListBounds(values=("eu",))
+
+
+def test__parse_boundary_literal__date_only_but_impossible__is_declined() -> None:
+    # Arrange / Act -- shaped like a date, and not one.
+    assert parse_boundary_literal("2026-02-31", UTC) is None
+
+
+def test__parse_boundary_literal__value_carrying_no_instant__is_declined() -> None:
+    # Arrange / Act / Assert -- no separator means nothing to parse.
+    assert parse_boundary_literal("42", UTC) is None
+    assert parse_boundary_literal("", UTC) is None
+    assert parse_boundary_literal("MAXVALUE", UTC) is None

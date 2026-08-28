@@ -2525,3 +2525,75 @@ def test__require_column_in_constraints__every_key_column_present__accepted() ->
 
     # Act / Assert -- no exception
     _require_column_in_constraints(spec, (("id", "tenant_id", "shard_id", "created_at"),), "public.events")
+
+
+async def test__maintain_lifecycle__pruning_cannot_read_a_bound__records_an_issue_and_carries_on(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange -- deciding what to prune is as failable as pruning it, and it
+    # runs after create has already committed DDL.
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+    service._pruning_service.identify_partitions_to_prune = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SQLAlchemyError("unreadable boundary")
+    )
+
+    # Act
+    result = await service.maintain_lifecycle(config, continue_on_error=True)
+
+    # Assert
+    assert result.success
+    assert MaintenanceIssueStep.DETACH in [issue.step for issue in result.issues]
+    assert result.dropped_count == 0
+
+
+async def test__maintain_lifecycle__pruning_cannot_read_a_bound__propagates_without_the_flag(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    service = _make_service(mock_repo, mock_metadata, mock_locks, mock_calculator)
+    service._pruning_service.identify_partitions_to_prune = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SQLAlchemyError("unreadable boundary")
+    )
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError):
+        await service.maintain_lifecycle(config)
+
+
+async def test__default_conflict__composite_config_on_a_single_column_repository__names_the_capability(
+    mock_metadata: MagicMock, mock_locks: MagicMock, mock_calculator: MagicMock
+) -> None:
+    # Arrange -- a repository that added attach_composite_partition but kept the
+    # 0.4.0 reconcile_default_rows. A runtime_checkable Protocol matches on
+    # method names, so it gets past the capability gate.
+    repo = MagicMock()
+    repo.attach_composite_partition = AsyncMock(return_value=None)
+    repo.reconcile_default_rows = AsyncMock(side_effect=TypeError("unexpected keyword argument 'trailing_columns'"))
+    composite = TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        trailing_partition_columns=("tenant_id",),
+        granularity=PartitionGranularity.MONTH,
+    )
+    service = PartitionLifecycleService(repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert -- a bare "unexpected keyword argument" says nothing about
+    # what the repository is missing.
+    with pytest.raises(UnsupportedCapabilityError, match="composite partition keys"):
+        await service._creation_service._move_default_rows(
+            composite,
+            source="events_default",
+            target="events__2024_04",
+            from_value="2024-04-01",
+            to_value="2024-05-01",
+        )

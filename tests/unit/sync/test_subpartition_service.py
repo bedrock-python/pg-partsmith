@@ -496,3 +496,50 @@ def test__build_new_branch__every_bucket_attaches__returns_the_count(repo: Magic
 
     # Assert
     assert created == 2
+
+
+def test__reconcile__static_root__converges_the_roots_own_partition_set(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- a HASH_BASED root: its own partitions are the level the config
+    # describes, so there is nothing per-branch to iterate.
+    config = TablePartitionConfig(
+        table_name="events",
+        schema="public",
+        partition_type=PartitionType.HASH,
+        partition_strategy=PartitionStrategy.HASH_BASED,
+        partition_column="tenant_id",
+        root_layout=HashSubpartitionSpec(column="tenant_id", modulus=2),
+    )
+    metadata.get_partition_tree = MagicMock(
+        return_value=PartitionNode(
+            name="public.events",
+            partition_type=PartitionType.HASH,
+            partition_columns=("tenant_id",),
+            children=(PartitionNode(name="public.events__h0", bounds=HashBounds(modulus=2, remainder=0)),),
+        )
+    )
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = service.reconcile(config)
+
+    # Assert -- the missing bucket is created on the root itself.
+    assert result.created_count == 1
+    assert repo.attach_subpartition.call_args.args[1] == "public.events__h1"
+
+
+def test__reconcile__execution_finding__reaches_the_returned_result(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- a conflict raised while executing, not while planning.
+    conflict = SQLAlchemyError("rows in default")
+    orig = MagicMock()
+    orig.sqlstate = "23514"
+    conflict.orig = orig  # type: ignore[attr-defined]
+    repo.attach_subpartition = MagicMock(side_effect=conflict)
+    metadata.get_partition_tree = MagicMock(return_value=_root_with(_branch_node(0)))
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = service.reconcile(_config(subpartition=_spec()))
+
+    # Assert -- findings collected during execution have to travel out with the
+    # result, or they never reach MaintenanceResult.issues.
+    assert TopologyReason.DEFAULT_HOLDS_ROWS in [f.reason for f in result.findings]
