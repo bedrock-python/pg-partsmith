@@ -41,5 +41,4 @@ class WeekPeriodCalculator(BasePeriodCalculator):
             msg = "Week is required for WeekPeriodCalculator"
             raise ValueError(msg)
 
-        fmt = "%Y-%m-%d"
-        return (period.to_date().strftime(fmt), (period + 1).to_date().strftime(fmt))
+        return self._encoded_boundaries(period, lambda d: d.strftime("%Y-%m-%d"))

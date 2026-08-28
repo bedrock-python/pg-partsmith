@@ -5,10 +5,16 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, tzinfo
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from pg_partsmith.entities import Period
+from pg_partsmith.partition_bounds import parse_boundary_literal
 from pg_partsmith.utils import timezone_name
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pg_partsmith.boundaries import RangeBoundaryCodec
 
 
 class BasePeriodCalculator(ABC):
@@ -27,23 +33,33 @@ class BasePeriodCalculator(ABC):
     Subclasses must define ``_NAME_PATTERN`` (a compiled regex) and implement
     ``_period_from_match`` to construct a ``Period`` from regex groups.
     Group 1 is conventionally the table name; subsequent groups encode the period.
+
+    Passing ``boundary_codec`` decouples the semantic period from the physical
+    partition key: periods, names, create-ahead and retention keep working in
+    calendar terms while the ``FOR VALUES FROM … TO …`` literals are whatever
+    the key actually stores (a UUIDv7, a sortable id). Without one, boundaries
+    are rendered as the calendar literals they have always been.
     """
 
     _NAME_PATTERN: ClassVar[re.Pattern[str]]
 
-    def __init__(self, tz: tzinfo = UTC) -> None:
+    def __init__(self, tz: tzinfo = UTC, *, boundary_codec: RangeBoundaryCodec | None = None) -> None:
         """Initialize calculator.
 
         Args:
             tz: Timezone the calculator works in. Only ``datetime.UTC`` and
                 :class:`zoneinfo.ZoneInfo` instances are accepted — the zone
                 must have an IANA name usable in ``SET LOCAL TIME ZONE``.
+            boundary_codec: Optional encoder for the physical partition key.
+                When set, period boundaries are encoded through it instead of
+                being rendered as calendar literals.
 
         Raises:
             ValueError: If ``tz`` carries no IANA name.
         """
         self._tz = tz
         self._tz_name = timezone_name(tz)
+        self._boundary_codec = boundary_codec
 
     @property
     def tz(self) -> tzinfo:
@@ -54,6 +70,48 @@ class BasePeriodCalculator(ABC):
     def timezone_name(self) -> str:
         """IANA name of :attr:`tz`, usable in ``SET LOCAL TIME ZONE``."""
         return self._tz_name
+
+    @property
+    def boundary_codec(self) -> RangeBoundaryCodec | None:
+        """Codec used to render and read physical boundary literals, if any."""
+        return self._boundary_codec
+
+    def period_start(self, period: Period) -> datetime:
+        """Return the instant a period begins, in the calculator's timezone.
+
+        ``Period.to_datetime`` pins UTC; a calculator working in a business
+        timezone means the same calendar period starts at a different instant,
+        which is what a boundary codec has to encode.
+        """
+        return period.to_datetime().replace(tzinfo=self._tz)
+
+    def decode_boundary(self, literal: str) -> datetime | None:
+        """Return the instant a catalog boundary literal stands for, or None.
+
+        Retention compares partitions by their upper bound, so whatever encoded
+        a boundary has to be able to read it back. Falls back to interpreting
+        the literal as a timestamp when no codec is configured.
+        """
+        if self._boundary_codec is not None:
+            return self._boundary_codec.decode(literal)
+        return parse_boundary_literal(literal, self._tz)
+
+    def _encoded_boundaries(
+        self,
+        period: Period,
+        render: Callable[[datetime], str],
+    ) -> tuple[str, str]:
+        """Return this period's half-open boundaries as SQL literals.
+
+        Args:
+            period: The period to bound.
+            render: Formats a boundary instant the way this granularity has
+                always rendered it; used only when no codec is configured.
+        """
+        start, end = self.period_start(period), self.period_start(period + 1)
+        if self._boundary_codec is not None:
+            return self._boundary_codec.encode(start, end)
+        return render(start), render(end)
 
     def _now(self) -> datetime:
         """Current time in the calculator's timezone."""
