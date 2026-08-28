@@ -115,6 +115,21 @@ class DropRetryExhaustedError(PartitionError):
         self.cause = cause
 
 
+class PlanStaleError(PartitionError):
+    """Raised when a plan's assumption about a relation no longer holds at apply time.
+
+    A relation may be dropped and recreated under the same name between the
+    plan and its application; its OID then differs from the one the plan
+    recorded, and a destructive operation must not proceed against the
+    replacement.
+    """
+
+    def __init__(self, partition_name: str, detail: str) -> None:
+        super().__init__(f"Plan is stale for {partition_name!r}: {detail}")
+        self.partition_name = partition_name
+        self.detail = detail
+
+
 class UnmanagedPartitionDropError(PartitionError):
     """Raised when attempting to drop a table not managed by this library."""
 

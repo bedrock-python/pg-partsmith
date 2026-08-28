@@ -12,6 +12,7 @@ from pg_partsmith.constants import (
     DEFAULT_DROP_MAX_RETRIES,
     DEFAULT_DROP_RETRY_DELAY,
 )
+from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.utils import (
     orphan_comment_prefix,
     validate_ddl_timeout,
@@ -28,13 +29,15 @@ from .resolver import PartitionRelationResolver
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from pg_partsmith.entities import PartitionInfo, SubpartitionBounds, SubpartitionSpec, TablePartitionConfig
+    from pg_partsmith.plan import PartitionBy
+    from pg_partsmith.topology import PartitionBounds
 
 
 class PostgresPartitionRepository:
     """PostgreSQL implementation of partition repository.
 
     Facade that delegates to specialized helper classes for improved maintenance and SRP.
+    Every statement runs in its own transaction and commits immediately.
     """
 
     def __init__(
@@ -86,66 +89,42 @@ class PostgresPartitionRepository:
         """
         return self._ddl_timezone
 
-    async def create_partition(
-        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
-    ) -> PartitionInfo:
-        return await self._creator.create(config, partition_name, from_value, to_value)
+    async def create_table_like(self, template_name: str, table_name: str, partition_by: PartitionBy | None) -> None:
+        """Create a detached table shaped like ``template_name``.
 
-    async def attach_partition(self, table_name: str, partition_name: str, from_value: str, to_value: str) -> None:
-        await self._creator.attach(table_name, partition_name, from_value, to_value)
+        See :meth:`PartitionCreator.create_table_like`.
+        """
+        await self._creator.create_table_like(template_name, table_name, partition_by)
 
-    async def create_branch(
+    async def attach_partition(
         self,
-        config: TablePartitionConfig,
-        branch_name: str,
-        from_value: str,
-        to_value: str,
-        spec: SubpartitionSpec,
-    ) -> PartitionInfo:
-        """Create a detached time partition that is itself partitioned.
-
-        See :meth:`PartitionCreator.create_branch`. Its buckets are created
-        separately and the branch is attached last, so an interrupted run can
-        never leave a partially-covering branch reachable from the root.
-        """
-        return await self._creator.create_branch(config, branch_name, from_value, to_value, spec)
-
-    async def create_subpartition_table(self, parent_name: str, child_name: str, spec: SubpartitionSpec | None) -> None:
-        """Create a detached table shaped like ``parent_name``.
-
-        See :meth:`PartitionCreator.create_subpartition_table`.
-        """
-        await self._creator.create_subpartition_table(parent_name, child_name, spec)
-
-    async def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
-        """Attach one subpartition to its parent.
-
-        See :meth:`PartitionCreator.attach_subpartition`.
-        """
-        await self._creator.attach_subpartition(parent_name, child_name, bounds)
-
-    async def attach_composite_partition(
-        self,
-        table_name: str,
+        parent_name: str,
         partition_name: str,
-        from_value: str,
-        to_value: str,
+        bounds: PartitionBounds,
         *,
-        key_arity: int,
+        key_arity: int = 1,
     ) -> None:
-        """Attach a partition to a parent with a composite partition key.
+        """Attach a table to a partitioned parent.
 
-        See :meth:`PartitionCreator.attach_composite_partition`.
+        See :meth:`PartitionCreator.attach`.
         """
-        await self._creator.attach_composite_partition(
-            table_name, partition_name, from_value, to_value, key_arity=key_arity
-        )
+        await self._creator.attach(parent_name, partition_name, bounds, key_arity=key_arity)
 
-    async def detach_partition(self, table_name: str, partition_name: str, *, concurrent: bool = True) -> None:
-        await self._remover.detach(table_name, partition_name, concurrent=concurrent)
+    async def detach_partition(
+        self, parent_name: str, partition_name: str, *, mode: DetachMode = DetachMode.AUTO
+    ) -> None:
+        """Detach a partition, writing the orphan marker first.
 
-    async def drop_partition(self, partition_name: str) -> None:
-        await self._remover.drop(partition_name)
+        See :meth:`PartitionRemover.detach`.
+        """
+        await self._remover.detach(parent_name, partition_name, mode=mode)
+
+    async def drop_partition(self, partition_name: str, *, expected_oid: int | None = None) -> None:
+        """Drop a detached, marker-tagged partition.
+
+        See :meth:`PartitionRemover.drop`.
+        """
+        await self._remover.drop(partition_name, expected_oid=expected_oid)
 
     async def adopt_partition(self, table_name: str, partition_name: str) -> bool:
         """Mark a detached legacy table as owned by this library (orphan marker).
@@ -160,16 +139,18 @@ class PostgresPartitionRepository:
         *,
         default_partition_name: str,
         target_partition_name: str,
-        partition_column: str,
-        trailing_columns: tuple[str, ...] = (),
+        key_columns: tuple[str, ...],
         from_value: str,
         to_value: str,
     ) -> int:
+        """Move rows from a DEFAULT partition to the partition for a window.
+
+        See :meth:`PartitionCreator.reconcile_default_rows`.
+        """
         return await self._creator.reconcile_default_rows(
             default_partition_name=default_partition_name,
             target_partition_name=target_partition_name,
-            partition_column=partition_column,
-            trailing_columns=trailing_columns,
+            key_columns=key_columns,
             from_value=from_value,
             to_value=to_value,
         )

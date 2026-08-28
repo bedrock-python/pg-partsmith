@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -14,12 +15,15 @@ from pg_partsmith.exceptions import (
     PartitionAttachedError,
     PartitionDetachInProgressError,
     PartitionNotFoundError,
+    PlanStaleError,
     UnmanagedPartitionDropError,
 )
+from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.utils import (
     build_ddl_statement,
     coerce_str,
-    orphan_table_comment,
+    orphan_comment,
+    parse_orphan_comment,
     pg_sqlstate,
     to_regclass_argument,
 )
@@ -42,6 +46,12 @@ _RETRYABLE_PG_STATES: frozenset[str] = frozenset(
         "57014",  # query_canceled      (lock_timeout / statement_timeout)
     }
 )
+
+# SQLSTATEs PostgreSQL raises when DETACH CONCURRENTLY is not possible here:
+# feature_not_supported, syntax_error (older servers), and
+# object_not_in_prerequisite_state ("cannot detach partitions concurrently
+# when a default partition exists").
+_CONCURRENT_DETACH_UNAVAILABLE: frozenset[str] = frozenset({"0A000", "42601", "55000"})
 
 
 class PartitionRemover:
@@ -72,17 +82,27 @@ class PartitionRemover:
         self._fk_manager = fk_manager
         self._allow_unmanaged = allow_unmanaged
 
-    def detach(self, table_name: str, partition_name: str, *, concurrent: bool = True) -> None:
-        """Detach partition from parent.
+    def detach(self, table_name: str, partition_name: str, *, mode: DetachMode = DetachMode.AUTO) -> None:
+        """Detach partition from parent, writing the orphan marker first.
 
         A partition left in ``inhdetachpending`` state by a cancelled
         ``DETACH CONCURRENTLY`` (e.g. our own DDL timeout) is completed with
         ``DETACH PARTITION ... FINALIZE`` instead of failing forever.
+
+        Args:
+            table_name: Parent table name.
+            partition_name: Partition table name.
+            mode: ``CONCURRENT`` runs only the concurrent form and fails when
+                PostgreSQL refuses it (a DEFAULT partition exists);
+                ``BLOCKING`` runs the plain form; ``AUTO`` tries the concurrent
+                form and falls back to the blocking one.
         """
         if self._finalize_if_pending(table_name, partition_name):
             return
 
-        if concurrent and self._detach_concurrently(table_name, partition_name):
+        if mode is not DetachMode.BLOCKING and self._detach_concurrently(
+            table_name, partition_name, fallback=mode is DetachMode.AUTO
+        ):
             return
 
         stmt = build_ddl_statement(
@@ -107,7 +127,8 @@ class PartitionRemover:
         Legacy partitions detached before the library was introduced carry no
         marker, so safe-drop refuses them. Adopting marks them as owned by the
         library; the next maintenance run collects and drops them like any
-        other orphan. Idempotent.
+        other orphan. The detach instant is left unknown, so a grace period
+        does not delay a table that has already waited. Idempotent.
 
         Returns:
             True when the marker is present after the call, False when the
@@ -122,7 +143,7 @@ class PartitionRemover:
             if not self._resolver.exists_conn(conn, partition_name):
                 return False
             self._ensure_not_attached(conn, partition_name)
-            self._mark_orphaned(conn, table_name, partition_name)
+            self._mark_orphaned(conn, table_name, partition_name, stamp_now=False)
             return True
 
     def _finalize_if_pending(self, table_name: str, partition_name: str) -> bool:
@@ -165,7 +186,12 @@ class PartitionRemover:
                 )
                 return True
 
-    def _detach_concurrently(self, table_name: str, partition_name: str) -> bool:
+    def _detach_concurrently(self, table_name: str, partition_name: str, *, fallback: bool) -> bool:
+        """Run ``DETACH … CONCURRENTLY``; False when the blocking form should run instead.
+
+        The statement cannot run inside a transaction block, so it goes out on
+        an AUTOCOMMIT connection.
+        """
         stmt = build_ddl_statement(
             "ALTER TABLE {parent} DETACH PARTITION {partition} CONCURRENTLY",
             parent=table_name,
@@ -183,7 +209,7 @@ class PartitionRemover:
                         domain_exc = self._translate_detach_error(exc, partition_name)
                         assert domain_exc is not None  # guaranteed by sqlstate match above
                         raise domain_exc from exc
-                    if sqlstate not in {"0A000", "42601", "55000"}:
+                    if sqlstate not in _CONCURRENT_DETACH_UNAVAILABLE or not fallback:
                         raise
                     logger.warning(
                         "DETACH PARTITION CONCURRENTLY failed; falling back to non-concurrent DETACH",
@@ -198,9 +224,24 @@ class PartitionRemover:
                 else:
                     return True
 
-    def _mark_orphaned(self, conn: Connection, table_name: str, partition_name: str) -> None:
+    def _mark_orphaned(
+        self,
+        conn: Connection,
+        table_name: str,
+        partition_name: str,
+        *,
+        stamp_now: bool = True,
+    ) -> None:
+        """Write the ownership marker, recording the detach instant.
+
+        Written *before* the DETACH so an interrupted run leaves a marked table
+        rather than an unmarked one that orphan discovery would never see.
+
+        Args:
+            stamp_now: Record the current instant as the detach time. Off for
+                adoption, where the table was detached at an unknown time.
+        """
         parent_fqn = self._resolver.resolve_fqn_conn(conn, table_name) or table_name
-        marker = orphan_table_comment(parent_fqn, marker_prefix=self._marker_prefix)
 
         comment_result = conn.execute(
             text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
@@ -208,10 +249,16 @@ class PartitionRemover:
         )
         existing_comment = coerce_str(comment_result.scalar())
 
-        if existing_comment == marker or (existing_comment and existing_comment.startswith(f"{marker}\n")):
+        instant = datetime.now(UTC) if stamp_now else None
+        new_comment = orphan_comment(
+            parent_fqn,
+            detached_at=instant,
+            existing_comment=existing_comment,
+            marker_prefix=self._marker_prefix,
+        )
+        if new_comment == existing_comment:
             return
 
-        new_comment = marker if not existing_comment else f"{marker}\n{existing_comment}"
         conn.execute(
             build_ddl_statement(
                 "COMMENT ON TABLE {partition} IS [comment]",
@@ -233,12 +280,24 @@ class PartitionRemover:
             return PartitionDetachInProgressError(partition_name)
         return None
 
-    def drop(self, partition_name: str) -> None:
-        """Drop a detached partition."""
+    def drop(self, partition_name: str, *, expected_oid: int | None = None) -> None:
+        """Drop a detached partition.
+
+        Args:
+            partition_name: The table to drop.
+            expected_oid: The identity the decision to drop was made about.
+                A relation that has since been dropped and recreated under the
+                same name carries another OID and is left alone.
+
+        Raises:
+            PlanStaleError: If the relation holding the name is not the one
+                ``expected_oid`` identifies.
+        """
         with self._engine.connect() as conn:
             apply_local_statement_timeout(conn, self._ddl_timeout)
             if not self._resolver.exists_conn(conn, partition_name):
                 return
+            self._ensure_expected_oid(conn, partition_name, expected_oid)
             self._ensure_not_attached(conn, partition_name)
             if not self._ensure_managed(conn, partition_name):
                 return
@@ -250,7 +309,7 @@ class PartitionRemover:
                 self._handle_retry_delay(attempt, last_exc, partition_name)
 
             try:
-                self._execute_drop(partition_name)
+                self._execute_drop(partition_name, expected_oid)
             except (SQLAlchemyError, OSError, TimeoutError) as exc:
                 if isinstance(exc, SQLAlchemyError) and pg_sqlstate(exc) not in _RETRYABLE_PG_STATES:
                     raise
@@ -260,7 +319,7 @@ class PartitionRemover:
 
         raise DropRetryExhaustedError(partition_name, self._drop_max_retries, last_exc) from last_exc
 
-    def _execute_drop(self, partition_name: str) -> None:
+    def _execute_drop(self, partition_name: str, expected_oid: int | None) -> None:
         """Lock, revalidate, and drop in one transaction.
 
         The pre-checks in :meth:`drop` run on a different connection, so the
@@ -282,12 +341,27 @@ class PartitionRemover:
                 if pg_sqlstate(exc) == "42P01":  # dropped concurrently — nothing left to do
                     return
                 raise
+            self._ensure_expected_oid(conn, partition_name, expected_oid)
             self._ensure_not_attached(conn, partition_name)
             if not self._ensure_managed(conn, partition_name):
                 return
             fk_constraints = self._fk_manager.list_constraints_conn(conn, partition_name)
             self._fk_manager.drop_constraints(conn, partition_name, fk_constraints)
             conn.execute(build_ddl_statement("DROP TABLE IF EXISTS {partition}", partition=partition_name))
+
+    def _ensure_expected_oid(self, conn: Connection, partition_name: str, expected_oid: int | None) -> None:
+        if expected_oid is None:
+            return
+        result = conn.execute(
+            text("SELECT c.oid FROM pg_class c WHERE c.oid = to_regclass(:name)"),
+            {"name": to_regclass_argument(partition_name)},
+        )
+        actual = result.scalar()
+        if actual is not None and int(actual) != expected_oid:
+            raise PlanStaleError(
+                partition_name,
+                f"the relation now holding the name has OID {int(actual)}, the plan decided about OID {expected_oid}",
+            )
 
     def _ensure_not_attached(self, conn: Connection, partition_name: str) -> None:
         result = conn.execute(
@@ -323,9 +397,7 @@ class PartitionRemover:
                 return False
             raise UnmanagedPartitionDropError(partition_name)
 
-        prefix = self._marker_prefix
-        has_parent = len(comment_str) > len(prefix) and comment_str[len(prefix)] != "\n"
-        if not comment_str.startswith(prefix) or not has_parent:
+        if parse_orphan_comment(comment_str, marker_prefix=self._marker_prefix) is None:
             raise UnmanagedPartitionDropError(partition_name)
 
         return True

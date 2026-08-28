@@ -11,23 +11,40 @@ from sqlalchemy.exc import DBAPIError
 
 from pg_partsmith.catalog_queries import (
     INSTANT_HAS_PASSED_SQL,
+    ORPHANS_SQL,
     PARTITION_COLUMNS_SQL,
+    PARTITION_FACTS_SQL,
     PARTITION_IS_ATTACHED_SQL,
+    PARTITION_STRATEGY_SQL,
     PARTITION_TREE_SQL,
     PARTITION_UPPER_BOUND_SQL,
     RELATION_EXISTS_SQL,
+    RELATION_OID_SQL,
+    SEQUENCE_LAST_VALUE_SQL,
     TEXT_INSTANT_HAS_PASSED_SQL,
     UNIQUE_CONSTRAINT_COLUMNS_SQL,
 )
 from pg_partsmith.entities import PartitionInfo, PartitionType
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.partition_bounds import is_addressable, parse_partition_bounds, parse_range_boundaries
-from pg_partsmith.topology import PartitionNode, PartitionTreeRow, build_partition_tree
+from pg_partsmith.topology import (
+    ActualTree,
+    DefaultBounds,
+    DetachedPartition,
+    FactKind,
+    PartitionFacts,
+    PartitionNode,
+    PartitionTreeRow,
+    RelationKind,
+    build_partition_tree,
+)
 from pg_partsmith.utils import (
     coerce_str,
     orphan_comment_prefix,
     orphan_table_comment,
+    parse_orphan_comment,
     qualify,
+    quote_identifier,
     quote_literal,
     to_regclass_argument,
 )
@@ -36,6 +53,7 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
 
     from pg_partsmith.boundaries import RangeBoundaryCodec
+    from pg_partsmith.lifecycle import SqlPredicate
 
 
 logger = logging.getLogger(__name__)
@@ -66,68 +84,38 @@ class PostgresMetadataProvider:
             marker_prefix: Optional COMMENT marker prefix for orphaned partitions.
                 When None, the library default prefix is used. Pass the same
                 value to both repository and metadata provider if you override it.
-            ddl_timezone: Session timezone to read naive boundary literals in.
-                Pass whatever the repository writes partitions with: a
-                ``timestamp``/``date`` key renders its bounds without an offset,
-                so reader and writer must agree or a partition is reported
-                closed at the wrong moment. A ``timestamptz`` key is unaffected
-                -- its literals carry an offset.
-            boundary_codec: Codec used to read boundary literals back into
-                instants. Required only when the partition key is an encoded
-                identifier rather than a timestamp; pass the same codec the
-                period calculator was built with.
+            ddl_timezone: Session timezone :meth:`is_partition_closed` reads
+                naive boundary literals in. Pass whatever the repository writes
+                partitions with: a ``timestamp``/``date`` key renders its bounds
+                without an offset, so reader and writer must agree or a
+                partition is reported closed at the wrong moment. A
+                ``timestamptz`` key is unaffected -- its literals carry an offset.
+            boundary_codec: Codec :meth:`is_partition_closed` reads encoded
+                boundary literals with. Required only when the partition key is
+                an encoded identifier rather than a timestamp; pass the codec
+                the table's ``TimeBoundaries`` was configured with. Planning
+                does not need it: the planner decodes through the config.
         """
         self._engine = engine
         self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
         self._boundary_codec = boundary_codec
         self._ddl_timezone = ddl_timezone
 
+    # ── The root ────────────────────────────────────────────────────────────────
+
     def get_partition_type(self, table_name: str) -> PartitionType | None:
         """Get partition type for a table."""
         with self._engine.connect() as conn:
-            result = conn.execute(
-                text(
-                    """
-                    SELECT partstrat
-                    FROM pg_partitioned_table t
-                    WHERE t.partrelid = to_regclass(:table_name)
-                    """
-                ),
-                {"table_name": to_regclass_argument(table_name)},
-            )
+            result = conn.execute(text(PARTITION_STRATEGY_SQL), {"table_name": to_regclass_argument(table_name)})
             strat = coerce_str(result.scalar(), encoding="ascii")
 
         return PartitionType.from_partstrat(strat)
 
-    def get_partition_column(self, table_name: str) -> str | None:
-        """Get partition column for a table.
-
-        Raises:
-            ValueError: If the table uses a composite (multi-column) partition
-                key.  Only single-column keys are supported by this library.
-        """
-        key = self._read_partition_key(table_name)
-        if not key:
-            return None
-
-        if len(key) > 1:
-            msg = (
-                f"Table {table_name!r} uses a composite partition key {list(key)!r}. "
-                "Only single-column partition keys are supported."
-            )
-            raise ValueError(msg)
-
-        if key[0] is None:
-            raise ValueError(_expression_key_message(table_name, 1))
-
-        return key[0]
-
     def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
         """Return a table's own partition key columns, in key order.
 
-        Unlike :meth:`get_partition_column`, which predates composite keys and
-        refuses them, this reports the whole key. Key order is not column
-        order, so it comes from ``partattrs``' own ordering.
+        Key order is not column order, so it comes from ``partattrs``' own
+        ordering.
 
         Args:
             table_name: Table to inspect, schema-qualified.
@@ -139,15 +127,6 @@ class PostgresMetadataProvider:
             InvalidPartitionConfigError: If any key position is an expression
                 rather than a column, which this library cannot address.
         """
-        key = self._read_partition_key(table_name)
-        for position, column in enumerate(key, start=1):
-            if column is None:
-                raise InvalidPartitionConfigError(_expression_key_message(table_name, position))
-
-        return tuple(column for column in key if column is not None)
-
-    def _read_partition_key(self, table_name: str) -> tuple[str | None, ...]:
-        """Read a table's partition key in key order, expressions included as None."""
         with self._engine.connect() as conn:
             result = conn.execute(
                 text(PARTITION_COLUMNS_SQL),
@@ -155,10 +134,255 @@ class PostgresMetadataProvider:
             )
             rows = result.fetchall()
 
-        return tuple(coerce_str(row[0]) for row in rows)
+        key = tuple(coerce_str(row[0]) for row in rows)
+        for position, column in enumerate(key, start=1):
+            if column is None:
+                raise InvalidPartitionConfigError(_expression_key_message(table_name, position))
+
+        return tuple(column for column in key if column is not None)
+
+    def get_partition_column(self, table_name: str) -> str | None:
+        """Get the single partition column of a table.
+
+        Raises:
+            ValueError: If the table uses a composite (multi-column) partition key.
+        """
+        key = self.get_partition_columns(table_name)
+        if not key:
+            return None
+        if len(key) > 1:
+            msg = (
+                f"Table {table_name!r} uses a composite partition key {list(key)!r}; "
+                "read it with get_partition_columns()."
+            )
+            raise ValueError(msg)
+        return key[0]
+
+    # ── The tree ────────────────────────────────────────────────────────────────
+
+    def get_actual_tree(self, table_name: str) -> ActualTree | None:
+        """Return the whole tree below ``table_name`` plus its orphans.
+
+        The tree is one round-trip regardless of depth; the orphans one more.
+        Nothing is measured here -- see :meth:`measure` -- so a plan for a
+        simple monthly table never pays for ``pg_total_relation_size``.
+
+        Args:
+            table_name: Root of the tree, schema-qualified.
+
+        Returns:
+            The tree with its orphans, or None when ``table_name`` is not
+            partitioned.
+        """
+        root = self.get_partition_tree(table_name)
+        if root is None or root.partition_type is None:
+            return None
+
+        parents = [node.name for node in root.walk() if node.partition_type is not None]
+        orphans = self._orphans_of(parents)
+        return ActualTree(root=root, orphans=orphans)
+
+    def measure(
+        self,
+        tree: ActualTree,
+        *,
+        targets: tuple[str, ...],
+        facts: frozenset[FactKind] = frozenset(),
+        sql_predicates: tuple[SqlPredicate, ...] = (),
+    ) -> ActualTree:
+        """Return ``tree`` with facts attached to the named targets.
+
+        Sizes and row estimates come in one query for every target;
+        each SQL predicate is asked once per target.
+
+        Args:
+            tree: The tree to annotate.
+            targets: Schema-qualified names to measure; anything else stays
+                unmeasured.
+            facts: What to measure.
+            sql_predicates: Questions to ask about each target.
+        """
+        wanted = set(targets)
+        if not wanted or not (facts or sql_predicates):
+            return tree
+        measured = self._measure(tree.root, tree.orphans, wanted, facts, sql_predicates)
+        root = _with_facts(tree.root, measured)
+        orphans = tuple(
+            o.model_copy(update={"facts": measured[o.name]}) if o.name in measured else o for o in tree.orphans
+        )
+        return ActualTree(root=root, orphans=orphans)
+
+    def get_partition_tree(self, table_name: str) -> PartitionNode | None:
+        """Return the tree rooted at ``table_name``, without orphans.
+
+        Works for a detached relation as well as a live root: a detached
+        branch is the root of its own tree, which is how a half-built branch
+        is inspected before it is attached.
+
+        Args:
+            table_name: Root of the tree, schema-qualified.
+
+        Returns:
+            The root node with its descendants, or None when ``table_name`` is
+            not partitioned and is not itself a partition.
+        """
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(PARTITION_TREE_SQL),
+                {"table_name": to_regclass_argument(table_name)},
+            )
+            rows = result.fetchall()
+
+        tree_rows: list[PartitionTreeRow] = []
+        unaddressable_parents: set[str] = set()
+        for row in rows:
+            schema = coerce_str(row.partition_schema) or ""
+            relname = coerce_str(row.partition_name) or ""
+            parent_schema_raw = coerce_str(row.parent_schema)
+            parent_relname_raw = coerce_str(row.parent_name)
+            if not is_addressable(schema, relname):
+                # The parent keeps a child the tree cannot show. Recording that
+                # is what keeps the planner from reading the shortened child set
+                # as a set of gaps to fill.
+                if parent_schema_raw and parent_relname_raw:
+                    unaddressable_parents.add(qualify(parent_schema_raw, parent_relname_raw))
+                continue
+
+            parent_name = (
+                qualify(parent_schema_raw, parent_relname_raw) if parent_schema_raw and parent_relname_raw else None
+            )
+
+            columns = row.partition_columns or ()
+            named = tuple(str(c) for c in columns if c is not None)
+            tree_rows.append(
+                PartitionTreeRow(
+                    level=row.level,
+                    name=qualify(schema, relname),
+                    oid=int(row.oid),
+                    parent_name=parent_name,
+                    relkind=RelationKind.from_relkind(coerce_str(row.relkind, encoding="ascii")),
+                    bounds=parse_partition_bounds(coerce_str(row.boundaries)),
+                    is_attached=bool(row.is_attached),
+                    detach_pending=bool(row.detach_pending),
+                    partition_type=PartitionType.from_partstrat(coerce_str(row.partstrat, encoding="ascii")),
+                    partition_columns=named,
+                    # An expression key position comes back as NULL and has no
+                    # name to report; what matters is that the key is wider than
+                    # the names, so nothing compares it as if it were complete.
+                    has_expression_key=len(named) != (row.key_arity or len(named)),
+                )
+            )
+
+        return build_partition_tree(tree_rows, unaddressable_parents)
+
+    def _orphans_of(self, parents: list[str]) -> tuple[DetachedPartition, ...]:
+        """Marker-tagged detached tables whose marker names one of ``parents``."""
+        if not parents:
+            return ()
+        markers = [orphan_table_comment(parent, marker_prefix=self._marker_prefix) for parent in parents]
+        with self._engine.connect() as conn:
+            result = conn.execute(text(ORPHANS_SQL), {"markers": markers})
+            rows = result.fetchall()
+
+        orphans: list[DetachedPartition] = []
+        for row in rows:
+            schema = coerce_str(row.partition_schema) or ""
+            relname = coerce_str(row.partition_name) or ""
+            if not is_addressable(schema, relname):
+                continue
+            parsed = parse_orphan_comment(coerce_str(row.description), marker_prefix=self._marker_prefix)
+            if parsed is None:
+                continue
+            parent, detached_at = parsed
+            orphans.append(
+                DetachedPartition(
+                    name=qualify(schema, relname),
+                    oid=int(row.oid),
+                    relkind=RelationKind.from_relkind(coerce_str(row.relkind, encoding="ascii")),
+                    parent_name=parent,
+                    detached_at=detached_at,
+                )
+            )
+        return tuple(orphans)
+
+    def _measure(
+        self,
+        root: PartitionNode,
+        orphans: tuple[DetachedPartition, ...],
+        targets: set[str],
+        facts: frozenset[FactKind],
+        sql_predicates: tuple[SqlPredicate, ...],
+    ) -> dict[str, PartitionFacts]:
+        """Gather the requested facts for the targets, by name."""
+        oids: dict[str, int] = {}
+        for node in root.walk():
+            if node.name in targets and node.oid is not None:
+                oids[node.name] = node.oid
+        for orphan in orphans:
+            if orphan.name in targets and orphan.oid is not None:
+                oids[orphan.name] = orphan.oid
+        if not oids:
+            return {}
+
+        sizes: dict[int, tuple[int, int]] = {}
+        if facts:
+            with self._engine.connect() as conn:
+                result = conn.execute(text(PARTITION_FACTS_SQL), {"oids": list(oids.values())})
+                for row in result.fetchall():
+                    sizes[int(row.oid)] = (int(row.size_bytes or 0), int(row.row_estimate or 0))
+
+        measured: dict[str, PartitionFacts] = {}
+        for name, oid in oids.items():
+            size, rows = sizes.get(oid, (0, 0))
+            answers: dict[str, bool] = {}
+            for predicate in sql_predicates:
+                answers[predicate.id] = self.evaluate_sql_predicate(predicate, name)
+            measured[name] = PartitionFacts(
+                size_bytes=size if FactKind.SIZE in facts else None,
+                row_estimate=rows if FactKind.ROWS in facts else None,
+                predicates=answers,
+            )
+        return measured
+
+    def evaluate_sql_predicate(self, predicate: SqlPredicate, partition_name: str) -> bool:
+        """Ask one :class:`~pg_partsmith.lifecycle.SqlPredicate` about one relation.
+
+        ``{partition}`` is replaced with the quoted, schema-qualified name;
+        nothing else is interpolated. An error in the statement propagates: a
+        rule that cannot be evaluated must not silently read as False.
+        """
+        statement = predicate.sql.replace("{partition}", quote_identifier(partition_name))
+        with self._engine.connect() as conn:
+            result = conn.execute(text(statement.replace(":", r"\:")))
+            return bool(result.scalar())
+
+    # ── Cursors ─────────────────────────────────────────────────────────────────
+
+    def get_key_high_water_mark(self, table_name: str, column: str, *, sequence: bool = False) -> int | None:
+        """Return the newest value of an integer partition key.
+
+        ``max(column)`` over the whole table is one index probe per leaf when
+        the key is indexed -- which a partition key almost always is. The
+        sequence form is one catalog read, and right only for a key fed by
+        that sequence.
+        """
+        with self._engine.connect() as conn:
+            if sequence:
+                result = conn.execute(
+                    text(SEQUENCE_LAST_VALUE_SQL),
+                    {"table_name": to_regclass_argument(table_name), "column": column},
+                )
+            else:
+                result = conn.execute(
+                    text(f"SELECT max({quote_identifier(column)}) FROM {quote_identifier(table_name)}")  # noqa: S608
+                )
+            value = result.scalar()
+        return None if value is None else int(value)
+
+    # ── Single relations ────────────────────────────────────────────────────────
 
     def list_partitions(self, table_name: str) -> list[PartitionInfo]:
-        """List all partitions for a table, including orphaned detached ones.
+        """List the direct partitions of a table, including its marker-tagged orphans.
 
         Orphaned partitions are detached-but-not-dropped tables previously
         detached by this library. They are detected by a COMMENT marker set on
@@ -169,126 +393,45 @@ class PostgresMetadataProvider:
         schema — a partition may live in a different schema than its parent,
         and a bare name could resolve to an unrelated table via ``search_path``.
         """
-        with self._engine.connect() as conn:
-            parent_info_result = conn.execute(
-                text(
-                    """
-                    SELECT
-                        pt.partstrat,
-                        ns.nspname || '.' || c.relname AS qualified_name
-                    FROM pg_class c
-                    JOIN pg_namespace ns ON c.relnamespace = ns.oid
-                    LEFT JOIN pg_partitioned_table pt ON pt.partrelid = c.oid
-                    WHERE c.oid = to_regclass(:name)
-                    """
-                ),
-                {"name": to_regclass_argument(table_name)},
-            )
-            parent_row = parent_info_result.fetchone()
-            if not parent_row:
-                return []
+        tree = self.get_actual_tree(table_name)
+        if tree is None or tree.root.partition_type is None:
+            return []
 
-            strat = coerce_str(parent_row[0], encoding="ascii")
-            parent_qualified = coerce_str(parent_row[1]) or table_name
-
-            partition_type = PartitionType.from_partstrat(strat)
-            if not partition_type:
-                return []
-
-            attached_result = conn.execute(
-                text(
-                    """
-                    SELECT
-                        ns.nspname AS partition_schema,
-                        child.relname AS partition_name,
-                        pg_get_expr(child.relpartbound, child.oid) AS boundaries,
-                        child.relispartition AS is_attached,
-                        child_pt.partstrat AS subpartstrat
-                    FROM pg_inherits inh
-                    JOIN pg_class child ON inh.inhrelid = child.oid
-                    JOIN pg_namespace ns ON child.relnamespace = ns.oid
-                    LEFT JOIN pg_partitioned_table child_pt ON child_pt.partrelid = child.oid
-                    WHERE inh.inhparent = to_regclass(:table_name)
-                    ORDER BY ns.nspname, child.relname
-                    """
-                ),
-                {"table_name": to_regclass_argument(table_name)},
-            )
-            attached_rows = attached_result.fetchall()
-
-            orphan_result = conn.execute(
-                text(
-                    """
-                    SELECT
-                        ns.nspname AS partition_schema,
-                        c.relname AS partition_name
-                    FROM pg_class c
-                    JOIN pg_namespace ns ON c.relnamespace = ns.oid
-                    JOIN pg_description d
-                      ON d.objoid = c.oid
-                     AND d.classoid = 'pg_class'::regclass
-                     AND d.objsubid = 0
-                    WHERE c.relkind IN ('r', 'p')
-                      AND c.relispartition = false
-                      AND split_part(d.description, E'\\n', 1) = :marker
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM pg_inherits inh
-                           WHERE inh.inhrelid = c.oid
-                       )
-                    ORDER BY ns.nspname, c.relname
-                    """
-                ),
-                {
-                    "marker": orphan_table_comment(parent_qualified, marker_prefix=self._marker_prefix),
-                },
-            )
-            orphan_rows = orphan_result.fetchall()
-
+        partition_type = tree.root.partition_type
         partitions: list[PartitionInfo] = []
-
-        for row in attached_rows:
-            relname = coerce_str(row.partition_name) or ""
-            part_schema = coerce_str(row.partition_schema) or ""
-
-            if not is_addressable(part_schema, relname):
-                continue
-
-            name = qualify(part_schema, relname)
-
-            boundaries_str = coerce_str(row.boundaries) or ""
-            is_default = boundaries_str.strip().upper() == "DEFAULT"
-            from_val, to_val = (None, None) if is_default else self._parse_boundaries(boundaries_str)
+        for child in tree.root.children:
+            bounds = child.bounds
+            is_default = isinstance(bounds, DefaultBounds)
+            from_value = to_value = None
+            if bounds is not None and bounds.kind == "range":
+                from_value, to_value = bounds.from_value, bounds.to_value
             partitions.append(
                 PartitionInfo(
-                    name=name,
+                    name=child.name,
+                    oid=child.oid,
                     partition_type=partition_type,
-                    from_value=from_val,
-                    to_value=to_val,
-                    boundaries_expr=boundaries_str if boundaries_str else None,
-                    bounds=parse_partition_bounds(boundaries_str),
-                    is_attached=row.is_attached,
+                    from_value=from_value,
+                    to_value=to_value,
+                    boundaries_expr=_render_bounds(child),
+                    bounds=bounds,
+                    is_attached=child.is_attached,
                     is_default=is_default,
-                    subpartition_type=PartitionType.from_partstrat(coerce_str(row.subpartstrat, encoding="ascii")),
+                    relkind=child.relkind,
+                    subpartition_type=child.partition_type,
                     parent_table=table_name,
                 )
             )
 
-        for row in orphan_rows:
-            relname = coerce_str(row.partition_name) or ""
-            part_schema = coerce_str(row.partition_schema) or ""
-
-            if not is_addressable(part_schema, relname):
+        for orphan in tree.orphans:
+            if orphan.parent_name != tree.root.name:
                 continue
-
-            name = qualify(part_schema, relname)
             partitions.append(
                 PartitionInfo(
-                    name=name,
+                    name=orphan.name,
+                    oid=orphan.oid,
                     partition_type=partition_type,
-                    from_value=None,
-                    to_value=None,
                     is_attached=False,
+                    relkind=orphan.relkind,
                     parent_table=table_name,
                 )
             )
@@ -297,9 +440,6 @@ class PostgresMetadataProvider:
 
     def partition_exists(self, partition_name: str) -> bool:
         """Check if a partition table exists in pg_class.
-
-        Args:
-            partition_name: Partition table name.
 
         Returns:
             True if the table exists as a regular or partitioned table
@@ -313,15 +453,7 @@ class PostgresMetadataProvider:
             return bool(result.scalar())
 
     def is_partition_attached(self, table_name: str, partition_name: str) -> bool:
-        """Check if a partition is currently attached to its parent via pg_inherits.
-
-        Args:
-            table_name: Parent table name.
-            partition_name: Partition table name.
-
-        Returns:
-            True if the partition is attached.
-        """
+        """Check if a partition is currently attached to its parent via pg_inherits."""
         with self._engine.connect() as conn:
             result = conn.execute(
                 text(PARTITION_IS_ATTACHED_SQL),
@@ -332,15 +464,15 @@ class PostgresMetadataProvider:
             )
             return bool(result.scalar())
 
+    def get_relation_oid(self, name: str) -> int | None:
+        """Return the OID of the relation currently holding ``name``, or None."""
+        with self._engine.connect() as conn:
+            result = conn.execute(text(RELATION_OID_SQL), {"name": to_regclass_argument(name)})
+            value = result.scalar()
+        return None if value is None else int(value)
+
     def get_partition_boundaries(self, partition_name: str) -> tuple[str, str] | None:
-        """Get partition boundaries.
-
-        Args:
-            partition_name: Partition table name.
-
-        Returns:
-            Tuple of (from_value, to_value) or None if not a range partition.
-        """
+        """Get a RANGE partition's ``(from_value, to_value)``, or None."""
         with self._engine.connect() as conn:
             result = conn.execute(
                 text(
@@ -357,15 +489,11 @@ class PostgresMetadataProvider:
         if not boundaries_expr:
             return None
 
-        from_val, to_val = self._parse_boundaries(boundaries_expr)
+        from_val, to_val = parse_range_boundaries(boundaries_expr)
         if from_val is not None and to_val is not None:
             return from_val, to_val
 
         return None
-
-    def _parse_boundaries(self, boundaries_expr: str | None) -> tuple[str | None, str | None]:
-        """Delegate to :func:`pg_partsmith.partition_bounds.parse_range_boundaries`; override to customise parsing."""
-        return parse_range_boundaries(boundaries_expr)
 
     def is_partition_closed(self, partition_name: str, *, settle_seconds: int = 0) -> bool:
         """True when the partition's upper bound (+ settle buffer) has passed.
@@ -450,96 +578,18 @@ class PostgresMetadataProvider:
         )
 
     def get_default_partition(self, table_name: str) -> PartitionInfo | None:
-        """Get DEFAULT partition for a table if it exists and is attached.
-
-        Args:
-            table_name: Parent table name.
-
-        Returns:
-            PartitionInfo with is_default=True, or None if no default partition exists.
-        """
+        """Get DEFAULT partition for a table if it exists and is attached."""
         all_partitions = self.list_partitions(table_name)
         defaults = [p for p in all_partitions if p.is_default and p.is_attached]
         return defaults[0] if defaults else None
-
-    def get_partition_tree(self, table_name: str) -> PartitionNode | None:
-        """Return the whole partition tree rooted at ``table_name``.
-
-        Unlike :meth:`list_partitions`, which reports the direct children a
-        lifecycle acts on, this walks the hierarchy to the leaves — the shape
-        subpartition reconciliation needs to know which buckets exist. One
-        round-trip regardless of depth.
-
-        Detached partitions are absent by construction: a detached branch is no
-        longer part of its parent's tree. Query it by name to inspect it.
-
-        Args:
-            table_name: Root of the tree, schema-qualified.
-
-        Returns:
-            The root node with its descendants, or None when ``table_name`` is
-            not partitioned and is not itself a partition.
-        """
-        with self._engine.connect() as conn:
-            result = conn.execute(
-                text(PARTITION_TREE_SQL),
-                {"table_name": to_regclass_argument(table_name)},
-            )
-            rows = result.fetchall()
-
-        tree_rows: list[PartitionTreeRow] = []
-        unaddressable_parents: set[str] = set()
-        for row in rows:
-            schema = coerce_str(row.partition_schema) or ""
-            relname = coerce_str(row.partition_name) or ""
-            parent_schema_raw = coerce_str(row.parent_schema)
-            parent_relname_raw = coerce_str(row.parent_name)
-            if not is_addressable(schema, relname):
-                # The parent keeps a child the tree cannot show. Recording that
-                # is what keeps the planner from reading the shortened child set
-                # as a set of gaps to fill.
-                if parent_schema_raw and parent_relname_raw:
-                    unaddressable_parents.add(qualify(parent_schema_raw, parent_relname_raw))
-                continue
-
-            parent_schema = coerce_str(row.parent_schema)
-            parent_relname = coerce_str(row.parent_name)
-            parent_name = qualify(parent_schema, parent_relname) if parent_schema and parent_relname else None
-
-            columns = row.partition_columns or ()
-            named = tuple(str(c) for c in columns if c is not None)
-            tree_rows.append(
-                PartitionTreeRow(
-                    level=row.level,
-                    name=qualify(schema, relname),
-                    parent_name=parent_name,
-                    bounds=parse_partition_bounds(coerce_str(row.boundaries)),
-                    is_attached=bool(row.is_attached),
-                    partition_type=PartitionType.from_partstrat(coerce_str(row.partstrat, encoding="ascii")),
-                    partition_columns=named,
-                    # An expression key position comes back as NULL and has no
-                    # name to report; what matters is that the key is wider than
-                    # the names, so nothing compares it as if it were complete.
-                    has_expression_key=len(named) != (row.key_arity or len(named)),
-                )
-            )
-
-        return build_partition_tree(tree_rows, unaddressable_parents)
 
     def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
         """Return the column tuples of every UNIQUE / PRIMARY KEY constraint.
 
         PostgreSQL requires such a constraint on a partitioned table to contain
-        all of its partition-key columns. Reading them lets a subpartitioning
-        config be refused with an explanation before any DDL is attempted,
-        instead of failing halfway through a maintenance run.
-
-        Args:
-            table_name: Table to inspect, schema-qualified.
-
-        Returns:
-            One tuple of column names per constraint; empty when the table has
-            no unique constraints at all.
+        all of its partition-key columns. Reading them lets a nested scheme be
+        refused with an explanation before any DDL is attempted, instead of
+        failing halfway through a maintenance run.
         """
         with self._engine.connect() as conn:
             result = conn.execute(
@@ -549,6 +599,32 @@ class PostgresMetadataProvider:
             rows = result.fetchall()
 
         return tuple(tuple(str(c) for c in (row.columns or ())) for row in rows)
+
+
+def _with_facts(node: PartitionNode, measured: dict[str, PartitionFacts]) -> PartitionNode:
+    """Return ``node`` with facts attached wherever they were measured."""
+    children = tuple(_with_facts(child, measured) for child in node.children)
+    facts = measured.get(node.name, node.facts)
+    if children == node.children and facts is node.facts:
+        return node
+    return node.model_copy(update={"children": children, "facts": facts})
+
+
+def _render_bounds(node: PartitionNode) -> str | None:
+    """Spell a node's bounds the way ``pg_get_expr`` would, for ``boundaries_expr``."""
+    bounds = node.bounds
+    if bounds is None:
+        return None
+    if bounds.kind == "range":
+        return f"FOR VALUES FROM ({quote_literal(bounds.from_value)}) TO ({quote_literal(bounds.to_value)})"
+    if bounds.kind == "hash":
+        return f"FOR VALUES WITH (modulus {bounds.modulus}, remainder {bounds.remainder})"
+    if bounds.kind == "list":
+        values = [quote_literal(v) for v in bounds.values]
+        if bounds.includes_null:
+            values.append("NULL")
+        return f"FOR VALUES IN ({', '.join(values)})"
+    return "DEFAULT"
 
 
 def _expression_key_message(table_name: str, position: int) -> str:

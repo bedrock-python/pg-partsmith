@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, tzinfo
 from typing import Protocol, TypeVar, runtime_checkable
 
-from .entities import Period
+from .periods import Period
 
 __all__ = [
     "BoundaryDecoder",
@@ -30,6 +30,17 @@ class PeriodCalculator(Protocol[PeriodT]):
 
         Returns:
             Current period.
+        """
+        ...
+
+    def period_at(self, instant: datetime) -> PeriodT:
+        """Return the period holding ``instant``.
+
+        Args:
+            instant: A timezone-aware datetime.
+
+        Returns:
+            The period it falls in.
         """
         ...
 

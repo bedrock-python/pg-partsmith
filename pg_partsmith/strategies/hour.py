@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, tzinfo
+from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING, ClassVar
 
-from pg_partsmith.entities import Period
+from pg_partsmith.periods import Period
 
 from .base import BasePeriodCalculator
 
@@ -40,9 +40,9 @@ class HourPeriodCalculator(BasePeriodCalculator):
             )
             raise ValueError(msg)
 
-    def current_period(self) -> Period:
-        """Get current hour period."""
-        now = self._now()
+    def period_at(self, instant: datetime) -> Period:
+        """Return the hour period holding ``instant``."""
+        now = self._local(instant)
         return Period(year=now.year, month=now.month, day=now.day, hour=now.hour)
 
     def format_partition_name(self, table_name: str, period: Period) -> str:

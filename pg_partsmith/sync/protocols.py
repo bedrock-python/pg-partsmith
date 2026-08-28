@@ -1,29 +1,33 @@
-"""Sync protocols (interfaces) for partition management."""
+"""Sync protocols (interfaces) for partition management.
+
+Three of them talk to a database and one runs a lifecycle:
+
+* :class:`PartitionRepository` — the DDL: create, attach, detach, drop, mark.
+* :class:`PartitionMetadataProvider` — the catalog: what exists, how big it
+  is, where the cursor of an integer axis stands.
+* :class:`LockManager` — mutual exclusion between maintainers.
+* :class:`PartitionLifecycle` — what an orchestrator depends on.
+
+Every method takes and returns plain domain objects, so a custom
+implementation — another driver, a caching layer, a stub for tests — never
+has to know how the planner works.
+"""
 
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
-from pg_partsmith.entities import (
-    MaintenanceResult,
-    PartitionInfo,
-    PartitionNode,
-    PartitionType,
-    SubpartitionBounds,
-    SubpartitionSpec,
-    TablePartitionConfig,
-)
+from pg_partsmith.entities import MaintenanceResult, PartitionInfo, TablePartitionConfig
+from pg_partsmith.lifecycle import DetachMode, SqlPredicate
+from pg_partsmith.plan import PartitionBy
+from pg_partsmith.topology import ActualTree, FactKind, PartitionBounds, PartitionNode, PartitionType
 
 __all__ = [
-    "CompositeKeyMetadata",
-    "CompositeKeyRepository",
     "LockManager",
-    "NestedPartitionMetadata",
     "PartitionLifecycle",
     "PartitionMetadataProvider",
     "PartitionRepository",
-    "SubpartitionRepository",
 ]
 
 
@@ -44,15 +48,15 @@ class PartitionLifecycle(Protocol):
         skip_drop: bool = False,
         continue_on_error: bool = False,
     ) -> MaintenanceResult:
-        """Run create + detach + drop in a single locked maintenance window.
+        """Plan and apply one maintenance run under the table's lock.
 
         Args:
             config: Table partitioning configuration.
-            skip_create: Skip the create-ahead step.
-            skip_detach: Skip detaching old partitions (orphans are still dropped).
-            skip_drop: Skip dropping detached partitions.
-            continue_on_error: Collect step failures into ``MaintenanceResult.issues``
-                and keep going instead of aborting the run.
+            skip_create: Leave out creations and re-attachments.
+            skip_detach: Leave out detaches (and the drops that follow them).
+            skip_drop: Leave out drops.
+            continue_on_error: Collect operation failures into
+                ``MaintenanceResult.issues`` and keep going instead of aborting.
 
         Returns:
             MaintenanceResult with the per-step counters and any collected issues.
@@ -68,63 +72,84 @@ class PartitionLifecycle(Protocol):
 class PartitionRepository(Protocol):
     """Repository for partition DDL operations.
 
-    This protocol is intentionally limited to write operations.  All read
-    operations (listing partitions, checking existence) live in
-    ``PartitionMetadataProvider`` so that the two concerns can be mocked,
-    swapped, or overridden independently.
+    This protocol is intentionally limited to write operations. All read
+    operations live in :class:`PartitionMetadataProvider` so that the two
+    concerns can be mocked, swapped, or overridden independently.
     """
 
-    def create_partition(
-        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
-    ) -> PartitionInfo:
-        """Create a new partition table.
+    def create_table_like(self, template_name: str, table_name: str, partition_by: PartitionBy | None) -> None:
+        """Create a detached table shaped like ``template_name``.
 
         Args:
-            config: Table partition configuration.
-            partition_name: Name for the new partition table.
-            from_value: Start boundary value.
-            to_value: End boundary value.
-
-        Returns:
-            Created partition info.
+            template_name: Relation whose columns, indexes and constraints are copied.
+            table_name: Schema-qualified name for the new table.
+            partition_by: How the new table partitions its own children, or
+                None for a plain leaf.
 
         Raises:
-            PartitionAlreadyExistsError: If partition already exists.
+            PartitionAlreadyExistsError: If a relation of that name exists.
         """
         ...
 
-    def attach_partition(self, table_name: str, partition_name: str, from_value: str, to_value: str) -> None:
-        """Attach partition to parent table.
+    def attach_partition(
+        self,
+        parent_name: str,
+        partition_name: str,
+        bounds: PartitionBounds,
+        *,
+        key_arity: int = 1,
+    ) -> None:
+        """Attach a table to a partitioned parent.
 
         Args:
-            table_name: Parent table name.
-            partition_name: Partition table name.
-            from_value: Start boundary value.
-            to_value: End boundary value.
+            parent_name: Partitioned relation to attach to.
+            partition_name: Table to attach.
+            bounds: What the partition owns: a RANGE window, a hash bucket, a
+                set of LIST values, or DEFAULT. A RANGE bound under a composite
+                key has its trailing columns padded with ``MINVALUE``.
+            key_arity: Number of columns in ``parent_name``'s partition key.
         """
         ...
 
-    def detach_partition(self, table_name: str, partition_name: str, *, concurrent: bool = True) -> None:
-        """Detach partition from parent table.
+    def detach_partition(self, parent_name: str, partition_name: str, *, mode: DetachMode = DetachMode.AUTO) -> None:
+        """Detach a partition, writing the orphan marker first.
 
         Args:
-            table_name: Parent table name.
+            parent_name: Parent table name.
             partition_name: Partition table name.
-            concurrent: Use DETACH PARTITION CONCURRENTLY if supported.
+            mode: Concurrent, blocking, or concurrent with a blocking fallback.
 
         Raises:
             PartitionNotFoundError: If partition doesn't exist.
+            PartitionDetachInProgressError: If another detach is pending.
         """
         ...
 
-    def drop_partition(self, partition_name: str) -> None:
-        """Drop a partition table.
+    def drop_partition(self, partition_name: str, *, expected_oid: int | None = None) -> None:
+        """Drop a detached, marker-tagged partition table.
 
         Args:
             partition_name: Partition table name.
+            expected_oid: The catalog identity the caller decided on. When the
+                relation now holding the name has another, nothing is dropped.
 
         Raises:
             PartitionAttachedError: If partition is still attached.
+            UnmanagedPartitionDropError: If the table carries no orphan marker.
+            PlanStaleError: If the relation is not the one ``expected_oid`` named.
+        """
+        ...
+
+    def adopt_partition(self, table_name: str, partition_name: str) -> bool:
+        """Stamp the orphan marker on a detached table this library did not detach.
+
+        Args:
+            table_name: The parent the table used to belong to.
+            partition_name: The detached table.
+
+        Returns:
+            True when the marker is present after the call, False when the
+            table does not exist.
         """
         ...
 
@@ -133,24 +158,23 @@ class PartitionRepository(Protocol):
         *,
         default_partition_name: str,
         target_partition_name: str,
-        partition_column: str,
+        key_columns: tuple[str, ...],
         from_value: str,
         to_value: str,
     ) -> int:
-        """Move rows from DEFAULT partition to target partition for given range.
+        """Move rows from a DEFAULT partition to the partition for a window.
 
         Args:
             default_partition_name: Qualified name of DEFAULT partition.
             target_partition_name: Qualified name of target partition.
-            partition_column: Column used for partitioning.
-            from_value: Range start boundary (inclusive).
-            to_value: Range end boundary (exclusive).
+            key_columns: The parent's partition key, leading column first. Rows
+                with a NULL in a trailing column stay in DEFAULT, where
+                PostgreSQL routes them.
+            from_value: Window start (inclusive) on the leading column.
+            to_value: Window end (exclusive) on the leading column.
 
         Returns:
             Number of rows moved.
-
-        Raises:
-            SQLAlchemyError: On database errors.
         """
         ...
 
@@ -160,94 +184,95 @@ class PartitionMetadataProvider(Protocol):
     """Provider for reading partition metadata from the database catalogue.
 
     This protocol owns *all* read operations so that the service layer depends
-    on a single injectable read interface.  Implement this protocol to support a
+    on a single injectable read interface. Implement this protocol to support a
     different database, a caching layer, or a stub for testing.
     """
 
     def get_partition_type(self, table_name: str) -> PartitionType | None:
-        """Get partition type for a table.
-
-        Args:
-            table_name: Table name.
-
-        Returns:
-            Partition type or None if table is not partitioned.
-        """
+        """Get partition type for a table, or None if it is not partitioned."""
         ...
 
-    def get_partition_column(self, table_name: str) -> str | None:
-        """Get partition column for a table.
-
-        Args:
-            table_name: Table name.
-
-        Returns:
-            Partition column name or None if table is not partitioned.
+    def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
+        """Return a table's own partition key columns, in key order.
 
         Raises:
-            ValueError: If the table uses a composite (multi-column) partition key.
+            InvalidPartitionConfigError: If any key position is an expression.
         """
         ...
 
-    def get_partition_boundaries(self, partition_name: str) -> tuple[str, str] | None:
-        """Get partition boundaries.
+    def get_actual_tree(self, table_name: str) -> ActualTree | None:
+        """Return the whole tree below ``table_name`` plus its orphans.
 
         Args:
-            partition_name: Partition table name.
+            table_name: Root of the tree, schema-qualified.
 
         Returns:
-            Tuple of (from_value, to_value) or None if not a range partition.
+            The tree, or None when the relation is not partitioned.
         """
         ...
 
-    def list_partitions(self, table_name: str) -> list[PartitionInfo]:
-        """List all partitions for a table, including orphaned detached ones.
-
-        Orphaned partitions are tables that were detached in a previous
-        maintenance run but never dropped.  They are returned with
-        ``is_attached=False`` and ``None`` boundaries so that the service can
-        schedule them for cleanup on the next run.
+    def measure(
+        self,
+        tree: ActualTree,
+        *,
+        targets: tuple[str, ...],
+        facts: frozenset[FactKind] = frozenset(),
+        sql_predicates: tuple[SqlPredicate, ...] = (),
+    ) -> ActualTree:
+        """Return ``tree`` with facts attached to the named targets.
 
         Args:
-            table_name: Parent table name.
-
-        Returns:
-            List of partition metadata.
+            tree: The tree to annotate.
+            targets: Schema-qualified names the facts and predicates are
+                gathered for; everything else stays unmeasured.
+            facts: What to measure.
+            sql_predicates: Questions to ask about each target.
         """
         ...
 
-    def partition_exists(self, partition_name: str) -> bool:
-        """Check if a partition table exists in the catalogue.
+    def get_partition_tree(self, table_name: str) -> PartitionNode | None:
+        """Return the tree rooted at ``table_name`` without orphans, or None.
 
-        Args:
-            partition_name: Partition table name.
-
-        Returns:
-            True if the table exists.
-        """
-        ...
-
-    def is_partition_attached(self, table_name: str, partition_name: str) -> bool:
-        """Check if a partition is currently attached to its parent table.
-
-        Args:
-            table_name: Parent table name.
-            partition_name: Partition table name.
-
-        Returns:
-            True if the partition is attached via pg_inherits.
+        Works for a detached relation too, which is how a half-built branch is
+        inspected before it is attached.
         """
         ...
 
     def get_default_partition(self, table_name: str) -> PartitionInfo | None:
-        """Get DEFAULT partition for a table if it exists and is attached.
+        """Get the attached DEFAULT partition of a table, if any."""
+        ...
+
+    def partition_exists(self, partition_name: str) -> bool:
+        """True when a table or partitioned table of that name exists."""
+        ...
+
+    def is_partition_attached(self, table_name: str, partition_name: str) -> bool:
+        """True when ``partition_name`` is attached to ``table_name`` via pg_inherits."""
+        ...
+
+    def get_relation_oid(self, name: str) -> int | None:
+        """Return the OID of the relation currently holding ``name``, or None."""
+        ...
+
+    def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
+        """Return the column tuples of every UNIQUE / PRIMARY KEY constraint on a table."""
+        ...
+
+    def get_key_high_water_mark(self, table_name: str, column: str, *, sequence: bool = False) -> int | None:
+        """Return the newest value of an integer partition key.
 
         Args:
-            table_name: Parent table name.
+            table_name: The partitioned table.
+            column: The key column.
+            sequence: Read the key's serial/identity sequence instead of ``max(column)``.
 
         Returns:
-            PartitionInfo with is_default=True, or None if no default partition exists.
+            The value, or None when the table is empty (or the sequence unused).
         """
+        ...
+
+    def list_partitions(self, table_name: str) -> list[PartitionInfo]:
+        """List the direct partitions of a table, including its marker-tagged orphans."""
         ...
 
 
@@ -275,185 +300,5 @@ class LockManager(Protocol):
         ...
 
     def is_locked(self, table_name: str) -> bool:
-        """Check if table is currently locked.
-
-        Args:
-            table_name: Table name.
-
-        Returns:
-            True if table is locked.
-        """
-        ...
-
-
-@runtime_checkable
-class SubpartitionRepository(Protocol):
-    """DDL for partitions that are themselves partitioned tables.
-
-    Kept separate from :class:`PartitionRepository` on purpose: a repository
-    written against the flat protocol keeps satisfying it, and is only required
-    to grow these three methods once a config actually asks for subpartitioning.
-    """
-
-    def create_branch(
-        self,
-        config: TablePartitionConfig,
-        branch_name: str,
-        from_value: str,
-        to_value: str,
-        spec: SubpartitionSpec,
-    ) -> PartitionInfo:
-        """Create a detached time partition that is itself partitioned.
-
-        Args:
-            config: Table partition configuration.
-            branch_name: Name for the new branch table.
-            from_value: Start boundary value.
-            to_value: End boundary value.
-            spec: Subpartitioning the branch applies to its own children.
-
-        Returns:
-            Info about the created (still detached) branch.
-
-        Raises:
-            PartitionAlreadyExistsError: If a relation of that name exists.
-        """
-        ...
-
-    def create_subpartition_table(self, parent_name: str, child_name: str, spec: SubpartitionSpec | None) -> None:
-        """Create a detached table shaped like ``parent_name``.
-
-        Args:
-            parent_name: Relation the table will later be attached to.
-            child_name: Name for the new table.
-            spec: Subpartitioning the table applies to its own children, or None.
-
-        Raises:
-            PartitionAlreadyExistsError: If a relation of that name exists.
-        """
-        ...
-
-    def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
-        """Attach one subpartition to its parent.
-
-        Args:
-            parent_name: Partitioned relation to attach to.
-            child_name: Table to attach.
-            bounds: What the child owns — a hash bucket, a set of LIST values,
-                or DEFAULT.
-        """
-        ...
-
-
-@runtime_checkable
-class NestedPartitionMetadata(Protocol):
-    """Structural introspection a nested configuration needs.
-
-    Also separate from :class:`PartitionMetadataProvider` so flat setups keep
-    working with providers that predate subpartitioning.
-    """
-
-    def get_partition_tree(self, table_name: str) -> PartitionNode | None:
-        """Return the whole partition tree rooted at ``table_name``.
-
-        Args:
-            table_name: Root of the tree, schema-qualified.
-
-        Returns:
-            The root node with its descendants, or None when the relation is
-            neither partitioned nor a partition.
-        """
-        ...
-
-    def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
-        """Return the column tuples of every UNIQUE / PRIMARY KEY constraint.
-
-        Args:
-            table_name: Table to inspect, schema-qualified.
-
-        Returns:
-            One tuple of column names per constraint.
-        """
-        ...
-
-
-@runtime_checkable
-class CompositeKeyRepository(Protocol):
-    """DDL for a parent whose partition key spans several columns.
-
-    Separate from :class:`PartitionRepository` for the same reason as the
-    nested protocols: a repository written before composite keys keeps
-    satisfying the flat one, and is only required to grow this method once a
-    config actually declares a multi-column key.
-    """
-
-    def attach_composite_partition(
-        self,
-        table_name: str,
-        partition_name: str,
-        from_value: str,
-        to_value: str,
-        *,
-        key_arity: int,
-    ) -> None:
-        """Attach a partition, padding the trailing key columns with MINVALUE.
-
-        Args:
-            table_name: Parent table name.
-            partition_name: Partition table name.
-            from_value: Start boundary for the leading column.
-            to_value: End boundary for the leading column.
-            key_arity: Number of columns in the parent's partition key.
-        """
-        ...
-
-    def reconcile_default_rows(
-        self,
-        *,
-        default_partition_name: str,
-        target_partition_name: str,
-        partition_column: str,
-        trailing_columns: tuple[str, ...] = (),
-        from_value: str,
-        to_value: str,
-    ) -> int:
-        """Move conflicting rows from a DEFAULT partition, honouring the whole key.
-
-        The composite widening of :meth:`PartitionRepository.reconcile_default_rows`.
-        It is declared here rather than on the base protocol so an
-        implementation written against the single-column signature keeps
-        satisfying ``PartitionRepository`` -- for a type checker as much as at
-        runtime.
-
-        PostgreSQL adds an IS NOT NULL test for every key column to a range
-        partition's constraint, so a row with a NULL trailing key value belongs
-        in DEFAULT and has to be left there.
-
-        Args:
-            default_partition_name: Qualified name of DEFAULT partition.
-            target_partition_name: Qualified name of target partition.
-            partition_column: Leading column of the partition key.
-            trailing_columns: The remaining key columns, in key order.
-            from_value: Range start boundary (inclusive).
-            to_value: Range end boundary (exclusive).
-
-        Returns:
-            Number of rows moved.
-        """
-        ...
-
-
-@runtime_checkable
-class CompositeKeyMetadata(Protocol):
-    """Introspection of a partition key that spans several columns."""
-
-    def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
-        """Return a table's own partition key columns, in key order.
-
-        Args:
-            table_name: Table to inspect, schema-qualified.
-
-        Returns:
-            The key columns in order; empty when the table is not partitioned.
-        """
+        """Check if table is currently locked."""
         ...

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import ClassVar
 
-from pg_partsmith.entities import Period
+from pg_partsmith.periods import Period
 
 from .base import BasePeriodCalculator
 
@@ -19,9 +20,9 @@ class QuarterPeriodCalculator(BasePeriodCalculator):
 
     _NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^(.+)__(\d{4})_q([1-4])$")
 
-    def current_period(self) -> Period:
-        """Get current quarter period."""
-        now = self._now()
+    def period_at(self, instant: datetime) -> Period:
+        """Return the quarter period holding ``instant``."""
+        now = self._local(instant)
         return Period(year=now.year, quarter=(now.month - 1) // 3 + 1)
 
     def format_partition_name(self, table_name: str, period: Period) -> str:

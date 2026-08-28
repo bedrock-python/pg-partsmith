@@ -1,8 +1,8 @@
-"""Shared pg_catalog SQL used by both the resolvers and the metadata providers.
+"""Shared pg_catalog SQL used by both the repositories and the metadata providers.
 
-Plain-string constants (bind names ``:table_name`` / ``:partition_name``) so
-the aio and sync mirrors wrap one canonical query text instead of hand-copying
-it.
+Plain-string constants (bind names ``:table_name`` / ``:partition_name`` and
+friends) so the aio and sync mirrors wrap one canonical query text instead of
+hand-copying it.
 """
 
 RELATION_EXISTS_SQL = """
@@ -12,6 +12,12 @@ RELATION_EXISTS_SQL = """
         WHERE oid = to_regclass(:partition_name)
           AND relkind IN ('r', 'p')
     )
+"""
+
+RELATION_OID_SQL = """
+    SELECT c.oid
+    FROM pg_class c
+    WHERE c.oid = to_regclass(:name)
 """
 
 PARTITION_IS_ATTACHED_SQL = """
@@ -30,17 +36,23 @@ PARTITION_IS_ATTACHED_SQL = """
 # ``pg_partition_tree`` walks the hierarchy for us, so nested trees cost one
 # query no matter how deep they go. Each row carries both halves of a node's
 # identity: ``relpartbound`` says how it sits inside its parent, while
-# ``partstrat``/``partkeydef`` say how it partitions its own children — a
-# branch has both, a leaf only the first.
+# ``partstrat``/``partattrs`` say how it partitions its own children — a
+# branch has both, a leaf only the first. ``relkind`` tells a foreign leaf
+# from a local one, ``oid`` is what a destructive operation is revalidated
+# against, and ``inhdetachpending`` flags a partition an interrupted
+# ``DETACH CONCURRENTLY`` left invisible.
 PARTITION_TREE_SQL = """
     SELECT
         t.level AS level,
+        cl.oid AS oid,
+        cl.relkind AS relkind,
         ns.nspname AS partition_schema,
         cl.relname AS partition_name,
         pns.nspname AS parent_schema,
         p.relname AS parent_name,
         pg_get_expr(cl.relpartbound, cl.oid) AS boundaries,
         cl.relispartition AS is_attached,
+        COALESCE(inh.inhdetachpending, false) AS detach_pending,
         pt.partstrat AS partstrat,
         (
             SELECT array_agg(a.attname ORDER BY k.ord)
@@ -57,9 +69,56 @@ PARTITION_TREE_SQL = """
     JOIN pg_namespace ns ON ns.oid = cl.relnamespace
     LEFT JOIN pg_class p ON p.oid = t.parentrelid
     LEFT JOIN pg_namespace pns ON pns.oid = p.relnamespace
+    LEFT JOIN pg_inherits inh ON inh.inhrelid = cl.oid AND inh.inhparent = t.parentrelid
     LEFT JOIN pg_partitioned_table pt ON pt.partrelid = cl.oid
     WHERE t.relid IS NOT NULL
     ORDER BY t.level, ns.nspname, cl.relname
+"""
+
+# Marker-tagged detached tables whose marker names one of ``:markers``.
+#
+# The first comment line is the ownership marker; the whole comment is
+# returned so the detach instant on the second line can be read too.
+ORPHANS_SQL = """
+    SELECT
+        c.oid AS oid,
+        c.relkind AS relkind,
+        ns.nspname AS partition_schema,
+        c.relname AS partition_name,
+        d.description AS description
+    FROM pg_class c
+    JOIN pg_namespace ns ON c.relnamespace = ns.oid
+    JOIN pg_description d
+      ON d.objoid = c.oid
+     AND d.classoid = 'pg_class'::regclass
+     AND d.objsubid = 0
+    WHERE c.relkind IN ('r', 'p', 'f')
+      AND c.relispartition = false
+      AND split_part(d.description, E'\\n', 1) = ANY(CAST(:markers AS text[]))
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_inherits inh
+          WHERE inh.inhrelid = c.oid
+      )
+    ORDER BY ns.nspname, c.relname
+"""
+
+# Size and row estimate of each relation in ``:oids``, subtree included.
+#
+# ``pg_total_relation_size`` of a partitioned relation is 0 -- it has no
+# storage of its own -- so sizes are summed over the leaves of each subtree.
+# Rows come from the statistics collector, never from ``COUNT(*)``: a plan
+# must not scan a 500 GB partition to decide what to do with it.
+PARTITION_FACTS_SQL = """
+    SELECT
+        root.oid AS oid,
+        COALESCE(SUM(pg_total_relation_size(t.relid)), 0) AS size_bytes,
+        COALESCE(SUM(COALESCE(s.n_live_tup, 0)), 0) AS row_estimate
+    FROM unnest(CAST(:oids AS oid[])) AS root(oid)
+    CROSS JOIN LATERAL pg_partition_tree(root.oid) t
+    LEFT JOIN pg_stat_user_tables s ON s.relid = t.relid
+    WHERE t.isleaf
+    GROUP BY root.oid
 """
 
 # A relation's live column names, in its own physical order.
@@ -175,4 +234,18 @@ PARTITION_COLUMNS_SQL = """
     LEFT JOIN pg_attribute a ON a.attrelid = t.partrelid AND a.attnum = k.attnum
     WHERE t.partrelid = to_regclass(:table_name)
     ORDER BY k.ord
+"""
+
+# Last value handed out by the serial/identity sequence feeding a column.
+#
+# NULL when the column has no sequence, or the sequence was never used.
+SEQUENCE_LAST_VALUE_SQL = """
+    SELECT pg_sequence_last_value(CAST(pg_get_serial_sequence(:table_name, :column) AS regclass))
+"""
+
+# A relation's own partitioning, for one name.
+PARTITION_STRATEGY_SQL = """
+    SELECT partstrat
+    FROM pg_partitioned_table t
+    WHERE t.partrelid = to_regclass(:table_name)
 """

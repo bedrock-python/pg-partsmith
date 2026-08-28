@@ -1,4 +1,4 @@
-"""Shape of a PostgreSQL partition tree: bounds, subpartition specs, and nodes.
+"""The partition tree that actually exists: bounds, nodes, orphans, facts.
 
 Everything here is IO-free and shared by the aio and sync mirrors:
 
@@ -6,12 +6,14 @@ Everything here is IO-free and shared by the aio and sync mirrors:
 * ``*Bounds`` — how a relation is bound *inside* its parent, as PostgreSQL
   renders it (``FOR VALUES FROM … TO …`` / ``WITH (MODULUS … REMAINDER …)`` /
   ``IN (…)`` / ``DEFAULT``).
-* :class:`HashSubpartitionSpec` — the subpartitioning a user *asks for*.
-* :class:`PartitionNode` — the tree that actually *exists*, as introspected
-  from ``pg_partition_tree`` and friends.
+* :class:`PartitionNode` — one relation of an introspected tree, and
+  :class:`ActualTree` — the tree plus the marker-tagged orphans below its root.
+* :class:`PartitionFacts` — what the introspector measured about a relation
+  when a policy asked for it.
 
-The planner that turns the difference between the last two into DDL intentions
-lives in :mod:`pg_partsmith.subpartition_plan`.
+The desired shape lives in :mod:`pg_partsmith.scheme`; the planner that turns
+the difference between the two into a :class:`~pg_partsmith.plan.MaintenancePlan`
+lives in :mod:`pg_partsmith.planner`.
 """
 
 from __future__ import annotations
@@ -19,24 +21,39 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Collection, Sequence
+from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, ClassVar, Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .constants import (
-    DEFAULT_HASH_NAME_SUFFIX,
-    DEFAULT_LIST_DEFAULT_NAME,
-    DEFAULT_LIST_NAME_SUFFIX,
-    MAX_HASH_KEYSPACE_LCM,
-    MAX_IDENTIFIER_LENGTH,
-    MAX_SUBPARTITION_DEPTH,
-)
+from .constants import MAX_HASH_KEYSPACE_LCM, MAX_IDENTIFIER_LENGTH
 from .types import NonNegativeInt, PositiveInt, StrippedNonEmptyStr
+
+__all__ = [
+    "ActualTree",
+    "DefaultBounds",
+    "DetachedPartition",
+    "FactKind",
+    "HashBounds",
+    "ListBounds",
+    "PartitionBounds",
+    "PartitionFacts",
+    "PartitionNode",
+    "PartitionTreeRow",
+    "PartitionType",
+    "RangeBounds",
+    "RelationKind",
+    "build_partition_tree",
+    "hash_keyspace_covered",
+    "missing_remainders",
+    "uniform_modulus",
+    "validate_pg_identifier",
+]
 
 
 class PartitionType(StrEnum):
-    """PostgreSQL partition type.
+    """PostgreSQL partitioning method.
 
     Attributes:
         RANGE: Range partitioning (e.g., by date ranges).
@@ -54,6 +71,33 @@ class PartitionType(StrEnum):
         return {"r": cls.RANGE, "l": cls.LIST, "h": cls.HASH}.get(strat or "")
 
 
+class RelationKind(StrEnum):
+    """What a member of a partition tree physically is (``pg_class.relkind``).
+
+    Attributes:
+        TABLE: An ordinary table — a leaf that stores rows.
+        PARTITIONED: A partitioned table — a branch with children of its own.
+        FOREIGN: A foreign table — a leaf whose rows live elsewhere. The
+            library never creates, drops, or comments on one.
+        OTHER: Anything else PostgreSQL may put in a tree in a future version.
+    """
+
+    TABLE = "table"
+    PARTITIONED = "partitioned"
+    FOREIGN = "foreign"
+    OTHER = "other"
+
+    @classmethod
+    def from_relkind(cls, relkind: str | None) -> RelationKind:
+        """Map a ``pg_class.relkind`` code to a kind."""
+        return {"r": cls.TABLE, "p": cls.PARTITIONED, "f": cls.FOREIGN}.get(relkind or "", cls.OTHER)
+
+    @property
+    def is_droppable_table(self) -> bool:
+        """True when ``DROP TABLE`` is the statement that removes it."""
+        return self in {RelationKind.TABLE, RelationKind.PARTITIONED}
+
+
 # ── Partition bounds ────────────────────────────────────────────────────────────
 #
 # One model per PostgreSQL bound spelling, discriminated on ``kind`` so a
@@ -63,9 +107,12 @@ class PartitionType(StrEnum):
 class RangeBounds(BaseModel):
     """``FOR VALUES FROM (from_value) TO (to_value)``.
 
+    Under a composite key only the leading element of each tuple is kept: the
+    trailing columns are bounded with ``MINVALUE`` at both ends.
+
     Attributes:
-        from_value: Lower bound, inclusive.
-        to_value: Upper bound, exclusive.
+        from_value: Lower bound, inclusive. ``MINVALUE`` when unbounded.
+        to_value: Upper bound, exclusive. ``MAXVALUE`` when unbounded.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -135,302 +182,41 @@ PartitionBounds = Annotated[
 ]
 """Any partition bound description, discriminated on ``kind``."""
 
-SubpartitionBounds = Annotated[
-    HashBounds | ListBounds | DefaultBounds,
-    Field(discriminator="kind"),
-]
-"""How a subpartition is bound in its parent.
 
-Narrower than :data:`PartitionBounds`: a RANGE bound belongs to the time
-dimension at the root, never to a level a subpartition spec creates. Keeping it
-out makes the DDL renderer total over the cases it can actually receive.
-"""
+# ── Facts ───────────────────────────────────────────────────────────────────────
 
 
-# ── Desired subpartitioning ─────────────────────────────────────────────────────
-#
-# A spec is declarative: it says what the tree *should* look like, and
-# ``pg_partsmith.subpartition_plan`` works out which nodes are missing. The
-# strategies differ in how a level is divided, so what they share — the column,
-# the naming template, the level below — lives on a common base.
-
-
-class SubpartitionSpecBase(BaseModel):
-    """Fields and tree arithmetic shared by every subpartitioning strategy.
-
-    A key is spelled as one leading column plus an optional tail, rather than a
-    single tuple, so that ``column`` stays an ordinary field: it can be read
-    without ever raising, and ``model_copy(update={"column": ...})`` does what
-    it says. :attr:`columns` derives the whole key from the two.
+class FactKind(StrEnum):
+    """Something the introspector can measure about a relation, on request.
 
     Attributes:
-        column: The leading column this level partitions on.
-        trailing_columns: The rest of the key, in key order; empty for the usual
-            single-column case. Every column named here and above must be part
-            of every UNIQUE/PRIMARY KEY constraint on the root table, or
-            PostgreSQL refuses the subtree.
-        name_suffix: Template appended to the parent's name to name each child.
-        subpartition: Optional further level of subpartitioning.
+        SIZE: Total on-disk size of the relation and its subtree, in bytes.
+        ROWS: Estimated live rows (planner statistics, never ``COUNT(*)``).
+    """
+
+    SIZE = "size"
+    ROWS = "rows"
+
+
+class PartitionFacts(BaseModel):
+    """What was measured about one relation.
+
+    Only what a policy asked for is populated; everything else stays None so a
+    plan for a simple monthly table never pays for ``pg_total_relation_size``.
+
+    Attributes:
+        size_bytes: Total size of the relation and its subtree.
+        row_estimate: Estimated live rows across the subtree, from planner
+            statistics. ``0`` before the first ``ANALYZE`` / stats flush.
+        predicates: Result of each :class:`~pg_partsmith.lifecycle.SqlPredicate`
+            evaluated against the relation, keyed by the predicate's id.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    column: StrippedNonEmptyStr
-    trailing_columns: tuple[StrippedNonEmptyStr, ...] = ()
-    name_suffix: str
-    subpartition: SubpartitionSpec | None = None
-
-    @property
-    def columns(self) -> tuple[str, ...]:
-        """The whole partition key of this level, in key order."""
-        return (self.column, *self.trailing_columns)
-
-    @property
-    def partition_type(self) -> PartitionType:
-        """PostgreSQL partition type this spec describes."""
-        raise NotImplementedError
-
-    @field_validator("column")
-    @classmethod
-    def validate_column(cls, v: str) -> str:
-        """Validate and normalise the leading partition key identifier."""
-        return validate_pg_identifier(v)
-
-    @field_validator("trailing_columns")
-    @classmethod
-    def validate_trailing_columns(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        """Validate and normalise the rest of the partition key."""
-        return tuple(validate_pg_identifier(column) for column in v)
-
-    @model_validator(mode="after")
-    def validate_key_is_distinct(self) -> SubpartitionSpecBase:
-        """A column repeated in the key would leave one position doing nothing."""
-        if len(set(self.columns)) != len(self.columns):
-            msg = f"Partition key columns must be distinct, got {self.columns!r}"
-            raise ValueError(msg)
-        return self
-
-    def own_name_budget(self) -> int:
-        """Bytes this level alone adds to a child's name."""
-        raise NotImplementedError
-
-    def name_length_budget(self) -> int:
-        """Bytes this level and everything below it add to a partition name.
-
-        Used to keep generated names inside PostgreSQL's 63-byte identifier
-        limit, which truncates silently — two children could otherwise collapse
-        onto one name.
-        """
-        below = self.subpartition.name_length_budget() if self.subpartition is not None else 0
-        return self.own_name_budget() + below
-
-    def depth(self) -> int:
-        """Number of subpartition levels this spec describes, including itself."""
-        return 1 + (self.subpartition.depth() if self.subpartition is not None else 0)
-
-    def walk(self) -> list[SubpartitionSpec]:
-        """Return this spec and every spec below it, outermost first."""
-        specs: list[SubpartitionSpec] = [self]  # type: ignore[list-item]
-        if self.subpartition is not None:
-            specs.extend(self.subpartition.walk())
-        return specs
-
-    @model_validator(mode="after")
-    def validate_depth(self) -> SubpartitionSpecBase:
-        """Bound the tree depth so a typo cannot fan out into thousands of tables."""
-        if self.depth() > MAX_SUBPARTITION_DEPTH:
-            msg = f"Subpartitioning is limited to {MAX_SUBPARTITION_DEPTH} levels, got {self.depth()}"
-            raise ValueError(msg)
-        return self
-
-
-class HashSubpartitionSpec(SubpartitionSpecBase):
-    """Divide each partition of the level above into HASH buckets.
-
-    ``modulus`` is the bucket count for *newly created* branches only. Existing
-    branches keep the modulus they were built with — a hash set cannot change
-    modulus without a rewrite — so lowering or raising it changes future
-    periods and leaves history alone. See the reconciliation guide.
-
-    Attributes:
-        strategy: Discriminator; always ``"hash"``.
-        modulus: Number of hash buckets to create per branch.
-        name_suffix: Must contain ``{remainder}`` and otherwise only lowercase
-            identifier characters.
-    """
-
-    _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{remainder\}[a-z0-9_]*$")
-
-    strategy: Literal["hash"] = "hash"
-    modulus: PositiveInt
-    name_suffix: str = DEFAULT_HASH_NAME_SUFFIX
-
-    @property
-    def partition_type(self) -> PartitionType:
-        """PostgreSQL partition type this spec describes."""
-        return PartitionType.HASH
-
-    @field_validator("name_suffix")
-    @classmethod
-    def validate_name_suffix(cls, v: str) -> str:
-        """Reject templates that could not produce a safe, unique identifier."""
-        if not cls._NAME_SUFFIX_PATTERN.match(v):
-            msg = (
-                f"name_suffix {v!r} must contain '{{remainder}}' and otherwise only "
-                "lowercase letters, digits, and underscores"
-            )
-            raise ValueError(msg)
-        return v
-
-    def child_name(self, parent_relname: str, remainder: int) -> str:
-        """Return the bare relation name of one bucket under ``parent_relname``."""
-        return f"{parent_relname}{self.name_suffix.format(remainder=remainder)}"
-
-    def bounds_for(self, remainder: int) -> HashBounds:
-        """Return the bounds of bucket ``remainder`` at this spec's modulus."""
-        return HashBounds(modulus=self.modulus, remainder=remainder)
-
-    def own_name_budget(self) -> int:
-        """Bytes this level adds, sized for the widest remainder."""
-        widest = len(str(self.modulus - 1))
-        return len(self.name_suffix) - len("{remainder}") + widest
-
-
-class ListGroup(BaseModel):
-    """One named LIST partition and the key values it owns.
-
-    Attributes:
-        name: Identifier fragment used to name the partition.
-        values: Values routed to it. Rendered as SQL string literals, which
-            PostgreSQL coerces to the partition key's type, so numeric and
-            textual keys are both written as strings here.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    name: StrippedNonEmptyStr
-    values: tuple[StrippedNonEmptyStr, ...]
-
-    @field_validator("name")
-    @classmethod
-    def validate_name(cls, v: str) -> str:
-        """Keep the fragment safe to splice into an identifier."""
-        return validate_pg_identifier(v)
-
-    @model_validator(mode="after")
-    def validate_values(self) -> ListGroup:
-        """A LIST partition owning no values could never route a row."""
-        if not self.values:
-            msg = f"LIST group {self.name!r} must own at least one value"
-            raise ValueError(msg)
-        if len(set(self.values)) != len(self.values):
-            msg = f"LIST group {self.name!r} repeats a value: {self.values!r}"
-            raise ValueError(msg)
-        return self
-
-    def bounds(self) -> ListBounds:
-        """Return this group's partition bounds."""
-        return ListBounds(values=self.values)
-
-
-class ListSubpartitionSpec(SubpartitionSpecBase):
-    """Divide each partition of the level above into named LIST partitions.
-
-    Unlike HASH, a LIST level is never "complete": there is always another
-    value the world could produce. That is what ``include_default`` is for — a
-    catch-all partition so an unknown value is stored rather than rejected.
-
-    Because groups are matched by the values they own rather than by name, a
-    tree built by another tool is recognised and left alone instead of being
-    duplicated under different names.
-
-    Attributes:
-        strategy: Discriminator; always ``"list"``.
-        groups: The partitions to maintain, each owning an explicit value set.
-        include_default: Maintain a DEFAULT catch-all partition alongside them.
-        default_name: Identifier fragment for that DEFAULT partition.
-        name_suffix: Must contain ``{name}`` and otherwise only lowercase
-            identifier characters.
-    """
-
-    _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{name\}[a-z0-9_]*$")
-
-    strategy: Literal["list"] = "list"
-    groups: tuple[ListGroup, ...]
-    include_default: bool = False
-    default_name: StrippedNonEmptyStr = DEFAULT_LIST_DEFAULT_NAME
-    name_suffix: str = DEFAULT_LIST_NAME_SUFFIX
-
-    @property
-    def partition_type(self) -> PartitionType:
-        """PostgreSQL partition type this spec describes."""
-        return PartitionType.LIST
-
-    @field_validator("name_suffix")
-    @classmethod
-    def validate_name_suffix(cls, v: str) -> str:
-        """Reject templates that could not produce a safe, unique identifier."""
-        if not cls._NAME_SUFFIX_PATTERN.match(v):
-            msg = (
-                f"name_suffix {v!r} must contain '{{name}}' and otherwise only "
-                "lowercase letters, digits, and underscores"
-            )
-            raise ValueError(msg)
-        return v
-
-    @field_validator("default_name")
-    @classmethod
-    def validate_default_name(cls, v: str) -> str:
-        """Keep the DEFAULT partition's fragment safe to splice into a name."""
-        return validate_pg_identifier(v)
-
-    @model_validator(mode="after")
-    def validate_groups(self) -> ListSubpartitionSpec:
-        """Reject a spec PostgreSQL would refuse or that names two partitions alike."""
-        if self.trailing_columns:
-            msg = (
-                f"LIST partitioning takes exactly one column, got {self.columns!r}. "
-                "PostgreSQL rejects a composite LIST key."
-            )
-            raise ValueError(msg)
-        if not self.groups:
-            msg = "LIST subpartitioning requires at least one group"
-            raise ValueError(msg)
-
-        names = [g.name for g in self.groups]
-        if self.include_default:
-            names.append(self.default_name)
-        if len(set(names)) != len(names):
-            msg = f"LIST group names must be distinct, got {names!r}"
-            raise ValueError(msg)
-
-        seen: dict[str, str] = {}
-        for group in self.groups:
-            for value in group.values:
-                if value in seen:
-                    msg = f"LIST value {value!r} is claimed by both {seen[value]!r} and {group.name!r}"
-                    raise ValueError(msg)
-                seen[value] = group.name
-
-        return self
-
-    def child_name(self, parent_relname: str, name: str) -> str:
-        """Return the bare relation name of one child under ``parent_relname``."""
-        return f"{parent_relname}{self.name_suffix.format(name=name)}"
-
-    def own_name_budget(self) -> int:
-        """Bytes this level adds, sized for the longest group name."""
-        names = [g.name for g in self.groups]
-        if self.include_default:
-            names.append(self.default_name)
-        return len(self.name_suffix) - len("{name}") + max(len(n) for n in names)
-
-
-SubpartitionSpec = Annotated[
-    HashSubpartitionSpec | ListSubpartitionSpec,
-    Field(discriminator="strategy"),
-]
-"""The subpartitioning of one level, discriminated on ``strategy``."""
+    size_bytes: NonNegativeInt | None = None
+    row_estimate: NonNegativeInt | None = None
+    predicates: dict[str, bool] = Field(default_factory=dict)
 
 
 # ── Introspected tree ───────────────────────────────────────────────────────────
@@ -446,10 +232,13 @@ class PartitionNode(BaseModel):
 
     Attributes:
         name: Schema-qualified relation name.
+        oid: ``pg_class.oid`` — the relation's identity across renames, and what
+            a destructive operation is revalidated against.
         parent_name: Schema-qualified parent name; None for the queried root.
         level: Depth below the queried root (0 for the root itself).
+        relkind: What the relation physically is.
         partition_type: How this relation partitions its *children*; None when
-            it is a plain (leaf) table. Note that
+            it is a leaf. Note that
             :attr:`~pg_partsmith.PartitionInfo.partition_type` means the
             opposite -- how the relation's *parent* partitions it -- and that
             the equivalent of this field there is ``subpartition_type``.
@@ -458,6 +247,9 @@ class PartitionNode(BaseModel):
         is_attached: ``pg_class.relispartition``. Descendants reached through a
             parent are attached by construction — a detached relation is not in
             anyone's tree — so this is informative mainly for the root itself.
+        detach_pending: ``pg_inherits.inhdetachpending`` — a
+            ``DETACH CONCURRENTLY`` was interrupted; the partition is invisible
+            through its parent and rejects its own rows until finalized.
         children: Direct children, ordered by name.
         has_unaddressable_children: Whether a child was left out of
             :attr:`children` because its name cannot be addressed by
@@ -467,27 +259,49 @@ class PartitionNode(BaseModel):
         has_expression_key: Whether any position of this relation's own
             partition key is an expression rather than a column. Such a
             position has no name, so :attr:`partition_columns` is shorter than
-            the real key and must not be compared against a spec as if it were
-            complete.
+            the real key and must not be compared against a scheme as if it
+            were complete.
+        facts: What the introspector measured, when something asked for it.
     """
 
     model_config = ConfigDict(frozen=True)
 
     name: StrippedNonEmptyStr
+    oid: int | None = None
     parent_name: StrippedNonEmptyStr | None = None
     level: NonNegativeInt = 0
+    relkind: RelationKind = RelationKind.TABLE
     partition_type: PartitionType | None = None
     partition_columns: tuple[str, ...] = ()
     bounds: PartitionBounds | None = None
     is_attached: bool = True
+    detach_pending: bool = False
     children: tuple[PartitionNode, ...] = ()
     has_unaddressable_children: bool = False
     has_expression_key: bool = False
+    facts: PartitionFacts | None = None
+
+    @model_validator(mode="after")
+    def derive_relkind(self) -> PartitionNode:
+        """A node that partitions children is a partitioned table, whatever was said."""
+        if self.partition_type is not None and self.relkind is RelationKind.TABLE:
+            object.__setattr__(self, "relkind", RelationKind.PARTITIONED)
+        return self
 
     @property
     def is_leaf(self) -> bool:
-        """True when this relation is a plain table that cannot hold partitions."""
+        """True when this relation cannot hold partitions of its own."""
         return self.partition_type is None
+
+    @property
+    def is_default(self) -> bool:
+        """True for a DEFAULT partition."""
+        return isinstance(self.bounds, DefaultBounds)
+
+    @property
+    def is_foreign(self) -> bool:
+        """True for a foreign table."""
+        return self.relkind is RelationKind.FOREIGN
 
     @property
     def relname(self) -> str:
@@ -513,11 +327,63 @@ class PartitionNode(BaseModel):
 
     def describe_topology(self) -> str:
         """Render a one-line summary used in topology diagnostics."""
+        if self.is_foreign:
+            return "a foreign table"
         if self.is_leaf:
             return "a plain leaf table"
         columns = ", ".join(self.partition_columns) or "?"
         assert self.partition_type is not None  # guarded by is_leaf above
         return f"partitioned by {self.partition_type.value.upper()} ({columns})"
+
+
+class DetachedPartition(BaseModel):
+    """A table this library detached (or adopted) and has not dropped yet.
+
+    Found by its ``COMMENT`` marker, not by name: the marker is the only
+    evidence that cleanup of the table is ours to do.
+
+    Attributes:
+        name: Schema-qualified relation name.
+        oid: ``pg_class.oid``, revalidated before the drop.
+        relkind: What the relation physically is.
+        parent_name: The parent the marker names.
+        detached_at: When the marker was written, when the marker records it.
+            Orphans marked by an older version carry no instant.
+        facts: What the introspector measured, when something asked for it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: StrippedNonEmptyStr
+    oid: int | None = None
+    relkind: RelationKind = RelationKind.TABLE
+    parent_name: StrippedNonEmptyStr
+    detached_at: datetime | None = None
+    facts: PartitionFacts | None = None
+
+    @property
+    def relname(self) -> str:
+        """Bare relation name without the schema qualifier."""
+        _, _, relname = self.name.rpartition(".")
+        return relname or self.name
+
+
+class ActualTree(BaseModel):
+    """Everything below one root that maintenance may act on.
+
+    Attributes:
+        root: The partitioned table and its whole attached subtree.
+        orphans: Marker-tagged detached tables whose marker names the root.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    root: PartitionNode
+    orphans: tuple[DetachedPartition, ...] = ()
+
+    def find(self, name: str) -> PartitionNode | None:
+        """Return the attached node with schema-qualified ``name``, or None."""
+        return self.root.find(name)
 
 
 def uniform_modulus(bounds: tuple[HashBounds, ...]) -> int | None:
@@ -598,23 +464,32 @@ class PartitionTreeRow(BaseModel):
     Attributes:
         level: Depth below the queried root, as ``pg_partition_tree`` reports it.
         name: Schema-qualified relation name.
+        oid: ``pg_class.oid``.
         parent_name: Schema-qualified parent name; None for the queried root.
+        relkind: What the relation physically is.
         bounds: How this relation is bound inside its parent.
         is_attached: ``pg_class.relispartition``.
+        detach_pending: ``pg_inherits.inhdetachpending``.
         partition_type: How this relation partitions its own children.
         partition_columns: This relation's own partition key columns.
+        has_expression_key: Whether the key holds an expression position.
+        facts: Measurements taken alongside, if any.
     """
 
     model_config = ConfigDict(frozen=True)
 
     level: NonNegativeInt
     name: StrippedNonEmptyStr
+    oid: int | None = None
     parent_name: StrippedNonEmptyStr | None = None
+    relkind: RelationKind = RelationKind.TABLE
     bounds: PartitionBounds | None = None
     is_attached: bool = True
+    detach_pending: bool = False
     partition_type: PartitionType | None = None
     partition_columns: tuple[str, ...] = ()
     has_expression_key: bool = False
+    facts: PartitionFacts | None = None
 
 
 def build_partition_tree(
@@ -664,15 +539,19 @@ def _to_node(
     )
     return PartitionNode(
         name=row.name,
+        oid=row.oid,
         parent_name=row.parent_name,
         level=row.level,
+        relkind=row.relkind,
         partition_type=row.partition_type,
         partition_columns=row.partition_columns,
         has_expression_key=row.has_expression_key,
         bounds=row.bounds,
         is_attached=row.is_attached,
+        detach_pending=row.detach_pending,
         children=children,
         has_unaddressable_children=row.name in unaddressable_parents,
+        facts=row.facts,
     )
 
 

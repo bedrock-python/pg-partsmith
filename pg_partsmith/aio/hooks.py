@@ -4,6 +4,10 @@ Hooks let you inject custom logic at each step of the partition lifecycle -
 for example, exporting data before a partition is dropped, publishing events
 to Kafka after a partition is created, or archiving rows before detachment.
 
+Hooks fire once per **lifecycle unit** -- the partition directly under the
+root -- never per leaf of its subtree: a cold-storage export wants the whole
+week, not one call per hash bucket.
+
 Usage example::
 
     class KafkaExportHooks(BasePartitionLifecycleHooks):
@@ -20,7 +24,6 @@ Usage example::
         repo=repo,
         metadata=metadata,
         locks=locks,
-        period_calculator=calculator,
         hooks=[KafkaExportHooks(producer)],
     )
 """
@@ -38,43 +41,17 @@ class PartitionLifecycleHooks(Protocol):
     lifecycle without inheriting from a specific base class.
     """
 
-    async def before_create(
-        self,
-        config: TablePartitionConfig,
-        partition_name: str,
-        from_value: str,
-        to_value: str,
-    ) -> None: ...
+    async def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None: ...
 
-    async def after_create(
-        self,
-        config: TablePartitionConfig,
-        partition: PartitionInfo,
-    ) -> None: ...
+    async def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None: ...
 
-    async def before_detach(
-        self,
-        table_name: str,
-        partition: PartitionInfo,
-    ) -> None: ...
+    async def before_detach(self, table_name: str, partition: PartitionInfo) -> None: ...
 
-    async def after_detach(
-        self,
-        table_name: str,
-        partition_name: str,
-    ) -> None: ...
+    async def after_detach(self, table_name: str, partition_name: str) -> None: ...
 
-    async def before_drop(
-        self,
-        table_name: str,
-        partition_name: str,
-    ) -> None: ...
+    async def before_drop(self, table_name: str, partition_name: str) -> None: ...
 
-    async def after_drop(
-        self,
-        table_name: str,
-        partition_name: str,
-    ) -> None: ...
+    async def after_drop(self, table_name: str, partition_name: str) -> None: ...
 
 
 class BasePartitionLifecycleHooks:
@@ -85,39 +62,25 @@ class BasePartitionLifecycleHooks:
     without implementing every step.
     """
 
-    async def before_create(
-        self,
-        config: TablePartitionConfig,
-        partition_name: str,
-        from_value: str,
-        to_value: str,
-    ) -> None:
+    async def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
         """Called before a partition is created.
 
         Args:
             config: Table partition configuration.
-            partition_name: Name the new partition will be given.
-            from_value: Start boundary value.
-            to_value: End boundary value.
+            partition: The partition about to be created: its name, its
+                bounds (``from_value`` / ``to_value`` for a RANGE window), and
+                how it partitions its own children, if it does.
         """
 
-    async def after_create(
-        self,
-        config: TablePartitionConfig,
-        partition: PartitionInfo,
-    ) -> None:
-        """Called after a partition has been created (and optionally attached).
+    async def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
+        """Called after a partition has been created and attached.
 
         Args:
             config: Table partition configuration.
             partition: Info about the newly created partition.
         """
 
-    async def before_detach(
-        self,
-        table_name: str,
-        partition: PartitionInfo,
-    ) -> None:
+    async def before_detach(self, table_name: str, partition: PartitionInfo) -> None:
         """Called before a partition is detached from its parent table.
 
         This is a good place to export or archive data while the partition
@@ -128,11 +91,7 @@ class BasePartitionLifecycleHooks:
             partition: Info about the partition being detached.
         """
 
-    async def after_detach(
-        self,
-        table_name: str,
-        partition_name: str,
-    ) -> None:
+    async def after_detach(self, table_name: str, partition_name: str) -> None:
         """Called after a partition has been detached.
 
         Args:
@@ -140,26 +99,19 @@ class BasePartitionLifecycleHooks:
             partition_name: Name of the detached partition.
         """
 
-    async def before_drop(
-        self,
-        table_name: str,
-        partition_name: str,
-    ) -> None:
+    async def before_drop(self, table_name: str, partition_name: str) -> None:
         """Called before a partition table is dropped.
 
         This is the last chance to read or export data from the partition
-        before it is permanently destroyed.
+        before it is permanently destroyed. Raising aborts the drop; the
+        orphan marker brings the partition back on the next run.
 
         Args:
             table_name: Parent table name.
             partition_name: Name of the partition about to be dropped.
         """
 
-    async def after_drop(
-        self,
-        table_name: str,
-        partition_name: str,
-    ) -> None:
+    async def after_drop(self, table_name: str, partition_name: str) -> None:
         """Called after a partition table has been dropped.
 
         Args:

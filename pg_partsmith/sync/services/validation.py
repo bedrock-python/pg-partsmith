@@ -5,11 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pg_partsmith.exceptions import InvalidPartitionConfigError
-from pg_partsmith.sync.protocols import CompositeKeyMetadata, NestedPartitionMetadata
-from pg_partsmith.utils import qualify
 
 if TYPE_CHECKING:
-    from pg_partsmith.entities import SubpartitionSpec, TablePartitionConfig
+    from pg_partsmith.entities import TablePartitionConfig
+    from pg_partsmith.scheme import SchemeBase
     from pg_partsmith.sync.protocols import PartitionMetadataProvider
 
 
@@ -21,7 +20,7 @@ class PartitionValidationService:
 
     def validate_config(self, config: TablePartitionConfig) -> None:
         """Fail fast if the provided config does not match the actual table definition."""
-        qualified_parent = qualify(config.db_schema, config.table_name)
+        qualified_parent = config.qualified_name
 
         actual_type = self._metadata.get_partition_type(qualified_parent)
         if actual_type is None:
@@ -35,7 +34,7 @@ class PartitionValidationService:
             )
             raise InvalidPartitionConfigError(msg)
 
-        actual_columns = self._actual_partition_columns(config, qualified_parent)
+        actual_columns = self._metadata.get_partition_columns(qualified_parent)
 
         if not actual_columns:
             msg = f"Could not determine partition column for table {qualified_parent!r}"
@@ -64,40 +63,10 @@ class PartitionValidationService:
                     f"config={config.partition_columns!r} actual={actual_columns!r}"
                 )
             raise InvalidPartitionConfigError(msg)
-        self._validate_subpartitioning(config, qualified_parent)
 
-    def _actual_partition_columns(
-        self,
-        config: TablePartitionConfig,
-        qualified_parent: str,
-    ) -> tuple[str, ...]:
-        """Read the table's real partition key, in key order.
+        self._validate_nested_levels(config, qualified_parent)
 
-        A single-column config goes through the original accessor unchanged, so
-        a metadata provider that predates composite keys keeps working; the
-        newer one is required only when the config declares a multi-column key.
-        """
-        metadata = self._metadata
-
-        if config.key_arity == 1:
-            # The long-standing accessor, untouched: a single-column config must
-            # keep working with a metadata provider that predates composite keys.
-            try:
-                actual_column = metadata.get_partition_column(qualified_parent)
-            except ValueError as exc:
-                raise InvalidPartitionConfigError(str(exc)) from exc
-            return (actual_column,) if actual_column is not None else ()
-
-        if not isinstance(metadata, CompositeKeyMetadata):
-            msg = (
-                f"Metadata provider {type(metadata).__name__} cannot introspect composite partition "
-                "keys; it must implement CompositeKeyMetadata."
-            )
-            raise InvalidPartitionConfigError(msg)
-
-        return metadata.get_partition_columns(qualified_parent)
-
-    def _validate_subpartitioning(self, config: TablePartitionConfig, qualified_parent: str) -> None:
+    def _validate_nested_levels(self, config: TablePartitionConfig, qualified_parent: str) -> None:
         """Refuse a partitioning layout the database could not accept.
 
         PostgreSQL requires every UNIQUE / PRIMARY KEY constraint on a
@@ -106,49 +75,44 @@ class PartitionValidationService:
         ``unique constraint on partitioned table must include all partitioning
         columns`` — mid-run, after other tables were already changed. Catching
         it here turns that into a configuration error with a fix in it.
+
+        The root's own key is already enforced by PostgreSQL at ``CREATE
+        TABLE``; only the levels below it can be wrong.
         """
-        levels = config.subpartition_levels
+        levels = config.levels[1:]
         if not levels:
             return
 
-        metadata = self._metadata
-        if not isinstance(metadata, NestedPartitionMetadata):
-            msg = (
-                f"Metadata provider {type(metadata).__name__} cannot introspect partition trees, "
-                "which subpartitioning requires; it must implement NestedPartitionMetadata."
-            )
-            raise InvalidPartitionConfigError(msg)
-
-        constraints = metadata.get_unique_constraint_columns(qualified_parent)
+        constraints = self._metadata.get_unique_constraint_columns(qualified_parent)
         if not constraints:
             return
 
-        for spec in levels:
-            _require_column_in_constraints(spec, constraints, qualified_parent)
+        for level in levels:
+            _require_column_in_constraints(level, constraints, qualified_parent)
 
 
 def _require_column_in_constraints(
-    spec: SubpartitionSpec,
+    level: SchemeBase,
     constraints: tuple[tuple[str, ...], ...],
     qualified_parent: str,
 ) -> None:
-    """Raise when a subpartition key column is missing from any unique constraint.
+    """Raise when a nested level's key column is missing from any unique constraint.
 
     Every column the level adds is checked, not only the leading one: a
-    composite subpartition key puts all of them into the branch's PARTITION BY,
-    and PostgreSQL requires all of them in every uniqueness constraint.
+    composite key puts all of them into the branch's PARTITION BY, and
+    PostgreSQL requires all of them in every uniqueness constraint.
     """
-    offenders = [columns for columns in constraints if any(column not in columns for column in spec.columns)]
+    offenders = [columns for columns in constraints if any(column not in columns for column in level.key)]
     if not offenders:
         return
 
-    absent = sorted({column for column in spec.columns for cols in offenders if column not in cols})
+    absent = sorted({column for column in level.key for cols in offenders if column not in cols})
     named = ", ".join(repr(column) for column in absent)
     missing = ", ".join("(" + ", ".join(columns) + ")" for columns in offenders)
     msg = (
         f"Subpartition column(s) {named} missing from unique constraint(s) {missing} "
         f"on table {qualified_parent!r}. PostgreSQL requires every UNIQUE/PRIMARY KEY on a "
         f"partitioned table to include all partition key columns, so add {named} to "
-        "them before enabling this subpartitioning."
+        "them before enabling this partitioning."
     )
     raise InvalidPartitionConfigError(msg)

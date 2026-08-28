@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import ClassVar
 
-from pg_partsmith.entities import Period
+from pg_partsmith.periods import Period
 
 from .base import BasePeriodCalculator
 
@@ -19,9 +20,9 @@ class WeekPeriodCalculator(BasePeriodCalculator):
 
     _NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^(.+)__(\d{4})_w(\d{2})$")
 
-    def current_period(self) -> Period:
-        """Get current ISO-week period."""
-        now = self._now()
+    def period_at(self, instant: datetime) -> Period:
+        """Return the ISO-week period holding ``instant``."""
+        now = self._local(instant)
         iso_year, iso_week, _ = now.isocalendar()
         return Period(year=iso_year, week=iso_week)
 
