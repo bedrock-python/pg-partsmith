@@ -5,13 +5,21 @@ friends) so the aio and sync mirrors wrap one canonical query text instead of
 hand-copying it.
 """
 
+# A relation that can be a partition: a table, a partitioned table, or a
+# foreign table.
 RELATION_EXISTS_SQL = """
     SELECT EXISTS (
         SELECT 1
         FROM pg_class
         WHERE oid = to_regclass(:partition_name)
-          AND relkind IN ('r', 'p')
+          AND relkind IN ('r', 'p', 'f')
     )
+"""
+
+RELATION_KIND_SQL = """
+    SELECT c.relkind
+    FROM pg_class c
+    WHERE c.oid = to_regclass(:name)
 """
 
 RELATION_OID_SQL = """
@@ -144,6 +152,36 @@ RELATION_COLUMNS_SQL = """
       AND a.attnum > 0
       AND NOT a.attisdropped
     ORDER BY a.attnum
+"""
+
+# A relation's live columns with their types, for a foreign table shaped like it.
+#
+# ``format_type`` renders the type the way ``CREATE TABLE`` accepts it,
+# typmod included (``numeric(10,2)``, ``character varying(80)``); names of
+# custom types come back quoted where they need to be.
+RELATION_COLUMN_DEFINITIONS_SQL = """
+    SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type_name, a.attnotnull
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass(:table_name)
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY a.attnum
+"""
+
+# A relation's owner and every grant on it, one row per grant (one row with
+# no grant when the ACL is empty, which is how a fresh table looks).
+#
+# ``aclexplode`` reports PUBLIC as grantee 0, which ``regrole`` cannot name.
+RELATION_PRIVILEGES_SQL = """
+    SELECT
+        pg_get_userbyid(c.relowner) AS owner,
+        CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE acl.grantee::regrole::text END AS grantee,
+        acl.privilege_type AS privilege_type,
+        acl.is_grantable AS is_grantable
+    FROM pg_class c
+    LEFT JOIN LATERAL aclexplode(c.relacl) acl ON true
+    WHERE c.oid = to_regclass(:table_name)
+    ORDER BY grantee, privilege_type
 """
 
 # Columns of every uniqueness-enforcing structure on a relation.

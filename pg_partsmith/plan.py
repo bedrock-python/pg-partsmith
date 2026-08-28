@@ -143,8 +143,9 @@ class FindingReason(StrEnum):
         UNBOUNDED_PARTITION: A partition open on one side (``MINVALUE`` /
             ``MAXVALUE`` / ``infinity``). It holds current data by definition
             and is never pruned.
-        FOREIGN_PARTITION: A foreign table in the tree. The library neither
-            creates, detaches, nor drops one.
+        FOREIGN_PARTITION: A foreign table in a tree whose configuration does
+            not realise its leaves as foreign tables. It is inspected and
+            never created, detached or dropped.
         DETACH_PENDING: A ``DETACH CONCURRENTLY`` was interrupted; the
             partition rejects its rows until ``DETACH … FINALIZE`` runs.
         GRACE_PENDING: A detached orphan still within its grace period.

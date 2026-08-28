@@ -11,14 +11,13 @@ import pytest
 from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer
 
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.entities import MaintenanceIssueStep
 from pg_partsmith.exceptions import PlanStaleError
 from pg_partsmith.lifecycle import CreateAhead, DetachMode, KeepNewest, LifecyclePolicy
 from pg_partsmith.plan import FindingReason, MaintenancePlan, OperationKind, Reason, Severity
 from pg_partsmith.planner import PlanMode
-from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.topology import RangeBounds, RelationKind
-from tests.integration.nested_support import METRICS_TABLE_DDL, MONTHLY_TABLE_DDL, monthly_config, orphan_marker
 from tests.integration.sync.support import (
     count_ddl,
     exec_sql,
@@ -30,6 +29,7 @@ from tests.integration.sync.support import (
     relkind,
     run_maintenance,
 )
+from tests.integration.nested_support import METRICS_TABLE_DDL, MONTHLY_TABLE_DDL, monthly_config, orphan_marker
 
 if TYPE_CHECKING:
     from collections.abc import Generator

@@ -19,6 +19,7 @@ from contextlib import AbstractAsyncContextManager
 from typing import Protocol, runtime_checkable
 
 from pg_partsmith.entities import MaintenanceResult, PartitionInfo, TablePartitionConfig
+from pg_partsmith.leaves import LocalLeaves
 from pg_partsmith.lifecycle import DetachMode, SqlPredicate
 from pg_partsmith.plan import PartitionBy
 from pg_partsmith.topology import ActualTree, FactKind, PartitionBounds, PartitionNode, PartitionType
@@ -77,7 +78,14 @@ class PartitionRepository(Protocol):
     concerns can be mocked, swapped, or overridden independently.
     """
 
-    async def create_table_like(self, template_name: str, table_name: str, partition_by: PartitionBy | None) -> None:
+    async def create_table_like(
+        self,
+        template_name: str,
+        table_name: str,
+        partition_by: PartitionBy | None,
+        *,
+        physical: LocalLeaves | None = None,
+    ) -> None:
         """Create a detached table shaped like ``template_name``.
 
         Args:
@@ -85,6 +93,29 @@ class PartitionRepository(Protocol):
             table_name: Schema-qualified name for the new table.
             partition_by: How the new table partitions its own children, or
                 None for a plain leaf.
+            physical: Tablespace, storage parameters and privileges for the
+                new table; None for the database defaults.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
+        ...
+
+    async def create_foreign_table_like(
+        self,
+        template_name: str,
+        table_name: str,
+        *,
+        server: str,
+        options: dict[str, str],
+    ) -> None:
+        """Create a detached foreign table with ``template_name``'s columns.
+
+        Args:
+            template_name: Relation whose columns are copied.
+            table_name: Schema-qualified name for the new foreign table.
+            server: The foreign server.
+            options: Foreign table options, rendered for this leaf.
 
         Raises:
             PartitionAlreadyExistsError: If a relation of that name exists.

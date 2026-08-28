@@ -1950,7 +1950,7 @@ def test__plan_maintenance__foreign_orphan__reported_not_dropped_and_not_reattac
     assert plan.attaches == ()
     assert plan.drops == ()
     assert _reasons(plan) == [FindingReason.FOREIGN_PARTITION]
-    assert "DROP TABLE cannot remove it" in plan.findings[0].detail
+    assert "not this library's to drop" in plan.findings[0].detail
 
 
 def test__plan_maintenance__orphans_of_another_parent__ignored() -> None:

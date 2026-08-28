@@ -33,6 +33,7 @@ from pg_partsmith.exceptions import (
     PartitionTopologyError,
     PlanStaleError,
 )
+from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
 from pg_partsmith.plan import (
     AttachPartition,
     CreatePartition,
@@ -176,7 +177,7 @@ class PlanExecutor:
             self._run_hooks(lambda h: h.before_create(config, info), "before_create", partition_name=op.target)
 
         try:
-            self._repo.create_table_like(op.parent_name, op.target, op.partition_by)
+            self._materialize(config, op)
         except PartitionAlreadyExistsError:
             # The relation exists but the plan did not see it attached: either
             # a previous run stopped between creating it and attaching it, or
@@ -206,6 +207,28 @@ class PlanExecutor:
         if fires_hooks:
             attached = info.model_copy(update={"is_attached": True})
             self._run_hooks(lambda h: h.after_create(config, attached), "after_create", partition_name=op.target)
+
+    def _materialize(self, config: TablePartitionConfig, op: CreatePartition) -> None:
+        """Create the relation ``op`` describes, detached, as the leaf backend says.
+
+        A branch is always a local partitioned table; a leaf is a local table
+        or a foreign table, depending on ``config.leaves``.
+        """
+        leaves = config.leaves
+        if op.partition_by is None and isinstance(leaves, ForeignLeaves):
+            schema, relname = split_qualified_name(op.target)
+            _, parent_relname = split_qualified_name(op.parent_name)
+            options = leaves.render_options(
+                relname=relname, schema=schema or "", parent=parent_relname, root=config.table_name
+            )
+            self._repo.create_foreign_table_like(op.parent_name, op.target, server=leaves.server, options=options)
+            return
+        if isinstance(leaves, LocalLeaves) and not leaves.is_plain:
+            self._repo.create_table_like(op.parent_name, op.target, op.partition_by, physical=leaves)
+        else:
+            # The plain case is spelled the way it always was, so a repository
+            # written before leaf backends existed keeps working unchanged.
+            self._repo.create_table_like(op.parent_name, op.target, op.partition_by)
 
     def _converge_detached(
         self,

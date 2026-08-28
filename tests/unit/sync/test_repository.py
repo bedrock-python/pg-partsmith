@@ -19,6 +19,7 @@ from pg_partsmith.exceptions import (
     PlanStaleError,
     UnmanagedPartitionDropError,
 )
+from pg_partsmith.leaves import LocalLeaves
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import PartitionBy
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
@@ -42,6 +43,11 @@ class _Catalog:
     detach_pending: bool = False
     fk_constraints: list[str] = field(default_factory=list)
     columns: list[str] = field(default_factory=lambda: ["created_at", "tenant_id", "data"])
+    column_defs: list[tuple[str, str, bool]] = field(
+        default_factory=lambda: [("ts", "timestamp with time zone", True), ("v", "double precision", False)]
+    )
+    privileges: list[tuple[str | None, str | None, str | None, bool]] = field(default_factory=list)
+    relkind: str = "r"
     moved_rows: int | None = 0
     failures: dict[str, object] = field(default_factory=dict)
 
@@ -78,7 +84,7 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
         return _scalar(_next(catalog.comment))
     if "relispartition = true" in sql:
         return _scalar(_next(catalog.attached_to))
-    if "relkind IN ('r', 'p')" in sql:
+    if "relkind IN ('r', 'p', 'f')" in sql:
         return _scalar(_next(catalog.exists))
     if "SELECT c.oid" in sql:
         return _scalar(_next(catalog.oid))
@@ -86,8 +92,14 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
         return _scalar(catalog.fqn)
     if "contype = 'f'" in sql:
         return _rows([(name,) for name in catalog.fk_constraints])
+    if "format_type(" in sql:
+        return _rows(list(catalog.column_defs))
     if "pg_attribute a" in sql:
         return _rows([(column,) for column in catalog.columns])
+    if "aclexplode" in sql:
+        return _rows(list(catalog.privileges))
+    if "SELECT c.relkind" in sql:
+        return _scalar(catalog.relkind)
     if "WITH moved AS" in sql:
         result = MagicMock()
         result.rowcount = catalog.moved_rows
@@ -1323,3 +1335,202 @@ def test__session_statement_timeout__reset_and_invalidate_both_fail__nothing_esc
     # Act / Assert -- must not raise
     with session_statement_timeout(conn, 2.0):
         pass
+
+
+# ── leaf backends: local physical settings ──────────────────────────────────────
+
+
+def test__create_table_like__storage_parameters_and_tablespace__spelled_as_literals() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+    physical = LocalLeaves(tablespace="fast_ssd", storage_parameters={"fillfactor": 70, "autovacuum_enabled": False})
+
+    # Act
+    repo.create_table_like("events", "events__2024_01", None, physical=physical)
+
+    # Assert
+    assert _statements(conn) == [
+        'CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY) '
+        "WITH (fillfactor = '70', autovacuum_enabled = 'false') TABLESPACE \"fast_ssd\""
+    ]
+
+
+def test__create_table_like__branch__takes_the_tablespace_but_no_storage_parameters() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+    physical = LocalLeaves(tablespace="fast_ssd", storage_parameters={"fillfactor": 70})
+
+    # Act
+    repo.create_table_like(
+        "events", "events__2024_01", PartitionBy(method=PartitionType.HASH, columns=("tenant_id",)), physical=physical
+    )
+
+    # Assert
+    assert _statements(conn) == [
+        'CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY) '
+        'PARTITION BY HASH ("tenant_id") TABLESPACE "fast_ssd"'
+    ]
+
+
+def test__create_table_like__plain_physical__adds_nothing() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_table_like("events", "events__2024_01", None, physical=LocalLeaves())
+
+    # Assert
+    assert _statements(conn) == ['CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY)']
+
+
+def test__create_table_like__inherit_privileges__replays_owner_and_grants_in_the_same_transaction() -> None:
+    # Arrange
+    privileges = [
+        ("app", "app", "SELECT", False),
+        ("app", "app", "INSERT", False),
+        ("app", "reader", "SELECT", False),
+        ("app", "PUBLIC", "SELECT", False),
+        ("app", '"odd role"', "UPDATE", True),
+    ]
+    engine, conn = _engine(_Catalog(privileges=privileges))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_table_like(
+        "public.events", "public.events__2024_01", None, physical=LocalLeaves(inherit_privileges=True)
+    )
+
+    # Assert
+    statements = _statements(conn)
+    assert statements[0].startswith('CREATE TABLE "public"."events__2024_01"')
+    assert 'ALTER TABLE "public"."events__2024_01" OWNER TO "app"' in statements
+    assert 'GRANT SELECT, INSERT ON TABLE "public"."events__2024_01" TO app' in statements
+    assert 'GRANT SELECT ON TABLE "public"."events__2024_01" TO reader' in statements
+    assert 'GRANT SELECT ON TABLE "public"."events__2024_01" TO PUBLIC' in statements
+    assert 'GRANT UPDATE ON TABLE "public"."events__2024_01" TO "odd role" WITH GRANT OPTION' in statements
+    engine.begin.assert_called_once()
+
+
+def test__create_table_like__inherit_privileges__empty_acl__sets_the_owner_only() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(privileges=[("app", None, None, False)]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_table_like("events", "events__2024_01", None, physical=LocalLeaves(inherit_privileges=True))
+
+    # Assert
+    assert [s for s in _statements(conn) if s.startswith(("GRANT", "ALTER"))] == [
+        'ALTER TABLE "events__2024_01" OWNER TO "app"'
+    ]
+
+
+def test__create_table_like__inherit_privileges__unknown_privilege_word__is_not_spliced() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(privileges=[("app", "reader", "SELECT; DROP", False)]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_table_like("events", "events__2024_01", None, physical=LocalLeaves(inherit_privileges=True))
+
+    # Assert
+    assert not [s for s in _statements(conn) if s.startswith("GRANT")]
+
+
+# ── leaf backends: foreign tables ───────────────────────────────────────────────
+
+
+def test__create_foreign_table_like__spells_columns_server_and_options() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_foreign_table_like(
+        "public.metrics",
+        "public.metrics__2026_01",
+        server="archive",
+        options={"table_name": "metrics__2026_01", "schema_name": "cold"},
+    )
+
+    # Assert
+    assert _statements(conn)[-1] == (
+        'CREATE FOREIGN TABLE "public"."metrics__2026_01" '
+        '("ts" timestamp with time zone NOT NULL, "v" double precision) '
+        "SERVER \"archive\" OPTIONS (table_name 'metrics__2026_01', schema_name 'cold')"
+    )
+    engine.begin.assert_called_once()
+
+
+def test__create_foreign_table_like__no_options__omits_the_clause() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={})
+
+    # Assert
+    assert _statements(conn)[-1].endswith('SERVER "archive"')
+
+
+def test__create_foreign_table_like__option_value_is_a_literal__quotes_are_escaped() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={"table_name": "it's"})
+
+    # Assert
+    assert "OPTIONS (table_name 'it''s')" in _statements(conn)[-1]
+
+
+def test__create_foreign_table_like__template_without_columns__raises_not_found() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(column_defs=[]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionNotFoundError, match="no readable columns"):
+        repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={})
+
+
+def test__create_foreign_table_like__name_taken__raises_already_exists() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"CREATE FOREIGN TABLE": _sqlstate_error("42P07")}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionAlreadyExistsError):
+        repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={})
+
+
+def test__detach_partition__foreign_table__marker_is_written_with_comment_on_foreign_table() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(relkind="f"))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("public.metrics", "public.metrics__2026_01", mode=DetachMode.BLOCKING)
+
+    # Assert
+    (comment,) = [s for s in _statements(conn) if s.startswith("COMMENT ON")]
+    assert comment.startswith('COMMENT ON FOREIGN TABLE "public"."metrics__2026_01" IS')
+
+
+def test__drop_partition__foreign_table__uses_drop_foreign_table_and_skips_constraints() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment=orphan_table_comment("public.metrics"), relkind="f", fk_constraints=["fk"]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("metrics__2026_01")
+
+    # Assert
+    statements = _statements(conn)
+    assert 'DROP FOREIGN TABLE IF EXISTS "metrics__2026_01"' in statements
+    assert not [s for s in statements if s.startswith("DROP TABLE") or "DROP CONSTRAINT" in s]

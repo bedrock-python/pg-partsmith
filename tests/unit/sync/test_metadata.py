@@ -915,7 +915,7 @@ def test__partition_exists__returns_the_catalog_answer(exists: bool) -> None:
     # Act / Assert
     assert provider.partition_exists("events__2024_W12") is exists
     assert _conn(engine).execute.call_args.args[1] == {"partition_name": '"events__2024_W12"'}
-    assert "relkind IN ('r', 'p')" in _statements(engine)[0]
+    assert "relkind IN ('r', 'p', 'f')" in _statements(engine)[0]
 
 
 @pytest.mark.parametrize("attached", [True, False])

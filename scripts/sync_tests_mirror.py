@@ -75,6 +75,12 @@ RULES: list[tuple[str, str]] = [
     (r"engine\.sync_engine", "engine"),
     (r"\(async\)", "(sync)"),
     (r"\bAsyncMock\b", "MagicMock"),
+    # unittest.mock spells the awaited assertions differently from the called ones.
+    (r"\bassert_awaited_once_with\b", "assert_called_once_with"),
+    (r"\bassert_awaited_with\b", "assert_called_with"),
+    (r"\bassert_awaited_once\b", "assert_called_once"),
+    (r"\bassert_not_awaited\b", "assert_not_called"),
+    (r"\bawait_count\b", "call_count"),
 ]
 
 

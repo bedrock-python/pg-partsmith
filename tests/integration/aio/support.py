@@ -102,6 +102,13 @@ async def exec_sql(engine: AsyncEngine, sql: str, **params: Any) -> None:
         await conn.execute(text(sql), params)
 
 
+async def exec_sql_autocommit(engine: AsyncEngine, sql: str, **params: Any) -> None:
+    """Run one statement outside any transaction block (CREATE TABLESPACE, DETACH CONCURRENTLY)."""
+    async with engine.connect() as base_conn:
+        conn = await base_conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(text(sql), params)
+
+
 async def scalar(engine: AsyncEngine, sql: str, **params: Any) -> Any:
     """Run one query and return its first column of its first row."""
     async with engine.connect() as conn:

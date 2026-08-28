@@ -16,6 +16,7 @@ import freezegun
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.boundaries import CursorSource, Window
 from pg_partsmith.entities import MaintenanceIssueStep, Period
 from pg_partsmith.lifecycle import (
@@ -35,15 +36,7 @@ from pg_partsmith.lifecycle import (
     WindowAgeAbove,
 )
 from pg_partsmith.plan import FindingReason, Reason
-from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.utils import DETACHED_AT_MARKER
-from tests.integration.nested_support import (
-    MONTHLY_TABLE_DDL,
-    QUEUE_TABLE_DDL,
-    monthly_config,
-    orphan_marker,
-    queue_config,
-)
 from tests.integration.sync.support import (
     count_ddl,
     exec_sql,
@@ -56,6 +49,13 @@ from tests.integration.sync.support import (
     run_maintenance,
     scalar,
     table_comment,
+)
+from tests.integration.nested_support import (
+    MONTHLY_TABLE_DDL,
+    QUEUE_TABLE_DDL,
+    monthly_config,
+    orphan_marker,
+    queue_config,
 )
 
 if TYPE_CHECKING:

@@ -39,9 +39,9 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
+    from pg_partsmith.sync.hooks import PartitionLifecycleHooks
     from pg_partsmith.boundaries import RangeBoundaryCodec
     from pg_partsmith.entities import MaintenanceResult, TablePartitionConfig
-    from pg_partsmith.sync.hooks import PartitionLifecycleHooks
 
 
 def make_table(engine: Engine, ddl: str, *, prefix: str = "nested") -> Generator[str, None]:
@@ -99,6 +99,13 @@ def run_maintenance(
 def exec_sql(engine: Engine, sql: str, **params: Any) -> None:
     """Run one statement in its own transaction."""
     with engine.begin() as conn:
+        conn.execute(text(sql), params)
+
+
+def exec_sql_autocommit(engine: Engine, sql: str, **params: Any) -> None:
+    """Run one statement outside any transaction block (CREATE TABLESPACE, DETACH CONCURRENTLY)."""
+    with engine.connect() as base_conn:
+        conn = base_conn.execution_options(isolation_level="AUTOCOMMIT")
         conn.execute(text(sql), params)
 
 

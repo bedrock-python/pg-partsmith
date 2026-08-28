@@ -29,6 +29,7 @@ from .resolver import PartitionRelationResolver
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from pg_partsmith.leaves import LocalLeaves
     from pg_partsmith.plan import PartitionBy
     from pg_partsmith.topology import PartitionBounds
 
@@ -89,12 +90,33 @@ class PostgresPartitionRepository:
         """
         return self._ddl_timezone
 
-    async def create_table_like(self, template_name: str, table_name: str, partition_by: PartitionBy | None) -> None:
+    async def create_table_like(
+        self,
+        template_name: str,
+        table_name: str,
+        partition_by: PartitionBy | None,
+        *,
+        physical: LocalLeaves | None = None,
+    ) -> None:
         """Create a detached table shaped like ``template_name``.
 
         See :meth:`PartitionCreator.create_table_like`.
         """
-        await self._creator.create_table_like(template_name, table_name, partition_by)
+        await self._creator.create_table_like(template_name, table_name, partition_by, physical=physical)
+
+    async def create_foreign_table_like(
+        self,
+        template_name: str,
+        table_name: str,
+        *,
+        server: str,
+        options: dict[str, str],
+    ) -> None:
+        """Create a detached foreign table with ``template_name``'s columns.
+
+        See :meth:`PartitionCreator.create_foreign_table_like`.
+        """
+        await self._creator.create_foreign_table_like(template_name, table_name, server=server, options=options)
 
     async def attach_partition(
         self,

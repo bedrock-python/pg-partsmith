@@ -55,6 +55,7 @@ from .topology import (
     PartitionFacts,
     PartitionNode,
     RangeBounds,
+    RelationKind,
     hash_keyspace_covered,
     missing_remainders,
     uniform_modulus,
@@ -213,6 +214,17 @@ class _Planner:
     def policy(self) -> LifecyclePolicy:
         return self.config.lifecycle
 
+    def _owns(self, relkind: RelationKind) -> bool:
+        """True when the lifecycle may detach and drop a relation of this kind.
+
+        Tables always; foreign tables only when the configuration realises its
+        leaves as foreign tables, since a foreign partition someone else
+        attached -- an archive behind ``postgres_fdw``, say -- is not ours.
+        """
+        if relkind is RelationKind.FOREIGN:
+            return self.config.manages_foreign_leaves
+        return relkind.is_droppable_table
+
     def run(self) -> None:
         self._plan_level(self.config.scheme, self.actual.root, depth=0)
 
@@ -287,7 +299,7 @@ class _Planner:
                 )
                 continue
 
-            orphan = _matching_orphan(orphans, consumed, boundaries, window)
+            orphan = self._matching_orphan(orphans, consumed, boundaries, window)
             if orphan is not None:
                 consumed.add(orphan.name)
                 self.attaches.append(self._reattach(level, node, orphan, window))
@@ -412,7 +424,7 @@ class _Planner:
         start = None if lower_unbounded else boundaries.decode(bounds.from_value)
         end = None if upper_unbounded else boundaries.decode(bounds.to_value)
 
-        if child.is_foreign:
+        if child.is_foreign and not self._owns(child.relkind):
             self._record(
                 child.name,
                 FindingReason.FOREIGN_PARTITION,
@@ -458,7 +470,7 @@ class _Planner:
         single = len(bounds.values) == 1 and len(readable) == 1 and not bounds.includes_null
         window = Window(start=next(iter(readable)), end=next(iter(readable)) + 1) if single else None
 
-        if child.is_foreign:
+        if child.is_foreign and not self._owns(child.relkind):
             self._record(
                 child.name,
                 FindingReason.FOREIGN_PARTITION,
@@ -557,7 +569,7 @@ class _Planner:
         ``DropNever`` detached tables belong to whatever process the policy hands
         them to -- an archiver, say -- so they are never brought back.
         """
-        if not isinstance(self.policy.drop, DropAfter) or not orphan.relkind.is_droppable_table:
+        if not isinstance(self.policy.drop, DropAfter) or not self._owns(orphan.relkind):
             return None
         window = boundaries.parse_child_name(orphan.relname)
         if window is None or window in occupied or not _on_grid(boundaries, window):
@@ -580,12 +592,12 @@ class _Planner:
         if not isinstance(drop, DropAfter):
             return  # DropNever: something else owns the drop
 
-        if not orphan.relkind.is_droppable_table:
+        if not self._owns(orphan.relkind):
             self._record(
                 orphan.name,
                 FindingReason.FOREIGN_PARTITION,
-                f"{orphan.name} is a detached foreign table; DROP TABLE cannot remove it and this library will not "
-                "try another statement.",
+                f"{orphan.name} is a detached foreign table and this configuration does not realise its leaves as "
+                "foreign tables, so it is not this library's to drop.",
             )
             return
 
@@ -691,6 +703,21 @@ class _Planner:
         if self.ctx.mode is PlanMode.EXPLICIT:
             return "explicitly requested"
         return self.policy.creation.describe()
+
+    def _matching_orphan(
+        self,
+        orphans: list[DetachedPartition],
+        consumed: set[str],
+        boundaries: RangeBoundaries,
+        window: Window,
+    ) -> DetachedPartition | None:
+        for orphan in orphans:
+            if orphan.name in consumed or not self._owns(orphan.relkind):
+                continue
+            parsed = boundaries.parse_child_name(orphan.relname)
+            if parsed is not None and parsed == window:
+                return orphan
+        return None
 
     # ── HASH: a set level ───────────────────────────────────────────────────────
 
@@ -1053,21 +1080,6 @@ def _on_grid(boundaries: RangeBoundaries, window: Window) -> bool:
     except (ValueError, TypeError, OverflowError):
         return False
     return bool(cell.start <= window.start and window.end <= cell.end)
-
-
-def _matching_orphan(
-    orphans: list[DetachedPartition],
-    consumed: set[str],
-    boundaries: RangeBoundaries,
-    window: Window,
-) -> DetachedPartition | None:
-    for orphan in orphans:
-        if orphan.name in consumed or not orphan.relkind.is_droppable_table:
-            continue
-        parsed = boundaries.parse_child_name(orphan.relname)
-        if parsed is not None and parsed == window:
-            return orphan
-    return None
 
 
 def _partition_by(level: SchemeBase | None) -> PartitionBy | None:

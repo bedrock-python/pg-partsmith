@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .boundaries import Axis, CursorSource, TimeBoundaries
+from .leaves import LeafBackend, LocalLeaves
 from .lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
 from .periods import PartitionGranularity, Period
 from .scheme import HashPartitioning, ListPartitioning, PartitionScheme, RangePartitioning, SchemeBase, name_fits
@@ -255,6 +256,10 @@ class TablePartitionConfig(BaseModel):
         lifecycle: When partitions of the progression level are created,
             detached and dropped. Meaningless — and ignored — for a scheme
             with no progression level, whose partition set is fixed.
+        leaves: What kind of relation the leaves are: ordinary tables
+            (:class:`~pg_partsmith.leaves.LocalLeaves`, the default, optionally
+            with a tablespace, storage parameters and inherited privileges) or
+            foreign tables (:class:`~pg_partsmith.leaves.ForeignLeaves`).
     """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True, populate_by_name=True)
@@ -266,6 +271,7 @@ class TablePartitionConfig(BaseModel):
     table_name: StrippedNonEmptyStr
     scheme: PartitionScheme
     lifecycle: LifecyclePolicy = Field(default_factory=LifecyclePolicy)
+    leaves: LeafBackend = Field(default_factory=LocalLeaves)
 
     @model_validator(mode="before")
     @classmethod
@@ -469,6 +475,11 @@ class TablePartitionConfig(BaseModel):
     def levels(self) -> list[SchemeBase]:
         """Every level of the scheme, root first."""
         return list(self.scheme.walk())
+
+    @property
+    def manages_foreign_leaves(self) -> bool:
+        """True when the leaves are foreign tables the lifecycle creates and drops."""
+        return self.leaves.kind == "foreign"
 
 
 def _scheme_from_flat(fields: dict[str, Any], checks: dict[str, Any]) -> SchemeBase:

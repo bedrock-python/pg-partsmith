@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.catalog_queries import RELATION_COLUMNS_SQL
+from pg_partsmith.catalog_queries import (
+    RELATION_COLUMN_DEFINITIONS_SQL,
+    RELATION_COLUMNS_SQL,
+    RELATION_PRIVILEGES_SQL,
+)
 from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionNotFoundError
 from pg_partsmith.topology import HashBounds, ListBounds, RangeBounds
 from pg_partsmith.utils import (
@@ -24,8 +29,12 @@ from pg_partsmith.utils import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+    from pg_partsmith.leaves import LocalLeaves
     from pg_partsmith.plan import PartitionBy
     from pg_partsmith.topology import PartitionBounds
+
+# Privilege names ``aclexplode`` reports; anything else is not spliced into a GRANT.
+_PRIVILEGE_PATTERN = re.compile(r"^[A-Z]+$")
 
 
 class PartitionCreator:
@@ -36,7 +45,14 @@ class PartitionCreator:
         self._ddl_timeout = ddl_timeout
         self._ddl_timezone = ddl_timezone
 
-    async def create_table_like(self, template_name: str, table_name: str, partition_by: PartitionBy | None) -> None:
+    async def create_table_like(
+        self,
+        template_name: str,
+        table_name: str,
+        partition_by: PartitionBy | None,
+        *,
+        physical: LocalLeaves | None = None,
+    ) -> None:
         """Create a detached table shaped like ``template_name``.
 
         Standalone — ``LIKE`` the template, not ``PARTITION OF`` it — so this
@@ -49,6 +65,9 @@ class PartitionCreator:
             table_name: Schema-qualified name for the new table.
             partition_by: How the new table partitions its own children, or
                 None for a plain leaf.
+            physical: Tablespace, storage parameters and privileges to give
+                the new table. Storage parameters apply to leaves only:
+                PostgreSQL refuses them on a partitioned table.
 
         Raises:
             PartitionAlreadyExistsError: If a relation of that name exists.
@@ -63,6 +82,14 @@ class PartitionCreator:
             clause, columns = _partition_by_clause(partition_by)
             template = f"{template} {clause}"
             params.update(columns)
+        if physical is not None:
+            if partition_by is None and physical.storage_parameters:
+                clause, values = _storage_parameters_clause(physical)
+                template = f"{template} {clause}"
+                params.update(values)
+            if physical.tablespace is not None:
+                template = f"{template} TABLESPACE {{tablespace}}"
+                params["tablespace"] = physical.tablespace
 
         stmt = build_ddl_statement(template, **params)
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
@@ -72,6 +99,101 @@ class PartitionCreator:
                 if pg_sqlstate(exc) == "42P07":  # duplicate_table
                     raise PartitionAlreadyExistsError(table_name) from exc
                 raise
+            if physical is not None and physical.inherit_privileges:
+                await self._inherit_privileges(conn, template_name, table_name)
+
+    async def create_foreign_table_like(
+        self,
+        template_name: str,
+        table_name: str,
+        *,
+        server: str,
+        options: dict[str, str],
+    ) -> None:
+        """Create a detached foreign table with ``template_name``'s columns.
+
+        ``CREATE FOREIGN TABLE`` has no ``LIKE``, so the columns are read from
+        the catalog and spelled out: name, type as ``format_type`` renders it,
+        and ``NOT NULL`` where the template has it -- ATTACH requires the
+        partition to match the parent's ``NOT NULL`` constraints.
+
+        Args:
+            template_name: Relation whose columns are copied.
+            table_name: Schema-qualified name for the new foreign table.
+            server: The foreign server.
+            options: Foreign table options, already rendered.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+            PartitionNotFoundError: If the template has no readable columns.
+        """
+        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            definitions = await self._column_definitions(conn, template_name)
+            params: dict[str, str] = {"partition": table_name, "server": server}
+            columns: list[str] = []
+            for index, (name, type_name, not_null) in enumerate(definitions):
+                params[f"col_{index}"] = name
+                columns.append(f"{{col_{index}}} {type_name}{' NOT NULL' if not_null else ''}")
+            template = f"CREATE FOREIGN TABLE {{partition}} ({', '.join(columns)}) SERVER {{server}}"
+            if options:
+                rendered: list[str] = []
+                for index, (name, value) in enumerate(options.items()):
+                    params[f"opt_{index}"] = value
+                    rendered.append(f"{name} [opt_{index}]")
+                template = f"{template} OPTIONS ({', '.join(rendered)})"
+            try:
+                await conn.execute(build_ddl_statement(template, **params))
+            except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                if pg_sqlstate(exc) == "42P07":  # duplicate_table
+                    raise PartitionAlreadyExistsError(table_name) from exc
+                raise
+
+    async def _column_definitions(self, conn: AsyncConnection, table_name: str) -> list[tuple[str, str, bool]]:
+        """Read ``(name, type, not_null)`` for every live column of a relation."""
+        result = await conn.execute(
+            text(RELATION_COLUMN_DEFINITIONS_SQL),
+            {"table_name": to_regclass_argument(table_name)},
+        )
+        definitions = [(coerce_str(row[0]) or "", coerce_str(row[1]) or "", bool(row[2])) for row in result.fetchall()]
+        if not definitions:
+            msg = f"Relation {table_name!r} has no readable columns, so nothing can be shaped like it."
+            raise PartitionNotFoundError(msg)
+        return definitions
+
+    async def _inherit_privileges(self, conn: AsyncConnection, template_name: str, table_name: str) -> None:
+        """Give the new relation the template's owner and grants.
+
+        Runs in the transaction that created the relation, so a grant the
+        current role may not make rolls the creation back with it rather than
+        leaving a half-configured table behind.
+        """
+        result = await conn.execute(
+            text(RELATION_PRIVILEGES_SQL),
+            {"table_name": to_regclass_argument(template_name)},
+        )
+        rows = result.fetchall()
+        if not rows:
+            return
+        owner = coerce_str(rows[0][0])
+        if owner:
+            await conn.execute(
+                build_ddl_statement("ALTER TABLE {partition} OWNER TO {owner}", partition=table_name, owner=owner)
+            )
+
+        grants: dict[tuple[str, bool], list[str]] = {}
+        for row in rows:
+            grantee, privilege, grantable = coerce_str(row[1]), coerce_str(row[2]), bool(row[3])
+            if not grantee or not privilege or not _PRIVILEGE_PATTERN.match(privilege):
+                continue
+            grants.setdefault((grantee, grantable), []).append(privilege)
+        for (grantee, grantable), privileges in grants.items():
+            # The grantee is catalog output (``regrole::text`` quotes what needs
+            # quoting; PUBLIC is a keyword) and the privileges are keywords, so
+            # neither goes through identifier quoting.
+            statement = f"GRANT {', '.join(privileges)} ON TABLE {quote_identifier(table_name)} TO {grantee}"
+            if grantable:
+                statement = f"{statement} WITH GRANT OPTION"
+            await conn.execute(_as_text(statement))
 
     async def attach(
         self, parent_name: str, partition_name: str, bounds: PartitionBounds, *, key_arity: int = 1
@@ -203,6 +325,21 @@ class PartitionCreator:
             moved_count = result.rowcount or 0
 
         return moved_count
+
+
+def _storage_parameters_clause(physical: LocalLeaves) -> tuple[str, dict[str, str]]:
+    """Render ``WITH (...)``, every value as a literal placeholder.
+
+    PostgreSQL accepts a quoted literal for every storage parameter type, so
+    numbers and booleans are spelled as strings and quoted like the rest; the
+    names were validated by the model and are spliced as they are.
+    """
+    values: dict[str, str] = {}
+    rendered: list[str] = []
+    for index, (name, value) in enumerate(physical.rendered_storage_parameters().items()):
+        values[f"with_{index}"] = value
+        rendered.append(f"{name} = [with_{index}]")
+    return f"WITH ({', '.join(rendered)})", values
 
 
 def _partition_by_clause(partition_by: PartitionBy) -> tuple[str, dict[str, str]]:

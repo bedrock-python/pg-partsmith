@@ -16,6 +16,8 @@ import freezegun
 import pytest
 from sqlalchemy import text
 
+from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.boundaries import TimeBoundaries
 from pg_partsmith.entities import MaintenanceIssueStep, PartitionInfo, PartitionType, Period, TablePartitionConfig
 from pg_partsmith.exceptions import InvalidPartitionConfigError
@@ -23,9 +25,23 @@ from pg_partsmith.lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
 from pg_partsmith.plan import FindingReason, Reason
 from pg_partsmith.scheme import HashPartitioning, RangePartitioning
 from pg_partsmith.strategies import WeekPeriodCalculator
-from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
-from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.topology import ListBounds
+from tests.integration.sync.support import (
+    child_count,
+    count_ddl,
+    exec_sql,
+    hash_children_of,
+    is_attached,
+    list_children_of,
+    make_maintainer,
+    make_service,
+    make_table,
+    range_children_of,
+    relkind,
+    routed_leaves,
+    run_maintenance,
+    scalar,
+)
 from tests.integration.nested_support import (
     BARE_UNIQUE_INDEX_TABLE_DDL,
     COMPOSITE_TABLE_DDL,
@@ -63,22 +79,6 @@ from tests.integration.nested_support import (
     tasks_config,
     tiered_config,
     uuid7_codec,
-)
-from tests.integration.sync.support import (
-    child_count,
-    count_ddl,
-    exec_sql,
-    hash_children_of,
-    is_attached,
-    list_children_of,
-    make_maintainer,
-    make_service,
-    make_table,
-    range_children_of,
-    relkind,
-    routed_leaves,
-    run_maintenance,
-    scalar,
 )
 
 if TYPE_CHECKING:
@@ -1667,7 +1667,7 @@ def test__static_root__time_based_config__refused_as_a_type_mismatch(
     # Act / Assert: the config describes a RANGE root; the table is HASH.
     with pytest.raises(InvalidPartitionConfigError, match="type mismatch"):
         service.create_future_partitions(flat_config(hash_root_table))
-    with pytest.raises(InvalidPartitionConfigError, match="RANGE root"):
+    with pytest.raises(InvalidPartitionConfigError, match="progression root"):
         service.ensure_partitions(hash_root_config(hash_root_table), [Period(year=2026, week=35)])
 
 

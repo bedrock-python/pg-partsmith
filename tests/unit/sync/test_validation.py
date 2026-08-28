@@ -8,6 +8,7 @@ import pytest
 
 from pg_partsmith.entities import PartitionGranularity, PartitionType, TablePartitionConfig
 from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.leaves import ForeignLeaves
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning
 from pg_partsmith.sync.services.validation import PartitionValidationService, _require_column_in_constraints
 
@@ -263,3 +264,29 @@ def test__require_column_in_constraints__every_key_column_present__accepted() ->
 
     # Act / Assert -- no exception
     _require_column_in_constraints(level, (("id", "tenant_id", "shard_id", "created_at"),), "public.events")
+
+
+# ── foreign leaves ──────────────────────────────────────────────────────────────
+
+
+def test__validate_config__foreign_leaves_on_a_table_with_a_unique_index__raises(
+    validation: PartitionValidationService, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_unique_constraint_columns.return_value = (("id", "created_at"),)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="refuses a foreign table as a partition") as excinfo:
+        validation.validate_config(_config(leaves=ForeignLeaves(server="archive")))
+
+    assert "(id, created_at)" in str(excinfo.value)
+
+
+def test__validate_config__foreign_leaves_on_an_index_free_table__passes(
+    validation: PartitionValidationService, metadata: MagicMock
+) -> None:
+    # Arrange / Act -- must not raise
+    validation.validate_config(_config(leaves=ForeignLeaves(server="archive")))
+
+    # Assert
+    metadata.get_unique_constraint_columns.assert_called_once_with("events")

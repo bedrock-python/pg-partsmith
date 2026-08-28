@@ -32,6 +32,7 @@ from pg_partsmith.exceptions import (
     PartitionTopologyError,
     PlanStaleError,
 )
+from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import (
     AttachPartition,
@@ -91,6 +92,7 @@ class _BoomError(Exception):
 def repo() -> MagicMock:
     repo = MagicMock()
     repo.create_table_like = AsyncMock(return_value=None)
+    repo.create_foreign_table_like = AsyncMock(return_value=None)
     repo.attach_partition = AsyncMock(return_value=None)
     repo.detach_partition = AsyncMock(return_value=None)
     repo.drop_partition = AsyncMock(return_value=None)
@@ -1528,3 +1530,86 @@ async def test__base_partition_service__cancelled_hook__propagates_without_loggi
 
     logger.warning.assert_not_called()
     logger.exception.assert_not_called()
+
+
+# ── leaf backends ───────────────────────────────────────────────────────────────
+
+
+def _leaves_config(leaves: LocalLeaves | ForeignLeaves, *, nested: bool = False) -> TablePartitionConfig:
+    return TablePartitionConfig(
+        schema="public",
+        table_name="events",
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+        subpartition=HashPartitioning(key="tenant_id", modulus=2) if nested else None,
+        leaves=leaves,
+    )
+
+
+async def test__apply__plain_local_leaves__create_is_spelled_as_it_always_was(
+    executor: PlanExecutor, repo: MagicMock
+) -> None:
+    # Arrange / Act
+    await executor.apply(
+        _leaves_config(LocalLeaves()), _plan(_create_op("public.events__2024_04", parent="public.events"))
+    )
+
+    # Assert
+    repo.create_table_like.assert_awaited_once_with("public.events", "public.events__2024_04", None)
+    repo.create_foreign_table_like.assert_not_awaited()
+
+
+async def test__apply__customised_local_leaves__physical_spec_reaches_the_repository(
+    executor: PlanExecutor, repo: MagicMock
+) -> None:
+    # Arrange
+    leaves = LocalLeaves(tablespace="fast", storage_parameters={"fillfactor": 70})
+
+    # Act
+    await executor.apply(_leaves_config(leaves), _plan(_create_op()))
+
+    # Assert
+    repo.create_table_like.assert_awaited_once_with("events", "events__2024_04", None, physical=leaves)
+
+
+async def test__apply__foreign_leaves__leaf_is_a_foreign_table_with_rendered_options(
+    executor: PlanExecutor, repo: MagicMock
+) -> None:
+    # Arrange
+    leaves = ForeignLeaves(server="archive", options={"table_name": "{relname}", "schema_name": "{schema}"})
+    op = _create_op("public.events__2024_04", parent="public.events")
+
+    # Act
+    result = await executor.apply(_leaves_config(leaves), _plan(op))
+
+    # Assert
+    repo.create_foreign_table_like.assert_awaited_once_with(
+        "public.events",
+        "public.events__2024_04",
+        server="archive",
+        options={"table_name": "events__2024_04", "schema_name": "public"},
+    )
+    repo.create_table_like.assert_not_awaited()
+    repo.attach_partition.assert_awaited_once_with("public.events", "public.events__2024_04", APRIL, key_arity=1)
+    assert result.created_count == 1
+
+
+async def test__apply__foreign_leaves__branch_stays_local_and_its_buckets_are_foreign(
+    executor: PlanExecutor, repo: MagicMock
+) -> None:
+    # Arrange
+    leaves = ForeignLeaves(server="archive", options={"table_name": "{parent}_{relname}"})
+
+    # Act
+    await executor.apply(_leaves_config(leaves, nested=True), _plan(_branch_op()))
+
+    # Assert
+    repo.create_table_like.assert_awaited_once_with("events", "events__2024_04", _branch_op().partition_by)
+    assert [call.args[1] for call in repo.create_foreign_table_like.call_args_list] == [
+        "events__2024_04__h0",
+        "events__2024_04__h1",
+    ]
+    assert repo.create_foreign_table_like.call_args_list[0].kwargs == {
+        "server": "archive",
+        "options": {"table_name": "events__2024_04_events__2024_04__h0"},
+    }

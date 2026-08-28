@@ -1713,7 +1713,7 @@ async def test__static_root__time_based_config__refused_as_a_type_mismatch(
     # Act / Assert: the config describes a RANGE root; the table is HASH.
     with pytest.raises(InvalidPartitionConfigError, match="type mismatch"):
         await service.create_future_partitions(flat_config(hash_root_table))
-    with pytest.raises(InvalidPartitionConfigError, match="RANGE root"):
+    with pytest.raises(InvalidPartitionConfigError, match="progression root"):
         await service.ensure_partitions(hash_root_config(hash_root_table), [Period(year=2026, week=35)])
 
 

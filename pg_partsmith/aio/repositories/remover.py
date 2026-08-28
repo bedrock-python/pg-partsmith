@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.catalog_queries import RELATION_KIND_SQL
 from pg_partsmith.exceptions import (
     DropRetryExhaustedError,
     PartitionAttachedError,
@@ -253,9 +254,11 @@ class PartitionRemover:
         if new_comment == existing_comment:
             return
 
+        # ``COMMENT ON TABLE`` refuses a foreign table ("is not a table").
+        relation = "FOREIGN TABLE" if await _relkind(conn, partition_name) == "f" else "TABLE"
         await conn.execute(
             build_ddl_statement(
-                "COMMENT ON TABLE {partition} IS [comment]",
+                f"COMMENT ON {relation} {{partition}} IS [comment]",
                 partition=partition_name,
                 comment=new_comment,
             )
@@ -325,17 +328,29 @@ class PartitionRemover:
                 text("SELECT set_config('lock_timeout', :timeout, true)"),
                 {"timeout": str(self._drop_lock_timeout_ms)},
             )
-            try:
-                await conn.execute(
-                    build_ddl_statement("LOCK TABLE {partition} IN ACCESS EXCLUSIVE MODE", partition=partition_name)
-                )
-            except (SQLAlchemyError, OSError, TimeoutError) as exc:
-                if pg_sqlstate(exc) == "42P01":  # dropped concurrently — nothing left to do
-                    return
-                raise
+            # A foreign table cannot be LOCKed ("not supported for foreign
+            # tables"); it holds no rows of its own, and DROP takes the lock
+            # it needs on the catalog entry itself.
+            foreign = await _relkind(conn, partition_name) == "f"
+            if not foreign:
+                try:
+                    await conn.execute(
+                        build_ddl_statement("LOCK TABLE {partition} IN ACCESS EXCLUSIVE MODE", partition=partition_name)
+                    )
+                except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                    if pg_sqlstate(exc) == "42P01":  # dropped concurrently — nothing left to do
+                        return
+                    raise
             await self._ensure_expected_oid(conn, partition_name, expected_oid)
             await self._ensure_not_attached(conn, partition_name)
             if not await self._ensure_managed(conn, partition_name):
+                return
+            if foreign:
+                # A foreign table carries no constraints of its own, and
+                # ``DROP TABLE`` refuses it ("is not a table").
+                await conn.execute(
+                    build_ddl_statement("DROP FOREIGN TABLE IF EXISTS {partition}", partition=partition_name)
+                )
                 return
             fk_constraints = await self._fk_manager.list_constraints_conn(conn, partition_name)
             await self._fk_manager.drop_constraints(conn, partition_name, fk_constraints)
@@ -409,3 +424,9 @@ class PartitionRemover:
                 "reason": str(last_exc),
             },
         )
+
+
+async def _relkind(conn: AsyncConnection, name: str) -> str | None:
+    """``pg_class.relkind`` of the relation holding ``name``, or None when there is none."""
+    result = await conn.execute(text(RELATION_KIND_SQL), {"name": to_regclass_argument(name)})
+    return coerce_str(result.scalar(), encoding="ascii")

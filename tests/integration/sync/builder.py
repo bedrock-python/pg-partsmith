@@ -9,21 +9,21 @@ from typing import TYPE_CHECKING
 import freezegun
 from sqlalchemy import text
 
-from pg_partsmith.entities import PartitionGranularity, Period, TablePartitionConfig
-from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
+from pg_partsmith.entities import PartitionGranularity, Period, TablePartitionConfig
+from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.topology import RangeBounds
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
+    from pg_partsmith.sync.hooks import PartitionLifecycleHooks
     from pg_partsmith.entities import MaintenanceResult
     from pg_partsmith.protocols import PeriodCalculator
-    from pg_partsmith.sync.hooks import PartitionLifecycleHooks
 
 
 @dataclass

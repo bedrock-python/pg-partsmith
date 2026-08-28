@@ -64,10 +64,10 @@ class PartitionValidationService:
                 )
             raise InvalidPartitionConfigError(msg)
 
-        self._validate_nested_levels(config, qualified_parent)
+        self._validate_unique_constraints(config, qualified_parent)
 
-    def _validate_nested_levels(self, config: TablePartitionConfig, qualified_parent: str) -> None:
-        """Refuse a partitioning layout the database could not accept.
+    def _validate_unique_constraints(self, config: TablePartitionConfig, qualified_parent: str) -> None:
+        """Refuse a layout the database could not accept because of its unique constraints.
 
         PostgreSQL requires every UNIQUE / PRIMARY KEY constraint on a
         partitioned table to contain all of its partition-key columns. A hash
@@ -76,16 +76,29 @@ class PartitionValidationService:
         columns`` — mid-run, after other tables were already changed. Catching
         it here turns that into a configuration error with a fix in it.
 
+        The same constraints rule out foreign leaves altogether: PostgreSQL
+        cannot enforce uniqueness across a foreign table, so it refuses to
+        make one a partition of a table that has a unique index.
+
         The root's own key is already enforced by PostgreSQL at ``CREATE
         TABLE``; only the levels below it can be wrong.
         """
         levels = config.levels[1:]
-        if not levels:
+        if not levels and not config.manages_foreign_leaves:
             return
 
         constraints = self._metadata.get_unique_constraint_columns(qualified_parent)
         if not constraints:
             return
+
+        if config.manages_foreign_leaves:
+            spelled = ", ".join("(" + ", ".join(columns) + ")" for columns in constraints)
+            msg = (
+                f"Table {qualified_parent!r} has unique constraint(s) {spelled}, and PostgreSQL refuses a foreign "
+                "table as a partition of a table with a unique index or primary key. Use local leaves, or drop "
+                "the constraint before enabling foreign leaves."
+            )
+            raise InvalidPartitionConfigError(msg)
 
         for level in levels:
             _require_column_in_constraints(level, constraints, qualified_parent)

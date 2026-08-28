@@ -543,7 +543,13 @@ def test__config__dump__carries_scheme_and_lifecycle_and_no_flat_fields() -> Non
     dumped = config.model_dump(mode="json")
 
     # Assert
-    assert set(dumped) == {"schema_name", "table_name", "scheme", "lifecycle"}
+    assert set(dumped) == {"schema_name", "table_name", "scheme", "lifecycle", "leaves"}
+    assert dumped["leaves"] == {
+        "kind": "local",
+        "tablespace": None,
+        "storage_parameters": {},
+        "inherit_privileges": False,
+    }
     assert dumped["scheme"]["method_name"] == "range"
     assert dumped["scheme"]["boundaries"] == {"kind": "time", "granularity": "week", "tz": "UTC", "codec": None}
     assert dumped["lifecycle"]["creation"] == {"kind": "create_ahead", "count": 6}

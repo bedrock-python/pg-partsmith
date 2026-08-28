@@ -44,6 +44,7 @@ from .exceptions import (
     UnmanagedPartitionDropError,
     UnsupportedCapabilityError,
 )
+from .leaves import ForeignLeaves, LeafBackend, LocalLeaves
 from .lifecycle import (
     AllOf,
     AnyOf,
@@ -139,6 +140,7 @@ __all__ = [
     "FactKind",
     "Finding",
     "FindingReason",
+    "ForeignLeaves",
     "HashBounds",
     "HashPartitioning",
     "HourPeriodCalculator",
@@ -147,11 +149,13 @@ __all__ = [
     "KeepBehind",
     "KeepFor",
     "KeepNewest",
+    "LeafBackend",
     "LevelKind",
     "LifecyclePolicy",
     "ListBounds",
     "ListGroup",
     "ListPartitioning",
+    "LocalLeaves",
     "LockAcquisitionError",
     "MaintenanceIssue",
     "MaintenanceIssueStep",

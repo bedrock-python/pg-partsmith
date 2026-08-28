@@ -9,23 +9,25 @@ import freezegun
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.entities import (
-    PartitionGranularity,
-    PartitionInfo,
-    PartitionStrategy,
-    PartitionType,
-    TablePartitionConfig,
-)
-from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
+from pg_partsmith.entities import (
+    MaintenanceResult,
+    PartitionGranularity,
+    PartitionInfo,
+    PartitionStrategy,
+    PartitionType,
+    TablePartitionConfig,
+)
+from pg_partsmith.exceptions import LockAcquisitionError
+from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.topology import RangeBounds
-from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
 from tests.integration.sync.support import count_ddl, make_table
+from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
 
 if TYPE_CHECKING:
     from collections.abc import Generator
