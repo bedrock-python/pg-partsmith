@@ -128,11 +128,11 @@ Every claim below was read in the cited file; things that could not be verified 
 | `retain_non_empty_partitions` | YES | `ExpireIf(AllOf((KeepFor(...), Not(RowsAbove(0)))))` (estimate-based) or an `SqlPredicate` |
 | int RANGE | YES | `NumericBoundaries(step)` with `max(key)`/sequence cursor; GitLab's "six empty trailing partitions" rule is `CreateAhead(6)` |
 | HASH / static LIST | YES | `HashPartitioning` / `ListPartitioning` roots and levels |
-| sliding LIST (`next_partition_if` / `detach_partition_if`) | PARTIAL | `CreateNextIf` / `ExpireIf` predicates exist on the RANGE axis; the LIST-valued progression level is modelled (RFC §4.2) but ships in P2.5; the column-DEFAULT routing invariant stays application-side |
+| sliding LIST (`next_partition_if` / `detach_partition_if`) | YES | `ListPartitioning(sequence=IntegerSequence(...))` with `CreateNextIf` / `ExpireIf`; the cursor is the newest partition; the column-DEFAULT routing invariant stays application-side |
 | state-dependent detach | YES | `ExpireIf(SqlPredicate(...))`, `Callback` |
 | detached grace period, per-table | YES | `DropAfter(grace=…)` per config; detach instant recorded in the marker |
 | large-partition drop scheduling | YES | `DropAfter(when=Callback(...))` with `SizeAbove` facts (the Saturday rule is a two-line callback) |
-| FK-based detach eligibility | NO | not in 1.0; a `before_detach` hook can raise to defer |
+| FK-based detach eligibility | YES | `Unreferenced()` — the condition PostgreSQL enforces on `DETACH` (`23503`); a refused detach is recorded as an issue |
 | lock_timeout ladder | PARTIAL | `drop_lock_timeout_ms` + retries on drop; detach has a DDL timeout, no ladder |
 | Redis lease | YES | `RedisDistributedLockManager` / advisory locks |
 | ANALYZE after create | NO (hook) | `after_create` hook |
@@ -300,8 +300,9 @@ Lessons carried into 1.0:
   reconciliation (move rows, retry, restore on failure).
 - **Template tables** carry what PostgreSQL does not propagate: non-key unique indexes and
   their tablespaces, UNLOGGED, reloptions, toast reloptions; pg_partman also copies
-  per-column statistics targets and REPLICA IDENTITY. Hook material in 1.0; a declarative
-  initializer is the P4 item.
+  per-column statistics targets and REPLICA IDENTITY. `LocalLeaves(tablespace,
+  storage_parameters, inherit_privileges)` is the declarative form of the first three;
+  statistics targets and replica identity stay hook material.
 - **Retention flow:** ascending scan, expire when `upper_bound < reference − retention`
   (from the catalog, never the name), never the last child, plain DETACH → optional index /
   publication drop → DROP or `SET SCHEMA`.
@@ -317,8 +318,9 @@ Capability comparison (core / extension / out of scope / future):
 | pg_partman | pg-partsmith 1.0 |
 |---|---|
 | premake, retention (time and id), detach-only, DEFAULT reconciliation, encoded keys, subpartitioning, advisory lock, per-set error isolation, timezone discipline, adoption of an existing set | core |
-| `retention_schema`, index/publication drop on detach, `p_analyze`, privileges, template properties, statistics/replica identity propagation | extension (hooks) now; initializer later (P4) |
-| `partition_data_proc` / `partition_data_async` batch movers, `undo_partition`, conversion of a plain table | out of scope for 1.0; P3 |
+| privileges, tablespace, reloptions (template properties) | core (`LocalLeaves`) |
+| `retention_schema`, index/publication drop on detach, `p_analyze`, statistics/replica identity propagation | extension (hooks) |
+| `partition_data_proc` / `partition_data_async` batch movers, `undo_partition`, conversion of a plain table | core (`partition_data`, `unpartition`) |
 | BGW scheduler and GUCs, `maintenance_order`, `automatic_maintenance`, jobmon | out of scope (the caller's scheduler) |
 | `pg_is_in_recovery()` guard, `check_default()` monitoring helper | future |
 
@@ -334,9 +336,12 @@ Capability comparison (core / extension / out of scope / future):
   CONCURRENTLY) and ATTACH work; a DEFAULT partition blocks concurrent detach.
 
 **Verdict:** introspection is exact (`RelationKind.FOREIGN` on the node,
-`FOREIGN_PARTITION` finding, never dropped, never detached) and the tree with a foreign
-leaf plans and maintains normally around it — verified by an integration test with a
-`postgres_fdw` loopback. Creating or offloading to foreign leaves is P4.
+`FOREIGN_PARTITION` finding under a local-leaves configuration, never dropped, never
+detached) and the tree with a foreign leaf plans and maintains normally around it;
+`ForeignLeaves(server, options)` creates every leaf as a foreign table and manages it
+through the whole lifecycle (`COMMENT ON FOREIGN TABLE` marker, `DROP FOREIGN TABLE`) —
+both verified by integration tests with a `postgres_fdw` loopback. The offload of an
+existing local partition (copy, drop, attach foreign) stays a hook-driven workflow.
 
 ## Cross-cutting patterns
 

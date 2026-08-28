@@ -132,23 +132,25 @@ The generic requirements they converge on:
 | UUIDv7 / encoded bounds | yes | GlitchTip, pg_partman | `RangeBoundaryCodec` | done |
 | `RANGE → HASH`, `→ LIST`, deeper | yes | GlitchTip, SaaS logs | `PartitionScheme.child` | P0 (reshaped) |
 | Root `HASH` / `LIST` | yes | Hatchet, outbox | `HashPartitioning` / `ListPartitioning` at root | P0 (reshaped) |
-| Composite keys | yes | — | `PartitionKey` with several columns | P0 |
+| Composite keys | yes | — | `key` with several columns | P0 |
 | Numeric `RANGE` | **no** | PGMQ, GitLab | `NumericBoundaries` + cursor from `max(key)` / sequence | P1 |
 | Match partitions by catalog bounds, not names | partial | Centrifugo, adoption | window decoding in the planner | P0 |
 | Plan / dry-run / serializable output | partial (nested only) | Hatchet, DBAs | `MaintenancePlan` + `plan()` / `apply()` | P0 |
-| Ownership classification | marker only | Centrifugo | `Ownership` on every node | P0 |
+| Ownership classification | marker only | Centrifugo | alignment with the scheme's grid, decided by the planner | P0 |
 | OID revalidation before DETACH/DROP | name only | safety | `oid` on operations, checked at apply | P0 |
 | Ensure-until creation | no | Hookdeck | `CreateUntil` | P2 |
 | Age-based retention | no | GitLab, Hatchet | `KeepFor` | P2 |
 | Detach grace period | no | GitLab | `DropAfter(grace)` | P2 |
 | Detach mode explicit | implicit | ColdFront | `DetachMode` | P2 |
 | Size / row facts on demand | no | Hatchet, GitLab | `PartitionFacts`, `SizeAbove`, `RowsAbove` | P2 |
-| State-dependent create/detach | no | GitLab | `CreateNextIf`, `DetachIf`, `SqlPredicate` | P2 |
-| Sliding `LIST` | no | GitLab | `ListPartitioning(sequence=…)` | P2.5 |
+| State-dependent create/detach | no | GitLab | `CreateNextIf`, `ExpireIf`, `SqlPredicate` | P2 |
+| Sliding `LIST` | no | GitLab | `ListPartitioning(sequence=IntegerSequence(…))` | P2.5 (shipped) |
+| FK-aware detach eligibility | no | GitLab | `Unreferenced()`; a refused detach is an issue | P2.5 (shipped) |
 | Foreign leaves introspection | crashes on `relkind='f'` in existence checks | pg_clickhouse | `RelationKind` on nodes | P0 |
 | Adopt existing trees | partial (`adopt_partition` for detached) | migrations | alignment-based ownership + `adopt_partition` | P0/P3 |
-| Batch migration of monolithic tables | no | pg_partman | future module | P3 |
-| Template properties / tablespaces | no | pg_partman | hooks now; initializer later | P4 |
+| Batch migration of monolithic tables | no | pg_partman | `partition_data` / `unpartition` | P3 (shipped) |
+| Template properties / tablespaces / privileges | no | pg_partman | `LocalLeaves` | P4 (shipped) |
+| Foreign leaves | no | pg_clickhouse | `ForeignLeaves` | P4 (shipped) |
 
 ## 4. Domain model
 
@@ -186,9 +188,10 @@ name).
 Two kinds of level fall out of this:
 
 - a **progression level** produces an ordered, open-ended sequence of slots — `RANGE`
-  windows, or a sliding `LIST` value sequence. It is the *lifecycle dimension*: partitions
-  are created ahead of a cursor and expire behind it. Its partition is the lifecycle unit,
-  subtree included.
+  windows, or the value sequence of a sliding `LIST`
+  (`ListPartitioning(sequence=IntegerSequence(...))`). It is the *lifecycle dimension*:
+  partitions are created ahead of a cursor and expire behind it. Its partition is the
+  lifecycle unit, subtree included.
 - a **set level** produces a fixed, complete set — `HASH` buckets, static `LIST` groups.
   It is reconciled (missing members created) and never expires.
 
@@ -207,14 +210,16 @@ window. Three implementations ship:
 |---|---|---|---|
 | `TimeBoundaries(granularity | calculator, tz, codec)` | instants | calendar periods via any `PeriodCalculator` | timestamps, or the codec's encoding (UUIDv7, epoch…) |
 | `NumericBoundaries(step, origin)` | integers | `[origin + k·step, origin + (k+1)·step)` | integer literals |
+| `IntegerSequence(start)` (sliding `LIST`) | integers | `[value, value + 1)`, one value per partition | `FOR VALUES IN (value)` |
 | custom `RangeBoundaries` | anything comparable | yours | yours |
 
 The existing period calculators are the time implementation; a custom calculator plugs in
 through `TimeBoundaries(calculator=...)` and keeps working with every topology and codec.
 
 A progression level's **cursor** is where "now" is on its axis: the clock for time, the
-key's high-water mark (`max(key)` or the serial/identity sequence) for integers. The
-introspector resolves it; the planner receives it in `PlanningContext`.
+key's high-water mark (`max(key)` or the serial/identity sequence) for integers, the newest
+partition for a sliding `LIST` (`CursorSource.NEWEST_MEMBER`, read off the tree). The
+introspector resolves the first two; the planner receives them in `PlanningContext`.
 
 ### 4.4 Lifecycle policy
 
@@ -229,7 +234,8 @@ LifecyclePolicy(
 
 Policies are **predicates over candidates**, evaluated by the pure planner. What a
 predicate needs to know is declared up front (`required_facts`): the introspector
-gathers exactly those facts — size, row estimate, the result of an `SqlPredicate` — and
+gathers exactly those facts — size, row estimate, whether rows of another table still
+reference the partition (`Unreferenced()`), the result of an `SqlPredicate` — and
 nothing else. A monthly table with `KeepNewest` never pays for `pg_total_relation_size`.
 
 A policy answers *eligible or not*; it never executes DDL. Ownership, safety and locking
@@ -298,6 +304,22 @@ the same name between plan and apply is left alone.
 `maintain()` is `plan` + `apply` under one lock, and is what `PartitionMaintainer` and
 `maintain_partitions` call. The 0.5 `skip_*` flags become plan filters.
 
+### 4.8 Leaves and data movement
+
+`config.leaves` decides what kind of relation the deepest members are: `LocalLeaves`
+(tables, optionally in a tablespace, with storage parameters and the parent's privileges
+replayed — `pg_partman`'s template table, declarative) or `ForeignLeaves(server, options)`
+(foreign tables with templated options — `pg_clickhouse`'s offload). PostgreSQL accepts a
+foreign partition only under a parent without a unique index; the service refuses the
+configuration before any DDL otherwise. A foreign partition is *owned* only under a
+`ForeignLeaves` configuration; under local leaves it is inspected and left alone.
+
+`service.partition_data` and `service.unpartition` are `pg_partman`'s batch movers over
+the plan: a partition is created detached through the executor, filled from DEFAULT in
+bounded batches (`DELETE … RETURNING` / `INSERT`, one statement per batch, a row in exactly
+one place at every commit point) and attached last; the way back empties every partition
+into one table and optionally drops it through the ordinary path.
+
 ## 5. API examples
 
 ### Ordinary monthly table (unchanged)
@@ -360,15 +382,32 @@ scheme=RangePartitioning(
 )
 ```
 
-### GitLab-like sliding list (P2.5)
+### GitLab-like sliding list
 
 ```python
 scheme=ListPartitioning(key="partition_id", sequence=IntegerSequence(start=100)),
 lifecycle=LifecyclePolicy(
-    creation=CreateNextIf(AnyOf(SizeAbove(10 * 2**30), OldestRowAgeAbove(timedelta(days=1)))),
-    retention=ExpireIf(SqlPredicate("NOT EXISTS (SELECT 1 FROM {partition} WHERE status = 'pending')")),
+    creation=CreateNextIf(AnyOf((SizeAbove(10 * 2**30), SqlPredicate("SELECT min(created_at) < now() - interval '1 day' FROM {partition}")))),
+    retention=ExpireIf(AllOf((KeepNewest(3), Unreferenced()))),
     drop=DropAfter(timedelta(days=7)),
 )
+```
+
+### pg_clickhouse-like foreign leaves
+
+```python
+TablePartitionConfig(
+    table_name="metrics",
+    scheme=RangePartitioning(key="ts", boundaries=TimeBoundaries(granularity=MONTH)),
+    leaves=ForeignLeaves(server="clickhouse", options={"table_name": "{relname}"}),
+)
+```
+
+### pg_partman-like migration
+
+```python
+await service.partition_data(config, batch_rows=50_000, max_batches=200)   # drain events_legacy (DEFAULT)
+await service.unpartition(config, "public.events_flat", drop_emptied=True)  # and the way back
 ```
 
 ### Cold tiering
@@ -453,25 +492,28 @@ Each phase is one mergeable PR keeping the whole suite green.
 - **P2 — lifecycle policies:** `CreateUntil`, `KeepFor`, `DropAfter` grace with the
   detached-at stamp, `DetachMode`, `PartitionFacts` and `SizeAbove`/`RowsAbove`,
   `SqlPredicate`, `CreateNextIf` / `ExpireIf`.
-- **P2.5 — sliding LIST:** `ListPartitioning(sequence=IntegerSequence(...))` as a
-  progression level. Not in 1.0.0: the same rotation is available today on an integer
-  RANGE axis (`NumericBoundaries(step=1)` + `CreateNextIf` / `ExpireIf`), see the recipes.
-- **P3 — adoption and migration:** inspection report for an existing tree, batch data
-  movement out of a monolithic table, `undo`.
-- **P4 — physical realisation:** partition initializer (tablespace, storage parameters,
-  grants), foreign leaves as a leaf backend.
+- **P2.5 — sliding LIST and foreign keys:** `ListPartitioning(sequence=IntegerSequence(...))`
+  as a progression level with its cursor on the newest member; `Unreferenced()` and the
+  refused-detach issue.
+- **P3 — adoption and migration:** `service.inspect` and the plan's findings as the
+  inspection report; `partition_data` (batch movement out of a DEFAULT partition, the
+  monolithic-table path) and `unpartition` (the way back).
+- **P4 — physical realisation:** `LocalLeaves` (tablespace, storage parameters, inherited
+  privileges) and `ForeignLeaves` (foreign tables as leaves).
+
+All phases ship in 1.0.0.
 
 ## 9. Risks
 
 | Risk | Mitigation |
 |---|---|
 | API complexity for the simple case | the flat fields stay; the composed form is opt-in |
-| Catalog parsing of bounds across types and versions | one parser, exercised by integration tests on 15 and 17 with every key type this RFC mentions |
+| Catalog parsing of bounds across types and versions | one parser, exercised by the integration suite on PostgreSQL 15, 16 and 17 in CI with every key type this RFC mentions |
 | Lock escalation | measured lock levels documented; converged tree issues zero DDL; `ATTACH` rather than `CREATE … PARTITION OF` on live parents |
 | `DETACH CONCURRENTLY` semantics | not transactional by construction; pending state finalised; DEFAULT present → blocking fallback |
 | Partial nested trees | attach-last ordering; next run converges |
 | Identifier length | per-level name budget validated at config time and re-checked at plan time |
 | Ownership ambiguity | alignment rule is conservative: not aligned → never destructive; findings explain |
 | Historical topology drift | preserved by rule, reported as `INFO` |
-| PostgreSQL version differences | 15 and 17 in the semantics script; capability checks explicit |
+| PostgreSQL version differences | 15 and 17 in the semantics scripts, 15, 16 and 17 in CI; capability checks explicit |
 | Two sources of truth for boundaries | the calculator now lives in the config; the service has no `period_calculator` |

@@ -5,11 +5,12 @@ method, the key, how children are named, and — optionally — the level below.
 classes describe a root and a nested level.
 
 ```python
-from pg_partsmith import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning, TimeBoundaries
+from pg_partsmith import HashPartitioning, IntegerSequence, ListGroup, ListPartitioning, RangePartitioning, TimeBoundaries
 
 RangePartitioning(key="created_at", boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH))
 HashPartitioning(key="tenant_id", modulus=16)
 ListPartitioning(key="region", groups=(ListGroup(name="eu", values=("de", "fr")),), include_default=True)
+ListPartitioning(key="partition_id", sequence=IntegerSequence(start=100))   # a sliding list
 ```
 
 Every level has a `key` (one column, or several in key order) and an optional `child`.
@@ -18,8 +19,8 @@ Every level has a `key` (one column, or several in key order) and an optional `c
 
 | Kind | Classes | What the planner does with it |
 |---|---|---|
-| **progression** | `RangePartitioning` | An ordered, open-ended sequence of windows with a *cursor*. Partitions are created ahead of the cursor and expire behind it — the lifecycle dimension. Its partition is the lifecycle unit, subtree included. |
-| **set** | `HashPartitioning`, `ListPartitioning` | A fixed, complete set of members. Missing members are created; nothing ever expires. |
+| **progression** | `RangePartitioning`; `ListPartitioning(sequence=...)` | An ordered, open-ended sequence of windows with a *cursor*. Partitions are created ahead of the cursor and expire behind it — the lifecycle dimension. Its partition is the lifecycle unit, subtree included. |
+| **set** | `HashPartitioning`; `ListPartitioning(groups=...)` | A fixed, complete set of members. Missing members are created; nothing ever expires. |
 
 So `retention_count=12` on a `RANGE(time) → HASH(tenant)` table keeps twelve periods,
 however many buckets each holds.
@@ -86,6 +87,31 @@ partition owns is reported (`list_values_conflict`), never forced.
 
 Values are written as SQL string literals, which PostgreSQL coerces to the key's type
 (`values=("1", "2")` for an integer key). LIST takes exactly one key column.
+
+### Sliding LIST
+
+```python
+ListPartitioning(key="partition_id", sequence=IntegerSequence(start=100))
+```
+
+With a `sequence` instead of `groups`, a LIST level is a **progression**: every partition
+owns one integer value (`FOR VALUES IN (101)`), the newest one is where the application
+writes, and the lifecycle policy opens the next value and expires old ones — GitLab's
+sliding list for `ci_builds`. Windows are `[value, value + 1)`, so every rule written for an
+integer axis applies (`KeepNewest`, `KeepBehind`, `ExpireIf`, …).
+
+The cursor is the **newest partition** (`CursorSource.NEWEST_MEMBER`, no query), which is
+why the creation rule has to be state-driven or bounded: `CreateNextIf(when)` opens
+`N + 1` once partition `N` satisfies `when`; `CreateUntil(position)` fills the sequence up to
+a value. `CreateAhead` would open another partition on every run and is refused at
+construction. With `IntegerSequence(cursor_source=CursorSource.MAX_KEY)` the cursor is read
+from the data instead and `CreateAhead` is allowed.
+
+Names are `{parent}__{value}` (`name_suffix="_p{value}"` to change). A hand-made partition
+owning several values, a non-integer value or `NULL` is `unmanaged_partition`: inspected,
+never touched, and a value it owns is never created. A sliding list has no DEFAULT partition.
+
+`ensure_partition(config, 250)` creates the partition for one value explicitly.
 
 ## Nesting
 
@@ -175,6 +201,13 @@ TablePartitionConfig(
 `partition_type` and `partition_strategy` are still accepted and checked against the
 scheme; they are no longer required. `config.scheme` and `config.lifecycle` expose the
 composed form either way.
+
+## Leaves
+
+What kind of relation the deepest members are is decided by `config.leaves`: ordinary
+tables, optionally in a tablespace, with storage parameters and inherited privileges
+(`LocalLeaves`, the default), or foreign tables on a foreign server (`ForeignLeaves`). See
+[Leaf backends](leaves.md).
 
 ## Introspection
 

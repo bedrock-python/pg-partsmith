@@ -2,9 +2,9 @@
 
 Everything the 1.0 design relies on was measured against real servers rather than assumed:
 `postgres:17-alpine` (17.11) and `postgres:15-alpine` (15.19) via testcontainers, on
-2026-08-28. Both versions behaved identically in every case below. The measurement script
-lives with the development scratch files; the integration suite re-asserts the load-bearing
-facts on every run.
+2026-08-28. Both versions behaved identically in every case below. The measurement scripts
+live with the development scratch files; the integration suite re-asserts the load-bearing
+facts on every run, on PostgreSQL 15, 16 and 17 in CI.
 
 ## Transactions
 
@@ -72,19 +72,69 @@ against a live parent; a converged tree must issue no DDL at all.
 
 ## Foreign tables
 
-- `CREATE FOREIGN TABLE … PARTITION OF parent` is refused with
-  `42809 cannot create foreign partition of partitioned table` when the parent has any
-  index (a primary key counts); it succeeds on an index-free parent.
+- `CREATE FOREIGN TABLE … PARTITION OF parent` and `ATTACH PARTITION` of a foreign table are
+  refused with `42809 cannot create foreign partition of partitioned table` / `cannot attach
+  foreign table … as partition` when the parent has a **unique index or primary key**; both
+  succeed on an index-free parent and on one with only non-unique indexes.
+- A foreign table attached as a partition must carry the parent's `NOT NULL` constraints
+  (`42804 column … in child table must be marked NOT NULL` otherwise), which is why
+  `create_foreign_table_like` copies `attnotnull` along with the types.
 - In `pg_partition_tree` the foreign leaf has `relkind = 'f'`, `isleaf = true`, a normal
   `relpartbound`; `SELECT … FROM parent` reads through it.
-- `DROP TABLE` and `COMMENT ON TABLE` on it fail with `42809 "x" is not a table`;
-  `COMMENT ON FOREIGN TABLE` and `DROP FOREIGN TABLE` work; `pg_total_relation_size` is 0.
+- `DROP TABLE`, `COMMENT ON TABLE` and `LOCK TABLE` on it fail with `42809 "x" is not a table`
+  / `not supported for foreign tables`; `COMMENT ON FOREIGN TABLE` and `DROP FOREIGN TABLE`
+  work; `pg_total_relation_size` is 0.
 - `ATTACH`, `DETACH` and `DETACH … CONCURRENTLY` all work with a foreign partition; a foreign
   DEFAULT partition is accepted.
 - `CREATE INDEX` on a parent that has a foreign partition succeeds (non-unique indexes skip
   foreign children).
 
-The library never plans DDL for a foreign leaf and reports it as `FOREIGN_PARTITION`.
+Under a `LocalLeaves` configuration the library never plans DDL for a foreign leaf and
+reports it as `FOREIGN_PARTITION`; under `ForeignLeaves` it creates, comments, detaches and
+drops foreign leaves with the statements above.
+
+## Storage parameters, tablespaces, privileges
+
+- `WITH (...)` on a partitioned table → `42809 cannot specify storage parameters for a
+  partitioned table`; on a leaf it works. `LocalLeaves` applies storage parameters to leaves
+  only.
+- `TABLESPACE pg_default` on a partitioned table → `0A000 cannot specify default tablespace
+  for partitioned relations`; a real tablespace is accepted on branches and leaves alike.
+- `CREATE TABLE … (LIKE parent INCLUDING ALL)` copies no grants and keeps the creator as
+  owner: the new relation's `relacl` is NULL while the parent's carries its grants.
+  `aclexplode(relacl)` lists them (PUBLIC is grantee 0); `LocalLeaves(inherit_privileges=True)`
+  replays owner and grants in the creating transaction.
+
+## Foreign keys (measured on 15.19 and 17.11, 98 scenarios, no difference)
+
+- An FK on another table pointing at the partitioned parent is cloned onto every partition
+  (`conparentid ≠ 0`, `conislocal = false`). `DETACH PARTITION` — plain and `CONCURRENTLY` —
+  is refused with `23503 removing partition "x" violates foreign key constraint "…"` while
+  a row of the referencing table points at a row of the partition; `ON DELETE CASCADE`
+  changes nothing and nothing is cascade-deleted. A failed `CONCURRENTLY` leaves no
+  `inhdetachpending` state behind. Once the referencing rows are gone the detach succeeds,
+  the detached table carries no FK-related constraint or trigger, and its rows are invisible
+  to the FK (an insert into the referencing table pointing at them fails `23503`).
+  Re-`ATTACH` recreates the clone.
+- `DROP TABLE` of an **attached** partition referenced by such an FK always fails (`2BP01`),
+  with or without referencing rows: the DETAIL names the parent constraint. `DROP … CASCADE`
+  silently removes the whole FK from the referencing table. Detach first, then drop.
+- An FK from the partitioned table to another table is cloned onto every partition under the
+  **same constraint name**; it survives DETACH as a standalone constraint (still enforced),
+  cannot be dropped on an attached partition (`42P16`), and can be dropped on the detached
+  one — which is what the safe-drop path does before `DROP TABLE`.
+- An FK pointing at a partition **directly** does not block DETACH; `DROP` of that partition
+  needs `CASCADE`, which drops that FK.
+- Locks: plain `DETACH` takes `ACCESS EXCLUSIVE` on the referencing table as well as on
+  parent and partition (the documented `SHARE` is what the referencing side needs; the
+  measured lock is `ACCESS EXCLUSIVE`, taken to drop the clone constraint); `DETACH …
+  CONCURRENTLY` takes it in its second transaction, while `inhdetachpending = true`; `ATTACH`
+  and `CREATE … PARTITION OF` take `SHARE ROW EXCLUSIVE` on the referencing table; a plain
+  `DETACH` that has to wait for the referencing table does so while already holding
+  `ACCESS EXCLUSIVE` on the parent.
+
+The library translates `23503` on detach into `PartitionReferencedError`, records it as an
+issue and goes on; `Unreferenced()` keeps such partitions out of the plan.
 
 ## Overlaps and gaps
 

@@ -50,7 +50,11 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
 - Ownership: an attached partition whose bounds are not a window of the scheme's grid (nor
   inside one) is reported as `unmanaged_partition` and never detached or dropped. In 0.x any
   attached partition with an old upper bound was pruned.
-- `PartitionStrategy` gains `NUMERIC_BASED`; `MaintenanceIssueStep` gains `PLAN` and `ATTACH`.
+- `PartitionStrategy` gains `NUMERIC_BASED`; `MaintenanceIssueStep` gains `PLAN`, `ATTACH` and `MOVE`.
+- Repository protocol additions a custom implementation has to provide:
+  `create_table_like(..., physical=)`, `create_foreign_table_like`, `move_rows`,
+  `reconcile_default_rows(..., limit=)`; metadata protocol: `get_leading_key_minimum`.
+  `partition_exists` now reports foreign tables too.
 
 ### Added
 
@@ -77,7 +81,27 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   never touched), `detach_pending`, `facts`; `DetachedPartition` carries `detached_at`.
 - `EpochBoundaryCodec`; codecs and boundaries addressable by name in serialized configs;
   `PartitionTableSettings` accepts `scheme` / `lifecycle` JSON, `tz`, `boundary_codec`.
-- `scripts/sync_mirror.py` regenerates `pg_partsmith.sync` from `pg_partsmith.aio`.
+- Sliding `LIST`: `ListPartitioning(key, sequence=IntegerSequence(start))` is a progression
+  level — one integer value per partition, the cursor read off the newest member
+  (`CursorSource.NEWEST_MEMBER`), rotated with `CreateNextIf` or bounded with `CreateUntil`;
+  `ensure_partition(s)` accept positions on the root's axis (a value, an instant).
+- Leaf backends: `config.leaves = LocalLeaves(tablespace, storage_parameters,
+  inherit_privileges)` (the default, plain) or `ForeignLeaves(server, options)` — leaves as
+  foreign tables with templated options; refused before any DDL on a parent with a unique
+  index; foreign relations commented with `COMMENT ON FOREIGN TABLE` and dropped with
+  `DROP FOREIGN TABLE`; a foreign partition is managed only under a `ForeignLeaves` config.
+- Batched data movement: `service.partition_data(config, batch_rows, max_batches)` drains a
+  DEFAULT partition into lifecycle partitions window by window (created detached, filled,
+  attached); `service.unpartition(config, into, drop_emptied)` moves everything back into
+  one table. `MigrationResult`; `PlanExecutor.create_partition(fill=...)`.
+- Foreign-key aware retention: `Unreferenced()` (the condition PostgreSQL enforces on
+  `DETACH`, `23503`), `FactKind.REFERENCES` / `PartitionFacts.referenced`; a refused detach
+  is `PartitionReferencedError`, recorded as an issue while the run goes on; measured lock
+  levels on referencing tables on `DetachPartition.capabilities`.
+- `scripts/sync_mirror.py` regenerates `pg_partsmith.sync` from `pg_partsmith.aio`;
+  `scripts/sync_tests_mirror.py` regenerates the sync integration suite.
+- Tests: the Redis lock managers against a real Redis; the integration suites run on
+  PostgreSQL 15, 16 and 17 in CI (`PG_PARTSMITH_TEST_PG_IMAGE`).
 - Design docs: RFC 0001, OSS research with migration verdicts per project, PostgreSQL
   semantics verified on 15 and 17.
 

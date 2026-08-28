@@ -17,6 +17,7 @@ nav = [
         { "Partition schemes" = "guide/partition-schemes.md" },
         { "Boundaries and codecs" = "guide/boundary-codecs.md" },
         { "Lifecycle policies" = "guide/lifecycle-policies.md" },
+        { "Leaf backends" = "guide/leaves.md" },
         { "Planning and dry runs" = "guide/planning.md" },
         { "Period strategies" = "guide/strategies.md" },
         { "Lifecycle hooks" = "guide/hooks.md" },

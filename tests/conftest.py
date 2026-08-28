@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys  # required for platform check below
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
@@ -76,7 +77,8 @@ def postgres_container() -> Generator[PostgresContainer, None, None]:
     """Start a PostgreSQL container for the test session."""
     if not _docker_is_available():
         pytest.skip("Docker is required for integration tests (testcontainers)")
-    with PostgresContainer("postgres:17-alpine") as postgres:
+    image = os.environ.get("PG_PARTSMITH_TEST_PG_IMAGE", "postgres:17-alpine")
+    with PostgresContainer(image) as postgres:
         yield postgres
 
 

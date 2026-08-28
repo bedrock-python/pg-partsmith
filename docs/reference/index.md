@@ -25,6 +25,10 @@ entities, exceptions and period calculators.
     options:
       heading_level: 4
 
+::: pg_partsmith.entities.MigrationResult
+    options:
+      heading_level: 4
+
 ::: pg_partsmith.periods.Period
     options:
       heading_level: 4
@@ -58,6 +62,10 @@ entities, exceptions and period calculators.
       heading_level: 4
 
 ::: pg_partsmith.boundaries.NumericBoundaries
+    options:
+      heading_level: 4
+
+::: pg_partsmith.boundaries.IntegerSequence
     options:
       heading_level: 4
 
@@ -105,11 +113,21 @@ entities, exceptions and period calculators.
         - RowsAbove
         - WindowAgeAbove
         - SqlPredicate
+        - Unreferenced
         - Callback
         - AllOf
         - AnyOf
         - Not
         - Candidate
+
+### Leaf backends
+
+::: pg_partsmith.leaves
+    options:
+      heading_level: 4
+      members:
+        - LocalLeaves
+        - ForeignLeaves
 
 ### The plan
 
@@ -179,6 +197,7 @@ entities, exceptions and period calculators.
         - DropRetryExhaustedError
         - UnmanagedPartitionDropError
         - PartitionTopologyError
+        - PartitionReferencedError
         - PlanStaleError
         - UnsupportedCapabilityError
 
@@ -224,6 +243,10 @@ Async implementations: service, executor, inspector, repositories, lock managers
       heading_level: 4
 
 ::: pg_partsmith.aio.services.inspection.PartitionInspector
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.services.migration.DataMover
     options:
       heading_level: 4
 

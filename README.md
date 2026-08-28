@@ -18,12 +18,18 @@ serialize, filter and apply. No extension, no superuser, no scheduler of its own
 
 ## Features
 
-- **Any topology** — `RANGE(time)`, `RANGE(id)`, root `HASH`, root `LIST`,
-  `RANGE → HASH`, `RANGE → LIST → HASH`, `LIST → RANGE`; composite keys
+- **Any topology** — `RANGE(time)`, `RANGE(id)`, root `HASH`, root `LIST`, a sliding
+  `LIST` rotated by application state, `RANGE → HASH`, `RANGE → LIST → HASH`,
+  `LIST → RANGE`; composite keys
 - **Any axis** — calendar periods over timestamps, or over encoded keys (UUIDv7, epoch
   integers, your own codec); fixed-width integer windows for id-partitioned queues
-- **Lifecycle policies** — create ahead by count or until a horizon, expire by count, age
-  or distance, or by a predicate (size, rows, SQL); detach now, drop after a grace period
+- **Lifecycle policies** — create ahead by count, until a horizon or when the newest
+  partition says so; expire by count, age or distance, or by a predicate (size, rows,
+  foreign-key references, SQL); detach now, drop after a grace period
+- **Leaf backends** — local tables with a tablespace, storage parameters and the parent's
+  grants, or foreign tables on an FDW server (`postgres_fdw`, ClickHouse)
+- **Batched data movement** — drain a DEFAULT partition into lifecycle partitions
+  (`partition_data`), or move everything back into one table (`unpartition`)
 - **Plan → apply** — `plan()` issues zero DDL and tells you *what*, *why* and *how big*;
   `apply()` revalidates every destructive operation against the catalog before running it
 - **Convergent and safe** — a converged tree costs zero DDL; gaps in hash sets are repaired
@@ -32,7 +38,7 @@ serialize, filter and apply. No extension, no superuser, no scheduler of its own
 - **Async and sync** — `pg_partsmith.aio` on `AsyncEngine`, `pg_partsmith.sync` on `Engine`
 - **Hooks, locks, schemas** — six lifecycle hooks; PostgreSQL advisory or Redis locks;
   schema-qualified everything
-- **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15 and 17 via testcontainers
+- **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15, 16 and 17 via testcontainers
 
 ## Installation
 

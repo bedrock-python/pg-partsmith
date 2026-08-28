@@ -41,9 +41,15 @@ jobs:
         continue-on-error: true
 
   test-integration:
-    name: Integration tests & coverage gate
+    name: Integration tests (PostgreSQL ${{ matrix.postgres }}) & coverage gate
     needs: lint
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15-alpine", "16-alpine", "17-alpine"]
+    env:
+      PG_PARTSMITH_TEST_PG_IMAGE: postgres:${{ matrix.postgres }}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -51,6 +57,7 @@ jobs:
       # Both suites together: the gate is on the whole library, not on one half of it.
       - run: uv run pytest --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
       - uses: codecov/codecov-action@v7
+        if: matrix.postgres == '17-alpine'
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml

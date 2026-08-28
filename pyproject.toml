@@ -8,7 +8,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "Alex Shalaev", email = "shalaevad.alexey@gmail.com" }]
 keywords = ["postgresql", "partitioning", "asyncio", "database", "partition-management"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",

@@ -100,30 +100,32 @@ async def on_startup() -> None:
 Rows already sitting in `events_default` move into each new monthly partition as it is
 attached (DEFAULT reconciliation).
 
-## Sliding queue: rotate by state, not by calendar
+## Sliding list: rotate by state, not by calendar
 
-GitLab's sliding-list pattern on a RANGE axis: open the next partition once the current
-one holds more than a day of data, detach a partition only when nothing in it is pending,
-keep it a week before dropping.
+GitLab's `ci_builds`: `LIST (partition_id)`, one integer value per partition, the
+application writes the newest value, the next value opens once the newest partition holds
+more than a day of data, and a partition is detached only when no `ci_pipelines` row
+references it any more.
 
 ```python
 config = TablePartitionConfig(
-    table_name="deleted_records",
-    scheme=RangePartitioning(key="partition_no", boundaries=NumericBoundaries(step=1)),
+    table_name="ci_builds",
+    scheme=ListPartitioning(key="partition_id", sequence=IntegerSequence(start=100)),
     lifecycle=LifecyclePolicy(
         creation=CreateNextIf(SqlPredicate(
             "SELECT min(created_at) < now() - interval '1 day' FROM {partition}"
         )),
-        retention=ExpireIf(SqlPredicate(
-            "SELECT NOT EXISTS (SELECT 1 FROM {partition} WHERE status = 'pending')"
-        )),
+        retention=ExpireIf(AllOf((KeepNewest(count=3), Unreferenced()))),
         drop=DropAfter(grace=timedelta(days=7)),
     ),
 )
 ```
 
-Writers insert with `partition_no = <current>`; the cursor is `max(partition_no)`. A
-LIST-valued progression level with the same policies is the next planned step.
+The cursor is the newest partition, so nothing is created "ahead"; the application reads
+the current value from `service.inspect(config)` (the highest single-value member) and
+writes it. `Unreferenced()` is the condition PostgreSQL itself imposes on the detach — a
+partition whose rows are still referenced through the foreign key from `ci_pipelines`
+cannot be detached — so the policy never plans a detach the database would refuse.
 
 ## Cold tiering: detach, archive, verify, drop
 
@@ -153,6 +155,53 @@ config = TablePartitionConfig(
 ```
 
 Or `drop=DropNever` to hand the detached tables to another process entirely.
+
+## Cold tiering to a column store: foreign leaves
+
+pg_clickhouse's shape: an index-free metrics table whose partitions are foreign tables on a
+ClickHouse (or any FDW) server, queried through one PostgreSQL parent.
+
+```python
+config = TablePartitionConfig(
+    table_name="metrics",
+    scheme=RangePartitioning(key="ts", boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH)),
+    lifecycle=LifecyclePolicy(creation=CreateAhead(count=2), retention=KeepNewest(count=24)),
+    leaves=ForeignLeaves(server="clickhouse", options={"table_name": "{relname}"}),
+)
+```
+
+Every month is created as `CREATE FOREIGN TABLE metrics__2026_09 (…) SERVER clickhouse
+OPTIONS (table_name 'metrics__2026_09')` and attached; an expired month is detached and
+`DROP FOREIGN TABLE`d, which removes the mapping and leaves the remote data alone. The
+parent must have no unique index (PostgreSQL's rule; checked before any DDL).
+
+## Hot leaves on fast storage, with the parent's grants
+
+```python
+config = TablePartitionConfig(
+    table_name="events",
+    partition_column="created_at",
+    granularity=PartitionGranularity.DAY,
+    create_ahead_count=3,
+    retention_count=30,
+    leaves=LocalLeaves(tablespace="nvme", storage_parameters={"fillfactor": 90}, inherit_privileges=True),
+)
+```
+
+Every new day lands on the `nvme` tablespace with the parent's owner and grants — what
+`pg_partman`'s template table and `inherit_privileges` did.
+
+## From a monolithic table
+
+```python
+# once: ALTER TABLE events RENAME TO events_legacy; CREATE TABLE events (LIKE events_legacy INCLUDING ALL)
+#       PARTITION BY RANGE (created_at); ALTER TABLE events ATTACH PARTITION events_legacy DEFAULT;
+while not (result := await service.partition_data(config, batch_rows=50_000, max_batches=100)).complete:
+    await asyncio.sleep(1)      # let the writers breathe between rounds
+```
+
+See [Partitioning a monolithic table](migration.md#partitioning-a-monolithic-table) for
+what is and is not visible while it runs.
 
 ## Large partitions on weekends only
 

@@ -54,7 +54,8 @@ marker-tagged orphan (drop). A table dropped and recreated under the same name b
 and apply is left alone and reported as `PlanStaleError`.
 
 Failures: a topology conflict discovered while executing — a DEFAULT sibling holding rows
-for a hash bucket, a name held by a relation with other bounds — is recorded in
+for a hash bucket, a name held by a relation with other bounds, a detach PostgreSQL refuses
+because rows of another table still reference the partition — is recorded in
 `result.issues` and never aborts the run. Any other error aborts unless
 `continue_on_error=True`, in which case it is recorded and the next operation runs.
 `result.plan` is the plan that was executed.
@@ -76,11 +77,11 @@ Ownership is derived from the catalog against the scheme; there is no metadata t
 
 | An attached partition whose bounds… | is | Lifecycle may |
 |---|---|---|
-| are a window of the boundaries' grid, or lie inside one (a day inside a monthly grid, left by an earlier finer config) | managed | create below it, detach, drop |
+| are a window of the boundaries' grid, or lie inside one (a day inside a monthly grid, left by an earlier finer config); for a sliding LIST, own exactly one integer value | managed | create below it, detach, drop |
 | are not on the grid — a hand-attached `events_archive` spanning years, a week straddling two months | `unmanaged_partition` (INFO) | inspect and report only; a wanted window overlapping it is `range_overlap` (WARNING) and not created |
 | are open on one side (`MINVALUE` / `MAXVALUE` / `infinity`) | `unbounded_partition` (INFO) | never pruned |
 | cannot be read on the level's axis | `unreadable_bound` (WARNING) | never pruned — guessing risks dropping live data |
-| belong to a foreign table | `foreign_partition` (INFO) | nothing — `DROP TABLE` cannot even remove it |
+| belong to a foreign table, under a `LocalLeaves` configuration | `foreign_partition` (INFO) | nothing — it is someone else's; under `ForeignLeaves` a foreign partition is managed like any other |
 | are pending an interrupted `DETACH CONCURRENTLY` | `detach_pending` (WARNING) | nothing until `FINALIZE` |
 
 Detached tables are considered only when they carry the library's `COMMENT` marker; the
@@ -129,13 +130,14 @@ nothing else. Expected steady states (`legacy_leaf`, `modulus_preserved`,
 `unmanaged_partition`, `grace_pending`) are logged at INFO/DEBUG and kept out of `issues`;
 read them from `result.plan.findings`.
 
-## Sizes and rows
+## Sizes, rows and references
 
 `SizeAbove` / `RowsAbove` and any `SqlPredicate` make the introspector measure the
 progression-level members: one query summing `pg_total_relation_size` over each subtree's
 leaves and reading `pg_stat_user_tables.n_live_tup`, plus one query per SQL predicate and
-candidate. The numbers appear on the operations (`size_bytes`, `row_estimate`). Nothing is
-measured for a policy that does not ask.
+candidate. `Unreferenced()` adds one `EXISTS` per incoming foreign key and candidate. The
+numbers appear on the operations (`size_bytes`, `row_estimate`). Nothing is measured for a
+policy that does not ask.
 
 ## Locks
 

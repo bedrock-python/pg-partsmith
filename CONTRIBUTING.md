@@ -61,7 +61,11 @@ PostgreSQL instance automatically. Docker must be running:
 
 ```bash
 make test-integration
+PG_PARTSMITH_TEST_PG_IMAGE=postgres:15-alpine make test-integration   # another server version
 ```
+
+CI runs the integration suite on PostgreSQL 15, 16 and 17; the default image is
+`postgres:17-alpine`.
 
 ## Adding a period strategy
 

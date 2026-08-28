@@ -54,6 +54,7 @@ config = TablePartitionConfig(
 |---|---|
 | `scheme` | [Partition schemes](partition-schemes.md) — `RangePartitioning`, `ListPartitioning`, `HashPartitioning`, nesting, composite keys |
 | `lifecycle` | [Lifecycle policies](lifecycle-policies.md) — creation, retention, detach mode, drop policy |
+| `leaves` | [Leaf backends](leaves.md) — `LocalLeaves` (tablespace, storage parameters, inherited privileges; the default) or `ForeignLeaves` (foreign tables on a server) |
 
 Passing `scheme` together with the flat scheme fields, or `lifecycle` together with
 `create_ahead_count` / `retention_count`, is an error: one spelling per config.
@@ -65,6 +66,7 @@ Whichever spelling you use, the config exposes both:
 ```python
 config.scheme                 # the root level
 config.lifecycle              # the policy
+config.leaves                 # what kind of relation the leaves are
 config.partition_type         # PartitionType.RANGE / LIST / HASH — the root's method
 config.partition_strategy     # TIME_BASED / NUMERIC_BASED / VALUE_BASED / HASH_BASED
 config.partition_columns      # the root's whole key

@@ -34,7 +34,10 @@ with the core, so a user predicate cannot turn into an accidental `DROP TABLE`.
 
 The **cursor** is "now" on the axis: the clock for time (in the calendar's timezone),
 `max(key)` — or the serial/identity sequence, with `NumericBoundaries(cursor_source=CursorSource.SEQUENCE)`
-— for integers. An empty integer-keyed table starts at `origin`.
+— for integers. An empty integer-keyed table starts at `origin`. A sliding LIST
+(`ListPartitioning(sequence=...)`) reads its cursor off its **newest partition**
+(`CursorSource.NEWEST_MEMBER`), so it rotates with `CreateNextIf` or is bounded with
+`CreateUntil`; `CreateAhead` is refused for it.
 
 ## Retention
 
@@ -65,12 +68,21 @@ retention=ExpireIf(AllOf((
 | `SizeAbove(bytes)` | size | the partition and its subtree exceed `bytes` on disk |
 | `RowsAbove(rows)` | rows | the planner's row estimate exceeds `rows` (never `COUNT(*)`; a fresh partition reads as empty until statistics catch up) |
 | `WindowAgeAbove(age)` | — | the window ended more than `age` ago |
+| `Unreferenced()` | references | no row of another table references a row of the partition through a foreign key — on the parent or on the partition itself. The condition PostgreSQL enforces on `DETACH` (`23503`); an unmeasured partition reads as referenced, so it is kept |
 | `SqlPredicate(sql)` | one query per candidate | the statement yields true; `{partition}` is replaced with the quoted name, nothing else is interpolated; a partition that does not exist yet reads as false |
 | `Callback(fn, facts=..., label=...)` | what it declares | `fn(candidate)` returns true — pure Python over the gathered facts, usable from both mirrors |
 | `AllOf`, `AnyOf`, `Not` | union of members | — |
 
 Facts are gathered only for the partitions a policy can decide over (progression-level
 members and their orphans), in one query for every target, and only when some rule asks.
+References cost one `EXISTS` per incoming foreign key and candidate, joining the referencing
+table to the partition on the key columns.
+
+"Older than twelve periods *and* no longer referenced" — the GitLab rule for `ci_builds`:
+
+```python
+retention=ExpireIf(AllOf((KeepNewest(count=12), Unreferenced())))
+```
 
 ## Detach
 
@@ -79,6 +91,13 @@ members and their orphans), in one query for every target, and only when some ru
 | `AUTO` (default) | `DETACH … CONCURRENTLY`, falling back to the blocking form when PostgreSQL refuses it — it does when a DEFAULT partition exists |
 | `CONCURRENT` | the concurrent form only; the refusal propagates |
 | `BLOCKING` | plain `DETACH`, `ACCESS EXCLUSIVE` on the parent |
+
+Either form takes `ACCESS EXCLUSIVE` on every table that references the parent through a
+foreign key (measured; the concurrent form in its second transaction). A partition whose
+rows such a table still references cannot be detached at all: PostgreSQL refuses with
+`23503`, the executor records it as an issue (`PartitionReferencedError`) and goes on with
+the rest of the plan. `Unreferenced()` in the retention rule keeps those partitions out of
+the plan until the referencing rows are gone.
 
 The concurrent form cannot run inside a transaction block, so it goes out on an autocommit
 connection; a detach interrupted mid-way (`inhdetachpending`) is finished with

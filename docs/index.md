@@ -22,12 +22,13 @@ pip install "pg-partsmith[redis-locks]"
 
 | Concept | Description |
 |---------|-------------|
-| **Partition scheme** | The shape of the tree: `RangePartitioning`, `ListPartitioning`, `HashPartitioning`, each with an optional level below |
-| **Boundaries** | How a `RANGE` axis is divided: calendar periods (`TimeBoundaries`, optionally over an encoded key) or integer steps (`NumericBoundaries`) |
+| **Partition scheme** | The shape of the tree: `RangePartitioning`, `ListPartitioning` (static groups or a sliding sequence), `HashPartitioning`, each with an optional level below |
+| **Boundaries** | How a progression axis is divided: calendar periods (`TimeBoundaries`, optionally over an encoded key), integer steps (`NumericBoundaries`) or one value per partition (`IntegerSequence`) |
+| **Leaf backend** | What kind of relation the leaves are: local tables with a tablespace, storage parameters and inherited privileges (`LocalLeaves`) or foreign tables (`ForeignLeaves`) |
 | **Lifecycle policy** | When partitions are created (`CreateAhead`, `CreateUntil`, `CreateNextIf`), expire (`KeepNewest`, `KeepFor`, `KeepBehind`, `ExpireIf`), are detached (`DetachMode`) and dropped (`DropAfter`, `DropNever`) |
 | **Actual tree** | The catalog's view: every node with its bounds, OID and kind, plus the marker-tagged orphans |
 | **Maintenance plan** | Typed, ordered operations with reasons and sizes, and the findings the planner refused to act on |
-| **Lifecycle service** | `plan()`, `apply()`, `maintain()` — and conveniences over them |
+| **Lifecycle service** | `plan()`, `apply()`, `maintain()` — and conveniences over them; `partition_data()` / `unpartition()` move rows in batches |
 | **Hooks** | Six points around create / detach / drop |
 | **Lock manager** | PostgreSQL advisory locks or Redis, around plan + apply |
 

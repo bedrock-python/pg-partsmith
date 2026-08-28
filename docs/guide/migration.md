@@ -59,9 +59,52 @@ other orphan, `before_drop` hooks included.
 ## A DEFAULT partition full of data
 
 Tables that started with only a DEFAULT partition (Hookdeck Outpost's shape) need no
-special step: as each new window is attached, rows belonging to it are moved out of DEFAULT
-and the attach retried. Rows with a NULL trailing key column stay in DEFAULT, where
-PostgreSQL routes them.
+special step for the windows create-ahead reaches: as each new window is attached, rows
+belonging to it are moved out of DEFAULT and the attach retried. Rows with a NULL trailing
+key column stay in DEFAULT, where PostgreSQL routes them.
+
+For the *history* sitting in DEFAULT — months create-ahead will never reach — there is
+`partition_data`.
+
+## Partitioning a monolithic table
+
+The `pg_partman` path, without the extension: create the partitioned parent, attach the old
+table as its DEFAULT partition, then drain it window by window in batches.
+
+```sql
+ALTER TABLE events RENAME TO events_legacy;
+CREATE TABLE events (LIKE events_legacy INCLUDING ALL) PARTITION BY RANGE (created_at);
+ALTER TABLE events ATTACH PARTITION events_legacy DEFAULT;      -- everything is visible again
+```
+
+```python
+while not (result := await service.partition_data(config, batch_rows=50_000, max_batches=200)).complete:
+    log.info("moved %d rows in %d batches into %s", result.rows_moved, result.batches, result.partitions)
+```
+
+Each round finds the oldest window still in DEFAULT, creates its partition **detached**
+(subtree included), moves the window's rows into it in batches of `batch_rows` — one
+`DELETE … RETURNING` / `INSERT` per batch, each committing on its own, so a row is in exactly
+one place at every commit point — and attaches it once nothing of that window is left.
+`max_batches` bounds one call; a partition left detached is resumed by the next.
+
+What a batch cannot hide: until the attach, that window's rows are invisible through the
+parent. PostgreSQL leaves no other order — a partition cannot be attached while DEFAULT holds
+rows for it — so run this in a maintenance window, or with small batches during a quiet hour
+and readers that tolerate a window's rows appearing a little later. Windows create-ahead
+already created are untouched; a window no partition can be created for (an unmanaged
+partition overlaps it) stops the run with a `MOVE` issue and `complete=False`.
+
+## The way back
+
+```python
+result = await service.unpartition(config, "public.events_flat", batch_rows=50_000, drop_emptied=True)
+```
+
+Every partition, oldest first and DEFAULT last, is emptied into `events_flat` (created
+`LIKE` the root when missing) in batches; with `drop_emptied` each emptied partition is
+detached and dropped through the ordinary path — marker, hooks, revalidation. Foreign
+partitions are skipped and reported: their rows are not this database's to move.
 
 ## Backfilling partitions for data you already have
 
@@ -88,6 +131,9 @@ the next tick.
 | `retention` (interval) | `KeepFor(age)` |
 | `retention` (integer, id sets) | `KeepBehind(distance)` |
 | `retention_keep_table = true` | `DropNever` |
+| `partition_data_proc` / `partition_data_time` / `partition_data_id` | `service.partition_data(config, batch_rows=…, max_batches=…)` |
+| `undo_partition_proc` | `service.unpartition(config, into, drop_emptied=True)` |
+| template table (tablespace, reloptions), `inherit_privileges` | `leaves=LocalLeaves(tablespace=…, storage_parameters=…, inherit_privileges=True)` |
 | `p_time_encoder` / `p_time_decoder` | `TimeBoundaries(codec=...)` |
 | `epoch` | `codec="epoch_seconds"` / `"epoch_milliseconds"` |
 | `create_sub_parent` | `child=` on the scheme |
@@ -110,8 +156,8 @@ p.schema_name  # "public"
 
 ## Who takes the lock
 
-`maintain()` (and the maintainer) takes the distributed lock around plan and apply. The
-granular methods — `reconcile`, `ensure_partition(s)`, `create_future_partitions`,
+`maintain()` (and the maintainer), `partition_data()` and `unpartition()` take the
+distributed lock. The granular methods — `reconcile`, `ensure_partition(s)`, `create_future_partitions`,
 `detach_old_partitions`, `drop_detached_partitions` — do **not**: hold the lock yourself
 when orchestrating them.
 
