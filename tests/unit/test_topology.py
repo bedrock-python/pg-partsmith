@@ -572,3 +572,21 @@ def test__build_partition_tree__no_omissions__leaves_every_node_unmarked() -> No
     # Assert
     assert tree is not None
     assert tree.has_unaddressable_children is False
+
+
+def test__partition_node__hash_children__ignores_siblings_bound_any_other_way() -> None:
+    # Arrange -- a branch holding a hash bucket, a DEFAULT sibling and a legacy
+    # LIST partition someone attached by hand.
+    node = PartitionNode(
+        name="public.events__2026_w35",
+        partition_type=PartitionType.HASH,
+        children=(
+            PartitionNode(name="public.events__2026_w35__h0", bounds=HashBounds(modulus=2, remainder=0)),
+            PartitionNode(name="public.events__2026_w35_default", bounds=DefaultBounds()),
+            PartitionNode(name="public.events__2026_w35__eu", bounds=ListBounds(values=("eu",))),
+        ),
+    )
+
+    # Act / Assert -- keyspace arithmetic is only meaningful over hash bounds;
+    # counting a DEFAULT sibling into it would report a tiled branch as short.
+    assert [c.name for c in node.hash_children] == ["public.events__2026_w35__h0"]

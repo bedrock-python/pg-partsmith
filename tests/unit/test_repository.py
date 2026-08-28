@@ -6,6 +6,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.aio.repositories.fk_manager import PartitionForeignKeyManager
 from pg_partsmith.entities import (
+    DefaultBounds,
+    HashSubpartitionSpec,
+    ListBounds,
     PartitionGranularity,
     PartitionStrategy,
     PartitionType,
@@ -22,6 +25,26 @@ from pg_partsmith.exceptions import (
 from pg_partsmith.utils import orphan_table_comment, pg_sqlstate
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
+
+
+def _ddl_engine() -> tuple[MagicMock, AsyncMock]:
+    """An engine whose ``begin()`` yields a connection that records statements."""
+    engine = MagicMock()
+    conn = AsyncMock()
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    return engine, conn
+
+
+def _sqlstate_error(sqlstate: str) -> SQLAlchemyError:
+    """A driver error carrying a PostgreSQL SQLSTATE."""
+    orig = MagicMock()
+    orig.sqlstate = sqlstate
+    error = SQLAlchemyError("boom")
+    error.orig = orig  # type: ignore[attr-defined]
+    return error
 
 
 @pytest.fixture
@@ -1199,3 +1222,90 @@ async def test__repository__reconcile_default_rows__single_column_key__adds_no_n
     # Assert -- the leading column already carries its own NOT NULL implicitly
     # through the range test, so the statement stays what it always was.
     assert "IS NOT NULL" not in str(conn.execute.call_args_list[-1].args[0])
+
+
+# ── rendered DDL for keys and bounds ────────────────────────────────────────────
+
+
+async def test__repository__attach_composite_partition__pads_every_trailing_column_with_minvalue() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_composite_partition("events", "events__2026_w35", "2026-08-24", "2026-08-31", key_arity=3)
+
+    # Assert -- one MINVALUE per trailing column, on both ends. Getting the
+    # count wrong makes PostgreSQL reject the bound outright.
+    stmt = str(conn.execute.call_args.args[0])
+    assert "FROM ('2026-08-24', MINVALUE, MINVALUE)" in stmt
+    assert "TO ('2026-08-31', MINVALUE, MINVALUE)" in stmt
+
+
+async def test__repository__attach_composite_partition__single_column_key__pads_nothing() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_composite_partition("events", "events__2026_w35", "2026-08-24", "2026-08-31", key_arity=1)
+
+    # Assert
+    stmt = str(conn.execute.call_args.args[0])
+    assert "FROM ('2026-08-24') TO ('2026-08-31')" in stmt
+
+
+async def test__repository__attach_subpartition__list_bounds_with_null__renders_null_as_a_keyword() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_subpartition(
+        "events__2026_w35",
+        "events__2026_w35__unknown",
+        ListBounds(values=("eu",), includes_null=True),
+    )
+
+    # Assert -- quoting NULL would create a partition for the three-character
+    # string, which is a different partition.
+    assert "FOR VALUES IN ('eu', NULL)" in str(conn.execute.call_args.args[0])
+
+
+async def test__repository__attach_subpartition__default_bounds__renders_default() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_subpartition("events__2026_w35", "events__2026_w35__rest", DefaultBounds())
+
+    # Assert
+    assert str(conn.execute.call_args.args[0]).rstrip().endswith("DEFAULT")
+
+
+async def test__repository__create_subpartition_table__composite_spec__partitions_by_every_column() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=4)
+
+    # Act
+    await repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", spec)
+
+    # Assert -- key order is the spec's order, and both columns are quoted.
+    stmt = str(conn.execute.call_args.args[0])
+    assert 'PARTITION BY HASH ("tenant_id", "shard_id")' in stmt
+
+
+async def test__repository__create_subpartition_table__name_already_taken__raises_already_exists() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    # The async creator wraps the whole transaction in asyncio.timeout rather
+    # than issuing a SET LOCAL, so the create is the first statement it sends.
+    conn.execute.side_effect = [_sqlstate_error("42P07")]
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- the planner reads this as a lost race rather than a fault.
+    with pytest.raises(PartitionAlreadyExistsError):
+        await repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", None)

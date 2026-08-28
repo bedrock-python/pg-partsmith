@@ -5,6 +5,7 @@ import pytest
 from pydantic_settings import SettingsConfigDict
 
 from pg_partsmith.entities import (
+    HashSubpartitionSpec,
     PartitionGranularity,
     PartitionStrategy,
     PartitionType,
@@ -165,3 +166,55 @@ def test__settings__without_subpartition__config_stays_flat() -> None:
 
     # Act / Assert
     assert settings.to_config().subpartition is None
+
+
+# ── loading from the environment ────────────────────────────────────────────────
+
+
+def test__settings__from_environment__reads_every_field_including_the_new_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange — env loading is the whole reason this class exists, and a field
+    # that only works when passed as a kwarg is a field this class does not have.
+    class OutboxSettings(PartitionTableSettings):
+        model_config = SettingsConfigDict(env_prefix="OUTBOX_")
+
+    monkeypatch.setenv("OUTBOX_TABLE_NAME", "outbox")
+    monkeypatch.setenv("OUTBOX_PARTITION_TYPE", "range")
+    monkeypatch.setenv("OUTBOX_PARTITION_STRATEGY", "time_based")
+    monkeypatch.setenv("OUTBOX_PARTITION_COLUMN", "created_at")
+    monkeypatch.setenv("OUTBOX_TRAILING_PARTITION_COLUMNS", '["tenant_id"]')
+    monkeypatch.setenv("OUTBOX_GRANULARITY", "week")
+    monkeypatch.setenv("OUTBOX_SUBPARTITION", '{"strategy": "hash", "column": "shard_id", "modulus": 4}')
+
+    # Act
+    config = OutboxSettings().to_config()
+
+    # Assert
+    assert config.table_name == "outbox"
+    assert config.partition_columns == ("created_at", "tenant_id")
+    assert config.granularity is PartitionGranularity.WEEK
+    assert isinstance(config.subpartition, HashSubpartitionSpec)
+    assert config.subpartition.modulus == 4
+
+
+def test__settings__from_environment__root_layout__builds_a_static_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    class TenantSettings(PartitionTableSettings):
+        model_config = SettingsConfigDict(env_prefix="TENANT_")
+
+    monkeypatch.setenv("TENANT_TABLE_NAME", "tenants")
+    monkeypatch.setenv("TENANT_PARTITION_TYPE", "hash")
+    monkeypatch.setenv("TENANT_PARTITION_STRATEGY", "hash_based")
+    monkeypatch.setenv("TENANT_PARTITION_COLUMN", "organization_id")
+    monkeypatch.setenv("TENANT_ROOT_LAYOUT", '{"strategy": "hash", "column": "organization_id", "modulus": 16}')
+
+    # Act
+    config = TenantSettings().to_config()
+
+    # Assert — a static root has no periods, so this is the whole configuration.
+    assert config.is_time_based is False
+    assert config.root_layout is not None
+    assert config.root_layout.modulus == 16

@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.aio.services.subpartitions import PartitionSubpartitionService
 from pg_partsmith.entities import (
+    DefaultBounds,
     HashBounds,
     HashSubpartitionSpec,
     PartitionGranularity,
@@ -351,3 +352,70 @@ async def test__materialize__nested_action__creates_children_before_attaching_th
         f"attach {BRANCH}__h0__h0",
         f"attach {BRANCH}__h0",
     ]
+
+
+# ── Which branches a run touches, and what one failure costs ────────────────────
+
+
+async def test__reconcile__branch_named_in_exclude__is_left_alone(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- the branch this run is about to prune.
+    metadata.get_partition_tree = AsyncMock(return_value=_root_with(_branch_node(0)))
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.reconcile(_config(subpartition=_spec()), exclude={BRANCH})
+
+    # Assert -- repairing a branch about to be dropped is pure waste, and takes
+    # locks on it while it happens.
+    assert result.created_count == 0
+    repo.create_subpartition_table.assert_not_called()
+
+
+async def test__reconcile__detached_branch__is_left_alone(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    branch = _branch_node(0).model_copy(update={"is_attached": False})
+    metadata.get_partition_tree = AsyncMock(return_value=_root_with(branch))
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.reconcile(_config(subpartition=_spec()))
+
+    # Assert -- a detached branch routes no rows, so a gap in it rejects nothing.
+    assert result.created_count == 0
+    repo.create_subpartition_table.assert_not_called()
+
+
+async def test__reconcile__default_partition__is_left_alone(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    default = PartitionNode(name="public.events_default", parent_name="public.events", level=1, bounds=DefaultBounds())
+    metadata.get_partition_tree = AsyncMock(return_value=_root_with(default))
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.reconcile(_config(subpartition=_spec()))
+
+    # Assert -- it is a catch-all leaf by design; subpartitioning it would move
+    # where overflow rows land.
+    assert result.created_count == 0
+    repo.create_subpartition_table.assert_not_called()
+
+
+async def test__reconcile__one_branch_fails__the_others_are_still_converged(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- two branches, each missing remainder 1; the first one throws.
+    first = _branch_node(0)
+    second = _branch_node(0).model_copy(update={"name": "public.events__2026_w36"})
+    root = _root_with(first).model_copy(update={"children": (first, second)})
+    metadata.get_partition_tree = AsyncMock(return_value=root)
+    repo.create_subpartition_table = AsyncMock(side_effect=[SQLAlchemyError("disk full"), None])
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.reconcile(_config(subpartition=_spec()))
+
+    # Assert -- reconciliation runs before pruning, so letting one branch abort
+    # the run would also stop the table reclaiming disk, on every run forever.
+    assert result.created_count == 1
+    assert [f.reason for f in result.findings] == [TopologyReason.UNCONVERGEABLE]
+    assert result.findings[0].partition_name == BRANCH

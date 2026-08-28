@@ -160,3 +160,28 @@ def test__day_calculator__with_codec__boundaries_round_trip_through_periods() ->
     # Assert
     assert calculator.decode_boundary(lower) == datetime(2026, 8, 24, tzinfo=UTC)
     assert calculator.decode_boundary(upper) == datetime(2026, 8, 25, tzinfo=UTC)
+
+
+def test__uuid7_codec__instant_before_the_epoch__clamps_to_the_lowest_uuid() -> None:
+    # Arrange -- a UUIDv7 timestamp field is unsigned, so a pre-1970 instant has
+    # no representation at all.
+    codec = UUIDv7BoundaryCodec()
+
+    # Act
+    encoded = codec.min_uuid_for(datetime(1969, 7, 20, tzinfo=UTC))
+
+    # Assert -- clamping keeps the bound sortable and below every real row,
+    # where wrapping would place it above most of them.
+    assert encoded == codec.min_uuid_for(datetime(1970, 1, 1, tzinfo=UTC))
+
+
+def test__uuid7_codec__instant_past_the_representable_range__clamps_to_the_highest() -> None:
+    # Arrange
+    codec = UUIDv7BoundaryCodec()
+
+    # Act -- 48 unsigned milliseconds run out in the year 10889.
+    encoded = codec.min_uuid_for(datetime(9999, 12, 31, tzinfo=UTC))
+
+    # Assert
+    assert encoded == codec.min_uuid_for(datetime(9999, 12, 31, tzinfo=UTC))
+    assert str(encoded) > str(codec.min_uuid_for(datetime(2026, 8, 24, tzinfo=UTC)))

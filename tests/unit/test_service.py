@@ -27,6 +27,7 @@ from pg_partsmith.exceptions import (
     PartitionAttachedError,
 )
 from pg_partsmith.strategies import MonthPeriodCalculator
+from pg_partsmith.subpartition_plan import SubpartitionReconcileResult
 from pg_partsmith.utils import timezone_name
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────
@@ -2182,3 +2183,99 @@ async def test__validation_service__nested_config_on_a_flat_metadata_provider__r
     # Act / Assert
     with pytest.raises(InvalidPartitionConfigError, match="NestedPartitionMetadata"):
         await service.maintain_lifecycle(config)
+
+
+# ── Static roots and the reconcile entry point ──────────────────────────────────
+
+
+def _static_config(**overrides: object) -> TablePartitionConfig:
+    """A HASH_BASED root: partitions all the way down, no periods anywhere."""
+    return TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.HASH,
+        partition_strategy=PartitionStrategy.HASH_BASED,
+        partition_column="organization_id",
+        root_layout=HashSubpartitionSpec(column="organization_id", modulus=4),
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+async def test__service__reconcile_subpartitions__hands_the_exclusions_through(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks, mock_calculator)
+    inner = AsyncMock(return_value=SubpartitionReconcileResult(created_count=3))
+    service._subpartition_service.reconcile = inner  # type: ignore[method-assign]
+
+    # Act -- the public entry point takes no lock of its own, so a caller can
+    # repair a table while another process holds the maintenance lock.
+    result = await service.reconcile_subpartitions(config, exclude={"public.events__2024_01"})
+
+    # Assert
+    assert result.created_count == 3
+    inner.assert_called_once_with(config, exclude={"public.events__2024_01"})
+
+
+async def test__service__static_root__skip_create__does_nothing_at_all(
+    mock_repo: MagicMock, mock_metadata: MagicMock, mock_locks: MagicMock
+) -> None:
+    # Arrange -- a static root has no detach or drop stage, so create is the
+    # only stage there is, and skipping it must skip everything.
+    mock_metadata.get_partition_type.return_value = PartitionType.HASH
+    mock_metadata.get_partition_column.return_value = "organization_id"
+    mock_metadata.get_unique_constraint_columns = AsyncMock(return_value=())
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks)
+    inner = AsyncMock()
+    service._subpartition_service.reconcile = inner  # type: ignore[method-assign]
+
+    # Act
+    result = await service.maintain_lifecycle(_static_config(), skip_create=True)
+
+    # Assert
+    assert result.success
+    assert result.created_count == 0
+    inner.assert_not_called()
+
+
+async def test__service__static_root__reconcile_raises__continue_on_error_records_an_issue(
+    mock_repo: MagicMock, mock_metadata: MagicMock, mock_locks: MagicMock
+) -> None:
+    # Arrange
+    mock_metadata.get_partition_type.return_value = PartitionType.HASH
+    mock_metadata.get_partition_column.return_value = "organization_id"
+    mock_metadata.get_unique_constraint_columns = AsyncMock(return_value=())
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks)
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SQLAlchemyError("disk full")
+    )
+
+    # Act
+    result = await service.maintain_lifecycle(_static_config(), continue_on_error=True)
+
+    # Assert -- the flag means the same thing here as it does for a time-based
+    # table: report the failure, do not raise it. `success` stays True because
+    # it reports a fatal error, and a recorded issue is the opposite of one.
+    assert result.success
+    assert [i.step for i in result.issues] == [MaintenanceIssueStep.RECONCILE]
+
+
+async def test__service__static_root__reconcile_raises__without_the_flag_it_propagates(
+    mock_repo: MagicMock, mock_metadata: MagicMock, mock_locks: MagicMock
+) -> None:
+    # Arrange
+    mock_metadata.get_partition_type.return_value = PartitionType.HASH
+    mock_metadata.get_partition_column.return_value = "organization_id"
+    mock_metadata.get_unique_constraint_columns = AsyncMock(return_value=())
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks)
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SQLAlchemyError("disk full")
+    )
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError):
+        await service.maintain_lifecycle(_static_config())
