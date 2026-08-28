@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pg_partsmith.aio.protocols import NestedPartitionMetadata
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.utils import qualify
 
 if TYPE_CHECKING:
     from pg_partsmith.aio.protocols import PartitionMetadataProvider
-    from pg_partsmith.entities import TablePartitionConfig
+    from pg_partsmith.entities import SubpartitionSpec, TablePartitionConfig
 
 
 class PartitionValidationService:
@@ -58,3 +59,53 @@ class PartitionValidationService:
                 f"config={config.partition_column!r} actual={actual_column!r}"
             )
             raise InvalidPartitionConfigError(msg)
+
+        await self._validate_subpartitioning(config, qualified_parent)
+
+    async def _validate_subpartitioning(self, config: TablePartitionConfig, qualified_parent: str) -> None:
+        """Refuse a subpartitioning the database could not accept.
+
+        PostgreSQL requires every UNIQUE / PRIMARY KEY constraint on a
+        partitioned table to contain all of its partition-key columns. A hash
+        column missing from one of them makes the very first branch fail with
+        ``unique constraint on partitioned table must include all partitioning
+        columns`` — mid-run, after other tables were already changed. Catching
+        it here turns that into a configuration error with a fix in it.
+        """
+        if config.subpartition is None:
+            return
+
+        metadata = self._metadata
+        if not isinstance(metadata, NestedPartitionMetadata):
+            msg = (
+                f"Metadata provider {type(metadata).__name__} cannot introspect partition trees, "
+                "which subpartitioning requires; it must implement NestedPartitionMetadata."
+            )
+            raise InvalidPartitionConfigError(msg)
+
+        constraints = await metadata.get_unique_constraint_columns(qualified_parent)
+        if not constraints:
+            return
+
+        for spec in config.subpartition.walk():
+            _require_column_in_constraints(spec, constraints, qualified_parent)
+
+
+def _require_column_in_constraints(
+    spec: SubpartitionSpec,
+    constraints: tuple[tuple[str, ...], ...],
+    qualified_parent: str,
+) -> None:
+    """Raise when a subpartition column is missing from any unique constraint."""
+    offenders = [columns for columns in constraints if spec.column not in columns]
+    if not offenders:
+        return
+
+    missing = ", ".join("(" + ", ".join(columns) + ")" for columns in offenders)
+    msg = (
+        f"Subpartition column {spec.column!r} is missing from unique constraint(s) {missing} "
+        f"on table {qualified_parent!r}. PostgreSQL requires every UNIQUE/PRIMARY KEY on a "
+        f"partitioned table to include all partition key columns, so add {spec.column!r} to "
+        "them before enabling this subpartitioning."
+    )
+    raise InvalidPartitionConfigError(msg)

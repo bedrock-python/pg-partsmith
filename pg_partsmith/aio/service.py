@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from pg_partsmith.aio.protocols import LockManager, PartitionMetadataProvider, PartitionRepository
+from pg_partsmith.aio.protocols import (
+    LockManager,
+    NestedPartitionMetadata,
+    PartitionMetadataProvider,
+    PartitionRepository,
+    SubpartitionRepository,
+)
 from pg_partsmith.entities import (
     MaintenanceIssue,
     MaintenanceIssueStep,
@@ -15,15 +21,19 @@ from pg_partsmith.entities import (
     Period,
     TablePartitionConfig,
 )
+from pg_partsmith.subpartition_plan import SubpartitionReconcileResult, to_maintenance_issue
 from pg_partsmith.utils import describe_exception, qualify, validate_timezone_alignment
 
 from .services.creation import PartitionCreationService
 from .services.deletion import PartitionDeletionService
 from .services.detachment import PartitionDetachmentService
 from .services.pruning import PartitionPruningService
+from .services.subpartitions import PartitionSubpartitionService
 from .services.validation import PartitionValidationService
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from pg_partsmith.aio.hooks import PartitionLifecycleHooks
     from pg_partsmith.protocols import PeriodCalculator
 
@@ -61,7 +71,17 @@ class PartitionLifecycleService:
 
         # Component services
         self._validation_service = PartitionValidationService(metadata)
-        self._creation_service = PartitionCreationService(repo, metadata, period_calculator, hooks)
+        # Subpartitioning is optional, so the collaborators are typed loosely
+        # here and checked against the nested protocols only when a config
+        # actually asks for it — a flat setup with a custom repository or
+        # metadata provider keeps working unchanged.
+        self._subpartition_service = PartitionSubpartitionService(
+            cast("SubpartitionRepository", repo),
+            cast("NestedPartitionMetadata", metadata),
+        )
+        self._creation_service = PartitionCreationService(
+            repo, metadata, period_calculator, hooks, subpartitions=self._subpartition_service
+        )
         self._pruning_service = PartitionPruningService(metadata, period_calculator)
         self._detachment_service = PartitionDetachmentService(repo, hooks)
         self._deletion_service = PartitionDeletionService(repo, hooks)
@@ -153,6 +173,28 @@ class PartitionLifecycleService:
         """
         return await self._deletion_service.drop_detached_partitions(table_name, partition_names)
 
+    async def reconcile_subpartitions(
+        self,
+        config: TablePartitionConfig,
+        *,
+        exclude: Collection[str] = (),
+    ) -> SubpartitionReconcileResult:
+        """Converge the subtree of every attached partition towards the config.
+
+        Idempotent and safe to call on its own: it creates only the buckets a
+        branch is genuinely missing, and reports rather than "repairs" any
+        branch whose shape it cannot converge without risk.
+
+        Args:
+            config: Table partitioning configuration. Without a subpartition
+                spec this is a no-op returning an empty result.
+            exclude: Schema-qualified partition names to skip.
+
+        Returns:
+            The subpartitions created and the divergences left alone.
+        """
+        return await self._subpartition_service.reconcile(config, exclude=exclude)
+
     async def maintain_lifecycle(
         self,
         config: TablePartitionConfig,
@@ -179,6 +221,12 @@ class PartitionLifecycleService:
                 are collected into ``MaintenanceResult.issues``. Validation and
                 lock failures are always fatal.
 
+        Subpartitioned configs additionally reconcile each branch's bucket set
+        between create and detach; branches whose shape cannot be converged
+        safely are reported through ``MaintenanceResult.issues`` regardless of
+        ``continue_on_error``, since leaving them silent would hide writes that
+        PostgreSQL is rejecting.
+
         Returns:
             ``MaintenanceResult`` with the per-step counters; ``error`` is unset
             because exceptions propagate from this method (the maintainer is
@@ -191,6 +239,7 @@ class PartitionLifecycleService:
         qualified_parent = qualify(config.db_schema, config.table_name)
 
         created_count = 0
+        repaired_count = 0
         detached_count = 0
         dropped_count = 0
         issues: list[MaintenanceIssue] = []
@@ -227,8 +276,29 @@ class PartitionLifecycleService:
 
             partitions_to_prune = await self._pruning_service.identify_partitions_to_prune(config, all_partitions)
 
+            # Reconcile before pruning so a branch that is on its way out is not
+            # repaired just to be dropped moments later.
+            if config.subpartition is not None:
+                try:
+                    reconciled = await self._subpartition_service.reconcile(
+                        config, exclude={p.name for p in partitions_to_prune}
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    if not continue_on_error:
+                        raise
+                    _record_issue(MaintenanceIssueStep.RECONCILE, e)
+                else:
+                    repaired_count = reconciled.created_count
+                    issues.extend(to_maintenance_issue(f) for f in reconciled.findings if f.is_actionable)
+
             if not partitions_to_prune:
-                return MaintenanceResult(created_count=created_count, issues=tuple(issues))
+                return MaintenanceResult(
+                    created_count=created_count,
+                    repaired_count=repaired_count,
+                    issues=tuple(issues),
+                )
 
             attached_to_detach = [p for p in partitions_to_prune if p.is_attached]
             orphan_names = [p.name for p in partitions_to_prune if not p.is_attached]
@@ -267,6 +337,7 @@ class PartitionLifecycleService:
 
         return MaintenanceResult(
             created_count=created_count,
+            repaired_count=repaired_count,
             detached_count=detached_count,
             dropped_count=dropped_count,
             issues=tuple(issues),

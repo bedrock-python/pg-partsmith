@@ -33,7 +33,13 @@ except ImportError as _err:
 from pydantic import Field
 
 from .constants import DEFAULT_CREATE_AHEAD_COUNT, DEFAULT_RETENTION_COUNT
-from .entities import PartitionGranularity, PartitionStrategy, PartitionType, TablePartitionConfig
+from .entities import (
+    PartitionGranularity,
+    PartitionStrategy,
+    PartitionType,
+    SubpartitionSpec,
+    TablePartitionConfig,
+)
 from .strategies import BasePeriodCalculator, get_period_calculator
 
 
@@ -85,6 +91,13 @@ class PartitionTableSettings(BaseSettings):
         default=True,
         description="Attach new partitions immediately after creation",
     )
+    subpartition: SubpartitionSpec | None = Field(
+        default=None,
+        description=(
+            "Subpartitioning inside each time partition, as JSON: "
+            '{"strategy": "hash", "column": "tenant_id", "modulus": 4}'
+        ),
+    )
 
     def to_config(self) -> TablePartitionConfig:
         """Build a :class:`~pg_partsmith.TablePartitionConfig` from these settings."""
@@ -98,6 +111,7 @@ class PartitionTableSettings(BaseSettings):
             create_ahead_count=self.create_ahead_count,
             retention_count=self.retention_count,
             auto_attach_after_create=self.auto_attach_after_create,
+            subpartition=self.subpartition,
         )
 
     def get_period_calculator(self, tz: tzinfo = UTC) -> BasePeriodCalculator:

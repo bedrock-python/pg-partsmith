@@ -38,6 +38,41 @@ class PartitionDetachInProgressError(PartitionError):
         self.partition_name = partition_name
 
 
+class PartitionTopologyError(PartitionError):
+    """Raised when an existing partition tree diverges from the configured one.
+
+    Carries the planner's finding verbatim so callers can branch on
+    :attr:`reason` instead of matching on message text. Reconciliation records
+    these on ``MaintenanceResult.issues`` rather than raising, because one
+    historical branch with an unexpected shape must not abort maintenance for
+    every other partition.
+    """
+
+    def __init__(self, partition_name: str, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.partition_name = partition_name
+        self.reason = reason
+        self.detail = detail
+
+
+class SubpartitioningNotSupportedError(PartitionError):
+    """Raised when a nested config is wired to components that cannot serve it.
+
+    Custom repositories and metadata providers written against the flat
+    protocols keep working for flat configs; they are only refused when a
+    config actually asks for subpartitioning.
+    """
+
+    def __init__(self, component: str, expected: str) -> None:
+        msg = (
+            f"{component} does not support subpartitioning: it must implement {expected}. "
+            "Use the bundled PostgreSQL implementation, or extend yours with the missing methods."
+        )
+        super().__init__(msg)
+        self.component = component
+        self.expected = expected
+
+
 class InvalidPartitionConfigError(PartitionError):
     """Raised when partition configuration is invalid."""
 

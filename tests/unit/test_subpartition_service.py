@@ -1,0 +1,296 @@
+"""Behaviour of the reconciliation service around races and unsupported wirings."""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from sqlalchemy.exc import SQLAlchemyError
+
+from pg_partsmith.aio.services.subpartitions import PartitionSubpartitionService
+from pg_partsmith.entities import (
+    HashBounds,
+    HashSubpartitionSpec,
+    PartitionGranularity,
+    PartitionNode,
+    PartitionStrategy,
+    PartitionType,
+    RangeBounds,
+    TablePartitionConfig,
+)
+from pg_partsmith.exceptions import PartitionAlreadyExistsError, SubpartitioningNotSupportedError
+from pg_partsmith.subpartition_plan import SubpartitionAction
+
+BRANCH = "public.events__2026_w35"
+
+
+def _config(*, subpartition: HashSubpartitionSpec | None = None) -> TablePartitionConfig:
+    return TablePartitionConfig(
+        table_name="events",
+        schema="public",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.WEEK,
+        subpartition=subpartition,
+    )
+
+
+def _spec(modulus: int = 2) -> HashSubpartitionSpec:
+    return HashSubpartitionSpec(column="tenant_id", modulus=modulus)
+
+
+@pytest.fixture
+def repo() -> MagicMock:
+    repo = MagicMock()
+    repo.create_branch = AsyncMock()
+    repo.create_subpartition_table = AsyncMock(return_value=None)
+    repo.attach_subpartition = AsyncMock(return_value=None)
+    return repo
+
+
+@pytest.fixture
+def metadata() -> MagicMock:
+    metadata = MagicMock()
+    metadata.get_partition_tree = AsyncMock(return_value=None)
+    metadata.get_unique_constraint_columns = AsyncMock(return_value=())
+    metadata.is_partition_attached = AsyncMock(return_value=False)
+    return metadata
+
+
+def _branch_node(*remainders: int, modulus: int = 2) -> PartitionNode:
+    return PartitionNode(
+        name=BRANCH,
+        parent_name="public.events",
+        level=1,
+        bounds=RangeBounds(from_value="2026-08-24", to_value="2026-08-31"),
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        children=tuple(
+            PartitionNode(name=f"{BRANCH}__h{r}", bounds=HashBounds(modulus=modulus, remainder=r)) for r in remainders
+        ),
+    )
+
+
+def _root_with(branch: PartitionNode) -> PartitionNode:
+    return PartitionNode(
+        name="public.events",
+        partition_type=PartitionType.RANGE,
+        partition_columns=("created_at",),
+        children=(branch,),
+    )
+
+
+# ── Wiring ──────────────────────────────────────────────────────────────────────
+
+
+async def test__reconcile__config_without_a_spec__is_a_no_op(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.reconcile(_config())
+
+    # Assert
+    assert result.created_count == 0
+    assert result.findings == ()
+    metadata.get_partition_tree.assert_not_awaited()
+
+
+async def test__reconcile__repository_without_subpartition_ddl__refused_with_an_explanation(
+    metadata: MagicMock,
+) -> None:
+    # Arrange: a repository written against the flat protocol only.
+    flat_repo = MagicMock(spec=["create_partition", "attach_partition"])
+    service = PartitionSubpartitionService(flat_repo, metadata)
+
+    # Act / Assert
+    with pytest.raises(SubpartitioningNotSupportedError, match="SubpartitionRepository"):
+        await service.reconcile(_config(subpartition=_spec()))
+
+
+async def test__reconcile__metadata_without_tree_introspection__refused_with_an_explanation(
+    repo: MagicMock,
+) -> None:
+    # Arrange
+    flat_metadata = MagicMock(spec=["list_partitions", "get_partition_type"])
+    service = PartitionSubpartitionService(repo, flat_metadata)
+
+    # Act / Assert
+    with pytest.raises(SubpartitioningNotSupportedError, match="NestedPartitionMetadata"):
+        await service.reconcile(_config(subpartition=_spec()))
+
+
+async def test__build_new_branch__config_without_a_spec__rejected(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="requires a config with a subpartition spec"):
+        await service.build_new_branch(_config(), BRANCH)
+
+
+# ── Convergence ─────────────────────────────────────────────────────────────────
+
+
+async def test__reconcile__root_not_partitioned__returns_an_empty_result(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    metadata.get_partition_tree = AsyncMock(return_value=None)
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.reconcile(_config(subpartition=_spec()))
+
+    # Assert
+    assert result.created_count == 0
+    repo.create_subpartition_table.assert_not_awaited()
+
+
+async def test__reconcile__branch_missing_a_bucket__creates_and_attaches_only_that_one(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_partition_tree = AsyncMock(return_value=_root_with(_branch_node(0)))
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.reconcile(_config(subpartition=_spec(modulus=2)))
+
+    # Assert
+    assert result.created_count == 1
+    repo.create_subpartition_table.assert_awaited_once_with(BRANCH, f"{BRANCH}__h1", None)
+    repo.attach_subpartition.assert_awaited_once_with(BRANCH, f"{BRANCH}__h1", HashBounds(modulus=2, remainder=1))
+
+
+async def test__reconcile__excluded_branch__is_skipped(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    metadata.get_partition_tree = AsyncMock(return_value=_root_with(_branch_node(0)))
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act: a branch about to be pruned is not worth repairing.
+    result = await service.reconcile(_config(subpartition=_spec()), exclude={BRANCH})
+
+    # Assert
+    assert result.created_count == 0
+    repo.create_subpartition_table.assert_not_awaited()
+
+
+async def test__converge_branch__branch_does_not_exist__returns_an_empty_result(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_partition_tree = AsyncMock(return_value=None)
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    result = await service.converge_branch(_config(subpartition=_spec()), BRANCH)
+
+    # Assert
+    assert result.created_count == 0
+
+
+# ── Interrupted runs and races ──────────────────────────────────────────────────
+
+
+async def test__materialize__table_left_by_an_interrupted_run__attached_rather_than_recreated(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    repo.create_subpartition_table = AsyncMock(side_effect=PartitionAlreadyExistsError(f"{BRANCH}__h0"))
+    service = PartitionSubpartitionService(repo, metadata)
+    action = SubpartitionAction(
+        parent_name=BRANCH, child_name=f"{BRANCH}__h0", bounds=HashBounds(modulus=2, remainder=0)
+    )
+
+    # Act
+    created = await service.materialize((action,))
+
+    # Assert: the half-finished node is completed, not abandoned.
+    assert created == 1
+    repo.attach_subpartition.assert_awaited_once()
+
+
+async def test__materialize__concurrent_worker_won_the_attach__tolerated_without_double_counting(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    conflict = SQLAlchemyError("duplicate")
+    conflict.orig = MagicMock(sqlstate="42P07")  # type: ignore[attr-defined]
+    repo.attach_subpartition = AsyncMock(side_effect=conflict)
+    metadata.is_partition_attached = AsyncMock(return_value=True)
+    service = PartitionSubpartitionService(repo, metadata)
+    action = SubpartitionAction(
+        parent_name=BRANCH, child_name=f"{BRANCH}__h0", bounds=HashBounds(modulus=2, remainder=0)
+    )
+
+    # Act
+    created = await service.materialize((action,))
+
+    # Assert
+    assert created == 0
+
+
+async def test__materialize__conflict_sqlstate_but_not_actually_attached__re_raised(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange: 42809 also fires for object mismatches unrelated to a lost race.
+    conflict = SQLAlchemyError("wrong object type")
+    conflict.orig = MagicMock(sqlstate="42809")  # type: ignore[attr-defined]
+    repo.attach_subpartition = AsyncMock(side_effect=conflict)
+    metadata.is_partition_attached = AsyncMock(return_value=False)
+    service = PartitionSubpartitionService(repo, metadata)
+    action = SubpartitionAction(
+        parent_name=BRANCH, child_name=f"{BRANCH}__h0", bounds=HashBounds(modulus=2, remainder=0)
+    )
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError):
+        await service.materialize((action,))
+
+
+async def test__materialize__unrelated_database_error__propagates(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    failure = SQLAlchemyError("disk full")
+    failure.orig = MagicMock(sqlstate="53100")  # type: ignore[attr-defined]
+    repo.attach_subpartition = AsyncMock(side_effect=failure)
+    service = PartitionSubpartitionService(repo, metadata)
+    action = SubpartitionAction(
+        parent_name=BRANCH, child_name=f"{BRANCH}__h0", bounds=HashBounds(modulus=2, remainder=0)
+    )
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="disk full"):
+        await service.materialize((action,))
+
+
+async def test__materialize__nested_action__creates_children_before_attaching_the_parent(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    order: list[str] = []
+    repo.create_subpartition_table = AsyncMock(side_effect=lambda _p, c, _s: order.append(f"create {c}"))
+    repo.attach_subpartition = AsyncMock(side_effect=lambda _p, c, _b: order.append(f"attach {c}"))
+    service = PartitionSubpartitionService(repo, metadata)
+    action = SubpartitionAction(
+        parent_name=BRANCH,
+        child_name=f"{BRANCH}__h0",
+        bounds=HashBounds(modulus=1, remainder=0),
+        subpartition=_spec(modulus=1),
+        children=(
+            SubpartitionAction(
+                parent_name=f"{BRANCH}__h0",
+                child_name=f"{BRANCH}__h0__h0",
+                bounds=HashBounds(modulus=1, remainder=0),
+            ),
+        ),
+    )
+
+    # Act
+    created = await service.materialize((action,))
+
+    # Assert: the inner node is in place before the outer one becomes reachable.
+    assert created == 2
+    assert order == [
+        f"create {BRANCH}__h0",
+        f"create {BRANCH}__h0__h0",
+        f"attach {BRANCH}__h0__h0",
+        f"attach {BRANCH}__h0",
+    ]

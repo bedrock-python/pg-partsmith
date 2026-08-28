@@ -5,13 +5,23 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
-from pg_partsmith.entities import MaintenanceResult, PartitionInfo, PartitionType, TablePartitionConfig
+from pg_partsmith.entities import (
+    HashBounds,
+    MaintenanceResult,
+    PartitionInfo,
+    PartitionNode,
+    PartitionType,
+    SubpartitionSpec,
+    TablePartitionConfig,
+)
 
 __all__ = [
     "LockManager",
+    "NestedPartitionMetadata",
     "PartitionLifecycle",
     "PartitionMetadataProvider",
     "PartitionRepository",
+    "SubpartitionRepository",
 ]
 
 
@@ -270,5 +280,107 @@ class LockManager(Protocol):
 
         Returns:
             True if table is locked.
+        """
+        ...
+
+
+@runtime_checkable
+class SubpartitionRepository(Protocol):
+    """DDL for partitions that are themselves partitioned tables.
+
+    Kept separate from :class:`PartitionRepository` on purpose: a repository
+    written against the flat protocol keeps satisfying it, and is only required
+    to grow these three methods once a config actually asks for subpartitioning.
+    """
+
+    def create_branch(
+        self,
+        config: TablePartitionConfig,
+        branch_name: str,
+        from_value: str,
+        to_value: str,
+        spec: SubpartitionSpec,
+    ) -> PartitionInfo:
+        """Create a detached time partition that is itself partitioned.
+
+        Args:
+            config: Table partition configuration.
+            branch_name: Name for the new branch table.
+            from_value: Start boundary value.
+            to_value: End boundary value.
+            spec: Subpartitioning the branch applies to its own children.
+
+        Returns:
+            Info about the created (still detached) branch.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
+        ...
+
+    def create_subpartition_table(self, parent_name: str, child_name: str, spec: SubpartitionSpec | None) -> None:
+        """Create a detached table shaped like ``parent_name``.
+
+        Args:
+            parent_name: Relation the table will later be attached to.
+            child_name: Name for the new table.
+            spec: Subpartitioning the table applies to its own children, or None.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
+        ...
+
+    def attach_subpartition(self, parent_name: str, child_name: str, bounds: HashBounds) -> None:
+        """Attach a hash bucket to its parent.
+
+        Args:
+            parent_name: Partitioned relation to attach to.
+            child_name: Table to attach.
+            bounds: Modulus and remainder the bucket owns.
+        """
+        ...
+
+
+@runtime_checkable
+class NestedPartitionMetadata(Protocol):
+    """Structural introspection a nested configuration needs.
+
+    Also separate from :class:`PartitionMetadataProvider` so flat setups keep
+    working with providers that predate subpartitioning.
+    """
+
+    def get_partition_tree(self, table_name: str) -> PartitionNode | None:
+        """Return the whole partition tree rooted at ``table_name``.
+
+        Args:
+            table_name: Root of the tree, schema-qualified.
+
+        Returns:
+            The root node with its descendants, or None when the relation is
+            neither partitioned nor a partition.
+        """
+        ...
+
+    def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
+        """Return the column tuples of every UNIQUE / PRIMARY KEY constraint.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            One tuple of column names per constraint.
+        """
+        ...
+
+    def is_partition_attached(self, table_name: str, partition_name: str) -> bool:
+        """Check if a partition is currently attached to its parent table.
+
+        Args:
+            table_name: Parent table name.
+            partition_name: Partition table name.
+
+        Returns:
+            True if the partition is attached via pg_inherits.
         """
         ...

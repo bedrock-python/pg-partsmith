@@ -8,9 +8,14 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.aio.protocols import SubpartitionRepository
 from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, DEFAULT_CONFLICT_MAX_RETRIES, MAX_IDENTIFIER_LENGTH
 from pg_partsmith.entities import PartitionInfo, Period
-from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionAlreadyExistsError
+from pg_partsmith.exceptions import (
+    InvalidPartitionConfigError,
+    PartitionAlreadyExistsError,
+    SubpartitioningNotSupportedError,
+)
 from pg_partsmith.utils import is_default_partition_conflict, pg_sqlstate, qualify, split_qualified_name
 
 from .base import BasePartitionService
@@ -18,6 +23,7 @@ from .base import BasePartitionService
 if TYPE_CHECKING:
     from pg_partsmith.aio.hooks import PartitionLifecycleHooks
     from pg_partsmith.aio.protocols import PartitionMetadataProvider, PartitionRepository
+    from pg_partsmith.aio.services.subpartitions import PartitionSubpartitionService
     from pg_partsmith.entities import TablePartitionConfig
     from pg_partsmith.protocols import PeriodCalculator
 
@@ -33,11 +39,13 @@ class PartitionCreationService(BasePartitionService):
         metadata: PartitionMetadataProvider,
         calculator: PeriodCalculator[Period],
         hooks: list[PartitionLifecycleHooks] | None = None,
+        subpartitions: PartitionSubpartitionService | None = None,
     ) -> None:
         super().__init__(hooks=hooks)
         self._repo = repo
         self._metadata = metadata
         self._calculator = calculator
+        self._subpartitions = subpartitions
 
     async def create_future_partitions(
         self,
@@ -77,6 +85,10 @@ class PartitionCreationService(BasePartitionService):
         insert (e.g. an hourly outbox buffer). Runs the same DEFAULT
         reconciliation and attach-race handling as the create-ahead path.
 
+        For a subpartitioned config this also completes the branch's bucket set,
+        so a writer that gets a successful return can rely on every row of that
+        period having somewhere to land.
+
         Returns:
             The created partition, or None when it already existed (an existing
             detached partition is re-attached when ``auto_attach_after_create``).
@@ -84,7 +96,14 @@ class PartitionCreationService(BasePartitionService):
         qualified_parent = qualify(config.db_schema, config.table_name)
         existing_partitions = await self._metadata.list_partitions(qualified_parent)
         existing = self._map_partitions_to_periods(existing_partitions).get(period)
-        return await self._ensure_partition_for_period(config, period, existing)
+        created = await self._ensure_partition_for_period(config, period, existing)
+
+        if created is None and existing is not None and config.subpartition is not None:
+            # The branch was already there; a writer calling this needs its
+            # buckets complete, not merely the branch present.
+            await self._converge_existing_branch(config, existing.name)
+
+        return created
 
     def _map_partitions_to_periods(self, partitions: list[PartitionInfo]) -> dict[Period, PartitionInfo]:
         """Map partitions to periods, handling ambiguities."""
@@ -331,19 +350,64 @@ class PartitionCreationService(BasePartitionService):
     async def _create_and_attach_partition(
         self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
     ) -> PartitionInfo | None:
-        """Create partition and optionally attach it to parent."""
+        """Create the partition (or the whole branch) and attach it to the parent.
+
+        With a subpartition spec the partition is a branch: it is created
+        detached, filled with its buckets, and attached last, so the root never
+        sees a branch that cannot route part of its keyspace.
+        """
         try:
-            partition_info = await self._repo.create_partition(config, partition_name, from_value, to_value)
+            partition_info = await self._create_partition_relation(config, partition_name, from_value, to_value)
         except PartitionAlreadyExistsError:
+            # The relation exists but list_partitions did not report it, so it
+            # is not attached: almost always a previous run interrupted between
+            # creating a branch and attaching it. Finish that work rather than
+            # leaving an invisible table behind forever.
+            await self._converge_existing_branch(config, partition_name)
             if config.auto_attach_after_create:
                 await self._attach_tolerating_lost_race(config, partition_name, from_value, to_value)
             return None
+
+        if config.subpartition is not None:
+            await self._subpartition_service().build_new_branch(config, partition_name)
 
         if config.auto_attach_after_create:
             await self._attach_tolerating_lost_race(config, partition_name, from_value, to_value)
             partition_info = partition_info.model_copy(update={"is_attached": True})
 
         return partition_info
+
+    async def _create_partition_relation(
+        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
+    ) -> PartitionInfo:
+        """Create the detached relation backing one period."""
+        if config.subpartition is None:
+            return await self._repo.create_partition(config, partition_name, from_value, to_value)
+
+        self._subpartition_service()
+        repo = self._repo
+        if not isinstance(repo, SubpartitionRepository):
+            raise SubpartitioningNotSupportedError(f"Repository {type(repo).__name__}", "SubpartitionRepository")
+        return await repo.create_branch(config, partition_name, from_value, to_value, config.subpartition)
+
+    async def _converge_existing_branch(self, config: TablePartitionConfig, partition_name: str) -> None:
+        """Complete the subtree of a branch left half-built by an earlier run."""
+        if config.subpartition is None:
+            return
+        result = await self._subpartition_service().converge_branch(config, partition_name)
+        if result.created_count:
+            logger.info(
+                "Completed the subtree of a partition left behind by an earlier run",
+                extra={"partition_name": partition_name, "subpartition_count": result.created_count},
+            )
+
+    def _subpartition_service(self) -> PartitionSubpartitionService:
+        """Return the wired subpartition service, or explain that there is none."""
+        if self._subpartitions is None:
+            raise SubpartitioningNotSupportedError(
+                f"Creation service {type(self).__name__}", "a PartitionSubpartitionService collaborator"
+            )
+        return self._subpartitions
 
     async def _attach_tolerating_lost_race(
         self,

@@ -6,9 +6,18 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
-from pg_partsmith.catalog_queries import PARTITION_IS_ATTACHED_SQL, RELATION_EXISTS_SQL
+from pg_partsmith.catalog_queries import (
+    INSTANT_HAS_PASSED_SQL,
+    PARTITION_CLOSED_SQL,
+    PARTITION_IS_ATTACHED_SQL,
+    PARTITION_TREE_SQL,
+    PARTITION_UPPER_BOUND_SQL,
+    RELATION_EXISTS_SQL,
+    UNIQUE_CONSTRAINT_COLUMNS_SQL,
+)
 from pg_partsmith.entities import PartitionInfo, PartitionType
-from pg_partsmith.partition_bounds import is_addressable, parse_range_boundaries
+from pg_partsmith.partition_bounds import is_addressable, parse_partition_bounds, parse_range_boundaries
+from pg_partsmith.topology import PartitionNode, PartitionTreeRow, build_partition_tree
 from pg_partsmith.utils import (
     coerce_str,
     orphan_comment_prefix,
@@ -19,6 +28,8 @@ from pg_partsmith.utils import (
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
+
+    from pg_partsmith.boundaries import RangeBoundaryCodec
 
 
 class PostgresMetadataProvider:
@@ -31,7 +42,13 @@ class PostgresMetadataProvider:
     is safe to call outside any existing transaction.
     """
 
-    def __init__(self, engine: Engine, *, marker_prefix: str | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        marker_prefix: str | None = None,
+        boundary_codec: RangeBoundaryCodec | None = None,
+    ) -> None:
         """Initialize provider.
 
         Args:
@@ -39,9 +56,14 @@ class PostgresMetadataProvider:
             marker_prefix: Optional COMMENT marker prefix for orphaned partitions.
                 When None, the library default prefix is used. Pass the same
                 value to both repository and metadata provider if you override it.
+            boundary_codec: Codec used to read boundary literals back into
+                instants. Required only when the partition key is an encoded
+                identifier rather than a timestamp; pass the same codec the
+                period calculator was built with.
         """
         self._engine = engine
         self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
+        self._boundary_codec = boundary_codec
 
     def get_partition_type(self, table_name: str) -> PartitionType | None:
         """Get partition type for a table."""
@@ -140,10 +162,12 @@ class PostgresMetadataProvider:
                         ns.nspname AS partition_schema,
                         child.relname AS partition_name,
                         pg_get_expr(child.relpartbound, child.oid) AS boundaries,
-                        child.relispartition AS is_attached
+                        child.relispartition AS is_attached,
+                        child_pt.partstrat AS subpartstrat
                     FROM pg_inherits inh
                     JOIN pg_class child ON inh.inhrelid = child.oid
                     JOIN pg_namespace ns ON child.relnamespace = ns.oid
+                    LEFT JOIN pg_partitioned_table child_pt ON child_pt.partrelid = child.oid
                     WHERE inh.inhparent = to_regclass(:table_name)
                     ORDER BY ns.nspname, child.relname
                     """
@@ -202,8 +226,10 @@ class PostgresMetadataProvider:
                     from_value=from_val,
                     to_value=to_val,
                     boundaries_expr=boundaries_str if boundaries_str else None,
+                    bounds=parse_partition_bounds(boundaries_str),
                     is_attached=row.is_attached,
                     is_default=is_default,
+                    subpartition_type=PartitionType.from_partstrat(coerce_str(row.subpartstrat, encoding="ascii")),
                     parent_table=table_name,
                 )
             )
@@ -314,33 +340,55 @@ class PostgresMetadataProvider:
             settle_seconds: Extra buffer after the upper bound for late writers
                 still holding open transactions.
 
+        Works for a subpartitioned branch exactly as for a plain leaf: what is
+        read is the branch's own RANGE bound in the root table, and its whole
+        subtree closes with it.
+
         Returns:
             True when ``now() >= upper_bound + settle_seconds``. False for the
             DEFAULT partition, non-RANGE partitions, unbounded upper bounds
-            (MAXVALUE / infinity), detached tables, and unresolvable names.
+            (MAXVALUE / infinity), detached tables, unresolvable names, and
+            boundaries that carry no instant this provider can read.
         """
+        if self._boundary_codec is not None:
+            return self._is_encoded_partition_closed(partition_name, settle_seconds=settle_seconds)
+
         with self._engine.connect() as conn:
             result = conn.execute(
-                text(
-                    """
-                    SELECT now() >= b.upper_bound + make_interval(secs => :settle_seconds)
-                    FROM (
-                        SELECT (regexp_match(
-                                    pg_get_expr(c.relpartbound, c.oid),
-                                    'TO \\(''([^'']+)'''
-                               ))[1]::timestamptz AS upper_bound
-                        FROM pg_class c
-                        JOIN pg_inherits i ON i.inhrelid = c.oid
-                        JOIN pg_partitioned_table pt ON pt.partrelid = i.inhparent
-                        WHERE c.oid = to_regclass(:partition_name)
-                          AND pt.partstrat = 'r'
-                    ) AS b
-                    """
-                ),
+                text(PARTITION_CLOSED_SQL),
                 {
                     "partition_name": to_regclass_argument(partition_name),
                     "settle_seconds": settle_seconds,
                 },
+            )
+            return bool(result.scalar())
+
+    def _is_encoded_partition_closed(self, partition_name: str, *, settle_seconds: int) -> bool:
+        """Closure check for a partition whose upper bound is an encoded literal.
+
+        The bound is decoded client-side because only the codec knows how to
+        read it, but the comparison still runs server-side against ``now()`` —
+        so the check stays immune to app-clock skew and replica lag, exactly
+        like the timestamp path.
+        """
+        assert self._boundary_codec is not None  # guarded by the caller
+
+        with self._engine.connect() as conn:
+            bound_result = conn.execute(
+                text(PARTITION_UPPER_BOUND_SQL),
+                {"partition_name": to_regclass_argument(partition_name)},
+            )
+            raw_bound = coerce_str(bound_result.scalar())
+            if raw_bound is None:
+                return False
+
+            upper_bound = self._boundary_codec.decode(raw_bound)
+            if upper_bound is None:
+                return False
+
+            result = conn.execute(
+                text(INSTANT_HAS_PASSED_SQL),
+                {"upper_bound": upper_bound, "settle_seconds": settle_seconds},
             )
             return bool(result.scalar())
 
@@ -356,3 +404,78 @@ class PostgresMetadataProvider:
         all_partitions = self.list_partitions(table_name)
         defaults = [p for p in all_partitions if p.is_default and p.is_attached]
         return defaults[0] if defaults else None
+
+    def get_partition_tree(self, table_name: str) -> PartitionNode | None:
+        """Return the whole partition tree rooted at ``table_name``.
+
+        Unlike :meth:`list_partitions`, which reports the direct children a
+        lifecycle acts on, this walks the hierarchy to the leaves — the shape
+        subpartition reconciliation needs to know which buckets exist. One
+        round-trip regardless of depth.
+
+        Detached partitions are absent by construction: a detached branch is no
+        longer part of its parent's tree. Query it by name to inspect it.
+
+        Args:
+            table_name: Root of the tree, schema-qualified.
+
+        Returns:
+            The root node with its descendants, or None when ``table_name`` is
+            not partitioned and is not itself a partition.
+        """
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(PARTITION_TREE_SQL),
+                {"table_name": to_regclass_argument(table_name)},
+            )
+            rows = result.fetchall()
+
+        tree_rows: list[PartitionTreeRow] = []
+        for row in rows:
+            schema = coerce_str(row.partition_schema) or ""
+            relname = coerce_str(row.partition_name) or ""
+            if not is_addressable(schema, relname):
+                continue
+
+            parent_schema = coerce_str(row.parent_schema)
+            parent_relname = coerce_str(row.parent_name)
+            parent_name = qualify(parent_schema, parent_relname) if parent_schema and parent_relname else None
+
+            columns = row.partition_columns or ()
+            tree_rows.append(
+                PartitionTreeRow(
+                    level=row.level,
+                    name=qualify(schema, relname),
+                    parent_name=parent_name,
+                    bounds=parse_partition_bounds(coerce_str(row.boundaries)),
+                    is_attached=bool(row.is_attached),
+                    partition_type=PartitionType.from_partstrat(coerce_str(row.partstrat, encoding="ascii")),
+                    partition_columns=tuple(str(c) for c in columns),
+                )
+            )
+
+        return build_partition_tree(tree_rows)
+
+    def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
+        """Return the column tuples of every UNIQUE / PRIMARY KEY constraint.
+
+        PostgreSQL requires such a constraint on a partitioned table to contain
+        all of its partition-key columns. Reading them lets a subpartitioning
+        config be refused with an explanation before any DDL is attempted,
+        instead of failing halfway through a maintenance run.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            One tuple of column names per constraint; empty when the table has
+            no unique constraints at all.
+        """
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(UNIQUE_CONSTRAINT_COLUMNS_SQL),
+                {"table_name": to_regclass_argument(table_name)},
+            )
+            rows = result.fetchall()
+
+        return tuple(tuple(str(c) for c in (row.columns or ())) for row in rows)

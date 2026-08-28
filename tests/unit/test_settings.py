@@ -2,6 +2,7 @@ from datetime import UTC
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic_settings import SettingsConfigDict
 
 from pg_partsmith.entities import (
     PartitionGranularity,
@@ -124,3 +125,43 @@ def test__settings__get_period_calculator__no_tz_argument__defaults_to_utc() -> 
 
     # Assert
     assert calc.tz is UTC
+
+
+def test__settings__subpartition_from_env_json__reaches_the_config() -> None:
+    # Arrange
+    class NestedSettings(PartitionTableSettings):
+        model_config = SettingsConfigDict(env_prefix="NESTED_")
+
+    settings = NestedSettings(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.WEEK,
+        subpartition={"strategy": "hash", "column": "tenant_id", "modulus": 4},
+    )
+
+    # Act
+    config = settings.to_config()
+
+    # Assert
+    assert config.subpartition is not None
+    assert config.subpartition.column == "tenant_id"
+    assert config.subpartition.modulus == 4
+
+
+def test__settings__without_subpartition__config_stays_flat() -> None:
+    # Arrange
+    class FlatSettings(PartitionTableSettings):
+        model_config = SettingsConfigDict(env_prefix="FLAT_")
+
+    settings = FlatSettings(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+    )
+
+    # Act / Assert
+    assert settings.to_config().subpartition is None

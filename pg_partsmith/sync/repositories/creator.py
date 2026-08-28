@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.entities import PartitionInfo
+from pg_partsmith.entities import HashBounds, PartitionInfo
 from pg_partsmith.exceptions import PartitionAlreadyExistsError
 from pg_partsmith.utils import build_ddl_statement, pg_sqlstate, qualify, quote_identifier, quote_literal
 
@@ -16,7 +16,7 @@ from .timeouts import apply_local_statement_timeout
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
-    from pg_partsmith.entities import TablePartitionConfig
+    from pg_partsmith.entities import SubpartitionSpec, TablePartitionConfig
 
 
 class PartitionCreator:
@@ -122,3 +122,128 @@ class PartitionCreator:
             moved_count = result.rowcount or 0
 
         return moved_count
+
+    def create_branch(
+        self,
+        config: TablePartitionConfig,
+        branch_name: str,
+        from_value: str,
+        to_value: str,
+        spec: SubpartitionSpec,
+    ) -> PartitionInfo:
+        """Create a time partition that is itself a partitioned table.
+
+        The branch is created standalone — ``LIKE`` the parent, not
+        ``PARTITION OF`` it — so this takes only an ACCESS SHARE lock on the
+        live root table. Its buckets are built while it is still detached, and
+        only the final ATTACH makes the completed subtree reachable for row
+        routing. A branch is therefore never visible to writers in a state
+        where part of its keyspace has nowhere to go.
+
+        Args:
+            config: Table partition configuration.
+            branch_name: Name for the new branch table.
+            from_value: Start boundary value.
+            to_value: End boundary value.
+            spec: Subpartitioning the branch itself applies to its children.
+
+        Returns:
+            Info about the created (still detached) branch.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
+        stmt = build_ddl_statement(
+            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL) " + _partition_by_clause(spec),
+            partition=branch_name,
+            parent=qualify(config.db_schema, config.table_name),
+            column=spec.column,
+        )
+        with self._engine.begin() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            try:
+                conn.execute(stmt)
+            except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                if pg_sqlstate(exc) == "42P07":  # duplicate_table
+                    raise PartitionAlreadyExistsError(branch_name) from exc
+                raise
+
+        return PartitionInfo(
+            name=branch_name,
+            partition_type=config.partition_type,
+            from_value=from_value,
+            to_value=to_value,
+            is_attached=False,
+            subpartition_type=spec.partition_type,
+            parent_table=qualify(config.db_schema, config.table_name),
+        )
+
+    def create_subpartition_table(self, parent_name: str, child_name: str, spec: SubpartitionSpec | None) -> None:
+        """Create a detached table shaped like ``parent_name``.
+
+        Args:
+            parent_name: Relation the table will later be attached to.
+            child_name: Name for the new table.
+            spec: Subpartitioning this table applies to its own children, or
+                None to create a leaf.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
+        template = "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL)"
+        params = {"partition": child_name, "parent": parent_name}
+        if spec is not None:
+            template = f"{template} {_partition_by_clause(spec)}"
+            params["column"] = spec.column
+
+        stmt = build_ddl_statement(template, **params)
+        with self._engine.begin() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            try:
+                conn.execute(stmt)
+            except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                if pg_sqlstate(exc) == "42P07":  # duplicate_table
+                    raise PartitionAlreadyExistsError(child_name) from exc
+                raise
+
+    def attach_subpartition(self, parent_name: str, child_name: str, bounds: HashBounds) -> None:
+        """Attach a hash bucket to its parent.
+
+        ATTACH rather than ``CREATE … PARTITION OF`` on purpose: attaching takes
+        SHARE UPDATE EXCLUSIVE on the parent, so filling a gap in a live branch
+        does not block reads or writes, where creating in place would take
+        ACCESS EXCLUSIVE and stall every writer routing through it.
+
+        Args:
+            parent_name: Partitioned relation to attach to.
+            child_name: Table to attach.
+            bounds: Modulus and remainder the bucket owns.
+        """
+        stmt = build_ddl_statement(
+            "ALTER TABLE {parent} ATTACH PARTITION {partition} " + _hash_values_clause(bounds),
+            parent=parent_name,
+            partition=child_name,
+        )
+        with self._engine.begin() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            conn.execute(stmt)
+
+
+def _partition_by_clause(spec: SubpartitionSpec) -> str:
+    """Render the ``PARTITION BY`` clause for a spec.
+
+    The strategy comes from a closed enum and ``{column}`` is substituted by
+    :func:`~pg_partsmith.utils.build_ddl_statement` as a quoted identifier, so
+    neither half of the clause is unescaped caller text.
+    """
+    return f"PARTITION BY {spec.partition_type.value.upper()} ({{column}})"
+
+
+def _hash_values_clause(bounds: HashBounds) -> str:
+    """Render ``FOR VALUES WITH (MODULUS …, REMAINDER …)``.
+
+    Both numbers are validated integers on a frozen model, so formatting them
+    into the statement cannot inject anything; they also cannot be bound as
+    parameters, since PostgreSQL requires literals here.
+    """
+    return f"FOR VALUES WITH (MODULUS {bounds.modulus:d}, REMAINDER {bounds.remainder:d})"
