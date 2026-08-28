@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.4.0...pg-partsmith-v0.5.0) (2026-08-28)
+
+
+### Features
+
+* add boundary codecs for time-sortable partition keys ([c10ffdb](https://github.com/bedrock-python/pg-partsmith/commit/c10ffdbf505d206076c22d35978fe3fc5fbc3afe))
+* add ensure_partitions for backfilling explicit periods ([2ce6d10](https://github.com/bedrock-python/pg-partsmith/commit/2ce6d10eda0b6015bc6ba1f6afafb8f5f6bd2274))
+* add LIST subpartitioning alongside HASH ([1267b5b](https://github.com/bedrock-python/pg-partsmith/commit/1267b5b387d4ed79dc38c6baa248a40bd615d9c0))
+* manage HASH and LIST roots that have no time dimension ([59321d4](https://github.com/bedrock-python/pg-partsmith/commit/59321d42647440dce02f9f4e3e80b3984d9d7674))
+* manage nested RANGE -&gt; HASH partition trees ([0d98360](https://github.com/bedrock-python/pg-partsmith/commit/0d9836028e4d3956ce7285bc023c3c561813a8ae))
+* partition trees, boundary codecs, static roots and composite keys ([#23](https://github.com/bedrock-python/pg-partsmith/issues/23)) ([f150233](https://github.com/bedrock-python/pg-partsmith/commit/f150233beb516289ec86640846fde1ffdf319732))
+* support composite partition keys ([184c55c](https://github.com/bedrock-python/pg-partsmith/commit/184c55c083d0abdb66b4e17e762d5840b6eb7b56))
+
+
+### Bug Fixes
+
+* answer "is it closed?" instead of raising, and refuse a key we cannot address ([188285a](https://github.com/bedrock-python/pg-partsmith/commit/188285afb888c950405fbc1f24f84f0026556f0e))
+* count buckets built while finishing a half-built branch ([a9ed268](https://github.com/bedrock-python/pg-partsmith/commit/a9ed268fe076caffa6ff220daaa57cb4f7017ae4))
+* exclude identity columns when creating partitions ([8f2b985](https://github.com/bedrock-python/pg-partsmith/commit/8f2b9859b5e41901e287f9e3ce77538db897697d))
+* explain a partition that can never report as closed ([1acf74a](https://github.com/bedrock-python/pg-partsmith/commit/1acf74a41828b33909cc1a7ad4d23ca3151dae6a))
+* keep doubled quotes from splitting a LIST bound ([3f07273](https://github.com/bedrock-python/pg-partsmith/commit/3f07273d2b79193a8fc3a6ac80419f1405014c4a))
+* keep partition_column in serialized configuration ([39c7093](https://github.com/bedrock-python/pg-partsmith/commit/39c7093f3de17f14bfd9e335eb96b372aa29a279))
+* leave NULL-keyed rows where PostgreSQL puts them ([55c9b75](https://github.com/bedrock-python/pg-partsmith/commit/55c9b75af47a66736c8cce7807ee29b615890afc))
+* never publish a branch that cannot route its whole keyspace ([8b8b1b3](https://github.com/bedrock-python/pg-partsmith/commit/8b8b1b376783afe0b6973de0323799b45bbac2be))
+* quoting hazards that only a hand-built statement can reach ([f73dff8](https://github.com/bedrock-python/pg-partsmith/commit/f73dff8ee8139acdde441d72e2d75d762cce4ec5))
+* read the whole key, every constraint, and the timezone that wrote the bound ([5e4ea60](https://github.com/bedrock-python/pg-partsmith/commit/5e4ea60c280d3e14f61df10157194e3cc40f371b))
+* spell a partition key as one leading column plus a trailing tuple ([a511b44](https://github.com/bedrock-python/pg-partsmith/commit/a511b44f753b4a30a3a8cdfc24788f27341a5e64))
+* stop the planner abandoning subtrees and planning unusable names ([b2bcb96](https://github.com/bedrock-python/pg-partsmith/commit/b2bcb96950a2573ea8cf3a9733dcb74ce286f4b4))
+* tell a lost race apart from a real conflict, and isolate each branch ([cf77fb9](https://github.com/bedrock-python/pg-partsmith/commit/cf77fb9a3b5d40c3a6aeb96ffe52c4b4e21eb52a))
+* tell NULL from 'NULL', and a hidden child from a missing one ([46af2e7](https://github.com/bedrock-python/pg-partsmith/commit/46af2e78cbf24a2c963e5145f465b8be13450bd3))
+
+
+### Documentation
+
+* add the new boundary and bounds names to the API reference ([cfd92b1](https://github.com/bedrock-python/pg-partsmith/commit/cfd92b15a2f8647f3ad18b1ad8a758b273cbb11a))
+* correct three more claims, and test the one that was only written down ([eb6388c](https://github.com/bedrock-python/pg-partsmith/commit/eb6388c3c3c3ad65c6eb691308ea52af0cd56fff))
+* correct what the fact-checker falsified, and add what it found missing ([5175daf](https://github.com/bedrock-python/pg-partsmith/commit/5175daffdaf058697867c6ba0ad6b445e5776065))
+* document subpartitioning, boundary codecs and the migration path ([fdc4f28](https://github.com/bedrock-python/pg-partsmith/commit/fdc4f282b29aa55bcc0305206c0887d28dfdd759))
+* name the difference between two fields called partition_type ([5ed8863](https://github.com/bedrock-python/pg-partsmith/commit/5ed886395348e452a55678f93fb397f7e9b166e4))
+* say that issues now fills up on a successful run ([d4f37f8](https://github.com/bedrock-python/pg-partsmith/commit/d4f37f8373b1e3303cc3140f4eb018d9a758cfa7))
+* say what the database reported, not what was assumed ([058801e](https://github.com/bedrock-python/pg-partsmith/commit/058801e03e3a8cdec4b0c78b94863f96f77ac42f))
+
 ## [0.4.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.3.0...pg-partsmith-v0.4.0) (2026-08-27)
 
 ### ⚠ BREAKING CHANGES
