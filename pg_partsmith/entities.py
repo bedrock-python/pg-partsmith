@@ -811,7 +811,13 @@ class TablePartitionConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_subpartitioning(self) -> TablePartitionConfig:
-        """Reject subpartitioning the library cannot manage on this root."""
+        """Reject subpartitioning the library cannot manage on this root.
+
+        Defence in depth rather than a reachable path today: a static root
+        rejects ``subpartition`` earlier and points at ``root_layout``, and a
+        TIME_BASED root already has to be RANGE. Kept so that adding a strategy
+        cannot open the case silently.
+        """
         if self.subpartition is not None and self.partition_type != PartitionType.RANGE:
             msg = "Subpartitioning is only supported under a RANGE-partitioned root table"
             raise ValueError(msg)

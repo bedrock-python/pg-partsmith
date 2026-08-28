@@ -11,6 +11,7 @@ from pg_partsmith.catalog_queries import RELATION_COLUMNS_SQL
 from pg_partsmith.entities import HashBounds, ListBounds, PartitionInfo
 from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionNotFoundError
 from pg_partsmith.utils import (
+    _as_text,
     build_ddl_statement,
     coerce_str,
     pg_sqlstate,
@@ -208,7 +209,7 @@ class PartitionCreator:
             # created with LIKE.
             #
             # All identifiers and literals are properly quoted, S608 is a false positive
-            move_sql = text(
+            move_sql = _as_text(
                 f"WITH moved AS ("  # noqa: S608
                 f"DELETE FROM {default_quoted} "
                 f"WHERE {column_quoted} >= {from_quoted} "
