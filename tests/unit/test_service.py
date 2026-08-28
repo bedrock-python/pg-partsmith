@@ -2673,3 +2673,63 @@ async def test__creation_service__nested_config_with_no_subpartition_collaborato
     # Act / Assert
     with pytest.raises(UnsupportedCapabilityError, match="subpartitioning"):
         service._creation_service._subpartition_service()
+
+
+async def test__maintain_lifecycle__branch_completed_during_create__counts_as_a_repair(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange -- an earlier run created the branch and stopped before attaching
+    # it, so the relation exists but is absent from list_partitions.
+    repo = _nested_repo(partition_info)
+    repo.create_branch = AsyncMock(side_effect=PartitionAlreadyExistsError("events__2024_04"))
+    metadata = _nested_metadata()
+    metadata.get_partition_tree = AsyncMock(
+        return_value=PartitionNode(
+            name="public.events__2024_04",
+            partition_type=PartitionType.HASH,
+            partition_columns=("tenant_id",),
+            is_attached=False,
+        )
+    )
+    service = PartitionLifecycleService(repo, metadata, mock_locks, mock_calculator)
+    # The reconcile stage runs afterwards and finds the branch complete.
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        return_value=SubpartitionReconcileResult()
+    )
+
+    # Act
+    result = await service.maintain_lifecycle(_nested_config())
+
+    # Assert -- the two buckets were built by this run. created_count is right
+    # to stay 0 (the partition already existed), but the work has to land
+    # somewhere, and repairing a pre-existing branch is what repaired_count is.
+    assert repo.attach_subpartition.call_count == 2
+    assert result.created_count == 0
+    assert result.repaired_count == 2
+
+
+async def test__maintain_lifecycle__finding_from_a_branch_completed_during_create__is_reported(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange
+    repo = _nested_repo(partition_info)
+    repo.create_branch = AsyncMock(side_effect=PartitionAlreadyExistsError("events__2024_04"))
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+    actionable = TopologyFinding(
+        partition_name="public.events__2024_04",
+        reason=TopologyReason.STRATEGY_MISMATCH,
+        detail="events__2024_04 is LIST but the configuration asks for HASH.",
+    )
+    service._creation_service._subpartitions.converge_branch = AsyncMock(  # type: ignore[union-attr]
+        return_value=SubpartitionReconcileResult(findings=(actionable,))
+    )
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        return_value=SubpartitionReconcileResult()
+    )
+
+    # Act
+    result = await service.maintain_lifecycle(_nested_config())
+
+    # Assert -- the later reconcile sees nothing wrong, so if this finding is
+    # dropped here it is reported nowhere at all.
+    assert [issue.partition_name for issue in result.issues] == ["public.events__2024_04"]

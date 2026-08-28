@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
     from pg_partsmith.entities import TablePartitionConfig
     from pg_partsmith.protocols import PeriodCalculator
+    from pg_partsmith.subpartition_plan import SubpartitionReconcileResult
     from pg_partsmith.sync.hooks import PartitionLifecycleHooks
     from pg_partsmith.sync.protocols import PartitionMetadataProvider, PartitionRepository
     from pg_partsmith.sync.services.subpartitions import PartitionSubpartitionService
@@ -56,8 +57,20 @@ class PartitionCreationService(BasePartitionService):
         config: TablePartitionConfig,
         *,
         existing_partitions: list[PartitionInfo] | None = None,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> list[PartitionInfo]:
         """Create partitions for future periods.
+
+        Args:
+            config: Table partitioning configuration.
+            existing_partitions: Partitions already read from the catalog, to
+                save a second listing.
+            converged: Collector for subtrees completed while finishing a branch
+                an earlier run left half-built. That work is real -- buckets get
+                created and attached -- but it happens under CREATE, where the
+                reconcile stage that normally counts it has not run yet. Pass a
+                list and the counts and findings survive; omit it and they are
+                only logged.
 
         Returns:
             List of newly created and attached partitions.
@@ -75,7 +88,7 @@ class PartitionCreationService(BasePartitionService):
         existing_by_period = self._map_partitions_to_periods(existing_partitions)
 
         for period in periods:
-            p_info = self._ensure_partition_for_period(config, period, existing_by_period.get(period))
+            p_info = self._ensure_partition_for_period(config, period, existing_by_period.get(period), converged)
             if p_info:
                 created.append(p_info)
 
@@ -216,12 +229,13 @@ class PartitionCreationService(BasePartitionService):
         config: TablePartitionConfig,
         period: Period,
         existing: PartitionInfo | None,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> PartitionInfo | None:
         """Ensure a partition exists and is attached for a specific period."""
         partition_name, from_value, to_value = self._get_partition_metadata(config, period)
 
         if existing is not None:
-            self._handle_existing_partition(config, existing, from_value, to_value)
+            self._handle_existing_partition(config, existing, from_value, to_value, converged)
             return None
 
         # Hooks: before create
@@ -232,7 +246,7 @@ class PartitionCreationService(BasePartitionService):
         )
 
         # Creation and optional attachment
-        partition_info = self._create_and_attach_partition(config, partition_name, from_value, to_value)
+        partition_info = self._create_and_attach_partition(config, partition_name, from_value, to_value, converged)
 
         if partition_info:
             # Hooks: after create
@@ -461,7 +475,12 @@ class PartitionCreationService(BasePartitionService):
             )
 
     def _handle_existing_partition(
-        self, config: TablePartitionConfig, existing: PartitionInfo, from_value: str, to_value: str
+        self,
+        config: TablePartitionConfig,
+        existing: PartitionInfo,
+        from_value: str,
+        to_value: str,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> None:
         """Handle case where partition already exists in metadata."""
         if not (config.auto_attach_after_create and not existing.is_attached):
@@ -472,7 +491,7 @@ class PartitionCreationService(BasePartitionService):
         # be short of what the spec asks for -- and if the process stops in
         # that window, it stays live and rejecting. A detached branch is
         # introspectable on its own, so there is no reason to attach first.
-        self._converge_existing_branch(config, existing.name)
+        self._converge_existing_branch(config, existing.name, converged)
         self._attach_tolerating_lost_race(config, existing.name, from_value, to_value)
 
     def _is_attach_conflict_benign(self, qualified_parent: str, partition_name: str, exc: SQLAlchemyError) -> bool:
@@ -488,7 +507,12 @@ class PartitionCreationService(BasePartitionService):
         return self._metadata.is_partition_attached(qualified_parent, partition_name)
 
     def _create_and_attach_partition(
-        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
+        self,
+        config: TablePartitionConfig,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> PartitionInfo | None:
         """Create the partition (or the whole branch) and attach it to the parent.
 
@@ -503,7 +527,7 @@ class PartitionCreationService(BasePartitionService):
             # is not attached: almost always a previous run interrupted between
             # creating a branch and attaching it. Finish that work rather than
             # leaving an invisible table behind forever.
-            self._converge_existing_branch(config, partition_name)
+            self._converge_existing_branch(config, partition_name, converged)
             if config.auto_attach_after_create:
                 self._attach_tolerating_lost_race(config, partition_name, from_value, to_value)
             return None
@@ -548,11 +572,24 @@ class PartitionCreationService(BasePartitionService):
                 f"Repository {type(self._repo).__name__}", "composite partition keys", "CompositeKeyRepository"
             )
 
-    def _converge_existing_branch(self, config: TablePartitionConfig, partition_name: str) -> None:
-        """Complete the subtree of a branch left half-built by an earlier run."""
+    def _converge_existing_branch(
+        self,
+        config: TablePartitionConfig,
+        partition_name: str,
+        converged: list[SubpartitionReconcileResult] | None = None,
+    ) -> None:
+        """Complete the subtree of a branch left half-built by an earlier run.
+
+        The result goes into ``converged`` when the caller is collecting. It has
+        to: the reconcile stage runs after this and finds the branch already
+        complete, so buckets created here are counted nowhere and the findings
+        that came with them are reported nowhere.
+        """
         if config.subpartition is None:
             return
         result = self._subpartition_service().converge_branch(config, partition_name)
+        if converged is not None:
+            converged.append(result)
         if result.created_count:
             logger.info(
                 "Completed the subtree of a partition left behind by an earlier run",

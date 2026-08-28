@@ -371,10 +371,14 @@ class PartitionLifecycleService:
             # Optimization: fetch all partitions once
             all_partitions = await self._metadata.list_partitions(qualified_parent)
 
+            # Finishing a branch an earlier run left half-built happens during
+            # CREATE, before the reconcile stage that would otherwise count it.
+            converged: list[SubpartitionReconcileResult] = []
+
             if not skip_create:
                 try:
                     created = await self._require_periods().create_future_partitions(
-                        config, existing_partitions=all_partitions
+                        config, existing_partitions=all_partitions, converged=converged
                     )
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     raise
@@ -386,6 +390,16 @@ class PartitionLifecycleService:
                     created_count = len(created)
                     if created:
                         all_partitions.extend(created)
+
+            # Buckets built while completing a half-built branch are repairs of
+            # a pre-existing branch, which is exactly what repaired_count means.
+            repaired_count += sum(result.created_count for result in converged)
+            issues.extend(
+                to_maintenance_issue(finding)
+                for result in converged
+                for finding in result.findings
+                if finding.is_actionable
+            )
 
             try:
                 partitions_to_prune = await self._require_pruning().identify_partitions_to_prune(config, all_partitions)
@@ -415,7 +429,7 @@ class PartitionLifecycleService:
                         raise
                     _record_issue(MaintenanceIssueStep.RECONCILE, e)
                 else:
-                    repaired_count = reconciled.created_count
+                    repaired_count += reconciled.created_count
                     issues.extend(to_maintenance_issue(f) for f in reconciled.findings if f.is_actionable)
 
             if not partitions_to_prune:
