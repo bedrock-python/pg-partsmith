@@ -32,6 +32,12 @@ Top-level public API: entities, enums, exceptions, and period calculators.
 
 Bounds, subpartition specs, and the introspected tree.
 
+`PartitionBounds` is the discriminated union of every bound below
+(`RangeBounds | ListBounds | HashBounds | DefaultBounds`); `SubpartitionBounds`
+is the narrower one a subpartition can be attached with
+(`HashBounds | ListBounds | DefaultBounds`), which excludes RANGE because that
+belongs to the time dimension at the root.
+
 ::: pg_partsmith.topology.HashSubpartitionSpec
     options:
       heading_level: 4
@@ -108,6 +114,10 @@ Bounds, subpartition specs, and the introspected tree.
       heading_level: 4
 
 ::: pg_partsmith.boundaries.UUIDv7BoundaryCodec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.protocols.BoundaryDecoder
     options:
       heading_level: 4
 
