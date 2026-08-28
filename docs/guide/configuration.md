@@ -46,10 +46,10 @@ schema=None          # relies on search_path (not recommended)
 ### `partition_type`
 
 ```python
-class PartitionType(str, Enum):
-    RANGE = "RANGE"
-    LIST  = "LIST"
-    HASH  = "HASH"
+class PartitionType(StrEnum):
+    RANGE = "range"
+    LIST  = "list"
+    HASH  = "hash"
 ```
 
 Use `RANGE` for time-based partitioning.
@@ -57,11 +57,15 @@ Use `RANGE` for time-based partitioning.
 ### `partition_strategy`
 
 ```python
-class PartitionStrategy(str, Enum):
-    TIME_BASED  = "TIME_BASED"
-    VALUE_BASED = "VALUE_BASED"
-    HASH_BASED  = "HASH_BASED"
+class PartitionStrategy(StrEnum):
+    TIME_BASED  = "time_based"
+    VALUE_BASED = "value_based"
+    HASH_BASED  = "hash_based"
 ```
+
+The values matter when the config comes from the environment: a
+`PartitionTableSettings` subclass reads `…_PARTITION_STRATEGY=time_based`, not
+the member name.
 
 Use `TIME_BASED` for automatic period calculation via a `PeriodCalculator`.
 

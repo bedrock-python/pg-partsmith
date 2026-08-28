@@ -82,9 +82,14 @@ class PartitionCreator:
         """Attach a partition to a parent whose partition key has several columns.
 
         Only the leading column carries the period; the trailing ones are
-        bounded with MINVALUE at both ends. That makes the partition hold
-        exactly the rows whose leading column falls in ``[from_value,
-        to_value)`` -- the same set a single-column bound would select.
+        bounded with MINVALUE at both ends, so the partition holds the rows
+        whose leading column falls in ``[from_value, to_value)``.
+
+        Not *all* of them: PostgreSQL adds an IS NOT NULL test for every key
+        column to the constraint it derives from this bound, so a row with a
+        NULL in any trailing column goes to DEFAULT regardless of its leading
+        value. Declare the trailing columns NOT NULL if you need every row of a
+        period in that period's partition.
 
         Args:
             table_name: Parent table name.

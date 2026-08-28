@@ -214,6 +214,14 @@ class PartitionLifecycleService:
         branch is genuinely missing, and reports rather than "repairs" any
         branch whose shape it cannot converge without risk.
 
+        It takes **no distributed lock of its own** -- unlike
+        :meth:`maintain_lifecycle`, which runs its whole sequence under one.
+        Two workers calling this concurrently is safe: a lost race on a bucket
+        is recognised by its bounds and reported, not retried into a failure.
+        But calling it while a maintainer is mid-run means both are converging
+        the same tree, and the wasted work is yours to weigh. Wrap it in your
+        own lock if you would rather they queued.
+
         Args:
             config: Table partitioning configuration. Without a subpartition
                 spec this is a no-op returning an empty result.
