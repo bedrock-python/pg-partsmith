@@ -325,10 +325,10 @@ class PartitionCreationService(BasePartitionService):
                     },
                 )
 
-                moved_count = await self._repo.reconcile_default_rows(
-                    default_partition_name=default_partition.name,
-                    target_partition_name=partition_name,
-                    partition_column=config.partition_column,
+                moved_count = await self._move_default_rows(
+                    config,
+                    source=default_partition.name,
+                    target=partition_name,
                     from_value=from_value,
                     to_value=to_value,
                 )
@@ -372,6 +372,39 @@ class PartitionCreationService(BasePartitionService):
             qualified_parent, partition_name, from_value, to_value, key_arity=config.key_arity
         )
 
+    async def _move_default_rows(
+        self,
+        config: TablePartitionConfig,
+        *,
+        source: str,
+        target: str,
+        from_value: str,
+        to_value: str,
+    ) -> int:
+        """Move rows between a DEFAULT partition and one period's partition.
+
+        The trailing key columns are only passed for a composite key, so a
+        repository written against the single-column signature keeps serving
+        every config it could already serve.
+        """
+        if config.key_arity == 1:
+            return await self._repo.reconcile_default_rows(
+                default_partition_name=source,
+                target_partition_name=target,
+                partition_column=config.partition_column,
+                from_value=from_value,
+                to_value=to_value,
+            )
+
+        return await self._repo.reconcile_default_rows(
+            default_partition_name=source,
+            target_partition_name=target,
+            partition_column=config.partition_column,
+            trailing_columns=config.trailing_partition_columns,
+            from_value=from_value,
+            to_value=to_value,
+        )
+
     async def _restore_reconciled_rows(
         self,
         default_partition_name: str | None,
@@ -390,10 +423,10 @@ class PartitionCreationService(BasePartitionService):
         if default_partition_name is None:
             return
         try:
-            restored = await self._repo.reconcile_default_rows(
-                default_partition_name=partition_name,
-                target_partition_name=default_partition_name,
-                partition_column=config.partition_column,
+            restored = await self._move_default_rows(
+                config,
+                source=partition_name,
+                target=default_partition_name,
                 from_value=from_value,
                 to_value=to_value,
             )

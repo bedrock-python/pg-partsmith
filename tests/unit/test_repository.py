@@ -1142,3 +1142,60 @@ def test__repository__ddl_timezone_property__none_when_disabled() -> None:
 def _set_attr(obj: object, attr: str, value: object) -> object:
     setattr(obj, attr, value)
     return obj
+
+
+async def test__repository__reconcile_default_rows__composite_key__leaves_null_trailing_rows_in_default() -> None:
+    # Arrange
+    move_result = MagicMock()
+    move_result.rowcount = 3
+    engine = MagicMock()
+    conn = AsyncMock()
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        partition_column="created_at",
+        trailing_columns=("tenant_id",),
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert -- PostgreSQL adds an IS NOT NULL test for every key column, so a
+    # row with a NULL tenant belongs in DEFAULT and moving it would be rejected
+    # with the very error this call exists to clear.
+    move = str(conn.execute.call_args_list[-1].args[0])
+    assert '"tenant_id" IS NOT NULL' in move
+
+
+async def test__repository__reconcile_default_rows__single_column_key__adds_no_null_test() -> None:
+    # Arrange
+    move_result = MagicMock()
+    move_result.rowcount = 3
+    engine = MagicMock()
+    conn = AsyncMock()
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        partition_column="created_at",
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert -- the leading column already carries its own NOT NULL implicitly
+    # through the range test, so the statement stays what it always was.
+    assert "IS NOT NULL" not in str(conn.execute.call_args_list[-1].args[0])

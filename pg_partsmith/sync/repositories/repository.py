@@ -163,6 +163,7 @@ class PostgresPartitionRepository:
         default_partition_name: str,
         target_partition_name: str,
         partition_column: str,
+        trailing_columns: tuple[str, ...] = (),
         from_value: str,
         to_value: str,
     ) -> int:
@@ -170,6 +171,7 @@ class PostgresPartitionRepository:
             default_partition_name=default_partition_name,
             target_partition_name=target_partition_name,
             partition_column=partition_column,
+            trailing_columns=trailing_columns,
             from_value=from_value,
             to_value=to_value,
         )

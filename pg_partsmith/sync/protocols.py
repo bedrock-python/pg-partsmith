@@ -134,6 +134,7 @@ class PartitionRepository(Protocol):
         default_partition_name: str,
         target_partition_name: str,
         partition_column: str,
+        trailing_columns: tuple[str, ...] = (),
         from_value: str,
         to_value: str,
     ) -> int:
@@ -142,7 +143,10 @@ class PartitionRepository(Protocol):
         Args:
             default_partition_name: Qualified name of DEFAULT partition.
             target_partition_name: Qualified name of target partition.
-            partition_column: Column used for partitioning.
+            partition_column: Leading column of the partition key.
+            trailing_columns: The remaining key columns, for a composite key.
+                Only ever passed for a composite config, so an implementation
+                predating composite keys keeps working without it.
             from_value: Range start boundary (inclusive).
             to_value: Range end boundary (exclusive).
 

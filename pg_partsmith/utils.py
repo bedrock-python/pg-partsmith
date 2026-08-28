@@ -114,13 +114,22 @@ def quote_identifier(identifier: str) -> str:
 def quote_literal(value: str) -> str:
     """Quote SQL string literal to prevent injection.
 
+    A backslash is an escape character only while ``standard_conforming_strings``
+    is off -- which any client can turn off on its own connection, and which
+    would let a backslash-terminated value swallow the closing quote. Values
+    carrying one are emitted as an E-string instead, where the escaping rules
+    are the same either way.
+
     Args:
         value: Value to quote.
 
     Returns:
         Quoted string literal.
     """
-    return "'" + value.replace("'", "''") + "'"
+    escaped = value.replace("'", "''")
+    if "\\" not in value:
+        return f"'{escaped}'"
+    return "E'" + escaped.replace("\\", "\\\\") + "'"
 
 
 def coerce_str(value: object, encoding: str = "utf-8") -> str | None:
