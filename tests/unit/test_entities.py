@@ -1022,3 +1022,21 @@ def test__config__dump_from_before_composite_keys__still_parses() -> None:
 
     # Act / Assert
     assert TablePartitionConfig(**legacy).partition_columns == ("created_at",)
+
+
+def test__parse_partition_bounds__list_value_naming_modulus__stays_a_list_bound() -> None:
+    # Arrange / Act: an unanchored search would read this as HashBounds, and a
+    # partition whose bounds are misread is invisible to the planner -- which
+    # then plans a duplicate that PostgreSQL refuses on every run.
+    parsed = parse_partition_bounds("FOR VALUES IN ('modulus 4, remainder 1')")
+
+    # Assert
+    assert parsed == ListBounds(values=("modulus 4, remainder 1",))
+
+
+def test__parse_partition_bounds__range_literal_naming_modulus__stays_a_range_bound() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES FROM ('modulus 2, remainder 0') TO ('z')")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="modulus 2, remainder 0", to_value="z")

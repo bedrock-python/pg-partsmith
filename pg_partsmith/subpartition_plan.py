@@ -23,6 +23,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
+from .constants import MAX_IDENTIFIER_LENGTH
 from .entities import MaintenanceIssue, MaintenanceIssueStep
 from .exceptions import PartitionTopologyError
 from .topology import (
@@ -70,6 +71,9 @@ class TopologyReason(StrEnum):
         LIST_VALUES_CONFLICT: A configured LIST group claims a value another
             partition already owns. A value belongs to exactly one partition,
             so this needs a human.
+        NAME_UNUSABLE: The partition the configuration asks for cannot be given
+            a usable name -- the name is taken by a relation that does not match
+            it, or it exceeds PostgreSQL's identifier limit.
     """
 
     LEGACY_LEAF = "legacy_leaf"
@@ -81,6 +85,7 @@ class TopologyReason(StrEnum):
     NON_UNIFORM_INCOMPLETE = "non_uniform_incomplete"
     COVERAGE_UNKNOWN = "coverage_unknown"
     LIST_VALUES_CONFLICT = "list_values_conflict"
+    NAME_UNUSABLE = "name_unusable"
 
 
 # Reasons that describe a healthy, deliberate state (policy evolution) rather
@@ -285,12 +290,18 @@ def _plan_hash_level(
     """Fill the gaps in a hash bucket set; return the children worth recursing into."""
     hash_children = node.hash_children
     modulus = _effective_modulus(spec, node, hash_children, findings)
+
     if modulus is None:
-        return ()
+        # This level's own bucket set is left alone -- it already tiles the
+        # keyspace at another modulus, or its layout is one we refuse to guess
+        # at. That decision is about *this* level only: the buckets that do
+        # exist may still be missing children of their own, and skipping them
+        # would leave a branch rejecting rows while reporting nothing.
+        return hash_children
 
     bounds = tuple(c.bounds for c in hash_children if isinstance(c.bounds, HashBounds))
     gaps = missing_remainders(modulus, bounds)
-    actions.extend(_hash_actions(spec, node.name, gaps, modulus=modulus))
+    actions.extend(_hash_actions(spec, node.name, gaps, modulus=modulus, node=node, findings=findings))
     return hash_children
 
 
@@ -403,25 +414,29 @@ def _hash_actions(
     remainders: range | tuple[int, ...],
     *,
     modulus: int | None = None,
+    node: PartitionNode | None = None,
+    findings: list[TopologyFinding] | None = None,
 ) -> tuple[SubpartitionAction, ...]:
     """Build create-actions for ``remainders`` under ``parent_name``.
 
     ``modulus`` overrides the spec's bucket count when repairing a branch that
     already uses a different one; the names still come from the spec so a
-    repaired branch stays addressable by the same convention.
+    repaired branch stays addressable by the same convention. That override is
+    also why the names are re-checked here rather than trusted from the config
+    validator, which sized them against the configured modulus.
     """
     schema, parent_relname = split_qualified_name(parent_name)
     effective = spec.modulus if modulus is None else modulus
 
-    return tuple(
-        _action(
-            spec,
-            parent_name,
-            qualify(schema, spec.child_name(parent_relname, remainder)),
-            HashBounds(modulus=effective, remainder=remainder),
-        )
-        for remainder in remainders
-    )
+    actions = []
+    for remainder in remainders:
+        relname = spec.child_name(parent_relname, remainder)
+        child_name = qualify(schema, relname)
+        if _is_unusable_name(relname, child_name, node, findings):
+            continue
+        actions.append(_action(spec, parent_name, child_name, HashBounds(modulus=effective, remainder=remainder)))
+
+    return tuple(actions)
 
 
 # ── LIST levels ─────────────────────────────────────────────────────────────────
@@ -468,7 +483,14 @@ def _plan_list_level(
             claimed[value] = "(pending)"
 
     actions.extend(
-        _list_actions(spec, node.name, tuple(missing), include_default=spec.include_default and not has_default)
+        _list_actions(
+            spec,
+            node.name,
+            tuple(missing),
+            include_default=spec.include_default and not has_default,
+            node=node,
+            findings=findings,
+        )
     )
     return tuple(c for c in node.children if isinstance(c.bounds, (ListBounds, DefaultBounds)))
 
@@ -497,29 +519,24 @@ def _list_actions(
     groups: tuple[ListGroup, ...],
     *,
     include_default: bool,
+    node: PartitionNode | None = None,
+    findings: list[TopologyFinding] | None = None,
 ) -> tuple[SubpartitionAction, ...]:
     """Build create-actions for ``groups`` (and optionally DEFAULT) under a parent."""
     schema, parent_relname = split_qualified_name(parent_name)
 
-    actions = [
-        _action(
-            spec,
-            parent_name,
-            qualify(schema, spec.child_name(parent_relname, group.name)),
-            group.bounds(),
-        )
-        for group in groups
+    planned: list[tuple[str, SubpartitionBounds]] = [
+        (spec.child_name(parent_relname, group.name), group.bounds()) for group in groups
     ]
-
     if include_default:
-        actions.append(
-            _action(
-                spec,
-                parent_name,
-                qualify(schema, spec.child_name(parent_relname, spec.default_name)),
-                DefaultBounds(),
-            )
-        )
+        planned.append((spec.child_name(parent_relname, spec.default_name), DefaultBounds()))
+
+    actions = []
+    for relname, bounds in planned:
+        child_name = qualify(schema, relname)
+        if _is_unusable_name(relname, child_name, node, findings):
+            continue
+        actions.append(_action(spec, parent_name, child_name, bounds))
 
     return tuple(actions)
 
@@ -574,3 +591,55 @@ def to_maintenance_issue(finding: TopologyFinding) -> MaintenanceIssue:
         error=describe_exception(error),
         partition_name=finding.partition_name,
     )
+
+
+def _is_unusable_name(
+    relname: str,
+    child_name: str,
+    node: PartitionNode | None,
+    findings: list[TopologyFinding] | None,
+) -> bool:
+    """True when a planned name cannot safely be created, recording why.
+
+    Two ways a name goes wrong, both of which used to produce a partition that
+    silently never appeared:
+
+    * Another relation already holds it. The executor would read the resulting
+      "already exists" / "already a partition" errors as a lost race and report
+      success, leaving that slice of the keyspace rejecting rows forever.
+    * It exceeds PostgreSQL's 63-byte identifier limit, which truncates
+      *silently* -- so two children collapse onto one name and collide.
+    """
+    if len(relname.encode("utf-8")) > MAX_IDENTIFIER_LENGTH:
+        _record(
+            findings,
+            node,
+            TopologyReason.NAME_UNUSABLE,
+            f"would need a partition named {relname!r}, which exceeds PostgreSQL's "
+            f"{MAX_IDENTIFIER_LENGTH}-byte identifier limit and would be truncated into a collision",
+        )
+        return True
+
+    if node is not None and any(child.name == child_name for child in node.children):
+        _record(
+            findings,
+            node,
+            TopologyReason.NAME_UNUSABLE,
+            f"already has a partition named {child_name!r} that does not match the configured one; "
+            "creating it would collide, and the collision is indistinguishable from a lost race",
+        )
+        return True
+
+    return False
+
+
+def _record(
+    findings: list[TopologyFinding] | None,
+    node: PartitionNode | None,
+    reason: TopologyReason,
+    detail: str,
+) -> None:
+    """Append a finding about ``node`` when the caller is collecting them."""
+    if findings is None or node is None:
+        return
+    findings.append(TopologyFinding(partition_name=node.name, reason=reason, detail=f"{node.name} {detail}."))

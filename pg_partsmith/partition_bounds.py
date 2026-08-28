@@ -23,7 +23,14 @@ _FROM_PREFIX_PATTERN = re.compile(r"^.*?FROM\s*\(", re.IGNORECASE | re.DOTALL)
 _TRAILING_PAREN_PATTERN = re.compile(r"\)\s*$", re.IGNORECASE | re.DOTALL)
 _CAST_PATTERN = re.compile(r"^CAST\((?P<inner>.*)\s+AS\s+.*\)$", re.IGNORECASE | re.DOTALL)
 _STR_LITERAL_PATTERN = re.compile(r"'(?P<s>(?:[^']|'')*)'")
-_HASH_BOUND_PATTERN = re.compile(r"MODULUS\s+(?P<modulus>\d+)\s*,\s*REMAINDER\s+(?P<remainder>\d+)", re.IGNORECASE)
+# Anchored, not searched: an unanchored search matches the same words *inside*
+# a LIST value or a RANGE literal, and a partition whose bounds were misread as
+# HASH is invisible to the planner, which then plans a duplicate.
+_HASH_BOUND_PATTERN = re.compile(
+    r"^\s*FOR\s+VALUES\s+WITH\s*\(\s*MODULUS\s+(?P<modulus>\d+)\s*,"
+    r"\s*REMAINDER\s+(?P<remainder>\d+)\s*\)\s*$",
+    re.IGNORECASE,
+)
 _LIST_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+IN\s*\((?P<values>.*)\)\s*$", re.IGNORECASE | re.DOTALL)
 _DATE_ONLY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -139,7 +146,7 @@ def parse_partition_bounds(boundaries_expr: str | None) -> PartitionBounds | Non
     if expr.upper() == "DEFAULT":
         return DefaultBounds()
 
-    hash_match = _HASH_BOUND_PATTERN.search(expr)
+    hash_match = _HASH_BOUND_PATTERN.match(expr)
     if hash_match:
         try:
             return HashBounds(

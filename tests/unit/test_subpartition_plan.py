@@ -550,3 +550,98 @@ def test__plan_new_subtree__list_over_hash__builds_both_levels() -> None:
     # Assert
     assert [a.child_name for a in actions] == [f"{BRANCH}__eu", f"{BRANCH}__us"]
     assert [c.child_name for c in actions[0].children] == [f"{BRANCH}__eu__h0", f"{BRANCH}__eu__h1"]
+
+
+# ── Levels below a preserved one ────────────────────────────────────────────────
+
+
+def _nested_branch(*bucket_children: tuple[int, int, tuple[PartitionNode, ...]]) -> PartitionNode:
+    """A hash branch whose buckets are themselves HASH-partitioned."""
+    return PartitionNode(
+        name=BRANCH,
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        children=tuple(
+            PartitionNode(
+                name=f"{BRANCH}__h{remainder}",
+                bounds=HashBounds(modulus=modulus, remainder=remainder),
+                partition_type=PartitionType.HASH,
+                partition_columns=("shard_id",),
+                children=grandchildren,
+            )
+            for modulus, remainder, grandchildren in bucket_children
+        ),
+    )
+
+
+def test__plan_subpartitions__modulus_preserved__still_converges_the_levels_below() -> None:
+    # Arrange: the branch tiles the keyspace at 4 while the config says 2, so
+    # this level is left alone -- but its buckets have no children at all.
+    inner = HashSubpartitionSpec(column="shard_id", modulus=2)
+    spec = _spec(modulus=2, subpartition=inner)
+    node = _nested_branch(*((4, r, ()) for r in range(4)))
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert: leaving *this* level's modulus alone says nothing about the ones
+    # below it; abandoning them leaves the branch rejecting rows.
+    assert [a.child_name for a in plan.actions] == [f"{BRANCH}__h{r}__h{i}" for r in range(4) for i in range(2)]
+    assert [f.reason for f in plan.findings] == [TopologyReason.MODULUS_PRESERVED]
+
+
+def test__plan_subpartitions__non_uniform_but_complete__still_converges_the_levels_below() -> None:
+    # Arrange
+    inner = HashSubpartitionSpec(column="shard_id", modulus=1)
+    spec = _spec(modulus=2, subpartition=inner)
+    node = _nested_branch((2, 1, ()), (4, 0, ()), (4, 2, ()))
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert
+    assert len(plan.actions) == 3
+    assert [f.reason for f in plan.findings] == [TopologyReason.NON_UNIFORM_COMPLETE]
+
+
+# ── Names that cannot be used ───────────────────────────────────────────────────
+
+
+def test__plan_subpartitions__target_name_held_by_a_mismatched_partition__reported_not_planned() -> None:
+    # Arrange: the name the config would generate is taken by a LIST partition
+    # owning different values, so no value overlap makes the planner want it.
+    spec = _list_spec(groups=(ListGroup(name="eu", values=("eu",)),))
+    node = _list_branch(_list_child("eu", "europe"))
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert: creating it would collide, and the collision is indistinguishable
+    # from a lost race once PostgreSQL reports it.
+    assert plan.is_noop
+    assert [f.reason for f in plan.findings] == [TopologyReason.NAME_UNUSABLE]
+    assert plan.actionable_findings != ()
+
+
+def test__plan_subpartitions__repair_name_would_exceed_the_identifier_limit__reported() -> None:
+    # Arrange: repairing at the branch's own larger modulus needs more digits
+    # than the config validator sized the name for.
+    long_branch = "public." + "e" * 59
+    spec = _spec(modulus=8)
+    node = PartitionNode(
+        name=long_branch,
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        children=tuple(
+            PartitionNode(name=f"{long_branch}__h{r}", bounds=HashBounds(modulus=16, remainder=r)) for r in range(10)
+        ),
+    )
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert: PostgreSQL truncates at 63 bytes silently, so planning these
+    # would collapse six buckets onto existing names.
+    assert plan.is_noop
+    assert {f.reason for f in plan.findings} == {TopologyReason.MODULUS_REPAIRED, TopologyReason.NAME_UNUSABLE}
+    assert any(f.reason is TopologyReason.NAME_UNUSABLE and f.is_actionable for f in plan.findings)
