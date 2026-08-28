@@ -223,3 +223,25 @@ def test__uuid7_codec__min_uuid_for__fills_every_bit_below_the_timestamp_with_ze
     assert value.int & ((1 << 76) - 1) == (0b10 << 62)
     assert value.version == 7
     assert value.variant == "specified in RFC 4122"
+
+
+def test__uuidv7_codec__decode__value_that_is_not_a_uuid__returns_none() -> None:
+    # Arrange -- a bound written by something else entirely.
+    codec = UUIDv7BoundaryCodec()
+
+    # Act / Assert -- declining is what lets is_partition_closed answer False
+    # with a warning instead of raising out of a predicate.
+    assert codec.decode("not-a-uuid-at-all") is None
+    assert codec.decode("MAXVALUE") is None
+
+
+def test__base_period_calculator__boundary_codec__is_readable_back() -> None:
+    # Arrange
+    codec = UUIDv7BoundaryCodec()
+
+    # Act
+    calculator = WeekPeriodCalculator(boundary_codec=codec)
+
+    # Assert -- pruning reads it off the calculator to decide how to compare.
+    assert calculator.boundary_codec is codec
+    assert WeekPeriodCalculator().boundary_codec is None

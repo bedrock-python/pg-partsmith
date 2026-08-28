@@ -1160,3 +1160,17 @@ def test__parse_boundary_literal__value_carrying_no_instant__is_declined() -> No
     assert parse_boundary_literal("42", UTC) is None
     assert parse_boundary_literal("", UTC) is None
     assert parse_boundary_literal("MAXVALUE", UTC) is None
+
+
+def test__parse_partition_bounds__hash_bound_with_an_unusable_modulus__declines() -> None:
+    # Arrange / Act -- shaped like a hash bound and not one the models accept.
+    parsed = parse_partition_bounds("FOR VALUES WITH (MODULUS 0, REMAINDER 0)")
+
+    # Assert -- returning a half-valid bound would have the planner compare
+    # against something PostgreSQL never wrote.
+    assert parsed is None
+
+
+def test__parse_boundary_literal__blank_value__is_declined() -> None:
+    # Arrange / Act / Assert
+    assert parse_boundary_literal("   ", UTC) is None

@@ -2597,3 +2597,79 @@ async def test__default_conflict__composite_config_on_a_single_column_repository
             from_value="2024-04-01",
             to_value="2024-05-01",
         )
+
+
+async def test__maintain_lifecycle__reconcile_raises__continue_on_error_records_it_and_still_prunes(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange
+    repo = _nested_repo(partition_info)
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SQLAlchemyError("disk full")
+    )
+
+    # Act
+    result = await service.maintain_lifecycle(_nested_config(), continue_on_error=True)
+
+    # Assert -- a failed repair must not stop the table reclaiming disk.
+    assert result.success
+    assert MaintenanceIssueStep.RECONCILE in [issue.step for issue in result.issues]
+
+
+async def test__maintain_lifecycle__reconcile_raises__propagates_without_the_flag(
+    mock_locks: MagicMock, mock_calculator: MagicMock, partition_info: PartitionInfo
+) -> None:
+    # Arrange
+    repo = _nested_repo(partition_info)
+    service = PartitionLifecycleService(repo, _nested_metadata(), mock_locks, mock_calculator)
+    service._subpartition_service.reconcile = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SQLAlchemyError("disk full")
+    )
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError):
+        await service.maintain_lifecycle(_nested_config())
+
+
+async def test__get_partitions_for_pruning__service_without_a_calculator__explains_why(
+    mock_repo: MagicMock, mock_metadata: MagicMock, mock_locks: MagicMock, config: TablePartitionConfig
+) -> None:
+    # Arrange -- a static-root wiring asked to do something period-driven.
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError):
+        await service.get_partitions_for_pruning(config)
+
+
+async def test__attach__composite_config_on_a_single_column_repository__names_the_capability(
+    mock_metadata: MagicMock, mock_locks: MagicMock, mock_calculator: MagicMock
+) -> None:
+    # Arrange -- a repository with no attach_composite_partition at all.
+    repo = MagicMock(spec=["create_partition", "attach_partition", "detach_partition", "drop_partition"])
+    composite = TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        trailing_partition_columns=("tenant_id",),
+        granularity=PartitionGranularity.MONTH,
+    )
+    service = PartitionLifecycleService(repo, mock_metadata, mock_locks, mock_calculator)
+
+    # Act / Assert
+    with pytest.raises(UnsupportedCapabilityError, match="composite partition keys"):
+        await service.create_future_partitions(composite)
+
+
+async def test__creation_service__nested_config_with_no_subpartition_collaborator__explains_the_wiring(
+    mock_repo: MagicMock, mock_metadata: MagicMock, mock_locks: MagicMock, mock_calculator: MagicMock
+) -> None:
+    # Arrange -- a creation service built without the subpartition service.
+    service = PartitionLifecycleService(mock_repo, mock_metadata, mock_locks, mock_calculator)
+    service._creation_service._subpartitions = None
+
+    # Act / Assert
+    with pytest.raises(UnsupportedCapabilityError, match="subpartitioning"):
+        service._creation_service._subpartition_service()

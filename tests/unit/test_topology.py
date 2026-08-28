@@ -13,6 +13,7 @@ from pg_partsmith.topology import (
     PartitionNode,
     PartitionTreeRow,
     RangeBounds,
+    SubpartitionSpecBase,
     build_partition_tree,
     hash_keyspace_covered,
     missing_remainders,
@@ -590,3 +591,47 @@ def test__partition_node__hash_children__ignores_siblings_bound_any_other_way() 
     # Act / Assert -- keyspace arithmetic is only meaningful over hash bounds;
     # counting a DEFAULT sibling into it would report a tiled branch as short.
     assert [c.name for c in node.hash_children] == ["public.events__2026_w35__h0"]
+
+
+# ── Extension points and small accessors ────────────────────────────────────────
+
+
+def test__subpartition_spec_base__abstract_members__refuse_to_answer() -> None:
+    # Arrange -- the base exists to be subclassed; answering here would let a
+    # half-written spec through instead of failing where it is written.
+    base = SubpartitionSpecBase(column="tenant_id", name_suffix="__h{remainder}")
+
+    # Act / Assert
+    with pytest.raises(NotImplementedError):
+        _ = base.partition_type
+    with pytest.raises(NotImplementedError):
+        base.own_name_budget()
+
+
+def test__hash_subpartition_spec__bounds_for__describes_the_bucket_at_its_own_modulus() -> None:
+    # Arrange
+    spec = HashSubpartitionSpec(column="tenant_id", modulus=4)
+
+    # Act / Assert
+    assert spec.bounds_for(2) == HashBounds(modulus=4, remainder=2)
+
+
+def test__partition_node__relname__strips_the_schema_and_survives_without_one() -> None:
+    # Arrange / Act / Assert
+    assert PartitionNode(name="public.events__h0").relname == "events__h0"
+    assert PartitionNode(name="events__h0").relname == "events__h0"
+
+
+def test__validate_pg_identifier__value_that_is_not_an_identifier__is_refused() -> None:
+    # Arrange / Act / Assert -- it reaches DDL as a quoted identifier, so a
+    # value shaped like an expression would create a very odd relation.
+    with pytest.raises(ValueError, match="Invalid SQL identifier"):
+        HashSubpartitionSpec(column="tenant_id; DROP TABLE t", modulus=2)
+
+
+def test__validate_pg_identifier__mixed_case__is_folded_the_way_postgresql_folds_it() -> None:
+    # Arrange / Act
+    spec = HashSubpartitionSpec(column="TenantId", modulus=2)
+
+    # Assert
+    assert spec.column == "tenantid"

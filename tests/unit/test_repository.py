@@ -1344,3 +1344,29 @@ async def test__repository__create_subpartition_table__copies_the_parent_but_not
     # refuses to attach the result; the parent's identity propagates on ATTACH.
     stmt = str(conn.execute.call_args.args[0])
     assert "INCLUDING ALL EXCLUDING IDENTITY" in stmt
+
+
+async def test__repository__reconcile_default_rows__relation_has_no_columns__is_reported_not_guessed() -> None:
+    # Arrange -- to_regclass resolved nothing, so the column lookup is empty.
+    move_result = MagicMock()
+    move_result.rowcount = 0
+    engine = MagicMock()
+    conn = AsyncMock()
+    empty = MagicMock()
+    empty.fetchall.return_value = []
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), empty, move_result]
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- moving rows into a shape we cannot name would be a guess.
+    with pytest.raises(PartitionNotFoundError):
+        await repo.reconcile_default_rows(
+            default_partition_name="events_default",
+            target_partition_name="events__2024_04",
+            partition_column="created_at",
+            from_value="2024-04-01",
+            to_value="2024-05-01",
+        )
