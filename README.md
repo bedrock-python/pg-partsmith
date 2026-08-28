@@ -15,7 +15,7 @@ A single library that covers the full PostgreSQL partition lifecycle: creating p
 
 - **Async and sync** — `pg_partsmith.aio` on the SQLAlchemy async engine, `pg_partsmith.sync` on the classic sync engine
 - **Full lifecycle** — create ahead, detach expired, drop orphans in one call
-- **Nested partitioning** — `RANGE(time) → HASH(column)` trees, reconciled towards the configured shape on every run
+- **Nested partitioning** — `RANGE(time) → HASH(column)` and `→ LIST(column)` trees, reconciled towards the configured shape on every run
 - **Encoded partition keys** — partition by time even when the key is a UUIDv7 or another sortable id
 - **Extensible hooks** — 6 hook points (`before`/`after` create, detach, drop)
 - **Multiple strategies** — hourly, daily, weekly, monthly, quarterly, yearly + fully custom
@@ -172,8 +172,12 @@ events
 ```
 
 The two dimensions stay separate: **time is the lifecycle dimension** (create-ahead,
-retention, detach, drop, hooks all operate on the whole week) and **hash is the
-distribution dimension**. `retention_count=12` keeps twelve weeks, not twelve leaves.
+retention, detach, drop, hooks all operate on the whole week) and the nested one is the
+distribution dimension. `retention_count=12` keeps twelve weeks, not twelve leaves.
+
+`ListSubpartitionSpec` splits a period into named value sets instead
+(`RANGE(time) → LIST(region)`), with an optional DEFAULT catch-all; the strategies also
+nest into each other.
 
 Maintenance converges the actual tree towards the configured one on every run: missing
 buckets are created, a converged tree costs **zero DDL**, and anything that cannot be
@@ -376,7 +380,7 @@ scheduler.add_job(
 
 **Entities** — `Period`, `PartitionInfo`, `TablePartitionConfig`, `MaintenanceResult`, `MaintenanceIssue`, `MaintenanceIssueStep`
 
-**Topology** — `HashSubpartitionSpec`, `SubpartitionSpec`, `PartitionNode`, `RangeBounds`, `HashBounds`, `ListBounds`, `DefaultBounds`, `PartitionBounds`
+**Topology** — `HashSubpartitionSpec`, `ListSubpartitionSpec`, `ListGroup`, `SubpartitionSpec`, `SubpartitionSpecBase`, `PartitionNode`, `RangeBounds`, `HashBounds`, `ListBounds`, `DefaultBounds`, `PartitionBounds`, `SubpartitionBounds`
 
 **Reconciliation** — `SubpartitionPlan`, `SubpartitionReconcileResult`, `TopologyFinding`, `TopologyReason`, `plan_subpartitions`
 

@@ -16,9 +16,12 @@ from pg_partsmith.subpartition_plan import (
     to_maintenance_issue,
 )
 from pg_partsmith.topology import (
+    DefaultBounds,
     HashBounds,
     HashSubpartitionSpec,
     ListBounds,
+    ListGroup,
+    ListSubpartitionSpec,
     PartitionNode,
     PartitionType,
     RangeBounds,
@@ -348,3 +351,202 @@ def test__topology_reason__actionability__matches_whether_a_human_must_intervene
 
     # Act / Assert
     assert finding.is_actionable is expected
+
+
+# ── LIST levels ─────────────────────────────────────────────────────────────────
+
+
+def _list_spec(**overrides: object) -> ListSubpartitionSpec:
+    base: dict[str, object] = {
+        "column": "region",
+        "groups": (ListGroup(name="eu", values=("de", "fr")), ListGroup(name="us", values=("us",))),
+    }
+    base.update(overrides)
+    return ListSubpartitionSpec(**base)  # type: ignore[arg-type]
+
+
+def _list_branch(*children: PartitionNode) -> PartitionNode:
+    return PartitionNode(
+        name=BRANCH,
+        parent_name="public.events",
+        level=1,
+        bounds=RangeBounds(from_value="2026-08-24", to_value="2026-08-31"),
+        partition_type=PartitionType.LIST,
+        partition_columns=("region",),
+        children=children,
+    )
+
+
+def _list_child(name: str, *values: str) -> PartitionNode:
+    return PartitionNode(name=f"{BRANCH}__{name}", bounds=ListBounds(values=values))
+
+
+def test__plan_new_subtree__list_spec__creates_every_group() -> None:
+    # Arrange / Act
+    actions = plan_new_subtree(_list_spec(), BRANCH)
+
+    # Assert
+    assert [(a.child_name, a.bounds) for a in actions] == [
+        (f"{BRANCH}__eu", ListBounds(values=("de", "fr"))),
+        (f"{BRANCH}__us", ListBounds(values=("us",))),
+    ]
+
+
+def test__plan_new_subtree__list_spec_with_default__adds_the_catch_all_last() -> None:
+    # Arrange / Act
+    actions = plan_new_subtree(_list_spec(include_default=True), BRANCH)
+
+    # Assert
+    assert actions[-1].child_name == f"{BRANCH}__other"
+    assert actions[-1].bounds == DefaultBounds()
+
+
+def test__plan_subpartitions__list_branch_missing_a_group__creates_only_that_group() -> None:
+    # Arrange
+    node = _list_branch(_list_child("eu", "de", "fr"))
+
+    # Act
+    plan = plan_subpartitions(_list_spec(), node)
+
+    # Assert
+    assert [a.child_name for a in plan.actions] == [f"{BRANCH}__us"]
+    assert plan.findings == ()
+
+
+def test__plan_subpartitions__list_branch_already_complete__plans_nothing() -> None:
+    # Arrange
+    node = _list_branch(_list_child("eu", "de", "fr"), _list_child("us", "us"))
+
+    # Act
+    plan = plan_subpartitions(_list_spec(), node)
+
+    # Assert
+    assert plan.is_noop
+    assert plan.findings == ()
+
+
+def test__plan_subpartitions__list_group_matched_by_values_not_name__left_alone() -> None:
+    # Arrange: a partition another tool named differently owns the same values.
+    node = _list_branch(_list_child("europe", "de", "fr"), _list_child("us", "us"))
+
+    # Act
+    plan = plan_subpartitions(_list_spec(), node)
+
+    # Assert: recognised, not duplicated under our own naming.
+    assert plan.is_noop
+
+
+def test__plan_subpartitions__list_value_already_owned_elsewhere__reported_not_created() -> None:
+    # Arrange: "de" sits in a partition that does not match the configured group.
+    node = _list_branch(_list_child("dach", "de", "at"))
+
+    # Act
+    plan = plan_subpartitions(_list_spec(), node)
+
+    # Assert: only the non-conflicting group is created.
+    assert [a.child_name for a in plan.actions] == [f"{BRANCH}__us"]
+    assert [f.reason for f in plan.findings] == [TopologyReason.LIST_VALUES_CONFLICT]
+    assert plan.actionable_findings != ()
+
+
+def test__plan_subpartitions__list_default_missing__is_created() -> None:
+    # Arrange
+    node = _list_branch(_list_child("eu", "de", "fr"), _list_child("us", "us"))
+
+    # Act
+    plan = plan_subpartitions(_list_spec(include_default=True), node)
+
+    # Assert
+    assert [a.bounds for a in plan.actions] == [DefaultBounds()]
+
+
+def test__plan_subpartitions__list_default_present__not_created_again() -> None:
+    # Arrange
+    node = _list_branch(
+        _list_child("eu", "de", "fr"),
+        _list_child("us", "us"),
+        PartitionNode(name=f"{BRANCH}__other", bounds=DefaultBounds()),
+    )
+
+    # Act
+    plan = plan_subpartitions(_list_spec(include_default=True), node)
+
+    # Assert
+    assert plan.is_noop
+
+
+def test__plan_subpartitions__list_spec_against_a_hash_branch__reports_strategy_mismatch() -> None:
+    # Arrange
+    node = _branch((2, 0), (2, 1))
+
+    # Act
+    plan = plan_subpartitions(_list_spec(), node)
+
+    # Assert
+    assert plan.is_noop
+    assert [f.reason for f in plan.findings] == [TopologyReason.STRATEGY_MISMATCH]
+
+
+def test__plan_subpartitions__hash_spec_against_a_list_branch__reports_strategy_mismatch() -> None:
+    # Arrange
+    node = _list_branch(_list_child("eu", "de"))
+
+    # Act
+    plan = plan_subpartitions(_spec(modulus=2), node)
+
+    # Assert
+    assert [f.reason for f in plan.findings] == [TopologyReason.STRATEGY_MISMATCH]
+
+
+def test__plan_subpartitions__list_branch_that_is_a_legacy_leaf__left_untouched() -> None:
+    # Arrange
+    node = PartitionNode(name=BRANCH, bounds=RangeBounds(from_value="a", to_value="b"))
+
+    # Act
+    plan = plan_subpartitions(_list_spec(), node)
+
+    # Assert
+    assert plan.is_noop
+    assert [f.reason for f in plan.findings] == [TopologyReason.LEGACY_LEAF]
+
+
+def test__plan_subpartitions__hash_under_list__gap_one_level_down_is_repaired() -> None:
+    # Arrange: RANGE -> LIST(region) -> HASH(tenant_id), with one bucket missing.
+    inner = HashSubpartitionSpec(column="tenant_id", modulus=2)
+    spec = _list_spec(subpartition=inner)
+    node = _list_branch(
+        PartitionNode(
+            name=f"{BRANCH}__eu",
+            bounds=ListBounds(values=("de", "fr")),
+            partition_type=PartitionType.HASH,
+            partition_columns=("tenant_id",),
+            children=(PartitionNode(name=f"{BRANCH}__eu__h0", bounds=HashBounds(modulus=2, remainder=0)),),
+        ),
+        PartitionNode(
+            name=f"{BRANCH}__us",
+            bounds=ListBounds(values=("us",)),
+            partition_type=PartitionType.HASH,
+            partition_columns=("tenant_id",),
+            children=tuple(
+                PartitionNode(name=f"{BRANCH}__us__h{r}", bounds=HashBounds(modulus=2, remainder=r)) for r in (0, 1)
+            ),
+        ),
+    )
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert
+    assert [a.child_name for a in plan.actions] == [f"{BRANCH}__eu__h1"]
+
+
+def test__plan_new_subtree__list_over_hash__builds_both_levels() -> None:
+    # Arrange
+    spec = _list_spec(subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2))
+
+    # Act
+    actions = plan_new_subtree(spec, BRANCH)
+
+    # Assert
+    assert [a.child_name for a in actions] == [f"{BRANCH}__eu", f"{BRANCH}__us"]
+    assert [c.child_name for c in actions[0].children] == [f"{BRANCH}__eu__h0", f"{BRANCH}__eu__h1"]

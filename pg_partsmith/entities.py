@@ -28,11 +28,15 @@ from .topology import (
     HashBounds,
     HashSubpartitionSpec,
     ListBounds,
+    ListGroup,
+    ListSubpartitionSpec,
     PartitionBounds,
     PartitionNode,
     PartitionType,
     RangeBounds,
+    SubpartitionBounds,
     SubpartitionSpec,
+    SubpartitionSpecBase,
     validate_pg_identifier,
 )
 from .types import NonNegativeInt, PositiveInt, StrippedNonEmptyStr
@@ -45,6 +49,8 @@ __all__ = [
     "HashBounds",
     "HashSubpartitionSpec",
     "ListBounds",
+    "ListGroup",
+    "ListSubpartitionSpec",
     "MaintenanceIssue",
     "MaintenanceIssueStep",
     "MaintenanceResult",
@@ -56,7 +62,9 @@ __all__ = [
     "PartitionType",
     "Period",
     "RangeBounds",
+    "SubpartitionBounds",
     "SubpartitionSpec",
+    "SubpartitionSpecBase",
     "TablePartitionConfig",
 ]
 

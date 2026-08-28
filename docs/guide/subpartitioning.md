@@ -20,6 +20,7 @@ The two dimensions do different jobs, and keeping them apart is the whole point:
 |-----------|---------|
 | Top-level `RANGE` over time | **Lifecycle** — create-ahead, retention, detach, drop, cold-storage export |
 | Nested `HASH` | **Distribution and pruning** — spreading a multi-tenant workload, letting the planner skip buckets |
+| Nested `LIST` | **Explicit segmentation** — a partition per region, tier or tenant class |
 
 Retention is therefore always counted in *time periods*, never in leaves:
 `retention_count=12` keeps twelve weeks, whether each week holds one table or sixteen.
@@ -69,9 +70,55 @@ characters. Because PostgreSQL truncates identifiers at 63 bytes **silently** �
 would collapse two buckets onto one name — `TablePartitionConfig` adds the bucket suffix
 to its length check and refuses a table name that would overflow.
 
+### LIST instead of HASH
+
+Where HASH divides a level into anonymous buckets, LIST divides it into named
+partitions with explicit value sets:
+
+```python
+from pg_partsmith import ListGroup, ListSubpartitionSpec
+
+subpartition=ListSubpartitionSpec(
+    column="region",
+    groups=(
+        ListGroup(name="eu", values=("de", "fr", "es")),
+        ListGroup(name="us", values=("us", "ca")),
+    ),
+    include_default=True,   # a catch-all for values you did not list
+)
+```
+
+giving `events__2026_w35__eu`, `events__2026_w35__us` and
+`events__2026_w35__other`.
+
+The two strategies differ in one way that matters for reconciliation: **a LIST
+level is never complete.** There is always another value the world could
+produce, so there is no "gap" to detect — only groups that do not exist yet.
+That is what `include_default` is for: without a DEFAULT partition, a row
+carrying an unconfigured value is *rejected*, exactly as a missing hash bucket
+would reject one.
+
+Groups are matched by **the values they own, not by their name**, so a tree
+built by another tool under a different naming convention is recognised and
+left alone rather than duplicated.
+
+A value belongs to exactly one partition. If a configured group claims a value
+that some other partition already owns, moving it would mean detaching that
+partition — so reconciliation creates the groups it safely can, and reports the
+clash through `MaintenanceResult.issues`:
+
+```text
+PartitionTopologyError: public.events__2026_w35 cannot gain the configured LIST
+partition 'eu': PostgreSQL already routes 'de' in public.events__2026_w35__dach.
+```
+
+Values are written as SQL string literals, which PostgreSQL coerces to the
+partition key's type — so a numeric key is configured as `values=("1", "2")`.
+
 ### Deeper trees
 
-A spec can carry its own `subpartition`, up to four levels:
+A spec can carry its own `subpartition`, up to four levels, and the strategies mix freely
+(`RANGE(time) → LIST(region) → HASH(tenant_id)`):
 
 ```python
 HashSubpartitionSpec(
@@ -180,6 +227,9 @@ restores ingestion for that slice of tenants.
 | Branch subpartitioned by another strategy or column | Leave it; report an issue |
 | Hash siblings at mixed moduli that still tile the keyspace | Leave it; no issue |
 | Hash siblings at mixed moduli leaving a gap | Leave it; report an issue |
+| LIST group missing | Create it |
+| LIST group present under another name but the same values | Leave it |
+| LIST group whose value another partition owns | Leave it; report an issue |
 
 ### Why a modulus is never changed
 

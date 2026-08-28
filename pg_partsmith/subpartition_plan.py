@@ -26,8 +26,14 @@ from pydantic import BaseModel, ConfigDict
 from .entities import MaintenanceIssue, MaintenanceIssueStep
 from .exceptions import PartitionTopologyError
 from .topology import (
+    DefaultBounds,
     HashBounds,
+    HashSubpartitionSpec,
+    ListBounds,
+    ListGroup,
+    ListSubpartitionSpec,
     PartitionNode,
+    SubpartitionBounds,
     SubpartitionSpec,
     hash_keyspace_covered,
     missing_remainders,
@@ -61,6 +67,9 @@ class TopologyReason(StrEnum):
             safe, so this needs a human.
         COVERAGE_UNKNOWN: The moduli are too coarse to enumerate, so coverage
             could not be verified.
+        LIST_VALUES_CONFLICT: A configured LIST group claims a value another
+            partition already owns. A value belongs to exactly one partition,
+            so this needs a human.
     """
 
     LEGACY_LEAF = "legacy_leaf"
@@ -71,6 +80,7 @@ class TopologyReason(StrEnum):
     NON_UNIFORM_COMPLETE = "non_uniform_complete"
     NON_UNIFORM_INCOMPLETE = "non_uniform_incomplete"
     COVERAGE_UNKNOWN = "coverage_unknown"
+    LIST_VALUES_CONFLICT = "list_values_conflict"
 
 
 # Reasons that describe a healthy, deliberate state (policy evolution) rather
@@ -118,7 +128,8 @@ class SubpartitionAction(BaseModel):
     Attributes:
         parent_name: Schema-qualified relation the new partition attaches to.
         child_name: Schema-qualified name of the partition to create.
-        bounds: Bounds to attach ``child_name`` with.
+        bounds: Bounds to attach ``child_name`` with (hash bucket, list
+            values, or DEFAULT).
         subpartition: How ``child_name`` partitions its own children, if at all.
         children: Partitions to create inside ``child_name`` before attaching it.
     """
@@ -127,7 +138,7 @@ class SubpartitionAction(BaseModel):
 
     parent_name: StrippedNonEmptyStr
     child_name: StrippedNonEmptyStr
-    bounds: HashBounds
+    bounds: SubpartitionBounds
     subpartition: SubpartitionSpec | None = None
     children: tuple[SubpartitionAction, ...] = ()
 
@@ -185,16 +196,18 @@ def plan_new_subtree(spec: SubpartitionSpec, branch_name: str) -> tuple[Subparti
     """Plan the complete subtree of a branch that does not exist yet.
 
     Used on the creation path, where there is nothing to reconcile against and
-    every bucket the spec describes has to be built.
+    every child the spec describes has to be built.
 
     Args:
         spec: The subpartitioning to materialise.
         branch_name: Schema-qualified name of the branch being created.
 
     Returns:
-        Actions creating every bucket described by ``spec``, nested.
+        Actions creating every child described by ``spec``, nested.
     """
-    return _new_bucket_actions(spec, branch_name, range(spec.modulus))
+    if isinstance(spec, HashSubpartitionSpec):
+        return _hash_actions(spec, branch_name, range(spec.modulus))
+    return _list_actions(spec, branch_name, spec.groups, include_default=spec.include_default)
 
 
 def _plan_into(
@@ -209,18 +222,14 @@ def _plan_into(
         findings.append(incompatibility)
         return
 
-    hash_children = node.hash_children
-    modulus = _effective_modulus(spec, node, hash_children, findings)
-    if modulus is None:
-        return
+    if isinstance(spec, HashSubpartitionSpec):
+        recurse_into = _plan_hash_level(spec, node, actions, findings)
+    else:
+        recurse_into = _plan_list_level(spec, node, actions, findings)
 
-    bounds = tuple(c.bounds for c in hash_children if isinstance(c.bounds, HashBounds))
-    gaps = missing_remainders(modulus, bounds)
-    actions.extend(_new_bucket_actions(spec, node.name, gaps, modulus=modulus))
-
-    # Existing buckets may themselves be missing a level below.
+    # Existing children may themselves be missing a level below.
     if spec.subpartition is not None:
-        for child in hash_children:
+        for child in recurse_into:
             _plan_into(spec.subpartition, child, actions, findings)
 
 
@@ -263,8 +272,29 @@ def _incompatibility(spec: SubpartitionSpec, node: PartitionNode) -> TopologyFin
     return None
 
 
+# ── HASH levels ─────────────────────────────────────────────────────────────────
+
+
+def _plan_hash_level(
+    spec: HashSubpartitionSpec,
+    node: PartitionNode,
+    actions: list[SubpartitionAction],
+    findings: list[TopologyFinding],
+) -> tuple[PartitionNode, ...]:
+    """Fill the gaps in a hash bucket set; return the children worth recursing into."""
+    hash_children = node.hash_children
+    modulus = _effective_modulus(spec, node, hash_children, findings)
+    if modulus is None:
+        return ()
+
+    bounds = tuple(c.bounds for c in hash_children if isinstance(c.bounds, HashBounds))
+    gaps = missing_remainders(modulus, bounds)
+    actions.extend(_hash_actions(spec, node.name, gaps, modulus=modulus))
+    return hash_children
+
+
 def _effective_modulus(
-    spec: SubpartitionSpec,
+    spec: HashSubpartitionSpec,
     node: PartitionNode,
     hash_children: tuple[PartitionNode, ...],
     findings: list[TopologyFinding],
@@ -324,7 +354,7 @@ def _effective_modulus(
 def _non_uniform_finding(
     node: PartitionNode,
     bounds: tuple[HashBounds, ...],
-    spec: SubpartitionSpec,
+    spec: HashSubpartitionSpec,
 ) -> TopologyFinding:
     """Classify a branch whose hash siblings disagree on modulus.
 
@@ -366,8 +396,8 @@ def _non_uniform_finding(
     )
 
 
-def _new_bucket_actions(
-    spec: SubpartitionSpec,
+def _hash_actions(
+    spec: HashSubpartitionSpec,
     parent_name: str,
     remainders: range | tuple[int, ...],
     *,
@@ -383,18 +413,129 @@ def _new_bucket_actions(
     effective = spec.modulus if modulus is None else modulus
 
     return tuple(
-        SubpartitionAction(
-            parent_name=parent_name,
-            child_name=qualify(schema, spec.child_name(parent_relname, remainder)),
-            bounds=HashBounds(modulus=effective, remainder=remainder),
-            subpartition=spec.subpartition,
-            children=(
-                plan_new_subtree(spec.subpartition, qualify(schema, spec.child_name(parent_relname, remainder)))
-                if spec.subpartition is not None
-                else ()
-            ),
+        _action(
+            spec,
+            parent_name,
+            qualify(schema, spec.child_name(parent_relname, remainder)),
+            HashBounds(modulus=effective, remainder=remainder),
         )
         for remainder in remainders
+    )
+
+
+# ── LIST levels ─────────────────────────────────────────────────────────────────
+
+
+def _plan_list_level(
+    spec: ListSubpartitionSpec,
+    node: PartitionNode,
+    actions: list[SubpartitionAction],
+    findings: list[TopologyFinding],
+) -> tuple[PartitionNode, ...]:
+    """Create the LIST partitions a branch is missing; return children to recurse into.
+
+    Unlike a hash set, a LIST level is never complete — there is always another
+    value the world could produce — so there is no "gap" to detect, only groups
+    that are not there yet. Groups are matched by the values they own rather
+    than by name, so a tree an earlier tool named differently is recognised
+    instead of duplicated.
+    """
+    claimed: dict[str, str] = {}
+    present: set[frozenset[str]] = set()
+    has_default = False
+
+    for child in node.children:
+        if isinstance(child.bounds, ListBounds):
+            present.add(frozenset(child.bounds.values))
+            for value in child.bounds.values:
+                claimed[value] = child.name
+        elif isinstance(child.bounds, DefaultBounds):
+            has_default = True
+
+    missing = []
+    for group in spec.groups:
+        if frozenset(group.values) in present:
+            continue
+
+        conflicts = {v: claimed[v] for v in group.values if v in claimed}
+        if conflicts:
+            findings.append(_list_conflict_finding(node, group, conflicts))
+            continue
+
+        missing.append(group)
+        for value in group.values:
+            claimed[value] = "(pending)"
+
+    actions.extend(
+        _list_actions(spec, node.name, tuple(missing), include_default=spec.include_default and not has_default)
+    )
+    return tuple(c for c in node.children if isinstance(c.bounds, (ListBounds, DefaultBounds)))
+
+
+def _list_conflict_finding(
+    node: PartitionNode,
+    group: ListGroup,
+    conflicts: dict[str, str],
+) -> TopologyFinding:
+    """Report a configured group whose values another partition already owns."""
+    detail = ", ".join(f"{value!r} in {owner}" for value, owner in sorted(conflicts.items()))
+    return TopologyFinding(
+        partition_name=node.name,
+        reason=TopologyReason.LIST_VALUES_CONFLICT,
+        detail=(
+            f"{node.name} cannot gain the configured LIST partition {group.name!r}: PostgreSQL already "
+            f"routes {detail}. A value belongs to exactly one partition, and moving one requires detaching "
+            "the partition that holds it, so this is left for manual inspection."
+        ),
+    )
+
+
+def _list_actions(
+    spec: ListSubpartitionSpec,
+    parent_name: str,
+    groups: tuple[ListGroup, ...],
+    *,
+    include_default: bool,
+) -> tuple[SubpartitionAction, ...]:
+    """Build create-actions for ``groups`` (and optionally DEFAULT) under a parent."""
+    schema, parent_relname = split_qualified_name(parent_name)
+
+    actions = [
+        _action(
+            spec,
+            parent_name,
+            qualify(schema, spec.child_name(parent_relname, group.name)),
+            group.bounds(),
+        )
+        for group in groups
+    ]
+
+    if include_default:
+        actions.append(
+            _action(
+                spec,
+                parent_name,
+                qualify(schema, spec.child_name(parent_relname, spec.default_name)),
+                DefaultBounds(),
+            )
+        )
+
+    return tuple(actions)
+
+
+def _action(
+    spec: SubpartitionSpec,
+    parent_name: str,
+    child_name: str,
+    bounds: SubpartitionBounds,
+) -> SubpartitionAction:
+    """Build one create-action, with the subtree that must exist inside it."""
+    return SubpartitionAction(
+        parent_name=parent_name,
+        child_name=child_name,
+        bounds=bounds,
+        subpartition=spec.subpartition,
+        children=plan_new_subtree(spec.subpartition, child_name) if spec.subpartition is not None else (),
     )
 
 

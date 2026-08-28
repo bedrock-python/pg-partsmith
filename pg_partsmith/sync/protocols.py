@@ -6,11 +6,11 @@ from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
 from pg_partsmith.entities import (
-    HashBounds,
     MaintenanceResult,
     PartitionInfo,
     PartitionNode,
     PartitionType,
+    SubpartitionBounds,
     SubpartitionSpec,
     TablePartitionConfig,
 )
@@ -331,13 +331,14 @@ class SubpartitionRepository(Protocol):
         """
         ...
 
-    def attach_subpartition(self, parent_name: str, child_name: str, bounds: HashBounds) -> None:
-        """Attach a hash bucket to its parent.
+    def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
+        """Attach one subpartition to its parent.
 
         Args:
             parent_name: Partitioned relation to attach to.
             child_name: Table to attach.
-            bounds: Modulus and remainder the bucket owns.
+            bounds: What the child owns — a hash bucket, a set of LIST values,
+                or DEFAULT.
         """
         ...
 

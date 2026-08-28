@@ -25,7 +25,9 @@ from typing import Annotated, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .constants import (
-    DEFAULT_SUBPARTITION_NAME_SUFFIX,
+    DEFAULT_HASH_NAME_SUFFIX,
+    DEFAULT_LIST_DEFAULT_NAME,
+    DEFAULT_LIST_NAME_SUFFIX,
     MAX_HASH_KEYSPACE_LCM,
     MAX_IDENTIFIER_LENGTH,
     MAX_SUBPARTITION_DEPTH,
@@ -128,16 +130,90 @@ PartitionBounds = Annotated[
 ]
 """Any partition bound description, discriminated on ``kind``."""
 
+SubpartitionBounds = Annotated[
+    HashBounds | ListBounds | DefaultBounds,
+    Field(discriminator="kind"),
+]
+"""How a subpartition is bound in its parent.
+
+Narrower than :data:`PartitionBounds`: a RANGE bound belongs to the time
+dimension at the root, never to a level a subpartition spec creates. Keeping it
+out makes the DDL renderer total over the cases it can actually receive.
+"""
+
 
 # ── Desired subpartitioning ─────────────────────────────────────────────────────
+#
+# A spec is declarative: it says what the tree *should* look like, and
+# ``pg_partsmith.subpartition_plan`` works out which nodes are missing. The
+# strategies differ in how a level is divided, so what they share — the column,
+# the naming template, the level below — lives on a common base.
 
 
-class HashSubpartitionSpec(BaseModel):
-    """Sub-partition each partition of the level above by HASH.
+class SubpartitionSpecBase(BaseModel):
+    """Fields and tree arithmetic shared by every subpartitioning strategy.
 
-    The spec is declarative: it says what the tree *should* look like, and
-    :func:`pg_partsmith.subpartition_plan.plan_subpartitions` works out which
-    nodes are missing.
+    Attributes:
+        column: Column this level partitions on. Must be part of every
+            UNIQUE/PRIMARY KEY constraint on the root table, or PostgreSQL
+            refuses the subtree.
+        name_suffix: Template appended to the parent's name to name each child.
+        subpartition: Optional further level of subpartitioning.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    column: StrippedNonEmptyStr
+    name_suffix: str
+    subpartition: SubpartitionSpec | None = None
+
+    @property
+    def partition_type(self) -> PartitionType:
+        """PostgreSQL partition type this spec describes."""
+        raise NotImplementedError
+
+    @field_validator("column")
+    @classmethod
+    def validate_column(cls, v: str) -> str:
+        """Validate and normalise the partition column identifier."""
+        return validate_pg_identifier(v)
+
+    def own_name_budget(self) -> int:
+        """Bytes this level alone adds to a child's name."""
+        raise NotImplementedError
+
+    def name_length_budget(self) -> int:
+        """Bytes this level and everything below it add to a partition name.
+
+        Used to keep generated names inside PostgreSQL's 63-byte identifier
+        limit, which truncates silently — two children could otherwise collapse
+        onto one name.
+        """
+        below = self.subpartition.name_length_budget() if self.subpartition is not None else 0
+        return self.own_name_budget() + below
+
+    def depth(self) -> int:
+        """Number of subpartition levels this spec describes, including itself."""
+        return 1 + (self.subpartition.depth() if self.subpartition is not None else 0)
+
+    def walk(self) -> list[SubpartitionSpec]:
+        """Return this spec and every spec below it, outermost first."""
+        specs: list[SubpartitionSpec] = [self]  # type: ignore[list-item]
+        if self.subpartition is not None:
+            specs.extend(self.subpartition.walk())
+        return specs
+
+    @model_validator(mode="after")
+    def validate_depth(self) -> SubpartitionSpecBase:
+        """Bound the tree depth so a typo cannot fan out into thousands of tables."""
+        if self.depth() > MAX_SUBPARTITION_DEPTH:
+            msg = f"Subpartitioning is limited to {MAX_SUBPARTITION_DEPTH} levels, got {self.depth()}"
+            raise ValueError(msg)
+        return self
+
+
+class HashSubpartitionSpec(SubpartitionSpecBase):
+    """Divide each partition of the level above into HASH buckets.
 
     ``modulus`` is the bucket count for *newly created* branches only. Existing
     branches keep the modulus they were built with — a hash set cannot change
@@ -146,35 +222,21 @@ class HashSubpartitionSpec(BaseModel):
 
     Attributes:
         strategy: Discriminator; always ``"hash"``.
-        column: Column to hash on. Must be part of every UNIQUE/PRIMARY KEY
-            constraint on the root table, or PostgreSQL refuses the subtree.
         modulus: Number of hash buckets to create per branch.
-        name_suffix: Template appended to the parent's name to name each
-            bucket. Must contain ``{remainder}`` and otherwise only lowercase
+        name_suffix: Must contain ``{remainder}`` and otherwise only lowercase
             identifier characters.
-        subpartition: Optional further level of subpartitioning.
     """
-
-    model_config = ConfigDict(frozen=True)
 
     _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{remainder\}[a-z0-9_]*$")
 
     strategy: Literal["hash"] = "hash"
-    column: StrippedNonEmptyStr
     modulus: PositiveInt
-    name_suffix: str = DEFAULT_SUBPARTITION_NAME_SUFFIX
-    subpartition: SubpartitionSpec | None = None
+    name_suffix: str = DEFAULT_HASH_NAME_SUFFIX
 
     @property
     def partition_type(self) -> PartitionType:
         """PostgreSQL partition type this spec describes."""
         return PartitionType.HASH
-
-    @field_validator("column")
-    @classmethod
-    def validate_column(cls, v: str) -> str:
-        """Validate and normalise the hash column identifier."""
-        return validate_pg_identifier(v)
 
     @field_validator("name_suffix")
     @classmethod
@@ -196,39 +258,141 @@ class HashSubpartitionSpec(BaseModel):
         """Return the bounds of bucket ``remainder`` at this spec's modulus."""
         return HashBounds(modulus=self.modulus, remainder=remainder)
 
-    def name_length_budget(self) -> int:
-        """Bytes this level and everything below it add to a partition name.
-
-        Used to keep generated names inside PostgreSQL's 63-byte identifier
-        limit, which truncates silently — two buckets could otherwise collapse
-        onto one name.
-        """
+    def own_name_budget(self) -> int:
+        """Bytes this level adds, sized for the widest remainder."""
         widest = len(str(self.modulus - 1))
-        own = len(self.name_suffix) - len("{remainder}") + widest
-        below = self.subpartition.name_length_budget() if self.subpartition is not None else 0
-        return own + below
+        return len(self.name_suffix) - len("{remainder}") + widest
 
-    def depth(self) -> int:
-        """Number of subpartition levels this spec describes, including itself."""
-        return 1 + (self.subpartition.depth() if self.subpartition is not None else 0)
 
-    def walk(self) -> list[SubpartitionSpec]:
-        """Return this spec and every spec below it, outermost first."""
-        specs: list[SubpartitionSpec] = [self]
-        if self.subpartition is not None:
-            specs.extend(self.subpartition.walk())
-        return specs
+class ListGroup(BaseModel):
+    """One named LIST partition and the key values it owns.
+
+    Attributes:
+        name: Identifier fragment used to name the partition.
+        values: Values routed to it. Rendered as SQL string literals, which
+            PostgreSQL coerces to the partition key's type, so numeric and
+            textual keys are both written as strings here.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: StrippedNonEmptyStr
+    values: tuple[StrippedNonEmptyStr, ...]
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Keep the fragment safe to splice into an identifier."""
+        return validate_pg_identifier(v)
 
     @model_validator(mode="after")
-    def validate_depth(self) -> HashSubpartitionSpec:
-        """Bound the tree depth so a typo cannot fan out into thousands of tables."""
-        if self.depth() > MAX_SUBPARTITION_DEPTH:
-            msg = f"Subpartitioning is limited to {MAX_SUBPARTITION_DEPTH} levels, got {self.depth()}"
+    def validate_values(self) -> ListGroup:
+        """A LIST partition owning no values could never route a row."""
+        if not self.values:
+            msg = f"LIST group {self.name!r} must own at least one value"
+            raise ValueError(msg)
+        if len(set(self.values)) != len(self.values):
+            msg = f"LIST group {self.name!r} repeats a value: {self.values!r}"
             raise ValueError(msg)
         return self
 
+    def bounds(self) -> ListBounds:
+        """Return this group's partition bounds."""
+        return ListBounds(values=self.values)
 
-SubpartitionSpec = HashSubpartitionSpec
+
+class ListSubpartitionSpec(SubpartitionSpecBase):
+    """Divide each partition of the level above into named LIST partitions.
+
+    Unlike HASH, a LIST level is never "complete": there is always another
+    value the world could produce. That is what ``include_default`` is for — a
+    catch-all partition so an unknown value is stored rather than rejected.
+
+    Because groups are matched by the values they own rather than by name, a
+    tree built by another tool is recognised and left alone instead of being
+    duplicated under different names.
+
+    Attributes:
+        strategy: Discriminator; always ``"list"``.
+        groups: The partitions to maintain, each owning an explicit value set.
+        include_default: Maintain a DEFAULT catch-all partition alongside them.
+        default_name: Identifier fragment for that DEFAULT partition.
+        name_suffix: Must contain ``{name}`` and otherwise only lowercase
+            identifier characters.
+    """
+
+    _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{name\}[a-z0-9_]*$")
+
+    strategy: Literal["list"] = "list"
+    groups: tuple[ListGroup, ...]
+    include_default: bool = False
+    default_name: StrippedNonEmptyStr = DEFAULT_LIST_DEFAULT_NAME
+    name_suffix: str = DEFAULT_LIST_NAME_SUFFIX
+
+    @property
+    def partition_type(self) -> PartitionType:
+        """PostgreSQL partition type this spec describes."""
+        return PartitionType.LIST
+
+    @field_validator("name_suffix")
+    @classmethod
+    def validate_name_suffix(cls, v: str) -> str:
+        """Reject templates that could not produce a safe, unique identifier."""
+        if not cls._NAME_SUFFIX_PATTERN.match(v):
+            msg = (
+                f"name_suffix {v!r} must contain '{{name}}' and otherwise only "
+                "lowercase letters, digits, and underscores"
+            )
+            raise ValueError(msg)
+        return v
+
+    @field_validator("default_name")
+    @classmethod
+    def validate_default_name(cls, v: str) -> str:
+        """Keep the DEFAULT partition's fragment safe to splice into a name."""
+        return validate_pg_identifier(v)
+
+    @model_validator(mode="after")
+    def validate_groups(self) -> ListSubpartitionSpec:
+        """Reject a spec PostgreSQL would refuse or that names two partitions alike."""
+        if not self.groups:
+            msg = "LIST subpartitioning requires at least one group"
+            raise ValueError(msg)
+
+        names = [g.name for g in self.groups]
+        if self.include_default:
+            names.append(self.default_name)
+        if len(set(names)) != len(names):
+            msg = f"LIST group names must be distinct, got {names!r}"
+            raise ValueError(msg)
+
+        seen: dict[str, str] = {}
+        for group in self.groups:
+            for value in group.values:
+                if value in seen:
+                    msg = f"LIST value {value!r} is claimed by both {seen[value]!r} and {group.name!r}"
+                    raise ValueError(msg)
+                seen[value] = group.name
+
+        return self
+
+    def child_name(self, parent_relname: str, name: str) -> str:
+        """Return the bare relation name of one child under ``parent_relname``."""
+        return f"{parent_relname}{self.name_suffix.format(name=name)}"
+
+    def own_name_budget(self) -> int:
+        """Bytes this level adds, sized for the longest group name."""
+        names = [g.name for g in self.groups]
+        if self.include_default:
+            names.append(self.default_name)
+        return len(self.name_suffix) - len("{name}") + max(len(n) for n in names)
+
+
+SubpartitionSpec = Annotated[
+    HashSubpartitionSpec | ListSubpartitionSpec,
+    Field(discriminator="strategy"),
+]
+"""The subpartitioning of one level, discriminated on ``strategy``."""
 """The subpartitioning of one level.
 
 HASH is the only strategy implemented today. When LIST/RANGE subpartitioning

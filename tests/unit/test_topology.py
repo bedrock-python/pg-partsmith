@@ -8,6 +8,8 @@ from pg_partsmith.topology import (
     HashBounds,
     HashSubpartitionSpec,
     ListBounds,
+    ListGroup,
+    ListSubpartitionSpec,
     PartitionNode,
     PartitionTreeRow,
     RangeBounds,
@@ -434,3 +436,103 @@ def test__partition_node__describe_topology__reads_naturally_for_both_kinds() ->
     # Act / Assert
     assert branch.describe_topology() == "partitioned by HASH (tenant_id)"
     assert leaf.describe_topology() == "a plain leaf table"
+
+
+# ── LIST subpartition spec ──────────────────────────────────────────────────────
+
+
+def _list_spec(**overrides: object) -> ListSubpartitionSpec:
+    base: dict[str, object] = {
+        "column": "region",
+        "groups": (ListGroup(name="eu", values=("de", "fr")), ListGroup(name="us", values=("us",))),
+    }
+    base.update(overrides)
+    return ListSubpartitionSpec(**base)  # type: ignore[arg-type]
+
+
+def test__list_spec__defaults__names_children_after_their_group() -> None:
+    # Arrange
+    spec = _list_spec()
+
+    # Act / Assert
+    assert spec.child_name("events__2026_w35", "eu") == "events__2026_w35__eu"
+    assert spec.partition_type == PartitionType.LIST
+
+
+def test__list_spec__group__renders_its_bounds() -> None:
+    # Arrange / Act
+    bounds = ListGroup(name="eu", values=("de", "fr")).bounds()
+
+    # Assert
+    assert bounds == ListBounds(values=("de", "fr"))
+
+
+def test__list_spec__no_groups__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="at least one group"):
+        ListSubpartitionSpec(column="region", groups=())
+
+
+def test__list_spec__group_without_values__rejected() -> None:
+    # Arrange / Act / Assert: such a partition could never route a row.
+    with pytest.raises(ValidationError, match="at least one value"):
+        ListGroup(name="eu", values=())
+
+
+def test__list_spec__group_repeating_a_value__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="repeats a value"):
+        ListGroup(name="eu", values=("de", "de"))
+
+
+def test__list_spec__value_claimed_by_two_groups__rejected() -> None:
+    # Arrange / Act / Assert: PostgreSQL would refuse the second partition.
+    with pytest.raises(ValidationError, match="claimed by both"):
+        _list_spec(groups=(ListGroup(name="eu", values=("de",)), ListGroup(name="dach", values=("de",))))
+
+
+def test__list_spec__duplicate_group_names__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="must be distinct"):
+        _list_spec(groups=(ListGroup(name="eu", values=("de",)), ListGroup(name="eu", values=("fr",))))
+
+
+def test__list_spec__default_name_colliding_with_a_group__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="must be distinct"):
+        _list_spec(include_default=True, default_name="eu")
+
+
+def test__list_spec__name_suffix_without_placeholder__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="name"):
+        _list_spec(name_suffix="_region")
+
+
+def test__list_spec__name_budget__sized_for_the_longest_name() -> None:
+    # Arrange
+    spec = _list_spec(groups=(ListGroup(name="eu", values=("de",)), ListGroup(name="apac", values=("jp",))))
+
+    # Act / Assert: "__" plus the longest group name.
+    assert spec.own_name_budget() == len("__") + len("apac")
+
+
+def test__list_spec__default_included__counts_towards_the_name_budget() -> None:
+    # Arrange
+    spec = _list_spec(
+        groups=(ListGroup(name="eu", values=("de",)),),
+        include_default=True,
+        default_name="everything_else",
+    )
+
+    # Act / Assert
+    assert spec.own_name_budget() == len("__") + len("everything_else")
+
+
+def test__list_spec__nested_under_hash__depth_and_columns_accumulate() -> None:
+    # Arrange
+    spec = HashSubpartitionSpec(column="tenant_id", modulus=2, subpartition=_list_spec())
+
+    # Act / Assert
+    assert spec.depth() == 2
+    assert [s.column for s in spec.walk()] == ["tenant_id", "region"]

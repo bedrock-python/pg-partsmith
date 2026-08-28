@@ -28,7 +28,7 @@ from .resolver import PartitionRelationResolver
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
-    from pg_partsmith.entities import HashBounds, PartitionInfo, SubpartitionSpec, TablePartitionConfig
+    from pg_partsmith.entities import PartitionInfo, SubpartitionBounds, SubpartitionSpec, TablePartitionConfig
 
 
 class PostgresPartitionRepository:
@@ -121,8 +121,8 @@ class PostgresPartitionRepository:
         """
         self._creator.create_subpartition_table(parent_name, child_name, spec)
 
-    def attach_subpartition(self, parent_name: str, child_name: str, bounds: HashBounds) -> None:
-        """Attach a hash bucket to its parent.
+    def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
+        """Attach one subpartition to its parent.
 
         See :meth:`PartitionCreator.attach_subpartition`.
         """

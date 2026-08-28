@@ -8,14 +8,14 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.entities import HashBounds, PartitionInfo
+from pg_partsmith.entities import HashBounds, ListBounds, PartitionInfo
 from pg_partsmith.exceptions import PartitionAlreadyExistsError
 from pg_partsmith.utils import build_ddl_statement, pg_sqlstate, qualify, quote_identifier, quote_literal
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from pg_partsmith.entities import SubpartitionSpec, TablePartitionConfig
+    from pg_partsmith.entities import SubpartitionBounds, SubpartitionSpec, TablePartitionConfig
 
 
 class PartitionCreator:
@@ -204,7 +204,7 @@ class PartitionCreator:
                     raise PartitionAlreadyExistsError(child_name) from exc
                 raise
 
-    async def attach_subpartition(self, parent_name: str, child_name: str, bounds: HashBounds) -> None:
+    async def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
         """Attach a hash bucket to its parent.
 
         ATTACH rather than ``CREATE … PARTITION OF`` on purpose: attaching takes
@@ -215,12 +215,15 @@ class PartitionCreator:
         Args:
             parent_name: Partitioned relation to attach to.
             child_name: Table to attach.
-            bounds: Modulus and remainder the bucket owns.
+            bounds: What the child owns — a hash bucket, a set of LIST values,
+                or DEFAULT.
         """
+        clause, values = _values_clause(bounds)
         stmt = build_ddl_statement(
-            "ALTER TABLE {parent} ATTACH PARTITION {partition} " + _hash_values_clause(bounds),
+            "ALTER TABLE {parent} ATTACH PARTITION {partition} " + clause,
             parent=parent_name,
             partition=child_name,
+            **values,
         )
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             await conn.execute(stmt)
@@ -236,11 +239,24 @@ def _partition_by_clause(spec: SubpartitionSpec) -> str:
     return f"PARTITION BY {spec.partition_type.value.upper()} ({{column}})"
 
 
-def _hash_values_clause(bounds: HashBounds) -> str:
-    """Render ``FOR VALUES WITH (MODULUS …, REMAINDER …)``.
+def _values_clause(bounds: SubpartitionBounds) -> tuple[str, dict[str, str]]:
+    """Render the bound clause for a subpartition, plus the literals it needs.
 
-    Both numbers are validated integers on a frozen model, so formatting them
-    into the statement cannot inject anything; they also cannot be bound as
-    parameters, since PostgreSQL requires literals here.
+    Hash moduli are validated integers on a frozen model, so formatting them in
+    cannot inject anything — and PostgreSQL requires literals there anyway. LIST
+    values are caller data, so they go back through ``build_ddl_statement`` as
+    ``[placeholder]`` literals rather than into the template: a value containing
+    a brace would otherwise be re-interpreted when the template is formatted.
+
+    Returns:
+        The clause and the literal parameters it references.
     """
-    return f"FOR VALUES WITH (MODULUS {bounds.modulus:d}, REMAINDER {bounds.remainder:d})"
+    if isinstance(bounds, HashBounds):
+        return f"FOR VALUES WITH (MODULUS {bounds.modulus:d}, REMAINDER {bounds.remainder:d})", {}
+
+    if isinstance(bounds, ListBounds):
+        values = {f"value_{index}": value for index, value in enumerate(bounds.values)}
+        placeholders = ", ".join(f"[{name}]" for name in values)
+        return f"FOR VALUES IN ({placeholders})", values
+
+    return "DEFAULT", {}

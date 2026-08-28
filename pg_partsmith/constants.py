@@ -8,7 +8,9 @@ DEFAULT_RETENTION_COUNT = 12
 MAX_IDENTIFIER_LENGTH = 63
 
 # Subpartitioning defaults and guard rails.
-DEFAULT_SUBPARTITION_NAME_SUFFIX = "__h{remainder}"
+DEFAULT_HASH_NAME_SUFFIX = "__h{remainder}"
+DEFAULT_LIST_NAME_SUFFIX = "__{name}"
+DEFAULT_LIST_DEFAULT_NAME = "other"
 # Depth of a declared subpartition tree (levels below the root table).
 MAX_SUBPARTITION_DEPTH = 4
 # Largest least-common-multiple of hash moduli we will enumerate when checking

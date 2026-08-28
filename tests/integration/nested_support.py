@@ -14,6 +14,8 @@ from sqlalchemy import event
 from pg_partsmith.boundaries import UUIDv7BoundaryCodec
 from pg_partsmith.entities import (
     HashSubpartitionSpec,
+    ListGroup,
+    ListSubpartitionSpec,
     PartitionGranularity,
     PartitionStrategy,
     PartitionType,
@@ -98,6 +100,20 @@ IDENTITY_TABLE_DDL = """
 """
 
 
+# A root that can carry LIST subpartitioning: `region` joins the primary key
+# because PostgreSQL needs every partition-key column in every unique
+# constraint.
+LIST_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        region TEXT NOT NULL,
+        tenant_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (id, region, tenant_id, created_at)
+    ) PARTITION BY RANGE (created_at)
+"""
+
+
 def nested_config(
     table_name: str,
     *,
@@ -119,6 +135,34 @@ def nested_config(
         create_ahead_count=create_ahead,
         retention_count=retention,
         subpartition=HashSubpartitionSpec(column=hash_column, modulus=modulus, subpartition=inner),
+    )
+
+
+def list_config(
+    table_name: str,
+    *,
+    groups: tuple[tuple[str, tuple[str, ...]], ...] = (("eu", ("de", "fr")), ("us", ("us",))),
+    include_default: bool = False,
+    create_ahead: int = 1,
+    retention: int = 12,
+    inner_modulus: int | None = None,
+) -> TablePartitionConfig:
+    """Build a weekly RANGE -> LIST configuration."""
+    inner = HashSubpartitionSpec(column="tenant_id", modulus=inner_modulus) if inner_modulus else None
+    return TablePartitionConfig(
+        table_name=table_name,
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.WEEK,
+        create_ahead_count=create_ahead,
+        retention_count=retention,
+        subpartition=ListSubpartitionSpec(
+            column="region",
+            groups=tuple(ListGroup(name=name, values=values) for name, values in groups),
+            include_default=include_default,
+            subpartition=inner,
+        ),
     )
 
 
@@ -196,3 +240,13 @@ def ddl_counter(sync_engine: Any) -> Iterator[DdlCounter]:
         yield counter
     finally:
         event.remove(sync_engine, "before_cursor_execute", counter)
+
+
+def list_children(rows: list[Any]) -> dict[str, tuple[str, ...]]:
+    """Map child relname -> its LIST values from a CHILD_BOUNDS_SQL result."""
+    parsed: dict[str, tuple[str, ...]] = {}
+    for name, bounds in rows:
+        match = re.search(r"FOR VALUES IN \((?P<values>.*)\)", bounds or "", re.IGNORECASE | re.DOTALL)
+        if match:
+            parsed[name] = tuple(v.strip().strip("'") for v in match.group("values").split(","))
+    return parsed

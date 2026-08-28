@@ -29,6 +29,7 @@ from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
     FROZEN_WEEK,
     IDENTITY_TABLE_DDL,
+    LIST_TABLE_DDL,
     NEXT_WEEK_SUFFIX,
     PREVIOUS_WEEK_BOUNDS,
     PREVIOUS_WEEK_SUFFIX,
@@ -43,6 +44,8 @@ from tests.integration.nested_support import (
     ddl_counter,
     flat_config,
     hash_children,
+    list_children,
+    list_config,
     nested_config,
     uuid7_codec,
 )
@@ -97,6 +100,12 @@ async def identity_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
         yield name
 
 
+@pytest_asyncio.fixture
+async def list_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, LIST_TABLE_DDL):
+        yield name
+
+
 def _maintainer(engine: AsyncEngine, *, codec: RangeBoundaryCodec | None = None) -> PartitionMaintainer:
     service = PartitionLifecycleService(
         repo=PostgresPartitionRepository(engine),
@@ -141,6 +150,14 @@ async def _exec(engine: AsyncEngine, sql: str) -> None:
 @contextlib.contextmanager
 def _count_ddl(engine: AsyncEngine) -> Iterator[DdlCounter]:
     yield from ddl_counter(engine.sync_engine)
+
+
+async def _list_children(engine: AsyncEngine, parent: str) -> dict[str, tuple[str, ...]]:
+    """Map child relname -> the LIST values it owns."""
+    async with engine.connect() as conn:
+        result = await conn.execute(text(CHILD_BOUNDS_SQL), {"parent": f'"{parent}"'})
+        rows = list(result.fetchall())
+    return list_children(rows)
 
 
 # ── A. Fresh creation ───────────────────────────────────────────────────────────
@@ -1188,3 +1205,174 @@ async def test__identity_root__inserts__generate_ids_and_keep_generated_columns(
     # INCLUDING ALL still carried the generated column over.
     assert [r[0] for r in result] == [1, 2, 3]
     assert all(doubled == amount * 2 for _, amount, doubled in result)
+
+
+# ── LIST subpartitioning ────────────────────────────────────────────────────────
+
+
+async def test__list__fresh_table__creates_one_partition_per_group(db_engine: AsyncEngine, list_table: str) -> None:
+    # Arrange / Act
+    result = await _run(db_engine, list_config(list_table))
+
+    # Assert
+    branch = f"{list_table}{WEEK_SUFFIX}"
+    assert result.success
+    assert await _relkind(db_engine, branch) == "p"
+    assert await _list_children(db_engine, branch) == {
+        f"{branch}__eu": ("de", "fr"),
+        f"{branch}__us": ("us",),
+    }
+
+
+async def test__list__include_default__adds_the_catch_all(db_engine: AsyncEngine, list_table: str) -> None:
+    # Arrange / Act
+    await _run(db_engine, list_config(list_table, include_default=True))
+
+    # Assert
+    branch = f"{list_table}{WEEK_SUFFIX}"
+    assert await _relkind(db_engine, f"{branch}__other") == "r"
+
+
+async def test__list__rows_route_to_the_partition_owning_their_value(db_engine: AsyncEngine, list_table: str) -> None:
+    # Arrange
+    await _run(db_engine, list_config(list_table, include_default=True))
+    branch = f"{list_table}{WEEK_SUFFIX}"
+
+    # Act
+    async with db_engine.begin() as conn:
+        for region in ("de", "fr", "us", "jp"):
+            await conn.execute(
+                text(f'INSERT INTO "{list_table}" (region, tenant_id, created_at) VALUES (:r, 1, :d)'),  # noqa: S608
+                {"r": region, "d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
+            )
+        rows = await conn.execute(
+            text(f'SELECT region, tableoid::regclass::text FROM "{list_table}" ORDER BY region')  # noqa: S608
+        )
+        routed = {str(r[0]): str(r[1]) for r in rows.fetchall()}
+
+    # Assert: an unconfigured value lands in DEFAULT rather than being rejected.
+    assert routed == {
+        "de": f"{branch}__eu",
+        "fr": f"{branch}__eu",
+        "us": f"{branch}__us",
+        "jp": f"{branch}__other",
+    }
+
+
+async def test__list__second_run_on_a_converged_tree__executes_zero_ddl(
+    db_engine: AsyncEngine, list_table: str
+) -> None:
+    # Arrange
+    config = list_config(list_table, include_default=True)
+    await _run(db_engine, config)
+
+    # Act
+    with _count_ddl(db_engine) as counter:
+        result = await _run(db_engine, config)
+
+    # Assert
+    assert result.repaired_count == 0
+    assert counter.statements == []
+
+
+async def test__list__branch_missing_a_group__creates_only_that_group(db_engine: AsyncEngine, list_table: str) -> None:
+    # Arrange: only the EU partition exists so far.
+    branch = f"{list_table}{WEEK_SUFFIX}"
+    await _exec(db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
+    await _exec(db_engine, f"""CREATE TABLE "{branch}__eu" PARTITION OF "{branch}" FOR VALUES IN ('de', 'fr')""")
+    await _exec(
+        db_engine,
+        f'ALTER TABLE "{list_table}" ATTACH PARTITION "{branch}" '
+        f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')",
+    )
+
+    # Act
+    result = await _run(db_engine, list_config(list_table))
+
+    # Assert
+    assert result.repaired_count == 1
+    assert set(await _list_children(db_engine, branch)) == {f"{branch}__eu", f"{branch}__us"}
+
+
+async def test__list__group_matched_by_values_under_a_foreign_name__left_alone(
+    db_engine: AsyncEngine, list_table: str
+) -> None:
+    # Arrange: another tool created the same value set under a different name.
+    branch = f"{list_table}{WEEK_SUFFIX}"
+    await _exec(db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
+    await _exec(db_engine, f"""CREATE TABLE "{branch}__europe" PARTITION OF "{branch}" FOR VALUES IN ('de', 'fr')""")
+    await _exec(db_engine, f"""CREATE TABLE "{branch}__usa" PARTITION OF "{branch}" FOR VALUES IN ('us')""")
+    await _exec(
+        db_engine,
+        f'ALTER TABLE "{list_table}" ATTACH PARTITION "{branch}" '
+        f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')",
+    )
+
+    # Act
+    result = await _run(db_engine, list_config(list_table))
+
+    # Assert: matched by the values they own, so nothing is duplicated.
+    assert result.repaired_count == 0
+    assert set(await _list_children(db_engine, branch)) == {f"{branch}__europe", f"{branch}__usa"}
+
+
+async def test__list__value_owned_by_another_partition__reported_and_not_mutated(
+    db_engine: AsyncEngine, list_table: str
+) -> None:
+    # Arrange: "de" sits in a partition that is not the configured EU group.
+    branch = f"{list_table}{WEEK_SUFFIX}"
+    await _exec(db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
+    await _exec(db_engine, f"""CREATE TABLE "{branch}__dach" PARTITION OF "{branch}" FOR VALUES IN ('de', 'at')""")
+    await _exec(
+        db_engine,
+        f'ALTER TABLE "{list_table}" ATTACH PARTITION "{branch}" '
+        f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')",
+    )
+
+    # Act
+    result = await _run(db_engine, list_config(list_table))
+
+    # Assert: the non-conflicting group is still created; the clash is reported.
+    assert result.success
+    assert set(await _list_children(db_engine, branch)) == {f"{branch}__dach", f"{branch}__us"}
+    issues = [i for i in result.issues if i.partition_name == f"public.{branch}"]
+    assert len(issues) == 1
+    assert "'de'" in issues[0].error
+
+
+async def test__list__over_hash__builds_and_routes_through_both_levels(db_engine: AsyncEngine, list_table: str) -> None:
+    # Arrange: RANGE(created_at) -> LIST(region) -> HASH(tenant_id)
+    await _run(db_engine, list_config(list_table, inner_modulus=2))
+    branch = f"{list_table}{WEEK_SUFFIX}"
+
+    # Act
+    async with db_engine.begin() as conn:
+        await conn.execute(
+            text(f'INSERT INTO "{list_table}" (region, tenant_id, created_at) VALUES (:r, 1, :d)'),  # noqa: S608
+            {"r": "de", "d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
+        )
+        routed = await conn.execute(
+            text(f'SELECT tableoid::regclass::text FROM "{list_table}"')  # noqa: S608
+        )
+        leaf = str(routed.scalar())
+
+    # Assert
+    assert set(await _children(db_engine, f"{branch}__eu")) == {f"{branch}__eu__h0", f"{branch}__eu__h1"}
+    assert leaf in {f"{branch}__eu__h0", f"{branch}__eu__h1"}
+
+
+async def test__list__expired_branch__dropped_with_its_whole_subtree(db_engine: AsyncEngine, list_table: str) -> None:
+    # Arrange
+    config = list_config(list_table, retention=1)
+    with freezegun.freeze_time("2026-08-10"):
+        await _maintainer(db_engine).run_maintenance(config)
+    old_branch = f"{list_table}__2026_w33"
+    assert await _relkind(db_engine, old_branch) == "p"
+
+    # Act
+    result = await _run(db_engine, config)
+
+    # Assert
+    assert result.dropped_count == 1
+    assert await _relkind(db_engine, old_branch) is None
+    assert await _relkind(db_engine, f"{old_branch}__eu") is None

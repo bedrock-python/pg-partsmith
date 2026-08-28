@@ -36,6 +36,18 @@ Bounds, subpartition specs, and the introspected tree.
     options:
       heading_level: 4
 
+::: pg_partsmith.topology.ListSubpartitionSpec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.ListGroup
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.SubpartitionSpecBase
+    options:
+      heading_level: 4
+
 ::: pg_partsmith.topology.PartitionNode
     options:
       heading_level: 4
