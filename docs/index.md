@@ -24,6 +24,8 @@ pip install "pg-partsmith[redis-locks]"
 | **Lifecycle hooks** | Inject custom logic before/after each DDL step |
 | **Lock manager** | Prevents concurrent maintenance runs |
 | **Maintainer** | Scheduler-friendly wrapper with safe error handling |
+| **Subpartition spec** | Splits each time partition along a second dimension (`RANGE(time) → HASH(column)`) |
+| **Boundary codec** | Encodes periods into the partition key's own literals (UUIDv7, sortable ids) |
 
 ## Quick start
 

@@ -24,6 +24,81 @@ Top-level public API: entities, enums, exceptions, and period calculators.
     options:
       heading_level: 4
 
+::: pg_partsmith.entities.MaintenanceIssue
+    options:
+      heading_level: 4
+
+### Partition topology
+
+Bounds, subpartition specs, and the introspected tree.
+
+::: pg_partsmith.topology.HashSubpartitionSpec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.PartitionNode
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.RangeBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.HashBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.ListBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.DefaultBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology
+    options:
+      heading_level: 4
+      members:
+        - uniform_modulus
+        - hash_keyspace_covered
+        - missing_remainders
+
+### Subpartition reconciliation
+
+::: pg_partsmith.subpartition_plan.SubpartitionPlan
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan.SubpartitionReconcileResult
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan.TopologyFinding
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan.TopologyReason
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan
+    options:
+      heading_level: 4
+      members:
+        - plan_subpartitions
+        - plan_new_subtree
+
+### Boundary codecs
+
+::: pg_partsmith.boundaries.RangeBoundaryCodec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.boundaries.UUIDv7BoundaryCodec
+    options:
+      heading_level: 4
+
 ### Exceptions
 
 ::: pg_partsmith.exceptions
@@ -39,6 +114,8 @@ Top-level public API: entities, enums, exceptions, and period calculators.
         - LockAcquisitionError
         - DropRetryExhaustedError
         - UnmanagedPartitionDropError
+        - PartitionTopologyError
+        - SubpartitioningNotSupportedError
 
 ### Period strategies
 
