@@ -16,8 +16,9 @@ into an accidental ``DROP TABLE``.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
@@ -27,6 +28,8 @@ from .boundaries import Axis, RangeBoundaries, Window
 from .constants import DEFAULT_CREATE_AHEAD_COUNT, DEFAULT_RETENTION_COUNT
 from .topology import FactKind, PartitionFacts, PartitionNode
 from .types import NonNegativeInt, PositiveInt
+
+_INTEGER_PATTERN = re.compile(r"-?\d+")
 
 __all__ = [
     "AllOf",
@@ -340,13 +343,6 @@ class Not(PredicateBase):
         return f"NOT {self.member.describe()}"
 
 
-Predicate = Annotated[
-    SizeAbove | RowsAbove | WindowAgeAbove | SqlPredicate | Callback | AllOf | AnyOf | Not,
-    Field(discriminator="kind"),
-]
-"""Any predicate, discriminated on ``kind``."""
-
-
 # ── Creation ────────────────────────────────────────────────────────────────────
 
 
@@ -385,6 +381,27 @@ class CreateUntil(PredicateBase):
 
     kind: Literal["create_until"] = "create_until"
     position: Any
+
+    @field_validator("position", mode="before")
+    @classmethod
+    def parse_position(cls, v: object) -> object:
+        """Read a horizon back from its serialized form.
+
+        A datetime dumps to an ISO string and an integer to a digit string;
+        either is turned back into the position it stood for so a policy that
+        went through JSON still plans.
+        """
+        if not isinstance(v, str):
+            return v
+        text = v.strip()
+        if _INTEGER_PATTERN.fullmatch(text):
+            return int(text)
+        try:
+            instant = datetime.fromisoformat(text)
+        except ValueError:
+            msg = f"CreateUntil.position must be a datetime, an integer, or their ISO/decimal spelling, got {v!r}"
+            raise ValueError(msg) from None
+        return instant if instant.tzinfo is not None else instant.replace(tzinfo=UTC)
 
     def desired_windows(
         self, cursor_window: Window, boundaries: RangeBoundaries, newest: Candidate | None
@@ -549,11 +566,30 @@ class ExpireIf(PredicateBase):
         return f"expire when {self.when.describe()}"
 
 
-RetentionPolicy = Annotated[
-    KeepNewest | KeepFor | KeepBehind | ExpireIf | Callback | AllOf | AnyOf | Not,
+Predicate = Annotated[
+    SizeAbove
+    | RowsAbove
+    | WindowAgeAbove
+    | SqlPredicate
+    | Callback
+    | KeepNewest
+    | KeepFor
+    | KeepBehind
+    | ExpireIf
+    | AllOf
+    | AnyOf
+    | Not,
     Field(discriminator="kind"),
 ]
-"""When a window behind the cursor has expired."""
+"""Any yes/no question about a candidate, discriminated on ``kind``.
+
+The retention rules are predicates too, so they combine with everything else:
+``AllOf((KeepNewest(count=12), SqlPredicate(...)))`` is "older than twelve
+periods *and* nothing pending".
+"""
+
+RetentionPolicy = Predicate
+"""When a window behind the cursor has expired: any predicate."""
 
 
 # ── Detach and drop ─────────────────────────────────────────────────────────────
@@ -683,10 +719,13 @@ class LifecyclePolicy(BaseModel):
 
 # Resolve the recursive combinator references now that every member exists.
 Callback.model_rebuild()
+KeepNewest.model_rebuild()
+KeepFor.model_rebuild()
+KeepBehind.model_rebuild()
+ExpireIf.model_rebuild()
 AllOf.model_rebuild()
 AnyOf.model_rebuild()
 Not.model_rebuild()
 CreateNextIf.model_rebuild()
-ExpireIf.model_rebuild()
 DropAfter.model_rebuild()
 LifecyclePolicy.model_rebuild()

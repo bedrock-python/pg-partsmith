@@ -258,6 +258,12 @@ class _Planner:
                 recurse_into.append(existing.node)
                 continue
 
+            if any(m.window == window for m in members):
+                # Held by a relation the lifecycle may not touch -- a foreign
+                # table, say. The window exists; there is nothing to create and
+                # nothing to complain about.
+                continue
+
             blocking = [m for m in members if m.overlaps(window)]
             if blocking:
                 names = ", ".join(sorted(m.node.name for m in blocking))
@@ -362,7 +368,10 @@ class _Planner:
                     FindingReason.FOREIGN_PARTITION,
                     f"{child.name} is a foreign table; it is inspected but never created, detached or dropped.",
                 )
-                members.append(_Member(child, start, end, None, managed=False))
+                bounded = start is not None and end is not None
+                members.append(
+                    _Member(child, start, end, Window(start=start, end=end) if bounded else None, managed=False)
+                )
                 continue
 
             if (not lower_unbounded and start is None) or (not upper_unbounded and end is None):
@@ -555,6 +564,10 @@ class _Planner:
         if self._is_unusable_name(relname, child_name, node):
             return None
 
+        children = self._complete_subtree(level.child, child_name)
+        if children is None:
+            return None
+
         from_value, to_value = boundaries.literals(window)
         return CreatePartition(
             target=child_name,
@@ -562,7 +575,7 @@ class _Planner:
             bounds=RangeBounds(from_value=from_value, to_value=to_value),
             partition_by=_partition_by(level.child),
             key_columns=level.key,
-            children=self._new_subtree(level.child, child_name),
+            children=children,
             lifecycle_unit=True,
             counts_as="created",
             reason=reason,
@@ -667,17 +680,17 @@ class _Planner:
             child_name = qualify(schema, relname)
             if self._is_unusable_name(relname, child_name, node, parent_name=parent_name):
                 continue
-            ops.append(
-                self._new_set_member(
-                    level,
-                    parent_name,
-                    child_name,
-                    HashBounds(modulus=modulus, remainder=remainder),
-                    reason=reason,
-                    detail=f"bucket {remainder} of {modulus}",
-                    depth=depth,
-                )
+            op = self._new_set_member(
+                level,
+                parent_name,
+                child_name,
+                HashBounds(modulus=modulus, remainder=remainder),
+                reason=reason,
+                detail=f"bucket {remainder} of {modulus}",
+                depth=depth,
             )
+            if op is not None:
+                ops.append(op)
         return ops
 
     # ── LIST: a set level ───────────────────────────────────────────────────────
@@ -766,9 +779,9 @@ class _Planner:
             child_name = qualify(schema, relname)
             if self._is_unusable_name(relname, child_name, node, parent_name=parent_name):
                 continue
-            ops.append(
-                self._new_set_member(level, parent_name, child_name, bounds, reason=reason, detail=detail, depth=depth)
-            )
+            op = self._new_set_member(level, parent_name, child_name, bounds, reason=reason, detail=detail, depth=depth)
+            if op is not None:
+                ops.append(op)
         return ops
 
     # ── Building new nodes ──────────────────────────────────────────────────────
@@ -783,21 +796,47 @@ class _Planner:
         reason: Reason,
         detail: str,
         depth: int,
-    ) -> CreatePartition:
+    ) -> CreatePartition | None:
+        children = self._complete_subtree(level.child, child_name)
+        if children is None:
+            return None
         return CreatePartition(
             target=child_name,
             parent_name=parent_name,
             bounds=bounds,
             partition_by=_partition_by(level.child),
             key_columns=level.key,
-            children=self._new_subtree(level.child, child_name),
+            children=children,
             lifecycle_unit=False,
             counts_as="created" if depth == 0 else "repaired",
             reason=reason,
             detail=detail,
         )
 
-    def _new_subtree(self, level: SchemeBase | None, parent_name: str) -> tuple[CreatePartition, ...]:
+    def _complete_subtree(self, level: SchemeBase | None, parent_name: str) -> tuple[CreatePartition, ...] | None:
+        """Plan a new partition's whole subtree, or None when it cannot be planned in full.
+
+        A partitioned relation attached with a hole in its child set rejects
+        every row of the hole, and one attached with no children at all rejects
+        every row it receives. When any member of the subtree was refused --
+        the refusal is already on record against the parent -- the partition
+        must not be created either, so the caller gets None and moves on.
+        """
+        if level is None:
+            return ()
+        refused_before = len(self.findings)
+        ops = self._new_subtree(level, parent_name)
+        if len(self.findings) > refused_before or not ops:
+            self._record(
+                parent_name,
+                FindingReason.UNCONVERGEABLE,
+                f"{parent_name} cannot be created: part of the subtree the scheme describes for it could not be "
+                "planned, and attaching a partitioned relation with a hole in its child set would reject rows.",
+            )
+            return None
+        return ops
+
+    def _new_subtree(self, level: SchemeBase, parent_name: str) -> tuple[CreatePartition, ...]:
         """Plan the complete subtree of a partition that does not exist yet.
 
         There is nothing to reconcile against: every member the scheme
@@ -805,8 +844,6 @@ class _Planner:
         against the parent -- dropping it silently would build a partitioned
         relation with a hole in its child set and attach it.
         """
-        if level is None:
-            return ()
         ops: list[CreatePartition]
         if isinstance(level, HashPartitioning):
             ops = self._hash_members(
@@ -827,11 +864,27 @@ class _Planner:
             boundaries = level.range_boundaries
             cursor_window = boundaries.window_at(self._cursor_position(level))
             ops = []
-            for window in self._desired_windows(level, cursor_window, None):
+            for window in self._windows_for_new_level(level, cursor_window):
                 op = self._new_range_partition(level, _phantom(parent_name), window, reason=Reason.SUBTREE, depth=-1)
                 if op is not None:
                     ops.append(op)
         return tuple(op.model_copy(update={"counts_as": "subtree", "reason": Reason.SUBTREE}) for op in ops)
+
+    def _windows_for_new_level(self, level: RangePartitioning, cursor_window: Window) -> list[Window]:
+        """The windows a progression level gets inside a partition being created.
+
+        Whatever the plan is for, a new branch must be able to route the rows
+        it will receive: the windows named for this level in EXPLICIT mode, and
+        otherwise what the creation policy wants ahead of the cursor -- a
+        RECONCILE run included, since a branch created with no windows at all
+        would reject everything until the next scheduled tick.
+        """
+        explicit = self.ctx.explicit_windows.get(level.leading_column)
+        if explicit:
+            windows = list(explicit)
+        else:
+            windows = self.policy.creation.desired_windows(cursor_window, level.range_boundaries, None)
+        return sorted(dict.fromkeys(windows), key=lambda w: w.start)
 
     # ── Names ───────────────────────────────────────────────────────────────────
 
