@@ -49,6 +49,7 @@ from .strategies import (
     get_period_calculator,
 )
 from .subpartition_plan import (
+    SubpartitionAction,
     SubpartitionPlan,
     SubpartitionReconcileResult,
     TopologyFinding,
@@ -93,6 +94,7 @@ __all__ = [
     "QuarterPeriodCalculator",
     "RangeBoundaryCodec",
     "RangeBounds",
+    "SubpartitionAction",
     "SubpartitionBounds",
     "SubpartitionPlan",
     "SubpartitionReconcileResult",

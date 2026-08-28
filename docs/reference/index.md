@@ -88,6 +88,10 @@ belongs to the time dimension at the root.
     options:
       heading_level: 4
 
+::: pg_partsmith.subpartition_plan.SubpartitionAction
+    options:
+      heading_level: 4
+
 ::: pg_partsmith.subpartition_plan.SubpartitionReconcileResult
     options:
       heading_level: 4

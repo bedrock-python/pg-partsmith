@@ -622,8 +622,12 @@ class TablePartitionConfig(BaseModel):
             a time-based table this is the time dimension.
         trailing_partition_columns: The rest of a composite partition key, in
             key order; empty for the usual single-column case. Trailing columns
-            are bounded with MINVALUE at both ends, so each partition still
-            holds exactly one period -- which requires them to be NOT NULL.
+            are bounded with MINVALUE at both ends, so each partition covers
+            exactly one period -- but only for rows whose trailing columns are
+            all non-NULL. PostgreSQL adds an IS NOT NULL test for every key
+            column, so a NULL in any of them routes the row to DEFAULT whatever
+            its period, and DEFAULT is never pruned. Declare them NOT NULL
+            unless you want that.
         granularity: Time granularity (for TIME_BASED strategy).
         create_ahead_count: Number of periods to ensure exist, including the current period.
         retention_count: Number of partitions to retain. Counted in top-level

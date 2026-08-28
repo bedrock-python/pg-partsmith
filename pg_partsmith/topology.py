@@ -448,8 +448,11 @@ class PartitionNode(BaseModel):
         name: Schema-qualified relation name.
         parent_name: Schema-qualified parent name; None for the queried root.
         level: Depth below the queried root (0 for the root itself).
-        partition_type: How this relation partitions its children; None when it
-            is a plain (leaf) table.
+        partition_type: How this relation partitions its *children*; None when
+            it is a plain (leaf) table. Note that
+            :attr:`~pg_partsmith.PartitionInfo.partition_type` means the
+            opposite -- how the relation's *parent* partitions it -- and that
+            the equivalent of this field there is ``subpartition_type``.
         partition_columns: This relation's own partition key columns.
         bounds: How this relation is bound inside its parent; None for the root.
         is_attached: ``pg_class.relispartition``. Descendants reached through a
