@@ -26,6 +26,7 @@ from pg_partsmith.sync.service import PartitionLifecycleService
 from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
     FROZEN_WEEK,
+    IDENTITY_TABLE_DDL,
     NEXT_WEEK_SUFFIX,
     PREVIOUS_WEEK_BOUNDS,
     PREVIOUS_WEEK_SUFFIX,
@@ -82,6 +83,11 @@ def two_level_table(sync_db_engine: Engine) -> Generator[str, None, None]:
 @pytest.fixture
 def unconstrained_table(sync_db_engine: Engine) -> Generator[str, None, None]:
     yield from _make_table(sync_db_engine, UNCONSTRAINED_TABLE_DDL)
+
+
+@pytest.fixture
+def identity_table(sync_db_engine: Engine) -> Generator[str, None, None]:
+    yield from _make_table(sync_db_engine, IDENTITY_TABLE_DDL)
 
 
 def _maintainer(engine: Engine, *, codec: RangeBoundaryCodec | None = None) -> PartitionMaintainer:
@@ -1108,3 +1114,52 @@ def test__backfill__then_maintenance__past_and_future_coexist(sync_db_engine: En
     assert result.success
     assert _relkind(sync_db_engine, f"{table}__2026_w34") == "p"
     assert _relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") == "p"
+
+
+# ── Identity columns ────────────────────────────────────────────────────────────
+
+
+def test__identity_root__flat_config__partition_is_created_and_attached(
+    sync_db_engine: Engine, identity_table: str
+) -> None:
+    # Arrange / Act
+    result = _run(sync_db_engine, flat_config(identity_table))
+
+    # Assert
+    assert result.success
+    assert _relkind(sync_db_engine, f"{identity_table}{WEEK_SUFFIX}") == "r"
+
+
+def test__identity_root__nested_config__whole_branch_is_created(sync_db_engine: Engine, identity_table: str) -> None:
+    # Arrange / Act
+    result = _run(sync_db_engine, nested_config(identity_table, modulus=2))
+
+    # Assert
+    branch = f"{identity_table}{WEEK_SUFFIX}"
+    assert result.success
+    assert _relkind(sync_db_engine, branch) == "p"
+    assert len(_children(sync_db_engine, branch)) == 2
+
+
+def test__identity_root__inserts__generate_ids_and_keep_generated_columns(
+    sync_db_engine: Engine, identity_table: str
+) -> None:
+    # Arrange
+    _run(sync_db_engine, nested_config(identity_table, modulus=2))
+
+    # Act
+    with sync_db_engine.begin() as conn:
+        for tenant in (1, 2, 3):
+            conn.execute(
+                text(f'INSERT INTO "{identity_table}" (tenant_id, created_at, amount) VALUES (:t, :d, :a)'),  # noqa: S608
+                {"t": tenant, "d": datetime(2026, 8, 25, 10, tzinfo=UTC), "a": tenant},
+            )
+        rows = conn.execute(
+            text(f'SELECT id, amount, doubled FROM "{identity_table}" ORDER BY id')  # noqa: S608
+        )
+        result = [(int(r[0]), int(r[1]), int(r[2])) for r in rows.fetchall()]
+
+    # Assert: the parent's identity supplies ids through the partition, and
+    # INCLUDING ALL still carried the generated column over.
+    assert [r[0] for r in result] == [1, 2, 3]
+    assert all(doubled == amount * 2 for _, amount, doubled in result)

@@ -34,6 +34,9 @@ PREVIOUS_WEEK_BOUNDS = ("2026-08-17", "2026-08-24")
 # Timestamp-keyed root. The primary key carries tenant_id because PostgreSQL
 # requires every unique constraint on a partitioned table to include all of its
 # partition key columns — including the ones a subpartition adds.
+#
+# BIGSERIAL here, identity in IDENTITY_TABLE_DDL below: both are supported, and
+# the two fixtures keep each column kind covered.
 TIMESTAMP_TABLE_DDL = """
     CREATE TABLE {table} (
         id BIGSERIAL,
@@ -76,6 +79,21 @@ UNCONSTRAINED_TABLE_DDL = """
         tenant_id BIGINT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
         PRIMARY KEY (id, created_at)
+    ) PARTITION BY RANGE (created_at)
+"""
+
+
+# A root using GENERATED ALWAYS AS IDENTITY. PostgreSQL refuses to attach a
+# partition that carries an identity column of its own, so partitions are built
+# with LIKE ... EXCLUDING IDENTITY and inherit the parent's identity on ATTACH.
+IDENTITY_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGINT GENERATED ALWAYS AS IDENTITY,
+        tenant_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        amount NUMERIC NOT NULL DEFAULT 0,
+        doubled NUMERIC GENERATED ALWAYS AS (amount * 2) STORED,
+        PRIMARY KEY (id, tenant_id, created_at)
     ) PARTITION BY RANGE (created_at)
 """
 

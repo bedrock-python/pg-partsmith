@@ -31,8 +31,12 @@ class PartitionCreator:
         self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
     ) -> PartitionInfo:
         """Create a new partition table."""
+        # EXCLUDING IDENTITY: PostgreSQL refuses to attach a partition that
+        # carries an identity column ("The new partition may not contain an
+        # identity column"), and propagates the parent's own identity on ATTACH
+        # instead. Tables without one are unaffected.
         stmt = build_ddl_statement(
-            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL)",
+            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY)",
             partition=partition_name,
             parent=qualify(config.db_schema, config.table_name),
         )
@@ -154,7 +158,7 @@ class PartitionCreator:
             PartitionAlreadyExistsError: If a relation of that name exists.
         """
         stmt = build_ddl_statement(
-            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL) " + _partition_by_clause(spec),
+            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY) " + _partition_by_clause(spec),
             partition=branch_name,
             parent=qualify(config.db_schema, config.table_name),
             column=spec.column,
@@ -190,7 +194,7 @@ class PartitionCreator:
         Raises:
             PartitionAlreadyExistsError: If a relation of that name exists.
         """
-        template = "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL)"
+        template = "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY)"
         params = {"partition": child_name, "parent": parent_name}
         if spec is not None:
             template = f"{template} {_partition_by_clause(spec)}"
