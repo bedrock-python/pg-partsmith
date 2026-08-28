@@ -465,11 +465,12 @@ def test__table_partition_config__time_based_with_list_type__raises_value_error(
         (PartitionStrategy.HASH_BASED, PartitionType.HASH),
     ],
 )
-def test__table_partition_config__unimplemented_strategy__raises_value_error(
+def test__table_partition_config__static_strategy_without_root_layout__raises_value_error(
     strategy: PartitionStrategy, partition_type: PartitionType
 ) -> None:
-    # Arrange / Act / Assert
-    with pytest.raises(ValueError, match="not yet implemented"):
+    # Arrange / Act / Assert: a static root has no periods to derive partitions
+    # from, so it has to say what it is divided into.
+    with pytest.raises(ValueError, match="requires root_layout"):
         TablePartitionConfig(
             table_name="events",
             partition_type=partition_type,
@@ -686,7 +687,7 @@ def test__config__with_hash_subpartition__accepted() -> None:
 
 def test__config__subpartition_on_the_root_partition_column__rejected() -> None:
     # Arrange / Act / Assert
-    with pytest.raises(ValidationError, match="already the root partition column"):
+    with pytest.raises(ValidationError, match="distinct across levels"):
         _config(subpartition=HashSubpartitionSpec(column="created_at", modulus=2))
 
 

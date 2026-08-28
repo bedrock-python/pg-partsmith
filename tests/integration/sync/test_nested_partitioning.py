@@ -26,7 +26,9 @@ from pg_partsmith.sync.service import PartitionLifecycleService
 from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
     FROZEN_WEEK,
+    HASH_ROOT_TABLE_DDL,
     IDENTITY_TABLE_DDL,
+    LIST_ROOT_TABLE_DDL,
     LIST_TABLE_DDL,
     NEXT_WEEK_SUFFIX,
     PREVIOUS_WEEK_BOUNDS,
@@ -42,8 +44,10 @@ from tests.integration.nested_support import (
     ddl_counter,
     flat_config,
     hash_children,
+    hash_root_config,
     list_children,
     list_config,
+    list_root_config,
     nested_config,
     uuid7_codec,
 )
@@ -96,6 +100,16 @@ def identity_table(sync_db_engine: Engine) -> Generator[str, None, None]:
 @pytest.fixture
 def list_table(sync_db_engine: Engine) -> Generator[str, None, None]:
     yield from _make_table(sync_db_engine, LIST_TABLE_DDL)
+
+
+@pytest.fixture
+def hash_root_table(sync_db_engine: Engine) -> Generator[str, None, None]:
+    yield from _make_table(sync_db_engine, HASH_ROOT_TABLE_DDL)
+
+
+@pytest.fixture
+def list_root_table(sync_db_engine: Engine) -> Generator[str, None, None]:
+    yield from _make_table(sync_db_engine, LIST_ROOT_TABLE_DDL)
 
 
 def _maintainer(engine: Engine, *, codec: RangeBoundaryCodec | None = None) -> PartitionMaintainer:
@@ -1348,3 +1362,154 @@ def test__list__expired_branch__dropped_with_its_whole_subtree(sync_db_engine: E
     assert result.dropped_count == 1
     assert _relkind(sync_db_engine, old_branch) is None
     assert _relkind(sync_db_engine, f"{old_branch}__eu") is None
+
+
+# ── Static roots (no time dimension) ────────────────────────────────────────────
+
+
+def _static_maintainer(engine: Engine) -> PartitionMaintainer:
+    """A lifecycle service with no period calculator, as a static root needs."""
+    service = PartitionLifecycleService(
+        repo=PostgresPartitionRepository(engine),
+        metadata=PostgresMetadataProvider(engine),
+        locks=PostgresAdvisoryLockManager(engine),
+    )
+    return PartitionMaintainer(service)
+
+
+def test__hash_root__fresh_table__creates_every_bucket(sync_db_engine: Engine, hash_root_table: str) -> None:
+    # Arrange / Act
+    result = _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=4))
+
+    # Assert: the table's own partitions, not a subtree inside a period.
+    assert result.success
+    assert result.created_count == 4
+    assert _children(sync_db_engine, hash_root_table) == {f"{hash_root_table}__h{r}": (4, r) for r in range(4)}
+
+
+def test__hash_root__second_run__executes_zero_ddl(sync_db_engine: Engine, hash_root_table: str) -> None:
+    # Arrange
+    config = hash_root_config(hash_root_table, modulus=2)
+    _static_maintainer(sync_db_engine).run_maintenance(config)
+
+    # Act
+    with _count_ddl(sync_db_engine) as counter:
+        result = _static_maintainer(sync_db_engine).run_maintenance(config)
+
+    # Assert
+    assert result.created_count == 0
+    assert counter.statements == []
+
+
+def test__hash_root__missing_bucket__is_repaired(sync_db_engine: Engine, hash_root_table: str) -> None:
+    # Arrange: an incomplete set, as a partial migration would leave.
+    for remainder in (0, 1, 3):
+        _exec(
+            sync_db_engine,
+            f'CREATE TABLE "{hash_root_table}__h{remainder}" PARTITION OF "{hash_root_table}" '
+            f"FOR VALUES WITH (MODULUS 4, REMAINDER {remainder})",
+        )
+
+    # Act
+    result = _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=4))
+
+    # Assert
+    assert result.created_count == 1
+    assert len(_children(sync_db_engine, hash_root_table)) == 4
+
+
+def test__hash_root__nothing_is_ever_pruned(sync_db_engine: Engine, hash_root_table: str) -> None:
+    # Arrange / Act
+    result = _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2))
+
+    # Assert: a static root has no periods, so nothing ages out of it.
+    assert result.detached_count == 0
+    assert result.dropped_count == 0
+
+
+def test__hash_root__rows_route_into_the_buckets(sync_db_engine: Engine, hash_root_table: str) -> None:
+    # Arrange
+    _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2))
+
+    # Act
+    with sync_db_engine.begin() as conn:
+        for tenant in range(1, 9):
+            conn.execute(
+                text(f'INSERT INTO "{hash_root_table}" (tenant_id) VALUES (:t)'),  # noqa: S608
+                {"t": tenant},
+            )
+        rows = conn.execute(
+            text(f'SELECT DISTINCT tableoid::regclass::text FROM "{hash_root_table}"')  # noqa: S608
+        )
+        leaves = {str(r[0]) for r in rows.fetchall()}
+
+    # Assert
+    assert leaves <= {f"{hash_root_table}__h0", f"{hash_root_table}__h1"}
+    assert leaves
+
+
+def test__hash_root__with_a_nested_level__builds_both(sync_db_engine: Engine, hash_root_table: str) -> None:
+    # Arrange / Act: HASH(tenant_id) -> HASH(id)
+    _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2, inner_modulus=2))
+
+    # Assert
+    assert set(_children(sync_db_engine, hash_root_table)) == {
+        f"{hash_root_table}__h0",
+        f"{hash_root_table}__h1",
+    }
+    assert set(_children(sync_db_engine, f"{hash_root_table}__h0")) == {
+        f"{hash_root_table}__h0__h0",
+        f"{hash_root_table}__h0__h1",
+    }
+
+
+def test__list_root__fresh_table__creates_one_partition_per_group(sync_db_engine: Engine, list_root_table: str) -> None:
+    # Arrange / Act
+    result = _static_maintainer(sync_db_engine).run_maintenance(list_root_config(list_root_table, include_default=True))
+
+    # Assert
+    assert result.success
+    assert _list_children(sync_db_engine, list_root_table) == {
+        f"{list_root_table}__eu": ("de", "fr"),
+        f"{list_root_table}__us": ("us",),
+    }
+    assert _relkind(sync_db_engine, f"{list_root_table}__other") == "r"
+
+
+def test__list_root__rows_route_by_value(sync_db_engine: Engine, list_root_table: str) -> None:
+    # Arrange
+    _static_maintainer(sync_db_engine).run_maintenance(list_root_config(list_root_table, include_default=True))
+
+    # Act
+    with sync_db_engine.begin() as conn:
+        for region in ("de", "us", "jp"):
+            conn.execute(
+                text(f'INSERT INTO "{list_root_table}" (region) VALUES (:r)'),  # noqa: S608
+                {"r": region},
+            )
+        rows = conn.execute(
+            text(f'SELECT region, tableoid::regclass::text FROM "{list_root_table}" ORDER BY region')  # noqa: S608
+        )
+        routed = {str(r[0]): str(r[1]) for r in rows.fetchall()}
+
+    # Assert
+    assert routed == {
+        "de": f"{list_root_table}__eu",
+        "us": f"{list_root_table}__us",
+        "jp": f"{list_root_table}__other",
+    }
+
+
+def test__static_root__time_based_api_without_a_calculator__refused_clearly(
+    sync_db_engine: Engine, hash_root_table: str
+) -> None:
+    # Arrange
+    service = PartitionLifecycleService(
+        repo=PostgresPartitionRepository(sync_db_engine),
+        metadata=PostgresMetadataProvider(sync_db_engine),
+        locks=PostgresAdvisoryLockManager(sync_db_engine),
+    )
+
+    # Act / Assert: create-ahead is period arithmetic and there are no periods.
+    with pytest.raises(InvalidPartitionConfigError, match="period_calculator"):
+        service.create_future_partitions(flat_config(hash_root_table))

@@ -593,10 +593,12 @@ def _split_name(name: str) -> tuple[str | None, str]:
 class TablePartitionConfig(BaseModel):
     """Configuration for table partitioning maintenance.
 
-    The root table must be TIME_BASED (RANGE by date/time); VALUE_BASED and
-    HASH_BASED *roots* are reserved for future use and raise a ValueError at
-    construction time. Each time partition may itself be subpartitioned via
-    :attr:`subpartition`.
+    A root is either **time-based** — RANGE over a date/time dimension, with a
+    create-ahead window and a retention window — or **static**: HASH_BASED or
+    VALUE_BASED, divided into a fixed set of partitions described by
+    :attr:`root_layout`, which neither grows with the clock nor ages out.
+
+    Either kind can be subpartitioned further.
 
     Attributes:
         schema: Optional schema name for the partitioned table. When set, all
@@ -613,10 +615,15 @@ class TablePartitionConfig(BaseModel):
             time periods, never in subpartitions - the time dimension is the
             lifecycle dimension.
         auto_attach_after_create: Whether to attach immediately after creation.
-        subpartition: Optional subpartitioning applied inside each time
-            partition, making it a partitioned table in its own right (for
-            example ``RANGE(created_at)`` weekly -> ``HASH(tenant_id)``). Leave
-            ``None`` for the classic one-leaf-per-period layout.
+        root_layout: For a HASH_BASED or VALUE_BASED root, the fixed set of
+            partitions the table itself is divided into. Such a table has no
+            time dimension, so it has no create-ahead window and nothing ages
+            out of it — maintenance only converges the set. Must be ``None``
+            for a TIME_BASED root, whose partitions come from its periods.
+        subpartition: Optional subpartitioning applied inside each partition,
+            making it a partitioned table in its own right (for example
+            ``RANGE(created_at)`` weekly -> ``HASH(tenant_id)``). Leave ``None``
+            for the classic one-leaf-per-partition layout.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -636,6 +643,7 @@ class TablePartitionConfig(BaseModel):
     )
     retention_count: PositiveInt = Field(default=DEFAULT_RETENTION_COUNT, description="Number of partitions to retain")
     auto_attach_after_create: bool = True
+    root_layout: SubpartitionSpec | None = None
     subpartition: SubpartitionSpec | None = None
 
     @property
@@ -662,63 +670,140 @@ class TablePartitionConfig(BaseModel):
     @model_validator(mode="after")
     def validate_strategy_requirements(self) -> TablePartitionConfig:
         """Validate strategy-specific requirements."""
-        if self.partition_strategy in (PartitionStrategy.VALUE_BASED, PartitionStrategy.HASH_BASED):
+        if self.partition_strategy == PartitionStrategy.TIME_BASED:
+            self._validate_time_based()
+        else:
+            self._validate_static_root()
+
+        return self
+
+    @property
+    def is_time_based(self) -> bool:
+        """True when this table's partitions come from a calendar period.
+
+        A time-based table has a create-ahead window and a retention window; a
+        static one — HASH or LIST at the root — has a fixed set of partitions
+        that neither grows with the clock nor ages out.
+        """
+        return self.partition_strategy == PartitionStrategy.TIME_BASED
+
+    def _validate_time_based(self) -> None:
+        """Check a TIME_BASED root and the names its periods will generate."""
+        if self.granularity is None:
+            msg = "TIME_BASED strategy requires granularity"
+            raise ValueError(msg)
+        if self.partition_type != PartitionType.RANGE:
+            msg = "TIME_BASED strategy requires RANGE partition type"
+            raise ValueError(msg)
+        if self.root_layout is not None:
             msg = (
-                f"{self.partition_strategy.value!r} strategy is not yet implemented. "
-                "Only TIME_BASED is currently supported."
+                "root_layout is only for HASH_BASED / VALUE_BASED roots; a TIME_BASED table's "
+                "partitions come from its periods. Use `subpartition` to divide each period."
             )
             raise ValueError(msg)
 
-        if self.partition_strategy == PartitionStrategy.TIME_BASED:
-            if self.granularity is None:
-                msg = "TIME_BASED strategy requires granularity"
-                raise ValueError(msg)
-            if self.partition_type != PartitionType.RANGE:
-                msg = "TIME_BASED strategy requires RANGE partition type"
-                raise ValueError(msg)
+        # Validate that generated partition names will not exceed PostgreSQL's
+        # 63-byte identifier limit (max_identifier_length default). PostgreSQL
+        # truncates silently, so two hash buckets could otherwise collapse
+        # onto a single name.
+        suffix_len = _NAME_SUFFIX_LEN[self.granularity]
+        subpartition_len = self.subpartition.name_length_budget() if self.subpartition is not None else 0
+        total = len(self.table_name) + suffix_len + subpartition_len
+        if total > MAX_IDENTIFIER_LENGTH:
+            subpartition_part = f" + subpartition suffix ({subpartition_len})" if subpartition_len else ""
+            msg = (
+                f"table_name {self.table_name!r} is too long for "
+                f"{self.granularity.value} granularity: "
+                f"table_name ({len(self.table_name)}) + suffix ({suffix_len})"
+                f"{subpartition_part} = {total} > {MAX_IDENTIFIER_LENGTH} bytes."
+            )
+            raise ValueError(msg)
 
-            # Validate that generated partition names will not exceed PostgreSQL's
-            # 63-byte identifier limit (max_identifier_length default). PostgreSQL
-            # truncates silently, so two hash buckets could otherwise collapse
-            # onto a single name.
-            suffix_len = _NAME_SUFFIX_LEN[self.granularity]
-            subpartition_len = self.subpartition.name_length_budget() if self.subpartition is not None else 0
-            total = len(self.table_name) + suffix_len + subpartition_len
-            if total > MAX_IDENTIFIER_LENGTH:
-                subpartition_part = f" + subpartition suffix ({subpartition_len})" if subpartition_len else ""
-                msg = (
-                    f"table_name {self.table_name!r} is too long for "
-                    f"{self.granularity.value} granularity: "
-                    f"table_name ({len(self.table_name)}) + suffix ({suffix_len})"
-                    f"{subpartition_part} = {total} > {MAX_IDENTIFIER_LENGTH} bytes."
-                )
-                raise ValueError(msg)
+    def _validate_static_root(self) -> None:
+        """Check a HASH_BASED or VALUE_BASED root and its generated names."""
+        expected_type = _STATIC_ROOT_TYPES[self.partition_strategy]
 
-        return self
+        if self.root_layout is None:
+            msg = (
+                f"{self.partition_strategy.value!r} strategy requires root_layout, describing the "
+                f"{expected_type.value.upper()} partitions the table is divided into"
+            )
+            raise ValueError(msg)
+        if self.partition_type != expected_type:
+            msg = (
+                f"{self.partition_strategy.value!r} strategy requires "
+                f"{expected_type.value.upper()} partition type, got {self.partition_type.value.upper()}"
+            )
+            raise ValueError(msg)
+        if self.root_layout.partition_type != expected_type:
+            msg = (
+                f"root_layout describes {self.root_layout.partition_type.value.upper()} partitions but "
+                f"{self.partition_strategy.value!r} needs {expected_type.value.upper()}"
+            )
+            raise ValueError(msg)
+        if self.root_layout.column != self.partition_column:
+            msg = (
+                f"root_layout column {self.root_layout.column!r} must be the table's own partition "
+                f"column {self.partition_column!r}"
+            )
+            raise ValueError(msg)
+        if self.granularity is not None:
+            msg = f"{self.partition_strategy.value!r} strategy has no periods, so granularity must be unset"
+            raise ValueError(msg)
+        if self.subpartition is not None:
+            msg = "Nest deeper levels inside root_layout's own `subpartition` rather than alongside it"
+            raise ValueError(msg)
+
+        total = len(self.table_name) + self.root_layout.name_length_budget()
+        if total > MAX_IDENTIFIER_LENGTH:
+            msg = (
+                f"table_name {self.table_name!r} is too long for this layout: table_name "
+                f"({len(self.table_name)}) + partition suffix ({self.root_layout.name_length_budget()}) "
+                f"= {total} > {MAX_IDENTIFIER_LENGTH} bytes."
+            )
+            raise ValueError(msg)
 
     @model_validator(mode="after")
     def validate_subpartitioning(self) -> TablePartitionConfig:
         """Reject subpartitioning the library cannot manage on this root."""
-        if self.subpartition is None:
-            return self
-
-        if self.partition_type != PartitionType.RANGE:
+        if self.subpartition is not None and self.partition_type != PartitionType.RANGE:
             msg = "Subpartitioning is only supported under a RANGE-partitioned root table"
             raise ValueError(msg)
 
-        columns = [spec.column for spec in self.subpartition.walk()]
-        if self.partition_column in columns:
-            msg = (
-                f"Subpartition column {self.partition_column!r} is already the root partition column; "
-                "subpartitioning must use a different dimension"
-            )
-            raise ValueError(msg)
-        if len(set(columns)) != len(columns):
-            msg = f"Subpartition columns must be distinct across levels, got {columns!r}"
+        # Every level must divide on a fresh dimension: reusing a column would
+        # leave the lower level with nothing left to separate. The root counts,
+        # and for a static root it is already the first declared spec.
+        columns = [self.partition_column]
+        if self.root_layout is not None:
+            columns.extend(spec.column for spec in self.root_layout.walk()[1:])
+        elif self.subpartition is not None:
+            columns.extend(spec.column for spec in self.subpartition.walk())
+
+        duplicates = sorted({column for column in columns if columns.count(column) > 1})
+        if duplicates:
+            msg = f"Partition columns must be distinct across levels; {duplicates!r} appears more than once"
             raise ValueError(msg)
 
         return self
 
+    @property
+    def subpartition_levels(self) -> list[SubpartitionSpec]:
+        """Every declared level, outermost first.
+
+        For a static root that starts with :attr:`root_layout` itself; for a
+        time-based one the root is the period dimension, which is not a spec, so
+        the list starts below it.
+        """
+        if self.root_layout is not None:
+            return self.root_layout.walk()
+        return self.subpartition.walk() if self.subpartition is not None else []
+
+
+# Root partition type each non-time strategy describes.
+_STATIC_ROOT_TYPES: dict[PartitionStrategy, PartitionType] = {
+    PartitionStrategy.HASH_BASED: PartitionType.HASH,
+    PartitionStrategy.VALUE_BASED: PartitionType.LIST,
+}
 
 # Partition-name suffix lengths per granularity; must track the _SPECS fmt
 # handlers and the calculators' _NAME_PATTERNs.

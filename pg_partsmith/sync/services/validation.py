@@ -62,7 +62,7 @@ class PartitionValidationService:
         self._validate_subpartitioning(config, qualified_parent)
 
     def _validate_subpartitioning(self, config: TablePartitionConfig, qualified_parent: str) -> None:
-        """Refuse a subpartitioning the database could not accept.
+        """Refuse a partitioning layout the database could not accept.
 
         PostgreSQL requires every UNIQUE / PRIMARY KEY constraint on a
         partitioned table to contain all of its partition-key columns. A hash
@@ -71,7 +71,8 @@ class PartitionValidationService:
         columns`` — mid-run, after other tables were already changed. Catching
         it here turns that into a configuration error with a fix in it.
         """
-        if config.subpartition is None:
+        levels = config.subpartition_levels
+        if not levels:
             return
 
         metadata = self._metadata
@@ -86,7 +87,7 @@ class PartitionValidationService:
         if not constraints:
             return
 
-        for spec in config.subpartition.walk():
+        for spec in levels:
             _require_column_in_constraints(spec, constraints, qualified_parent)
 
 

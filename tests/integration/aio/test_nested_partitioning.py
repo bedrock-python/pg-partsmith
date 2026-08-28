@@ -28,7 +28,9 @@ from pg_partsmith.subpartition_plan import TopologyReason
 from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
     FROZEN_WEEK,
+    HASH_ROOT_TABLE_DDL,
     IDENTITY_TABLE_DDL,
+    LIST_ROOT_TABLE_DDL,
     LIST_TABLE_DDL,
     NEXT_WEEK_SUFFIX,
     PREVIOUS_WEEK_BOUNDS,
@@ -44,8 +46,10 @@ from tests.integration.nested_support import (
     ddl_counter,
     flat_config,
     hash_children,
+    hash_root_config,
     list_children,
     list_config,
+    list_root_config,
     nested_config,
     uuid7_codec,
 )
@@ -103,6 +107,18 @@ async def identity_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
 @pytest_asyncio.fixture
 async def list_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
     async for name in _make_table(db_engine, LIST_TABLE_DDL):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def hash_root_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, HASH_ROOT_TABLE_DDL):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def list_root_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in _make_table(db_engine, LIST_ROOT_TABLE_DDL):
         yield name
 
 
@@ -1376,3 +1392,158 @@ async def test__list__expired_branch__dropped_with_its_whole_subtree(db_engine: 
     assert result.dropped_count == 1
     assert await _relkind(db_engine, old_branch) is None
     assert await _relkind(db_engine, f"{old_branch}__eu") is None
+
+
+# ── Static roots (no time dimension) ────────────────────────────────────────────
+
+
+def _static_maintainer(engine: AsyncEngine) -> PartitionMaintainer:
+    """A lifecycle service with no period calculator, as a static root needs."""
+    service = PartitionLifecycleService(
+        repo=PostgresPartitionRepository(engine),
+        metadata=PostgresMetadataProvider(engine),
+        locks=PostgresAdvisoryLockManager(engine),
+    )
+    return PartitionMaintainer(service)
+
+
+async def test__hash_root__fresh_table__creates_every_bucket(db_engine: AsyncEngine, hash_root_table: str) -> None:
+    # Arrange / Act
+    result = await _static_maintainer(db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=4))
+
+    # Assert: the table's own partitions, not a subtree inside a period.
+    assert result.success
+    assert result.created_count == 4
+    assert await _children(db_engine, hash_root_table) == {f"{hash_root_table}__h{r}": (4, r) for r in range(4)}
+
+
+async def test__hash_root__second_run__executes_zero_ddl(db_engine: AsyncEngine, hash_root_table: str) -> None:
+    # Arrange
+    config = hash_root_config(hash_root_table, modulus=2)
+    await _static_maintainer(db_engine).run_maintenance(config)
+
+    # Act
+    with _count_ddl(db_engine) as counter:
+        result = await _static_maintainer(db_engine).run_maintenance(config)
+
+    # Assert
+    assert result.created_count == 0
+    assert counter.statements == []
+
+
+async def test__hash_root__missing_bucket__is_repaired(db_engine: AsyncEngine, hash_root_table: str) -> None:
+    # Arrange: an incomplete set, as a partial migration would leave.
+    for remainder in (0, 1, 3):
+        await _exec(
+            db_engine,
+            f'CREATE TABLE "{hash_root_table}__h{remainder}" PARTITION OF "{hash_root_table}" '
+            f"FOR VALUES WITH (MODULUS 4, REMAINDER {remainder})",
+        )
+
+    # Act
+    result = await _static_maintainer(db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=4))
+
+    # Assert
+    assert result.created_count == 1
+    assert len(await _children(db_engine, hash_root_table)) == 4
+
+
+async def test__hash_root__nothing_is_ever_pruned(db_engine: AsyncEngine, hash_root_table: str) -> None:
+    # Arrange / Act
+    result = await _static_maintainer(db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2))
+
+    # Assert: a static root has no periods, so nothing ages out of it.
+    assert result.detached_count == 0
+    assert result.dropped_count == 0
+
+
+async def test__hash_root__rows_route_into_the_buckets(db_engine: AsyncEngine, hash_root_table: str) -> None:
+    # Arrange
+    await _static_maintainer(db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2))
+
+    # Act
+    async with db_engine.begin() as conn:
+        for tenant in range(1, 9):
+            await conn.execute(
+                text(f'INSERT INTO "{hash_root_table}" (tenant_id) VALUES (:t)'),  # noqa: S608
+                {"t": tenant},
+            )
+        rows = await conn.execute(
+            text(f'SELECT DISTINCT tableoid::regclass::text FROM "{hash_root_table}"')  # noqa: S608
+        )
+        leaves = {str(r[0]) for r in rows.fetchall()}
+
+    # Assert
+    assert leaves <= {f"{hash_root_table}__h0", f"{hash_root_table}__h1"}
+    assert leaves
+
+
+async def test__hash_root__with_a_nested_level__builds_both(db_engine: AsyncEngine, hash_root_table: str) -> None:
+    # Arrange / Act: HASH(tenant_id) -> HASH(id)
+    await _static_maintainer(db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2, inner_modulus=2))
+
+    # Assert
+    assert set(await _children(db_engine, hash_root_table)) == {
+        f"{hash_root_table}__h0",
+        f"{hash_root_table}__h1",
+    }
+    assert set(await _children(db_engine, f"{hash_root_table}__h0")) == {
+        f"{hash_root_table}__h0__h0",
+        f"{hash_root_table}__h0__h1",
+    }
+
+
+async def test__list_root__fresh_table__creates_one_partition_per_group(
+    db_engine: AsyncEngine, list_root_table: str
+) -> None:
+    # Arrange / Act
+    result = await _static_maintainer(db_engine).run_maintenance(
+        list_root_config(list_root_table, include_default=True)
+    )
+
+    # Assert
+    assert result.success
+    assert await _list_children(db_engine, list_root_table) == {
+        f"{list_root_table}__eu": ("de", "fr"),
+        f"{list_root_table}__us": ("us",),
+    }
+    assert await _relkind(db_engine, f"{list_root_table}__other") == "r"
+
+
+async def test__list_root__rows_route_by_value(db_engine: AsyncEngine, list_root_table: str) -> None:
+    # Arrange
+    await _static_maintainer(db_engine).run_maintenance(list_root_config(list_root_table, include_default=True))
+
+    # Act
+    async with db_engine.begin() as conn:
+        for region in ("de", "us", "jp"):
+            await conn.execute(
+                text(f'INSERT INTO "{list_root_table}" (region) VALUES (:r)'),  # noqa: S608
+                {"r": region},
+            )
+        rows = await conn.execute(
+            text(f'SELECT region, tableoid::regclass::text FROM "{list_root_table}" ORDER BY region')  # noqa: S608
+        )
+        routed = {str(r[0]): str(r[1]) for r in rows.fetchall()}
+
+    # Assert
+    assert routed == {
+        "de": f"{list_root_table}__eu",
+        "us": f"{list_root_table}__us",
+        "jp": f"{list_root_table}__other",
+    }
+
+
+async def test__static_root__time_based_api_without_a_calculator__refused_clearly(
+    db_engine: AsyncEngine, hash_root_table: str
+) -> None:
+    # Arrange
+    service = PartitionLifecycleService(
+        repo=PostgresPartitionRepository(db_engine),
+        metadata=PostgresMetadataProvider(db_engine),
+        locks=PostgresAdvisoryLockManager(db_engine),
+    )
+
+    # Act / Assert: create-ahead is period arithmetic and there are no periods.
+    with pytest.raises(InvalidPartitionConfigError, match="period_calculator"):
+        await service.create_future_partitions(flat_config(hash_root_table))

@@ -114,6 +114,27 @@ LIST_TABLE_DDL = """
 """
 
 
+# Roots with no time dimension at all: the table itself is divided into a fixed
+# set of partitions.
+HASH_ROOT_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        tenant_id BIGINT NOT NULL,
+        payload TEXT,
+        PRIMARY KEY (id, tenant_id)
+    ) PARTITION BY HASH (tenant_id)
+"""
+
+LIST_ROOT_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        region TEXT NOT NULL,
+        payload TEXT,
+        PRIMARY KEY (id, region)
+    ) PARTITION BY LIST (region)
+"""
+
+
 def nested_config(
     table_name: str,
     *,
@@ -162,6 +183,43 @@ def list_config(
             groups=tuple(ListGroup(name=name, values=values) for name, values in groups),
             include_default=include_default,
             subpartition=inner,
+        ),
+    )
+
+
+def hash_root_config(
+    table_name: str,
+    *,
+    modulus: int = 4,
+    inner_modulus: int | None = None,
+) -> TablePartitionConfig:
+    """Build a static HASH-root configuration."""
+    inner = HashSubpartitionSpec(column="id", modulus=inner_modulus) if inner_modulus else None
+    return TablePartitionConfig(
+        table_name=table_name,
+        partition_type=PartitionType.HASH,
+        partition_strategy=PartitionStrategy.HASH_BASED,
+        partition_column="tenant_id",
+        root_layout=HashSubpartitionSpec(column="tenant_id", modulus=modulus, subpartition=inner),
+    )
+
+
+def list_root_config(
+    table_name: str,
+    *,
+    groups: tuple[tuple[str, tuple[str, ...]], ...] = (("eu", ("de", "fr")), ("us", ("us",))),
+    include_default: bool = False,
+) -> TablePartitionConfig:
+    """Build a static LIST-root configuration."""
+    return TablePartitionConfig(
+        table_name=table_name,
+        partition_type=PartitionType.LIST,
+        partition_strategy=PartitionStrategy.VALUE_BASED,
+        partition_column="region",
+        root_layout=ListSubpartitionSpec(
+            column="region",
+            groups=tuple(ListGroup(name=name, values=values) for name, values in groups),
+            include_default=include_default,
         ),
     )
 

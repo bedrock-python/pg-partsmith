@@ -16,6 +16,7 @@ A single library that covers the full PostgreSQL partition lifecycle: creating p
 - **Async and sync** — `pg_partsmith.aio` on the SQLAlchemy async engine, `pg_partsmith.sync` on the classic sync engine
 - **Full lifecycle** — create ahead, detach expired, drop orphans in one call
 - **Nested partitioning** — `RANGE(time) → HASH(column)` and `→ LIST(column)` trees, reconciled towards the configured shape on every run
+- **Time-free tables** — HASH or LIST roots with a fixed partition set, managed by the same reconciler
 - **Encoded partition keys** — partition by time even when the key is a UUIDv7 or another sortable id
 - **Extensible hooks** — 6 hook points (`before`/`after` create, detach, drop)
 - **Multiple strategies** — hourly, daily, weekly, monthly, quarterly, yearly + fully custom
@@ -185,6 +186,24 @@ repaired safely — a bucket set at an older modulus, a partition from a previou
 shape the config does not describe — is left intact and reported through
 `MaintenanceResult.issues`. See the
 [subpartitioning guide](https://bedrock-python.github.io/pg-partsmith/guide/subpartitioning/).
+
+## Tables partitioned without a time dimension
+
+A table divided only by tenant or region has a fixed set of partitions — nothing
+is created ahead and nothing ages out. Configure it with `root_layout`:
+
+```python
+config = TablePartitionConfig(
+    table_name="issue_index",
+    partition_type=PartitionType.HASH,
+    partition_strategy=PartitionStrategy.HASH_BASED,
+    partition_column="organization_id",
+    root_layout=HashSubpartitionSpec(column="organization_id", modulus=16),
+)
+```
+
+Such a table needs no period calculator, and maintenance is purely
+reconciliation: missing partitions are created, nothing is ever pruned.
 
 ## Partitioning by an encoded key
 

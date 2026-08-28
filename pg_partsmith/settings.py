@@ -91,6 +91,13 @@ class PartitionTableSettings(BaseSettings):
         default=True,
         description="Attach new partitions immediately after creation",
     )
+    root_layout: SubpartitionSpec | None = Field(
+        default=None,
+        description=(
+            "For a HASH_BASED / VALUE_BASED table, the partitions it is divided into, as JSON: "
+            '{"strategy": "hash", "column": "tenant_id", "modulus": 16}'
+        ),
+    )
     subpartition: SubpartitionSpec | None = Field(
         default=None,
         description=(
@@ -111,6 +118,7 @@ class PartitionTableSettings(BaseSettings):
             create_ahead_count=self.create_ahead_count,
             retention_count=self.retention_count,
             auto_attach_after_create=self.auto_attach_after_create,
+            root_layout=self.root_layout,
             subpartition=self.subpartition,
         )
 

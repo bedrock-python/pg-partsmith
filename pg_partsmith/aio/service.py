@@ -21,6 +21,7 @@ from pg_partsmith.entities import (
     Period,
     TablePartitionConfig,
 )
+from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.subpartition_plan import SubpartitionReconcileResult, to_maintenance_issue
 from pg_partsmith.utils import describe_exception, qualify, validate_timezone_alignment
 
@@ -52,7 +53,7 @@ class PartitionLifecycleService:
         repo: PartitionRepository,
         metadata: PartitionMetadataProvider,
         locks: LockManager,
-        period_calculator: PeriodCalculator[Period],
+        period_calculator: PeriodCalculator[Period] | None = None,
         hooks: list[PartitionLifecycleHooks] | None = None,
     ) -> None:
         """Initialize the partition lifecycle service.
@@ -61,7 +62,9 @@ class PartitionLifecycleService:
             repo: DDL operations on partitions (create / attach / detach / drop).
             metadata: Read-only access to PostgreSQL catalog data.
             locks: Distributed lock manager preventing concurrent maintenance runs.
-            period_calculator: Strategy for determining partition names and boundaries.
+            period_calculator: Strategy for determining partition names and
+                boundaries. Required for a TIME_BASED table and meaningless for
+                a static HASH_BASED / VALUE_BASED one, which has no periods.
             hooks: Optional list of lifecycle hooks called around each step.
         """
         validate_timezone_alignment(repo, period_calculator)
@@ -79,10 +82,15 @@ class PartitionLifecycleService:
             cast("SubpartitionRepository", repo),
             cast("NestedPartitionMetadata", metadata),
         )
-        self._creation_service = PartitionCreationService(
-            repo, metadata, period_calculator, hooks, subpartitions=self._subpartition_service
+        # The period-driven services exist only when there are periods.
+        self._creation_service = (
+            PartitionCreationService(repo, metadata, period_calculator, hooks, subpartitions=self._subpartition_service)
+            if period_calculator is not None
+            else None
         )
-        self._pruning_service = PartitionPruningService(metadata, period_calculator)
+        self._pruning_service = (
+            PartitionPruningService(metadata, period_calculator) if period_calculator is not None else None
+        )
         self._detachment_service = PartitionDetachmentService(repo, hooks)
         self._deletion_service = PartitionDeletionService(repo, hooks)
 
@@ -103,7 +111,7 @@ class PartitionLifecycleService:
             PartitionAlreadyExistsError: If a partition exists with conflicting boundaries.
             InvalidPartitionConfigError: If ``config`` is incompatible with the parent table.
         """
-        return await self._creation_service.create_future_partitions(config)
+        return await self._require_periods().create_future_partitions(config)
 
     async def ensure_partition(self, config: TablePartitionConfig, period: Period) -> PartitionInfo | None:
         """Create and attach the partition for one specific period (idempotent).
@@ -121,7 +129,7 @@ class PartitionLifecycleService:
             The created partition, or None when it already existed (an existing
             detached partition is re-attached when ``auto_attach_after_create``).
         """
-        return await self._creation_service.ensure_partition(config, period)
+        return await self._require_periods().ensure_partition(config, period)
 
     async def ensure_partitions(
         self,
@@ -143,7 +151,7 @@ class PartitionLifecycleService:
             The partitions created by this call; periods that already had one
             are absent from the list.
         """
-        return await self._creation_service.ensure_partitions(config, periods)
+        return await self._require_periods().ensure_partitions(config, periods)
 
     async def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Return partitions older than ``config.retention_count`` periods.
@@ -154,7 +162,7 @@ class PartitionLifecycleService:
         Returns:
             Partitions that are eligible for detach + drop, sorted oldest first.
         """
-        return await self._pruning_service.get_partitions_for_pruning(config)
+        return await self._require_pruning().get_partitions_for_pruning(config)
 
     async def detach_old_partitions(
         self,
@@ -217,6 +225,28 @@ class PartitionLifecycleService:
         """
         return await self._subpartition_service.reconcile(config, exclude=exclude)
 
+    async def _maintain_static_root(self, config: TablePartitionConfig) -> MaintenanceResult:
+        """Converge a HASH_BASED / VALUE_BASED table's own partition set.
+
+        ``created_count`` reports every partition this call created, at any
+        level: a static root has no lifecycle stages to attribute them to.
+        """
+        reconciled = await self._subpartition_service.reconcile(config)
+        issues = tuple(to_maintenance_issue(f) for f in reconciled.findings if f.is_actionable)
+        return MaintenanceResult(created_count=reconciled.created_count, issues=issues)
+
+    def _require_periods(self) -> PartitionCreationService:
+        """Return the creation service, or explain that this wiring has no periods."""
+        if self._creation_service is None:
+            raise InvalidPartitionConfigError(_NO_CALCULATOR_MESSAGE)
+        return self._creation_service
+
+    def _require_pruning(self) -> PartitionPruningService:
+        """Return the pruning service, or explain that this wiring has no periods."""
+        if self._pruning_service is None:
+            raise InvalidPartitionConfigError(_NO_CALCULATOR_MESSAGE)
+        return self._pruning_service
+
     async def maintain_lifecycle(
         self,
         config: TablePartitionConfig,
@@ -277,12 +307,18 @@ class PartitionLifecycleService:
         async with self._locks.acquire_lock(qualified_parent):
             await self._validation_service.validate_config(config)
 
+            if not config.is_time_based:
+                # A static root has no periods: nothing is created ahead and
+                # nothing ages out, so converging its partition set is the
+                # whole of maintenance.
+                return await self._maintain_static_root(config)
+
             # Optimization: fetch all partitions once
             all_partitions = await self._metadata.list_partitions(qualified_parent)
 
             if not skip_create:
                 try:
-                    created = await self._creation_service.create_future_partitions(
+                    created = await self._require_periods().create_future_partitions(
                         config, existing_partitions=all_partitions
                     )
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -296,7 +332,7 @@ class PartitionLifecycleService:
                     if created:
                         all_partitions.extend(created)
 
-            partitions_to_prune = await self._pruning_service.identify_partitions_to_prune(config, all_partitions)
+            partitions_to_prune = await self._require_pruning().identify_partitions_to_prune(config, all_partitions)
 
             # Reconcile before pruning so a branch that is on its way out is not
             # repaired just to be dropped moments later.
@@ -364,3 +400,11 @@ class PartitionLifecycleService:
             dropped_count=dropped_count,
             issues=tuple(issues),
         )
+
+
+# Retention and create-ahead are period arithmetic, so both need a calculator;
+# a static root needs none, which is why the wiring allows it to be omitted.
+_NO_CALCULATOR_MESSAGE = (
+    "This service was built without a period_calculator, so it can only manage a static "
+    "HASH_BASED / VALUE_BASED table. Pass a calculator to manage a TIME_BASED one."
+)

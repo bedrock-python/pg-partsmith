@@ -128,6 +128,50 @@ HashSubpartitionSpec(
 )
 ```
 
+## Tables with no time dimension
+
+Not every partitioned table is partitioned by time. A table divided only by
+tenant, or only by region, has a **fixed** set of partitions: nothing is created
+ahead of the clock and nothing ages out. Those are configured with
+`root_layout` and the matching strategy:
+
+```python
+config = TablePartitionConfig(
+    table_name="issue_index",
+    partition_type=PartitionType.HASH,
+    partition_strategy=PartitionStrategy.HASH_BASED,
+    partition_column="organization_id",
+    root_layout=HashSubpartitionSpec(column="organization_id", modulus=16),
+)
+```
+
+`VALUE_BASED` works the same way with a `ListSubpartitionSpec`. Either can carry
+its own `subpartition` to nest further.
+
+Such a table has no periods, so it needs no period calculator:
+
+```python
+service = PartitionLifecycleService(
+    repo=PostgresPartitionRepository(engine),
+    metadata=PostgresMetadataProvider(engine),
+    locks=PostgresAdvisoryLockManager(engine),
+)                                    # no period_calculator
+```
+
+Maintenance is then **only** reconciliation: the configured partitions are
+created if missing, and `created_count` reports how many were made.
+`detached_count` and `dropped_count` are always zero — there is no retention
+window, because there is no time. `create_ahead_count` and `retention_count` are
+ignored, and `granularity` must be unset.
+
+Calling a period-driven API (`create_future_partitions`, `ensure_partitions`,
+`get_partitions_for_pruning`) on a service built without a calculator raises
+`InvalidPartitionConfigError` explaining that this wiring has no periods.
+
+The same convergence rules apply as for a nested level — an existing hash set at
+another modulus is preserved, a LIST value another partition owns is reported —
+because it is the same planner, just pointed at the root.
+
 ## Required unique constraints
 
 PostgreSQL requires every `UNIQUE` / `PRIMARY KEY` constraint on a partitioned table to

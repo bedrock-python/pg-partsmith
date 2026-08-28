@@ -98,24 +98,38 @@ class PartitionSubpartitionService:
         slice of the keyspace it should own, and that does not become harmless
         just because the period is old.
 
+        For a static (HASH_BASED / VALUE_BASED) root the table's own partitions
+        are what gets converged; for a time-based one they are the subtrees
+        inside each period.
+
         Args:
-            config: Table partitioning configuration. A config without a
-                subpartition spec reconciles to an empty result.
+            config: Table partitioning configuration. A config that declares
+                neither a root layout nor a subpartition spec reconciles to an
+                empty result.
             exclude: Schema-qualified names to skip — typically the partitions
-                this run is about to prune, which it would be wasteful to repair.
+                this run is about to prune, which it would be wasteful to
+                repair. Not meaningful for a static root, which has one level.
 
         Returns:
             The subpartitions created and the divergences left alone.
         """
-        if config.subpartition is None:
+        if config.root_layout is None and config.subpartition is None:
             return SubpartitionReconcileResult()
 
-        spec = self._require_spec(config)
+        self._require_support(config)
         root = qualify(config.db_schema, config.table_name)
         tree = await self._metadata.get_partition_tree(root)
         if tree is None:
             return SubpartitionReconcileResult()
 
+        if config.root_layout is not None:
+            # A static root *is* the level to converge: its own partitions are
+            # the ones the config describes, and deeper levels come from the
+            # layout's own `subpartition`, which the planner already recurses
+            # into. There is nothing per-branch to iterate.
+            return await self._apply(config.root_layout, tree)
+
+        spec = self._require_spec(config)
         result = SubpartitionReconcileResult()
         for branch in tree.children:
             if not self._is_reconcilable(branch, exclude):
@@ -208,14 +222,19 @@ class PartitionSubpartitionService:
             msg = "Subpartition reconciliation requires a config with a subpartition spec"
             raise ValueError(msg)
 
+        self._require_support(config)
+        return config.subpartition
+
+    def _require_support(self, config: TablePartitionConfig) -> None:
+        """Refuse collaborators that cannot serve a nested configuration."""
+        del config  # the check is about the wiring, not the config
+
         for component, obj, expected in (
             ("Repository", self._repo, "SubpartitionRepository"),
             ("Metadata provider", self._metadata, "NestedPartitionMetadata"),
         ):
             if not _supports(obj, expected):
                 raise SubpartitioningNotSupportedError(f"{component} {type(obj).__name__}", expected)
-
-        return config.subpartition
 
     @staticmethod
     def _is_reconcilable(branch: PartitionNode, exclude: Collection[str]) -> bool:
