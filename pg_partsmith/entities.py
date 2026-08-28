@@ -40,6 +40,7 @@ __all__ = [
     "MaintenanceIssue",
     "MaintenanceIssueStep",
     "MaintenanceResult",
+    "MigrationResult",
     "PartitionBounds",
     "PartitionGranularity",
     "PartitionInfo",
@@ -521,6 +522,7 @@ class MaintenanceIssueStep(StrEnum):
     ATTACH = "attach"
     DETACH = "detach"
     DROP = "drop"
+    MOVE = "move"
 
 
 class MaintenanceIssue(BaseModel):
@@ -583,6 +585,30 @@ class MaintenanceResult(BaseModel):
     def maintenance_plan(self) -> MaintenancePlan | None:
         """:attr:`plan`, typed."""
         return self.plan  # type: ignore[no-any-return]
+
+
+class MigrationResult(BaseModel):
+    """Result of a batched row move (``partition_data`` / ``unpartition``).
+
+    Attributes:
+        rows_moved: Rows moved by this call.
+        batches: Statements it took.
+        partitions: Partitions created and filled (``partition_data``) or
+            emptied (``unpartition``), in the order they were handled.
+        complete: True when nothing is left to move; False when the batch
+            budget ran out or a window could not be given a partition -- call
+            again, or read ``issues``.
+        issues: Windows that could not be handled, and findings the planner
+            reported on the way.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    rows_moved: NonNegativeInt = 0
+    batches: NonNegativeInt = 0
+    partitions: tuple[str, ...] = ()
+    complete: bool = True
+    issues: tuple[MaintenanceIssue, ...] = ()
 
 
 def _as_range_bounds(bounds: object) -> RangeBounds | None:

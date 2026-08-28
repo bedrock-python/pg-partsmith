@@ -1420,3 +1420,96 @@ async def test__drop_partition__foreign_table__uses_drop_foreign_table_and_skips
     statements = _statements(conn)
     assert 'DROP FOREIGN TABLE IF EXISTS "metrics__2026_01"' in statements
     assert not [s for s in statements if s.startswith("DROP TABLE") or "DROP CONSTRAINT" in s]
+
+
+# ── batched moves ───────────────────────────────────────────────────────────────
+
+
+async def test__reconcile_default_rows__with_a_limit__picks_a_batch_by_tableoid_and_ctid() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=10))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = await repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_01",
+        key_columns=("created_at",),
+        from_value="2024-01-01",
+        to_value="2024-02-01",
+        limit=10,
+    )
+
+    # Assert
+    assert moved == 10
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    assert statement == (
+        'WITH moved AS (DELETE FROM "events_default" WHERE (tableoid, ctid) IN ('
+        'SELECT tableoid, ctid FROM "events_default" '
+        "WHERE \"created_at\" >= '2024-01-01' AND \"created_at\" < '2024-02-01' LIMIT 10) "
+        'RETURNING "created_at", "tenant_id", "data") '
+        'INSERT INTO "events__2024_01" ("created_at", "tenant_id", "data") '
+        'SELECT "created_at", "tenant_id", "data" FROM moved'
+    )
+
+
+async def test__reconcile_default_rows__without_a_limit__moves_the_whole_window_as_before() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.reconcile_default_rows(
+        default_partition_name="d", target_partition_name="t", key_columns=("k",), from_value="1", to_value="2"
+    )
+
+    # Assert
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    assert "LIMIT" not in statement
+    assert statement.startswith('WITH moved AS (DELETE FROM "d" WHERE "k" >= \'1\' AND "k" < \'2\' RETURNING')
+
+
+async def test__move_rows__locks_both_sides_and_moves_a_batch_of_any_rows() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=4))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = await repo.move_rows("public.events__2024_01", "public.events_flat", limit=4)
+
+    # Assert
+    assert moved == 4
+    statements = _statements(conn)
+    assert statements[0] == 'LOCK TABLE "public"."events__2024_01" IN SHARE ROW EXCLUSIVE MODE'
+    assert statements[1] == 'LOCK TABLE "public"."events_flat" IN SHARE ROW EXCLUSIVE MODE'
+    assert statements[-1] == (
+        'WITH moved AS (DELETE FROM "public"."events__2024_01" WHERE (tableoid, ctid) IN ('
+        'SELECT tableoid, ctid FROM "public"."events__2024_01" LIMIT 4) '
+        'RETURNING "created_at", "tenant_id", "data") '
+        'INSERT INTO "public"."events_flat" ("created_at", "tenant_id", "data") '
+        'SELECT "created_at", "tenant_id", "data" FROM moved'
+    )
+    engine.begin.assert_called_once()
+
+
+async def test__move_rows__no_limit__moves_everything() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=99))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = await repo.move_rows("a", "b")
+
+    # Assert
+    assert moved == 99
+    assert _statements(conn)[-1].startswith('WITH moved AS (DELETE FROM "a" RETURNING')
+
+
+async def test__move_rows__source_without_columns__raises_not_found() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(columns=[]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionNotFoundError):
+        await repo.move_rows("gone", "b")

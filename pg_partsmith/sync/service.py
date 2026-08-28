@@ -7,7 +7,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from pg_partsmith.boundaries import Window
-from pg_partsmith.entities import MaintenanceResult, PartitionInfo, Period, TablePartitionConfig
+from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
+from pg_partsmith.entities import MaintenanceResult, MigrationResult, PartitionInfo, Period, TablePartitionConfig
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.plan import CreatePartition, DetachPartition, DropPartition, MaintenancePlan, OperationKind, Reason
 from pg_partsmith.planner import PlanMode, plan_maintenance
@@ -16,6 +17,7 @@ from pg_partsmith.utils import validate_timezone_alignment
 
 from .services.execution import PlanExecutor
 from .services.inspection import PartitionInspector
+from .services.migration import DataMover
 from .services.validation import PartitionValidationService
 
 if TYPE_CHECKING:
@@ -63,6 +65,7 @@ class PartitionLifecycleService:
         self._validation = PartitionValidationService(metadata)
         self._inspector = PartitionInspector(metadata)
         self._executor = PlanExecutor(repo, metadata, hooks)
+        self._mover = DataMover(repo, metadata, self._executor)
 
     # ── The three verbs ─────────────────────────────────────────────────────────
 
@@ -274,6 +277,91 @@ class PartitionLifecycleService:
         plan = self.plan(config, mode=PlanMode.EXPLICIT, windows=windows)
         result = self._executor.apply(config, plan)
         return _created_partitions(config, plan, result)
+
+    # ── Moving rows ─────────────────────────────────────────────────────────────
+
+    def partition_data(
+        self,
+        config: TablePartitionConfig,
+        *,
+        batch_rows: int = DEFAULT_MOVE_BATCH_ROWS,
+        max_batches: int | None = None,
+    ) -> MigrationResult:
+        """Move the rows of the DEFAULT partition into the partitions they belong to, in batches.
+
+        The migration path for a table that was partitioned around its data:
+        attach the old table as the DEFAULT partition of the new parent, then
+        call this until ``result.complete``. Window by window, oldest first,
+        the partition is created detached, filled in batches of
+        ``batch_rows`` and attached once nothing of its window is left in
+        DEFAULT. Until that attach the window's rows are invisible through the
+        parent -- PostgreSQL cannot attach a partition while DEFAULT holds rows
+        for it, so there is no order that keeps them visible throughout.
+
+        Takes the table's lock.
+
+        Args:
+            config: Table partitioning configuration; the root must be a RANGE level.
+            batch_rows: Rows moved per statement.
+            max_batches: Stop after this many statements and report
+                ``complete=False``; the next call carries on.
+
+        Returns:
+            What was moved and created, and whether DEFAULT is drained.
+
+        Raises:
+            InvalidPartitionConfigError: If the root is not a RANGE level or
+                the configuration does not match the table.
+            LockAcquisitionError: If the table-level maintenance lock is unavailable.
+        """
+
+        def plan_for(window: Window) -> MaintenancePlan:
+            return self.plan(config, mode=PlanMode.EXPLICIT, windows={config.scheme.leading_column: (window,)})
+
+        with self._locks.acquire_lock(config.qualified_name):
+            self._validation.validate_config(config)
+            return self._mover.partition_data(config, plan_for, batch_rows=batch_rows, max_batches=max_batches)
+
+    def unpartition(
+        self,
+        config: TablePartitionConfig,
+        into: str,
+        *,
+        batch_rows: int = DEFAULT_MOVE_BATCH_ROWS,
+        max_batches: int | None = None,
+        drop_emptied: bool = False,
+    ) -> MigrationResult:
+        """Move every partition's rows into one plain table, in batches.
+
+        The way back: ``into`` is created ``LIKE`` the root when it does not
+        exist, each partition is emptied oldest first, and with ``drop_emptied``
+        every emptied partition is detached and dropped through the ordinary
+        path -- marker, hooks, revalidation. Foreign partitions are skipped
+        and reported. Rows already moved are in ``into`` at every commit point,
+        never in two places.
+
+        Takes the table's lock.
+
+        Args:
+            config: Table partitioning configuration.
+            into: Schema-qualified name of the receiving table.
+            batch_rows: Rows moved per statement.
+            max_batches: Stop after this many statements and report
+                ``complete=False``; the next call carries on.
+            drop_emptied: Detach and drop each partition once it is empty.
+
+        Returns:
+            What was moved and emptied, and whether every partition is empty.
+
+        Raises:
+            InvalidPartitionConfigError: If the configuration does not match the table.
+            LockAcquisitionError: If the table-level maintenance lock is unavailable.
+        """
+        with self._locks.acquire_lock(config.qualified_name):
+            self._validation.validate_config(config)
+            return self._mover.unpartition(
+                config, into, batch_rows=batch_rows, max_batches=max_batches, drop_emptied=drop_emptied
+            )
 
     # ── Granular steps ──────────────────────────────────────────────────────────
 

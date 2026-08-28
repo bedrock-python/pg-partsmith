@@ -81,6 +81,8 @@ RULES: list[tuple[str, str]] = [
     (r"\bassert_awaited_once\b", "assert_called_once"),
     (r"\bassert_not_awaited\b", "assert_not_called"),
     (r"\bawait_count\b", "call_count"),
+    (r"\bawait_args_list\b", "call_args_list"),
+    (r"\bawait_args\b", "call_args"),
 ]
 
 

@@ -967,7 +967,15 @@ def test__maintenance_issue_step__covers_planning_and_attaching() -> None:
     # Arrange / Act / Assert
     assert MaintenanceIssueStep.PLAN.value == "plan"
     assert MaintenanceIssueStep.ATTACH.value == "attach"
-    assert {step.value for step in MaintenanceIssueStep} == {"plan", "create", "reconcile", "attach", "detach", "drop"}
+    assert {step.value for step in MaintenanceIssueStep} == {
+        "plan",
+        "create",
+        "reconcile",
+        "attach",
+        "detach",
+        "drop",
+        "move",
+    }
 
 
 # -- package-root exports -------------------------------------------------------------

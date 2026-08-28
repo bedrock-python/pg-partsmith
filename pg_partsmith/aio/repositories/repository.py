@@ -164,6 +164,7 @@ class PostgresPartitionRepository:
         key_columns: tuple[str, ...],
         from_value: str,
         to_value: str,
+        limit: int | None = None,
     ) -> int:
         """Move rows from a DEFAULT partition to the partition for a window.
 
@@ -175,4 +176,12 @@ class PostgresPartitionRepository:
             key_columns=key_columns,
             from_value=from_value,
             to_value=to_value,
+            limit=limit,
         )
+
+    async def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:
+        """Move rows from one relation into another.
+
+        See :meth:`PartitionCreator.move_rows`.
+        """
+        return await self._creator.move_rows(source_name, target_name, limit=limit)

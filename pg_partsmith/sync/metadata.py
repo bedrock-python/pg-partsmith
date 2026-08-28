@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
@@ -379,6 +379,24 @@ class PostgresMetadataProvider:
                 )
             value = result.scalar()
         return None if value is None else int(value)
+
+    def get_leading_key_minimum(self, table_name: str, key_columns: tuple[str, ...]) -> Any:
+        """Return the smallest leading-key value among rows whose whole key is non-NULL.
+
+        Sorted ``min()`` over the leading column is one index probe when the
+        key is indexed; the trailing ``IS NOT NULL`` tests leave out the rows
+        PostgreSQL would route to DEFAULT regardless of their leading value.
+        """
+        if not key_columns:
+            msg = "get_leading_key_minimum needs the parent's partition key"
+            raise ValueError(msg)
+        leading = quote_identifier(key_columns[0])
+        not_null = " AND ".join(f"{quote_identifier(column)} IS NOT NULL" for column in key_columns)
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(f"SELECT min({leading}) FROM {quote_identifier(table_name)} WHERE {not_null}")  # noqa: S608
+            )
+            return result.scalar()
 
     # ── Single relations ────────────────────────────────────────────────────────
 

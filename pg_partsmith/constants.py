@@ -39,6 +39,9 @@ PG_CHECK_VIOLATION = "23514"
 # (42809 is what PostgreSQL raises for "X is already a partition").
 ATTACH_CONFLICT_SQLSTATES = frozenset({"42P07", "42710", "42809"})
 
+# Rows one batch of partition_data / unpartition moves.
+DEFAULT_MOVE_BATCH_ROWS = 10_000
+
 # Retries for ATTACH after DEFAULT-partition reconciliation.
 DEFAULT_CONFLICT_MAX_RETRIES = 2
 

@@ -7,12 +7,10 @@ from datetime import UTC, datetime
 import freezegun
 import pytest
 from dateutil.parser import isoparse
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
-from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.entities import (
     MaintenanceIssueStep,
     PartitionGranularity,
@@ -23,6 +21,7 @@ from pg_partsmith.entities import (
 from pg_partsmith.exceptions import PartitionAttachedError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import FindingReason, Reason
+from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.topology import RangeBounds
 from tests.integration.sync.builder import PartitioningScenarioBuilder
 

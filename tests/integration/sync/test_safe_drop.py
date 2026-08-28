@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text
 
-from pg_partsmith.sync.metadata import PostgresMetadataProvider
-from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.exceptions import PartitionAttachedError, PlanStaleError
 from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
+from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.topology import RangeBounds
 from tests.integration.sync.support import make_table
 
@@ -19,7 +18,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from sqlalchemy import Engine
-
     from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.integration

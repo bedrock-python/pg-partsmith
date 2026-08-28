@@ -7,16 +7,16 @@ from typing import TYPE_CHECKING
 import pytest
 from sqlalchemy import text
 
-from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
-from pg_partsmith.sync.metadata import PostgresMetadataProvider
-from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import PartitionType, TablePartitionConfig
 from pg_partsmith.exceptions import LockAcquisitionError, PartitionAlreadyExistsError, UnmanagedPartitionDropError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import PartitionBy
+from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
+from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.topology import HashBounds, RangeBounds
-from tests.integration.sync.support import make_table, table_comment
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config, orphan_marker
+from tests.integration.sync.support import make_table, table_comment
 
 if TYPE_CHECKING:
     from collections.abc import Generator

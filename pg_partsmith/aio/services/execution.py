@@ -157,6 +157,37 @@ class PlanExecutor:
 
     # ── Creation ────────────────────────────────────────────────────────────────
 
+    async def create_partition(
+        self,
+        config: TablePartitionConfig,
+        plan: MaintenancePlan,
+        op: CreatePartition,
+        *,
+        issues: list[MaintenanceIssue],
+        fill: Callable[[str], Awaitable[bool]] | None = None,
+    ) -> bool:
+        """Create one partition with its subtree and attach it, filling it in between.
+
+        Extension point for callers that load rows into a partition before it
+        goes live: ``fill`` is called with the relation's name once it and its
+        subtree exist and before it is attached. It returns False to stop
+        short of the attach -- the relation then stays detached and invisible,
+        and the next call for the same window finds it, fills it further and
+        attaches it.
+
+        Args:
+            config: The configuration the plan was made from.
+            plan: The plan the operation belongs to.
+            op: The partition to create.
+            issues: Where topology findings met on the way are recorded.
+            fill: What to do with the relation before it is attached.
+
+        Returns:
+            True when the partition is attached; False when ``fill`` stopped
+            short of it.
+        """
+        return await self._create(config, plan, op, depth=0, tally=_Tally(), issues=issues, fill=fill)
+
     async def _create(
         self,
         config: TablePartitionConfig,
@@ -166,11 +197,13 @@ class PlanExecutor:
         depth: int,
         tally: _Tally,
         issues: list[MaintenanceIssue],
-    ) -> None:
+        fill: Callable[[str], Awaitable[bool]] | None = None,
+    ) -> bool:
         """Create one partition with its subtree, then attach it.
 
         ``depth`` is the index into ``config.levels`` of the level the new
         partition belongs to: the root's own partitions are at depth 0.
+        Returns whether the partition ended up attached.
         """
         fires_hooks = op.counts_as == "created"
         info = _partition_info(config, op)
@@ -188,7 +221,7 @@ class PlanExecutor:
                 logger.debug(
                     "Partition already attached (race with another worker)", extra={"partition_name": op.target}
                 )
-                return
+                return True
             logger.info(
                 "Relation already exists but is not attached; completing its subtree before attaching it",
                 extra={"partition_name": op.target},
@@ -197,6 +230,9 @@ class PlanExecutor:
         else:
             for child in op.children:
                 await self._create(config, plan, child, depth=depth + 1, tally=tally, issues=issues)
+
+        if fill is not None and not await fill(op.target):
+            return False
 
         await self._attach_with_reconcile(config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns)
 
@@ -208,6 +244,7 @@ class PlanExecutor:
         if fires_hooks:
             attached = info.model_copy(update={"is_attached": True})
             await self._run_hooks(lambda h: h.after_create(config, attached), "after_create", partition_name=op.target)
+        return True
 
     async def _materialize(self, config: TablePartitionConfig, op: CreatePartition) -> None:
         """Create the relation ``op`` describes, detached, as the leaf backend says.

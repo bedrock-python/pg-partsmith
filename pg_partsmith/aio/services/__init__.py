@@ -2,6 +2,7 @@
 
 from .execution import PlanExecutor
 from .inspection import PartitionInspector
+from .migration import DataMover
 from .validation import PartitionValidationService
 
-__all__ = ["PartitionInspector", "PartitionValidationService", "PlanExecutor"]
+__all__ = ["DataMover", "PartitionInspector", "PartitionValidationService", "PlanExecutor"]

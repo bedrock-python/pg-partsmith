@@ -7,16 +7,15 @@ from zoneinfo import ZoneInfo
 
 import freezegun
 import pytest
-from sqlalchemy import event, text
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event, text
 from testcontainers.postgres import PostgresContainer
 
+from pg_partsmith.boundaries import TimeBoundaries
+from pg_partsmith.entities import PartitionGranularity, Period, TablePartitionConfig
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
-from pg_partsmith.boundaries import TimeBoundaries
-from pg_partsmith.entities import PartitionGranularity, Period, TablePartitionConfig
 from pg_partsmith.topology import RangeBounds
 from pg_partsmith.utils import qualify
 

@@ -1154,3 +1154,45 @@ def test__constructor__non_string_marker_prefix__raises_type_error() -> None:
     # Arrange / Act / Assert
     with pytest.raises(TypeError, match="marker_prefix"):
         PostgresMetadataProvider(MagicMock(), marker_prefix=42)  # type: ignore[arg-type]
+
+
+# ── the DEFAULT probe ───────────────────────────────────────────────────────────
+
+
+def test__get_leading_key_minimum__single_key__min_over_non_null_rows() -> None:
+    # Arrange
+    engine = _make_engine(datetime(2026, 3, 3, tzinfo=UTC))
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    value = provider.get_leading_key_minimum("public.events_default", ("created_at",))
+
+    # Assert
+    assert value == datetime(2026, 3, 3, tzinfo=UTC)
+    assert _statements(engine) == [
+        'SELECT min("created_at") FROM "public"."events_default" WHERE "created_at" IS NOT NULL'
+    ]
+
+
+def test__get_leading_key_minimum__composite_key__leaves_out_rows_with_a_null_anywhere_in_the_key() -> None:
+    # Arrange
+    engine = _make_engine(None)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    value = provider.get_leading_key_minimum("d", ("created_at", "tenant_id"))
+
+    # Assert
+    assert value is None
+    assert _statements(engine) == [
+        'SELECT min("created_at") FROM "d" WHERE "created_at" IS NOT NULL AND "tenant_id" IS NOT NULL'
+    ]
+
+
+def test__get_leading_key_minimum__no_key__refused() -> None:
+    # Arrange
+    provider = PostgresMetadataProvider(_make_engine(None))
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="partition key"):
+        provider.get_leading_key_minimum("d", ())

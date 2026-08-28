@@ -260,6 +260,7 @@ class PartitionCreator:
         key_columns: tuple[str, ...],
         from_value: str,
         to_value: str,
+        limit: int | None = None,
     ) -> int:
         """Move conflicting rows from DEFAULT partition to target partition.
 
@@ -269,6 +270,8 @@ class PartitionCreator:
             key_columns: The parent's partition key, leading column first.
             from_value: Range start boundary (inclusive).
             to_value: Range end boundary (exclusive).
+            limit: Move at most this many rows; None moves every row of the
+                window in one statement.
 
         Returns:
             Number of rows moved.
@@ -312,22 +315,59 @@ class PartitionCreator:
             # created with LIKE.
             #
             # All identifiers and literals are properly quoted, S608 is a false positive
-            move_sql = _as_text(
-                f"WITH moved AS ("  # noqa: S608
-                f"DELETE FROM {default_quoted} "
-                f"WHERE {column_quoted} >= {from_quoted} "
-                f"AND {column_quoted} < {to_quoted}"
-                f"{not_null} "
-                f"RETURNING {column_list}"
-                f") "
-                f"INSERT INTO {target_quoted} ({column_list}) "
-                f"SELECT {column_list} FROM moved"
-            )
+            condition = f"{column_quoted} >= {from_quoted} AND {column_quoted} < {to_quoted}{not_null}"
+            move_sql = _as_text(_move_statement(default_quoted, target_quoted, column_list, condition, limit))
 
             result = conn.execute(move_sql)
             moved_count = result.rowcount or 0
 
         return moved_count
+
+    def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:
+        """Move rows from one relation into another, whatever their keys.
+
+        Args:
+            source_name: Qualified name of the relation to take rows from; a
+                partitioned table works, its leaves are addressed through it.
+            target_name: Qualified name of the relation to put them in.
+            limit: Move at most this many rows; None moves every row.
+
+        Returns:
+            Number of rows moved.
+        """
+        source_quoted = quote_identifier(source_name)
+        target_quoted = quote_identifier(target_name)
+        with self._engine.begin() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            conn.execute(text(f"LOCK TABLE {source_quoted} IN SHARE ROW EXCLUSIVE MODE"))
+            conn.execute(text(f"LOCK TABLE {target_quoted} IN SHARE ROW EXCLUSIVE MODE"))
+            columns = self._relation_columns(conn, source_name)
+            column_list = ", ".join(quote_identifier(column) for column in columns)
+            result = conn.execute(_as_text(_move_statement(source_quoted, target_quoted, column_list, None, limit)))
+            return result.rowcount or 0
+
+
+def _move_statement(source: str, target: str, column_list: str, condition: str | None, limit: int | None) -> str:
+    """One ``DELETE ... RETURNING`` / ``INSERT`` statement moving rows from ``source`` to ``target``.
+
+    Both sides name their columns: ``RETURNING *`` would emit the source's
+    physical order, and an unqualified INSERT binds it positionally -- silently
+    transposing values whenever the two relations were created independently.
+    A batch is bounded through ``(tableoid, ctid)`` rather than ``ctid`` alone
+    so a partitioned source, whose leaves each number their own tuples, is
+    addressed unambiguously. Every identifier and literal is already quoted.
+    """
+    where = f" WHERE {condition}" if condition else ""
+    if limit is not None:
+        picked = f"SELECT tableoid, ctid FROM {source}{where} LIMIT {int(limit):d}"  # noqa: S608
+        where = f" WHERE (tableoid, ctid) IN ({picked})"
+    return (
+        f"WITH moved AS ("  # noqa: S608
+        f"DELETE FROM {source}{where} RETURNING {column_list}"
+        f") "
+        f"INSERT INTO {target} ({column_list}) "
+        f"SELECT {column_list} FROM moved"
+    )
 
 
 def _storage_parameters_clause(physical: LocalLeaves) -> tuple[str, dict[str, str]]:

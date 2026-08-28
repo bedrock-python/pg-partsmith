@@ -19,6 +19,13 @@ from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
 from pg_partsmith.lifecycle import CreateAhead, DropAfter, KeepNewest, LifecyclePolicy
 from pg_partsmith.plan import FindingReason
 from pg_partsmith.utils import DETACHED_AT_MARKER
+from tests.integration.nested_support import (
+    METRICS_TABLE_DDL,
+    MONTHLY_TABLE_DDL,
+    TIMESTAMP_TABLE_DDL,
+    monthly_config,
+    nested_config,
+)
 from tests.integration.sync.support import (
     exec_sql,
     exec_sql_autocommit,
@@ -30,13 +37,6 @@ from tests.integration.sync.support import (
     run_maintenance,
     scalar,
     table_comment,
-)
-from tests.integration.nested_support import (
-    METRICS_TABLE_DDL,
-    MONTHLY_TABLE_DDL,
-    TIMESTAMP_TABLE_DDL,
-    monthly_config,
-    nested_config,
 )
 
 if TYPE_CHECKING:

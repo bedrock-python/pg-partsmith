@@ -9,17 +9,17 @@ import freezegun
 import pytest
 from sqlalchemy import text
 
+from pg_partsmith.boundaries import TimeBoundaries
+from pg_partsmith.entities import PartitionGranularity, TablePartitionConfig
+from pg_partsmith.lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
+from pg_partsmith.scheme import HashPartitioning, RangePartitioning
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
-from pg_partsmith.boundaries import TimeBoundaries
-from pg_partsmith.entities import PartitionGranularity, TablePartitionConfig
-from pg_partsmith.lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
-from pg_partsmith.scheme import HashPartitioning, RangePartitioning
-from tests.integration.sync.support import hash_children_of, relkind
 from tests.integration.nested_support import monthly_config
+from tests.integration.sync.support import hash_children_of, relkind
 
 if TYPE_CHECKING:
     from collections.abc import Generator

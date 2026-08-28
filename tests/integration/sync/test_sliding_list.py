@@ -11,11 +11,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pg_partsmith.sync.metadata import PostgresMetadataProvider
-from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.lifecycle import CreateNextIf, DetachMode, KeepNewest, LifecyclePolicy, SqlPredicate
 from pg_partsmith.plan import FindingReason, Reason
+from pg_partsmith.sync.metadata import PostgresMetadataProvider
+from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.topology import ListBounds
+from tests.integration.nested_support import SLIDING_LIST_TABLE_DDL, sliding_list_config
 from tests.integration.sync.support import (
     count_ddl,
     exec_sql,
@@ -26,7 +27,6 @@ from tests.integration.sync.support import (
     run_maintenance,
     scalar,
 )
-from tests.integration.nested_support import SLIDING_LIST_TABLE_DDL, sliding_list_config
 
 if TYPE_CHECKING:
     from collections.abc import Generator

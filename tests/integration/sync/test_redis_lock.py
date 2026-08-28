@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import time
-from time import sleep
 from contextlib import ExitStack
+from time import sleep
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import pytest
 from redis import Redis
 
-from pg_partsmith.sync.lock.redis import RedisDistributedLockManager
 from pg_partsmith.exceptions import LockAcquisitionError
+from pg_partsmith.sync.lock.redis import RedisDistributedLockManager
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Callable
+    from collections.abc import Callable, Generator
 
 pytestmark = pytest.mark.integration
 

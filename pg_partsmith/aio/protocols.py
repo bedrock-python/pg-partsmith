@@ -16,7 +16,7 @@ has to know how the planner works.
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pg_partsmith.entities import MaintenanceResult, PartitionInfo, TablePartitionConfig
 from pg_partsmith.leaves import LocalLeaves
@@ -194,6 +194,7 @@ class PartitionRepository(Protocol):
         key_columns: tuple[str, ...],
         from_value: str,
         to_value: str,
+        limit: int | None = None,
     ) -> int:
         """Move rows from a DEFAULT partition to the partition for a window.
 
@@ -205,6 +206,20 @@ class PartitionRepository(Protocol):
                 PostgreSQL routes them.
             from_value: Window start (inclusive) on the leading column.
             to_value: Window end (exclusive) on the leading column.
+            limit: Move at most this many rows; None moves them all.
+
+        Returns:
+            Number of rows moved.
+        """
+        ...
+
+    async def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:
+        """Move rows from one relation into another, whatever their keys.
+
+        Args:
+            source_name: Qualified name of the relation to take rows from.
+            target_name: Qualified name of the relation to put them in.
+            limit: Move at most this many rows; None moves them all.
 
         Returns:
             Number of rows moved.
@@ -301,6 +316,21 @@ class PartitionMetadataProvider(Protocol):
 
         Returns:
             The value, or None when the table is empty (or the sequence unused).
+        """
+        ...
+
+    async def get_leading_key_minimum(self, table_name: str, key_columns: tuple[str, ...]) -> Any:
+        """Return the smallest leading-key value of the rows a partition could take.
+
+        Rows with a NULL anywhere in the key are left out: PostgreSQL routes
+        them to DEFAULT whatever their other values.
+
+        Args:
+            table_name: The relation to probe -- a DEFAULT partition, usually.
+            key_columns: The parent's partition key, leading column first.
+
+        Returns:
+            The value as the driver returns it, or None when no such row exists.
         """
         ...
 

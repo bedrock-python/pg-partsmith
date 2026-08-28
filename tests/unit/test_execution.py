@@ -1613,3 +1613,85 @@ async def test__apply__foreign_leaves__branch_stays_local_and_its_buckets_are_fo
         "server": "archive",
         "options": {"table_name": "events__2024_04_events__2024_04__h0"},
     }
+
+
+# ── create_partition with a fill step ───────────────────────────────────────────
+
+
+async def test__create_partition__fill_runs_between_the_build_and_the_attach(
+    executor: PlanExecutor, repo: MagicMock, hooks: _RecordingHooks
+) -> None:
+    # Arrange
+    order = _record_ddl(repo)
+
+    async def fill(target: str) -> bool:
+        order.append(f"fill {target}")
+        return True
+
+    # Act
+    attached = await executor.create_partition(_config(), _plan(), _create_op(), issues=[], fill=fill)
+
+    # Assert
+    assert attached
+    assert order == ["create events__2024_04", "fill events__2024_04", "attach events__2024_04"]
+    assert hooks.names() == ["before_create", "after_create"]
+
+
+async def test__create_partition__fill_declines__relation_stays_detached_and_no_after_hook(
+    executor: PlanExecutor, repo: MagicMock, hooks: _RecordingHooks
+) -> None:
+    # Arrange
+    async def fill(target: str) -> bool:
+        return False
+
+    # Act
+    attached = await executor.create_partition(_config(), _plan(), _create_op(), issues=[], fill=fill)
+
+    # Assert
+    assert not attached
+    repo.attach_partition.assert_not_awaited()
+    assert hooks.names() == ["before_create"]
+
+
+async def test__create_partition__relation_already_attached__fill_is_skipped(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- a lost race: another worker attached it with the planned bounds
+    repo.create_table_like.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    metadata.is_partition_attached.return_value = True
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+    filled: list[str] = []
+
+    async def fill(target: str) -> bool:
+        filled.append(target)
+        return True
+
+    # Act
+    attached = await executor.create_partition(_config(), _plan(), _create_op(), issues=[], fill=fill)
+
+    # Assert
+    assert attached
+    assert filled == []
+    repo.attach_partition.assert_not_awaited()
+
+
+async def test__create_partition__relation_exists_detached__fill_runs_before_it_is_attached(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- an earlier call built it and stopped short of the attach
+    repo.create_table_like.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    metadata.is_partition_attached.return_value = False
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", is_attached=False)
+    filled: list[str] = []
+
+    async def fill(target: str) -> bool:
+        filled.append(target)
+        return True
+
+    # Act
+    attached = await executor.create_partition(_config(), _plan(), _create_op(), issues=[], fill=fill)
+
+    # Assert
+    assert attached
+    assert filled == ["events__2024_04"]
+    repo.attach_partition.assert_awaited_once()

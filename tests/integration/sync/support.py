@@ -39,9 +39,9 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
-    from pg_partsmith.sync.hooks import PartitionLifecycleHooks
     from pg_partsmith.boundaries import RangeBoundaryCodec
     from pg_partsmith.entities import MaintenanceResult, TablePartitionConfig
+    from pg_partsmith.sync.hooks import PartitionLifecycleHooks
 
 
 def make_table(engine: Engine, ddl: str, *, prefix: str = "nested") -> Generator[str, None]:
