@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith import pruning_rules
 from pg_partsmith.entities import (
+    HashSubpartitionSpec,
     MaintenanceIssueStep,
     MaintenanceResult,
     PartitionGranularity,
@@ -2130,3 +2131,52 @@ def test__ensure_partition__single_period__still_delegates_to_the_batch_path(
     assert result is not None
     assert result.name == "events__2024_07"
     assert result.is_attached is True
+
+
+# ── Wiring refusals ─────────────────────────────────────────────────────────────
+
+
+def test__validation_service__composite_config_on_a_flat_metadata_provider__refused(
+    mock_repo: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange: a provider written before composite keys existed.
+    metadata = MagicMock(spec=["get_partition_type", "get_partition_column", "list_partitions"])
+    metadata.get_partition_type = MagicMock(return_value=PartitionType.RANGE)
+    config = TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_columns=("created_at", "tenant_id"),
+        granularity=PartitionGranularity.MONTH,
+    )
+    service = _make_service(mock_repo, metadata, mock_locks, mock_calculator)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="CompositeKeyMetadata"):
+        service.maintain_lifecycle(config)
+
+
+def test__validation_service__nested_config_on_a_flat_metadata_provider__refused(
+    mock_repo: MagicMock,
+    mock_locks: MagicMock,
+    mock_calculator: MagicMock,
+) -> None:
+    # Arrange
+    metadata = MagicMock(spec=["get_partition_type", "get_partition_column", "list_partitions"])
+    metadata.get_partition_type = MagicMock(return_value=PartitionType.RANGE)
+    metadata.get_partition_column = MagicMock(return_value="created_at")
+    config = TablePartitionConfig(
+        table_name="events",
+        partition_type=PartitionType.RANGE,
+        partition_strategy=PartitionStrategy.TIME_BASED,
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+        subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+    )
+    service = _make_service(mock_repo, metadata, mock_locks, mock_calculator)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="NestedPartitionMetadata"):
+        service.maintain_lifecycle(config)

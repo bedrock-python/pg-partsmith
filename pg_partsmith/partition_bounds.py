@@ -164,23 +164,35 @@ def parse_partition_bounds(boundaries_expr: str | None) -> PartitionBounds | Non
 
 
 def _split_top_level(values: str) -> list[str]:
-    """Split a comma-separated bound list, ignoring commas inside quotes."""
+    """Split a comma-separated bound list, ignoring commas inside quotes.
+
+    Doubled quotes are how SQL escapes a quote inside a literal. Both
+    characters have to be consumed together: stepping over only the first would
+    leave the second to flip the in-quotes state, and every comma after it
+    would then be read as part of the value.
+    """
     parts: list[str] = []
     current: list[str] = []
     in_quotes = False
+    index = 0
 
-    for index, char in enumerate(values):
+    while index < len(values):
+        char = values[index]
+
         if char == "'":
-            # Doubled quotes escape a literal quote and must not toggle state.
-            if in_quotes and index + 1 < len(values) and values[index + 1] == "'":
-                current.append(char)
+            if in_quotes and values[index + 1 : index + 2] == "'":
+                # Keep both characters: _normalize unescapes them later.
+                current.append("''")
+                index += 2
                 continue
             in_quotes = not in_quotes
+
         if char == "," and not in_quotes:
             parts.append("".join(current))
             current = []
-            continue
-        current.append(char)
+        else:
+            current.append(char)
+        index += 1
 
     parts.append("".join(current))
     return [p for p in (part.strip() for part in parts) if p]

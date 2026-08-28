@@ -6,6 +6,7 @@ from pydantic import ValidationError
 import pg_partsmith
 from pg_partsmith.entities import (
     HashSubpartitionSpec,
+    ListBounds,
     ListGroup,
     ListSubpartitionSpec,
     MaintenanceIssue,
@@ -825,3 +826,116 @@ def test__parse_partition_bounds__composite_numeric_range__returns_the_leading_v
 
     # Assert
     assert parsed == RangeBounds(from_value="100", to_value="200")
+
+
+# ── Static-root configuration refusals ──────────────────────────────────────────
+
+
+def _static(**overrides: object) -> TablePartitionConfig:
+    base: dict[str, object] = {
+        "table_name": "issue_index",
+        "partition_type": PartitionType.HASH,
+        "partition_strategy": PartitionStrategy.HASH_BASED,
+        "partition_column": "tenant_id",
+        "root_layout": HashSubpartitionSpec(column="tenant_id", modulus=4),
+    }
+    base.update(overrides)
+    return TablePartitionConfig(**base)  # type: ignore[arg-type]
+
+
+def test__config__static_root__accepted() -> None:
+    # Arrange / Act
+    config = _static()
+
+    # Assert
+    assert config.is_time_based is False
+    assert config.key_arity == 1
+
+
+def test__config__time_based_with_root_layout__rejected() -> None:
+    # Arrange / Act / Assert: a time-based table's partitions come from periods.
+    with pytest.raises(ValidationError, match="only for HASH_BASED"):
+        _config(root_layout=HashSubpartitionSpec(column="tenant_id", modulus=2))
+
+
+def test__config__static_root__partition_type_disagreeing_with_strategy__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="requires HASH partition type"):
+        _static(partition_type=PartitionType.RANGE)
+
+
+def test__config__static_root__layout_of_the_wrong_strategy__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="root_layout describes"):
+        TablePartitionConfig(
+            table_name="regions",
+            partition_type=PartitionType.LIST,
+            partition_strategy=PartitionStrategy.VALUE_BASED,
+            partition_column="region",
+            root_layout=HashSubpartitionSpec(column="region", modulus=2),
+        )
+
+
+def test__config__static_root__layout_on_another_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="must be the table's own partition key"):
+        _static(root_layout=HashSubpartitionSpec(column="other_col", modulus=2))
+
+
+def test__config__static_root__with_granularity__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="no periods"):
+        _static(granularity=PartitionGranularity.WEEK)
+
+
+def test__config__static_root__with_a_sibling_subpartition__rejected() -> None:
+    # Arrange / Act / Assert: deeper levels nest inside root_layout instead.
+    with pytest.raises(ValidationError, match="inside root_layout"):
+        _static(subpartition=HashSubpartitionSpec(column="shard_id", modulus=2))
+
+
+def test__config__static_root__name_too_long_for_its_buckets__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="too long for this layout"):
+        _static(
+            table_name="i" * 60,
+            root_layout=HashSubpartitionSpec(column="tenant_id", modulus=100),
+        )
+
+
+def test__config__list_root__accepted() -> None:
+    # Arrange / Act
+    config = TablePartitionConfig(
+        table_name="regions",
+        partition_type=PartitionType.LIST,
+        partition_strategy=PartitionStrategy.VALUE_BASED,
+        partition_column="region",
+        root_layout=ListSubpartitionSpec(column="region", groups=(ListGroup(name="eu", values=("de",)),)),
+    )
+
+    # Assert
+    assert config.is_time_based is False
+
+
+# ── Bound parsing edge cases ────────────────────────────────────────────────────
+
+
+def test__parse_partition_bounds__quoted_comma_in_a_composite_bound__not_split() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES FROM ('a,b', MINVALUE) TO ('c,d', MINVALUE)")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="a,b", to_value="c,d")
+
+
+def test__parse_partition_bounds__doubled_quote_inside_a_value__preserved() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES IN ('O''Brien', 'other')")
+
+    # Assert
+    assert parsed == ListBounds(values=("O'Brien", "other"))
+
+
+def test__parse_partition_bounds__hash_bounds_with_an_unreadable_number__returns_none() -> None:
+    # Arrange / Act / Assert
+    assert parse_partition_bounds("FOR VALUES WITH (modulus x, remainder y)") is None
