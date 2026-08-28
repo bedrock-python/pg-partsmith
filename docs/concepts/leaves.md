@@ -7,7 +7,7 @@ relation each one is.
 ```python
 from pg_partsmith import ForeignLeaves, LocalLeaves
 
-TablePartitionConfig(..., leaves=LocalLeaves())                              # the default
+TablePartitionConfig(..., leaves=LocalLeaves())                                          # the default
 TablePartitionConfig(..., leaves=LocalLeaves(tablespace="fast_ssd", storage_parameters={"fillfactor": 70}))
 TablePartitionConfig(..., leaves=ForeignLeaves(server="archive", options={"table_name": "{relname}"}))
 ```
@@ -25,13 +25,13 @@ declared:
 |---|---|
 | `tablespace` | `TABLESPACE` on every created relation, leaves and branches alike. PostgreSQL refuses `pg_default` here; name a real tablespace. |
 | `storage_parameters` | `WITH (fillfactor = 70, autovacuum_enabled = false, toast.autovacuum_enabled = true)` on every created **leaf**. Branches take none — PostgreSQL refuses storage parameters on a partitioned table. Values of any type are rendered as string literals, which PostgreSQL accepts for every parameter. |
-| `inherit_privileges` | The parent's owner and grants are replayed onto every created relation, in the transaction that created it. `LIKE` copies neither; a role that reads *through the parent* needs no grant on a leaf, but one that addresses leaves directly (an export job, `pg_dump` of one partition) does. A grant the maintenance role may not make rolls the creation back — nothing half-configured is left behind. |
+| `inherit_privileges` | The parent's owner and grants are replayed onto every created relation, in the transaction that created it. `LIKE` copies neither. A role that reads *through the parent* needs no grant on a leaf, but one that addresses leaves directly — an export job, a `pg_dump` of one partition — does. A grant the maintenance role may not make rolls the creation back: nothing half-configured is left behind. |
 
 ```python
 leaves=LocalLeaves(tablespace="fast_ssd", storage_parameters={"fillfactor": 70}, inherit_privileges=True)
 ```
 
-The classic `pg_partman` template table carried exactly these: `LocalLeaves` is the
+The classic `pg_partman` template table carried exactly these; `LocalLeaves` is the
 declarative form.
 
 ## Foreign leaves
@@ -46,7 +46,7 @@ parent. This is the `pg_clickhouse` shape.
 leaves=ForeignLeaves(server="clickhouse", options={"table_name": "{relname}", "engine": "MergeTree"})
 ```
 
-Option values are templates. What they may refer to:
+Option values are templates:
 
 | Placeholder | Value |
 |---|---|
@@ -55,29 +55,25 @@ Option values are templates. What they may refer to:
 | `{parent}` | the relation it is attached to |
 | `{root}` | the table the configuration is for |
 
-A template with any other placeholder is refused at construction. Literal values pass
-through.
-
-The server and its user mapping exist before the first plan; pg-partsmith never creates
-them. Whether the remote table exists is the foreign data wrapper's business — `postgres_fdw`
-checks at query time, not at creation.
+A template with any other placeholder is refused at construction; literal values pass
+through. The server and its user mapping exist before the first plan; pg-partsmith never
+creates them. Whether the remote table exists is the foreign data wrapper's business —
+`postgres_fdw` checks at query time, not at creation.
 
 ### PostgreSQL's rule
 
 A foreign table can be a partition only of a parent **without a unique index or primary
-key**: PostgreSQL cannot enforce uniqueness across a foreign relation, and refuses both
+key**: PostgreSQL cannot enforce uniqueness across a foreign relation and refuses both
 `CREATE FOREIGN TABLE … PARTITION OF` and `ATTACH PARTITION` (`42809`) when one exists.
-Non-unique indexes are fine (they are skipped for the foreign member). The service checks
+Non-unique indexes are fine — they are skipped for the foreign member. The service checks
 this against the catalog and refuses the configuration before any DDL, naming the
 constraints in the way.
-
-Measured on PostgreSQL 15 and 17 — see [PostgreSQL semantics](../design/postgresql-semantics.md#foreign-tables).
 
 ### Ownership
 
 Under a `ForeignLeaves` configuration a foreign partition is a lifecycle partition like any
-other: it is created ahead, expires, is detached with its `COMMENT ON FOREIGN TABLE` marker
-and dropped with `DROP FOREIGN TABLE` — which removes the mapping and leaves the remote data
+other: created ahead, expired, detached with its `COMMENT ON FOREIGN TABLE` marker and
+dropped with `DROP FOREIGN TABLE` — which removes the mapping and leaves the remote data
 alone. Grace periods and `DropNever` apply unchanged.
 
 Under a `LocalLeaves` configuration the very same foreign partition is *not* ours: it is
@@ -94,4 +90,6 @@ tablespace but no storage parameters.
 ## Serialization
 
 `leaves` is discriminated on `kind` (`"local"` / `"foreign"`) and round-trips through
-`config.model_dump(mode="json")` like the rest of the configuration.
+`config.model_dump(mode="json")` with the rest of the configuration.
+
+Worked examples: [Tier cold data to a foreign server](../guide/cold-tiering.md).

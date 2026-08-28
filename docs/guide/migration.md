@@ -1,152 +1,122 @@
-# Migrating an existing partitioner
+# Migrate from pg_partman or a hand-rolled script
 
-This guide covers the traps we have seen real projects hit when replacing a hand-rolled
-partition maintenance script — or `pg_partman` — with pg-partsmith. Read it before the
-first production tick. For the 0.x → 1.0 API changes see the [changelog](../changelog.md).
+Replacing an existing partition manager is mostly a matter of not surprising yourself on
+the first tick. This guide is the checklist: what carries over unchanged, what to translate,
+and the two things that bite.
 
-## Start with a plan, not a tick
+## 1. Look at the plan first
 
 ```python
 plan = await service.plan(config)
 print(plan.describe())
 ```
 
-Nothing runs. The plan lists every creation, detach and drop with its reason and — with a
-size-aware policy — its size, and every finding: partitions the scheme did not produce,
-hash sets at an older modulus, a DEFAULT partition with rows in the way. If the plan against
-a staging copy is what you expect, the tick will do exactly that.
+Nothing runs. The plan lists every creation, detach and drop with its reason, and every
+finding: partitions the scheme did not produce, hash sets at another modulus, a DEFAULT
+partition with rows in the way. Run it against a staging copy until it says what you
+expect.
 
-## Retention: count, not distance
+## 2. Existing partitions carry over as they are
 
-Hand-rolled pruners usually express retention as a *distance*: "drop everything older than
-`N` periods from now", which keeps `N + 1` partitions on disk. `KeepNewest(count)` (and the
-flat `retention_count`) is a *count*: "keep exactly `N` newest periods, current one
-included". Passing a distance straight in silently drops one extra period on the first
-tick. Convert once at the boundary (`old_distance + 1`), or use `KeepFor(timedelta(...))`
-which expresses an age directly.
+Partitions are recognised by their **bounds**, never by name. An attached partition whose
+bounds are a window of the configured grid — the same month, the same ISO week, the same
+100 000-id step — is a lifecycle partition whatever it is called. Nothing needs renaming
+or recreating.
 
-## Existing partitions are recognised by their bounds
-
-Nothing needs renaming. An attached partition whose bounds are a window of the configured
-grid — the same month, the same ISO week, the same 100 000-id step — is a lifecycle
-partition whatever its name. One whose bounds are not (a yearly archive under a monthly
-config, a week straddling two months under a monthly config) is reported as
-`unmanaged_partition` and left alone; decide about those by hand.
+One whose bounds are not on the grid — a yearly archive under a monthly configuration, a
+week that straddles two months — is reported as `unmanaged_partition` and left alone.
+Decide about those by hand.
 
 New partitions follow the configured naming. To keep old and new names consistent, plug
-the old convention in as a calculator (`TimeBoundaries(calculator=...)`) or a `name_suffix`
-— see the [event store example](nested-migration.md#naming-and-adoption).
+the old convention in as a calculator or a `name_suffix` — see
+[Custom calendars, names and codecs](calendars-and-codecs.md).
 
-## Adopting legacy detached partitions
+## 3. Retention is a count, not a distance
 
-pg-partsmith only ever drops tables that carry its `COMMENT` marker. Partitions that are
-attached at migration time need nothing: the first tick detaches and marks them itself.
+Hand-rolled pruners usually express retention as a distance: "drop everything older than
+`N` months from now", which keeps `N + 1` partitions on disk. `KeepNewest(count)` — and
+the flat `retention_count` — is a *count*: "keep exactly the `N` newest periods, the
+current one included". Passing a distance straight in drops one extra period on the first
+tick. Convert once at the boundary (`old_distance + 1`), or express the age directly with
+`KeepFor(timedelta(...))`.
 
-Tables your *old* partitioner already detached and never dropped carry no marker, so they
-are invisible to orphan discovery and will sit there forever. **Do not reach for
-`drop_allow_unmanaged=True`** — that disables the safe-drop guard for every drop, and does
-not even help, because unmarked tables are never discovered. Adopt them once instead:
+## 4. Adopt the tables the old manager detached
+
+pg-partsmith only drops tables that carry its `COMMENT` marker. Partitions that are
+*attached* at migration time need nothing: the first tick that expires them writes the
+marker itself.
+
+Tables the old manager **detached and never dropped** carry no marker, so they are
+invisible to the lifecycle and would sit there forever. Adopt them once:
 
 ```python
 await repo.adopt_partition("public.events", "public.events__2024_01")   # True when marked
 ```
 
-Adoption is idempotent, refuses attached partitions (`PartitionAttachedError`), returns
-`False` for names that do not resolve, and records no detach instant — so a grace period
-does not delay a table that has already waited. The next tick drops adopted tables like any
-other orphan, `before_drop` hooks included.
+Idempotent; refuses attached partitions; returns `False` for names that do not resolve;
+records no detach instant, so a grace period does not delay a table that has already
+waited. The next tick drops adopted tables like any other orphan, `before_drop` hooks
+included.
 
-## A DEFAULT partition full of data
+!!! danger "Do not reach for `drop_allow_unmanaged=True`"
+    It disables the safe-drop guard for *every* drop — and does not even solve this
+    problem, because unmarked tables are never discovered in the first place.
 
-Tables that started with only a DEFAULT partition (Hookdeck Outpost's shape) need no
-special step for the windows create-ahead reaches: as each new window is attached, rows
-belonging to it are moved out of DEFAULT and the attach retried. Rows with a NULL trailing
-key column stay in DEFAULT, where PostgreSQL routes them.
+## 5. Translate the configuration
 
-For the *history* sitting in DEFAULT — months create-ahead will never reach — there is
-`partition_data`.
+### From pg_partman
 
-## Partitioning a monolithic table
+| pg_partman | pg-partsmith |
+|---|---|
+| `p_interval` (`'1 month'`, `'1 week'`, …) | `granularity=PartitionGranularity.MONTH` / `WEEK` / … |
+| `p_interval` (an integer, id sets) | `NumericBoundaries(step=…)` |
+| `premake` | `CreateAhead(count)` — the count includes the current period |
+| `retention` (an interval) | `KeepFor(age)` |
+| `retention` (an integer, id sets) | `KeepBehind(distance)` |
+| `retention_keep_table = true` | `DropNever()` |
+| `p_time_encoder` / `p_time_decoder` | `TimeBoundaries(codec=…)` |
+| `epoch = 'seconds'` / `'milliseconds'` | `boundary_codec="epoch_seconds"` / `"epoch_milliseconds"` |
+| `create_sub_parent` | `child=` on the scheme |
+| template table (tablespace, reloptions), `inherit_privileges` | `leaves=LocalLeaves(tablespace=…, storage_parameters=…, inherit_privileges=True)` |
+| `partition_data_proc` / `partition_data_time` / `partition_data_id` | `service.partition_data(config, batch_rows=…, max_batches=…)` |
+| `undo_partition_proc` | `service.unpartition(config, into, drop_emptied=True)` |
+| `part_config` rows | the `TablePartitionConfig` objects in your code |
+| `run_maintenance()` / the background worker | `maintainer.run_maintenance_safe(config)` from your scheduler |
+| `retention_schema`, index or publication drop on detach, `p_analyze` | a hook (`after_detach`, `before_drop`) |
 
-The `pg_partman` path, without the extension: create the partitioned parent, attach the old
-table as its DEFAULT partition, then drain it window by window in batches.
+Then remove the `part_config` row — pg_partman would otherwise keep managing the table —
+and let pg-partsmith's first plan show you the tree.
 
-```sql
-ALTER TABLE events RENAME TO events_legacy;
-CREATE TABLE events (LIKE events_legacy INCLUDING ALL) PARTITION BY RANGE (created_at);
-ALTER TABLE events ATTACH PARTITION events_legacy DEFAULT;      -- everything is visible again
-```
+### From a script
 
-```python
-while not (result := await service.partition_data(config, batch_rows=50_000, max_batches=200)).complete:
-    log.info("moved %d rows in %d batches into %s", result.rows_moved, result.batches, result.partitions)
-```
+Most scripts fold three concerns into one loop: compute the next few period names, create
+what is missing, drop what is older than N. The equivalents are the flat configuration and
+one tick. Two things scripts usually get wrong that the library does differently:
 
-Each round finds the oldest window still in DEFAULT, creates its partition **detached**
-(subtree included), moves the window's rows into it in batches of `batch_rows` — one
-`DELETE … RETURNING` / `INSERT` per batch, each committing on its own, so a row is in exactly
-one place at every commit point — and attaches it once nothing of that window is left.
-`max_batches` bounds one call; a partition left detached is resumed by the next.
+- creating with `CREATE TABLE … PARTITION OF`, which takes `ACCESS EXCLUSIVE` on the
+  parent — pg-partsmith creates standalone and attaches;
+- dropping attached partitions directly — pg-partsmith detaches first, and never drops a
+  table it did not mark.
 
-What a batch cannot hide: until the attach, that window's rows are invisible through the
-parent. PostgreSQL leaves no other order — a partition cannot be attached while DEFAULT holds
-rows for it — so run this in a maintenance window, or with small batches during a quiet hour
-and readers that tolerate a window's rows appearing a little later. Windows create-ahead
-already created are untouched; a window no partition can be created for (an unmanaged
-partition overlaps it) stops the run with a `MOVE` issue and `complete=False`.
+## 6. Backfill what the data already occupies
 
-## The way back
-
-```python
-result = await service.unpartition(config, "public.events_flat", batch_rows=50_000, drop_emptied=True)
-```
-
-Every partition, oldest first and DEFAULT last, is emptied into `events_flat` (created
-`LIKE` the root when missing) in batches; with `drop_emptied` each emptied partition is
-detached and dropped through the ordinary path — marker, hooks, revalidation. Foreign
-partitions are skipped and reported: their rows are not this database's to move.
-
-## Backfilling partitions for data you already have
-
-`create_future_partitions` walks *forward* from the current period, which is right for a
-scheduled tick and wrong for a migration: rows already in the table live in periods
-create-ahead will never reach. `ensure_partitions` takes the windows from you:
+`create_ahead` walks forward from now. Rows already in the table live in periods it will
+never reach:
 
 ```python
 calculator = config.scheme.time_boundaries.period_calculator
 current = calculator.current_period()
 past = [calculator.period_before(current, n) for n in reversed(range(1, 25))]
-created = await service.ensure_partitions(config, past)          # periods, or Window objects
+await service.ensure_partitions(config, past)
 ```
 
-Idempotent, one catalogue read for the batch, complete subtrees before attach. Only create
-what retention keeps: partitions outside the retention window are detached and dropped by
-the next tick.
+See [Backfill partitions for existing data](backfill.md). A table whose history sits in a
+DEFAULT partition is the job of [`partition_data`](partition-existing-table.md).
 
-## Coming from `pg_partman`
+## 7. Names are schema-qualified
 
-| pg_partman | pg-partsmith |
-|---|---|
-| `premake` | `CreateAhead(count)` |
-| `retention` (interval) | `KeepFor(age)` |
-| `retention` (integer, id sets) | `KeepBehind(distance)` |
-| `retention_keep_table = true` | `DropNever` |
-| `partition_data_proc` / `partition_data_time` / `partition_data_id` | `service.partition_data(config, batch_rows=…, max_batches=…)` |
-| `undo_partition_proc` | `service.unpartition(config, into, drop_emptied=True)` |
-| template table (tablespace, reloptions), `inherit_privileges` | `leaves=LocalLeaves(tablespace=…, storage_parameters=…, inherit_privileges=True)` |
-| `p_time_encoder` / `p_time_decoder` | `TimeBoundaries(codec=...)` |
-| `epoch` | `codec="epoch_seconds"` / `"epoch_milliseconds"` |
-| `create_sub_parent` | `child=` on the scheme |
-| `part_config` rows | the `TablePartitionConfig` objects in your code |
-| `run_maintenance()` / BGW | `maintainer.run_maintenance_safe(config)` from your scheduler |
-
-Drop the `part_config` row (`pg_partman` would otherwise keep managing the table) and let
-pg-partsmith's first plan show you the tree.
-
-## Partition names are schema-qualified
-
-`list_partitions` and every plan operation use `schema.relname`. Code that works with bare
-names should use the accessors:
+`list_partitions` and every plan operation name relations as `schema.relname`. Code that
+works with bare names should use the accessors:
 
 ```python
 p.name         # "public.events__2024_01" — for DDL and library calls
@@ -154,26 +124,9 @@ p.relname      # "events__2024_01"        — for parsing / external layouts
 p.schema_name  # "public"
 ```
 
-## Who takes the lock
+## 8. Export pipelines
 
-`maintain()` (and the maintainer), `partition_data()` and `unpartition()` take the
-distributed lock. The granular methods — `reconcile`, `ensure_partition(s)`, `create_future_partitions`,
-`detach_old_partitions`, `drop_detached_partitions` — do **not**: hold the lock yourself
-when orchestrating them.
-
-## One failed step should not stop the tick
-
-```python
-result = await maintainer.run_maintenance_safe(config, continue_on_error=True)
-for issue in result.issues:
-    log.warning("step failed", step=issue.step, error=issue.error, partition=issue.partition_name)
-```
-
-Operation failures land in `result.issues` instead of aborting; topology conflicts always
-do; validation and lock failures stay fatal.
-
-## Export pipelines: when is a partition finished?
-
-`metadata.is_partition_closed(name, settle_seconds=900)` answers "can this partition still
-receive in-range rows?" with one server-side check, so replica lag and app-clock skew do
-not skew the answer. With an encoded key pass the codec to the metadata provider.
+`metadata.is_partition_closed(name, settle_seconds=900)` answers "can this partition
+still receive in-range rows?" with one server-side check — `now()` is evaluated in the
+database, so replica lag and application clock skew do not skew the answer. With an
+encoded key pass the codec to the metadata provider.

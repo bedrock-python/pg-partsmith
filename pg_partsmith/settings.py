@@ -44,7 +44,8 @@ class PartitionTableSettings(BaseSettings):
     :meth:`to_config` to get a ready-to-use ``TablePartitionConfig``.
 
     The flat fields describe the ordinary time-partitioned table; any other
-    topology is given as ``scheme`` (JSON), which takes precedence over them.
+    topology is given as ``scheme`` (JSON), which takes precedence over them;
+    ``lifecycle`` and ``leaves`` take the same JSON their models dump.
     ``PartitionType``, ``PartitionStrategy``, and ``PartitionGranularity`` are
     ``StrEnum`` values — env vars accept their lowercase string forms
     (e.g. ``GRANULARITY=month``).
@@ -104,6 +105,14 @@ class PartitionTableSettings(BaseSettings):
         default=None,
         description='Lifecycle policy, as JSON: {"creation": {"kind": "create_ahead", "count": 3}, ...}',
     )
+    leaves: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Leaf backend, as JSON: "
+            '{"kind": "local", "tablespace": "fast", "storage_parameters": {"fillfactor": 70}} or '
+            '{"kind": "foreign", "server": "archive", "options": {"table_name": "{relname}"}}'
+        ),
+    )
 
     def to_config(self) -> TablePartitionConfig:
         """Build a :class:`~pg_partsmith.TablePartitionConfig` from these settings."""
@@ -128,6 +137,8 @@ class PartitionTableSettings(BaseSettings):
             fields["lifecycle"] = self.lifecycle
         else:
             fields.update(create_ahead_count=self.create_ahead_count, retention_count=self.retention_count)
+        if self.leaves is not None:
+            fields["leaves"] = self.leaves
 
         return TablePartitionConfig(**fields)
 

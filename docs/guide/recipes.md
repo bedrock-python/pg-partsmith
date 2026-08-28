@@ -1,13 +1,14 @@
-# Recipes
+# Recipes from real systems
 
-Real-world shapes as configurations. Each was checked against the source of a production
-system that hand-rolls it (see [OSS research](../design/oss-research.md)).
+Configurations for the shapes production systems build for themselves. Each was checked
+against the source of a project that hand-rolls it (see the
+[OSS research](../design/oss-research.md)); each is a complete `TablePartitionConfig` you
+can start from. The names used below are all importable from `pg_partsmith`.
 
 ## Error monitoring: weekly UUIDv7 events split by organisation
 
-The shape GlitchTip builds for `issue_events`: the partition key is a UUIDv7 `id`, periods
-are calendar weeks, each week is hashed by tenant, and the bucket count has changed over
-time.
+GlitchTip's `issue_events`: the partition key is a UUIDv7 `id`, periods are calendar
+weeks, each week is hashed by tenant, and the bucket count has changed over time.
 
 ```python
 config = TablePartitionConfig(
@@ -24,9 +25,7 @@ config = TablePartitionConfig(
 
 Requires `PRIMARY KEY (id, organization_id)`. Existing weeks built with `MODULUS 4` are
 preserved; an incomplete historical week is repaired at its own modulus; a legacy plain
-leaf stays valid. Cold storage before the drop is a `before_drop` hook; to finalize only
-closed weeks, gate on `metadata.is_partition_closed(name, settle_seconds=900)` with the
-codec on the provider.
+leaf stays valid. Walkthrough: [a multi-tenant event store](../getting-started/event-store.md).
 
 ## Queue: partitions every N message ids
 
@@ -42,13 +41,12 @@ config = TablePartitionConfig(
 
 The cursor is `max(msg_id)`; `KeepBehind` expires a window once the newest id is 100 000
 past its upper bound. Run maintenance often enough that four windows ahead outlast the
-insert rate between ticks — a row beyond the last window is rejected by PostgreSQL, not
-buffered.
+insert rate between ticks — a row beyond the last window is rejected, not buffered.
 
 ## Outbox / task table: root HASH for parallel workers
 
-pg-trx-outbox and Hatchet's `v1_task_events_olap_tmp`: a fixed set of buckets that workers
-address directly with `FOR UPDATE SKIP LOCKED`.
+pg-trx-outbox and Hatchet's task tables: a fixed set of buckets that workers address
+directly with `FOR UPDATE SKIP LOCKED`.
 
 ```python
 config = TablePartitionConfig(
@@ -60,9 +58,9 @@ config = TablePartitionConfig(
 No lifecycle: maintenance creates the missing buckets and otherwise issues zero DDL. The
 `(modulus, remainder) → name` mapping comes from `service.inspect(config)`.
 
-## Daily stream history with hand-managed neighbours
+## Daily stream history next to hand-managed neighbours
 
-Centrifugo's outbox tables: daily partitions, a few days ahead, dropped after N days —
+Centrifugo's outbox tables: daily partitions, a few days ahead, dropped after a week —
 next to partitions an operator attached by hand.
 
 ```python
@@ -76,9 +74,9 @@ config = TablePartitionConfig(
 A hand-attached partition whose bounds are not a day of the grid is `unmanaged_partition`:
 reported, never detached, never dropped.
 
-## Webhook log: partitions through next year, at startup
+## Webhook log: partitions through next year, at start-up
 
-Hookdeck Outpost's planned workflow:
+Hookdeck Outpost's workflow:
 
 ```python
 config = TablePartitionConfig(
@@ -90,21 +88,19 @@ config = TablePartitionConfig(
     ),
 )
 
+
 async def on_startup() -> None:
-    try:
-        await service.maintain(config)
-    except LockAcquisitionError:
-        pass   # another replica is doing it
+    await maintainer.run_maintenance_safe(config)     # replicas that lose the lock skip
 ```
 
 Rows already sitting in `events_default` move into each new monthly partition as it is
-attached (DEFAULT reconciliation).
+attached.
 
 ## Sliding list: rotate by state, not by calendar
 
 GitLab's `ci_builds`: `LIST (partition_id)`, one integer value per partition, the
 application writes the newest value, the next value opens once the newest partition holds
-more than a day of data, and a partition is detached only when no `ci_pipelines` row
+more than a day of data, and a partition is retired only when no `ci_pipelines` row
 references it any more.
 
 ```python
@@ -154,12 +150,12 @@ config = TablePartitionConfig(
 )
 ```
 
-Or `drop=DropNever` to hand the detached tables to another process entirely.
+Or `drop=DropNever()` to hand the detached tables to another process entirely.
 
 ## Cold tiering to a column store: foreign leaves
 
-pg_clickhouse's shape: an index-free metrics table whose partitions are foreign tables on a
-ClickHouse (or any FDW) server, queried through one PostgreSQL parent.
+pg_clickhouse's shape: an index-free metrics table whose partitions are foreign tables on
+a ClickHouse (or any FDW) server, queried through one PostgreSQL parent.
 
 ```python
 config = TablePartitionConfig(
@@ -170,10 +166,8 @@ config = TablePartitionConfig(
 )
 ```
 
-Every month is created as `CREATE FOREIGN TABLE metrics__2026_09 (…) SERVER clickhouse
-OPTIONS (table_name 'metrics__2026_09')` and attached; an expired month is detached and
-`DROP FOREIGN TABLE`d, which removes the mapping and leaves the remote data alone. The
-parent must have no unique index (PostgreSQL's rule; checked before any DDL).
+The parent must have no unique index (PostgreSQL's rule; checked before any DDL). See
+[Tier cold data to a foreign server](cold-tiering.md).
 
 ## Hot leaves on fast storage, with the parent's grants
 
@@ -191,18 +185,6 @@ config = TablePartitionConfig(
 Every new day lands on the `nvme` tablespace with the parent's owner and grants — what
 `pg_partman`'s template table and `inherit_privileges` did.
 
-## From a monolithic table
-
-```python
-# once: ALTER TABLE events RENAME TO events_legacy; CREATE TABLE events (LIKE events_legacy INCLUDING ALL)
-#       PARTITION BY RANGE (created_at); ALTER TABLE events ATTACH PARTITION events_legacy DEFAULT;
-while not (result := await service.partition_data(config, batch_rows=50_000, max_batches=100)).complete:
-    await asyncio.sleep(1)      # let the writers breathe between rounds
-```
-
-See [Partitioning a monolithic table](migration.md#partitioning-a-monolithic-table) for
-what is and is not visible while it runs.
-
 ## Large partitions on weekends only
 
 GitLab's 150 GB rule as a drop condition:
@@ -212,10 +194,29 @@ def small_or_weekend(candidate: Candidate) -> bool:
     size = candidate.facts.size_bytes or 0
     return size < 150 * 2**30 or candidate.now.weekday() >= 5
 
+
 lifecycle = LifecyclePolicy(
     retention=KeepFor(timedelta(days=30)),
-    drop=DropAfter(grace=timedelta(days=7), when=Callback(small_or_weekend, facts=frozenset({FactKind.SIZE}), label="<150GB or weekend")),
+    drop=DropAfter(
+        grace=timedelta(days=7),
+        when=Callback(small_or_weekend, facts=frozenset({FactKind.SIZE}), label="<150GB or weekend"),
+    ),
 )
 ```
 
 Deferred drops appear as `drop_deferred` findings with the size on the plan.
+
+## From a monolithic table
+
+```python
+# once, in SQL:
+#   ALTER TABLE events RENAME TO events_legacy;
+#   CREATE TABLE events (LIKE events_legacy INCLUDING ALL) PARTITION BY RANGE (created_at);
+#   ALTER TABLE events ATTACH PARTITION events_legacy DEFAULT;
+
+while not (result := await service.partition_data(config, batch_rows=50_000, max_batches=100)).complete:
+    await asyncio.sleep(1)          # let the writers breathe between rounds
+```
+
+See [Partition an existing table](partition-existing-table.md) for what is and is not
+visible while it runs.

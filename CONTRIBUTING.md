@@ -72,7 +72,7 @@ CI runs the integration suite on PostgreSQL 15, 16 and 17; the default image is
 1. Create `pg_partsmith/strategies/your_strategy.py`, subclassing `BasePeriodCalculator`
 2. Export it from `pg_partsmith/strategies/__init__.py` and `pg_partsmith/__init__.py`
 3. Add unit tests in `tests/unit/test_strategies.py`
-4. Document it in `docs/guide/strategies.md`
+4. Document it in `docs/guide/calendars-and-codecs.md`
 
 ## Adding a boundary codec
 
@@ -80,7 +80,7 @@ CI runs the integration suite on PostgreSQL 15, 16 and 17; the default image is
    (`encode` an instant into the column's literal, `decode` a literal back)
 2. Register its name in `_CODECS_BY_NAME` in `pg_partsmith/boundaries.py`, next to `uuidv7` and `epoch_*`
 3. Add unit tests in `tests/unit/test_boundaries.py`
-4. Document it in `docs/guide/boundary-codecs.md`
+4. Document it in `docs/guide/calendars-and-codecs.md` and `docs/concepts/boundaries.md`
 
 ## Adding a lock manager
 
@@ -88,7 +88,7 @@ CI runs the integration suite on PostgreSQL 15, 16 and 17; the default image is
    and/or `pg_partsmith.sync.protocols` (sync)
 2. Add it to `pg_partsmith/aio/__init__.py` / `pg_partsmith/sync/__init__.py` exports
    (optional extra if it has deps)
-3. Document it in `docs/guide/locks.md`
+3. Document it in `docs/guide/scheduling.md` and `docs/guide/extending.md`
 
 ## Keeping aio and sync in sync
 

@@ -9,6 +9,7 @@ from pydantic_settings import SettingsConfigDict
 
 from pg_partsmith.boundaries import UUIDv7BoundaryCodec
 from pg_partsmith.entities import PartitionGranularity, PartitionStrategy, PartitionType, TablePartitionConfig
+from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
 from pg_partsmith.lifecycle import CreateAhead, DropNever, KeepFor
 from pg_partsmith.scheme import HashPartitioning, RangePartitioning
 from pg_partsmith.settings import PartitionTableSettings
@@ -331,3 +332,44 @@ def test__settings__from_environment__missing_table_name__rejected(monkeypatch: 
     # Act / Assert
     with pytest.raises(ValidationError, match="table_name"):
         BareSettings()
+
+
+# -- to_config: leaves JSON ------------------------------------------------------------------
+
+
+def test__settings__to_config__leaves__local_backend_from_json() -> None:
+    # Arrange
+    class Settings(PartitionTableSettings):
+        model_config = SettingsConfigDict(env_prefix="LEAF_")
+
+    settings = Settings(
+        table_name="events",
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+        leaves={"kind": "local", "tablespace": "fast", "storage_parameters": {"fillfactor": 70}},
+    )
+
+    # Act
+    config = settings.to_config()
+
+    # Assert
+    assert config.leaves == LocalLeaves(tablespace="fast", storage_parameters={"fillfactor": 70})
+
+
+def test__settings__to_config__leaves__foreign_backend_from_json() -> None:
+    # Arrange
+    settings = PartitionTableSettings(
+        table_name="metrics",
+        partition_column="ts",
+        granularity=PartitionGranularity.MONTH,
+        leaves={"kind": "foreign", "server": "archive", "options": {"table_name": "{relname}"}},
+    )
+
+    # Act / Assert
+    assert settings.to_config().leaves == ForeignLeaves(server="archive", options={"table_name": "{relname}"})
+
+
+def test__settings__to_config__without_leaves__plain_local_tables() -> None:
+    settings = PartitionTableSettings(table_name="events", partition_column="created_at", granularity="month")
+
+    assert settings.to_config().leaves == LocalLeaves()

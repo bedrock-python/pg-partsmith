@@ -236,13 +236,13 @@ service = PartitionLifecycleService(repo, metadata, locks, hooks=[ColdStorageHoo
 
 ## Documentation
 
-- [Quick start](https://bedrock-python.github.io/pg-partsmith/guide/quickstart/)
-- [Partition schemes](https://bedrock-python.github.io/pg-partsmith/guide/partition-schemes/) — RANGE / LIST / HASH, nesting, composite keys, encoded keys
-- [Lifecycle policies](https://bedrock-python.github.io/pg-partsmith/guide/lifecycle-policies/) — creation, retention, predicates, detach modes, grace periods
-- [Planning and dry runs](https://bedrock-python.github.io/pg-partsmith/guide/planning/) — the plan, findings, ownership, revalidation
-- [Recipes](https://bedrock-python.github.io/pg-partsmith/guide/recipes/) — error monitoring, queues, outboxes, cold tiering
-- [Migrating an existing partitioner](https://bedrock-python.github.io/pg-partsmith/guide/migration/)
-- [Design: RFC 0001](https://bedrock-python.github.io/pg-partsmith/design/rfc-0001-partition-schemes/), [OSS research](https://bedrock-python.github.io/pg-partsmith/design/oss-research/), [verified PostgreSQL semantics](https://bedrock-python.github.io/pg-partsmith/design/postgresql-semantics/)
+[bedrock-python.github.io/pg-partsmith](https://bedrock-python.github.io/pg-partsmith/)
+
+- [Getting started](https://bedrock-python.github.io/pg-partsmith/getting-started/installation/) — install, your first partitioned table, running it in production, a multi-tenant event store
+- [Concepts](https://bedrock-python.github.io/pg-partsmith/concepts/overview/) — how it works: schemes, boundaries, lifecycle policies, the plan, ownership, executing DDL, leaf backends
+- [How-to guides](https://bedrock-python.github.io/pg-partsmith/guide/configuration/) — scheduling, monitoring, backfilling, partitioning an existing table, migrating from pg_partman, changing a scheme, archiving, foreign keys, cold tiering, troubleshooting, recipes
+- [Reference](https://bedrock-python.github.io/pg-partsmith/reference/) — the API, every configuration field, every finding and error
+- [Design](https://bedrock-python.github.io/pg-partsmith/design/rfc-0001-partition-schemes/) — RFC 0001, the OSS research, PostgreSQL semantics verified on real servers
 
 ## Development
 

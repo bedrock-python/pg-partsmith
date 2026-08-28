@@ -107,6 +107,8 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
 
 ### Changed
 
+- Documentation rebuilt around tutorials, concepts, how-to guides and reference pages,
+  with plans and findings captured from a real PostgreSQL 17.
 - Existing partitions are matched to windows by their catalog bounds, never by name; names
   are parsed only to recognise a detached orphan.
 - Topology conflicts discovered while applying (`PartitionTopologyError`) are recorded as
