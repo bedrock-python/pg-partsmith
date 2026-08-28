@@ -27,6 +27,13 @@ from pg_partsmith.utils import orphan_table_comment, pg_sqlstate
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 
+def _columns_result(*names: str) -> MagicMock:
+    """A result standing in for the relation-columns lookup the move issues first."""
+    result = MagicMock()
+    result.fetchall.return_value = [(name,) for name in (names or ("created_at", "tenant_id", "data"))]
+    return result
+
+
 def _ddl_engine() -> tuple[MagicMock, MagicMock]:
     """An engine whose ``begin()`` yields a connection that records statements."""
     engine = MagicMock()
@@ -1050,7 +1057,7 @@ def test__repository__reconcile_default_rows__matching_rows__returns_row_count()
     move_result.rowcount = 42
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -1068,7 +1075,7 @@ def test__repository__reconcile_default_rows__matching_rows__returns_row_count()
 
     # Assert
     assert count == 42
-    assert conn.execute.call_count == 5  # set_config + SET TIME ZONE + 2 LOCK TABLE + move
+    assert conn.execute.call_count == 6  # set_config + SET TIME ZONE + 2 LOCK TABLE + column lookup + move
 
 
 def test__repository__reconcile_default_rows__acquires_locks_on_both_tables() -> None:
@@ -1077,7 +1084,7 @@ def test__repository__reconcile_default_rows__acquires_locks_on_both_tables() ->
     move_result.rowcount = 5
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -1105,7 +1112,7 @@ def test__repository__reconcile_default_rows__no_matching_rows__returns_zero() -
     move_result.rowcount = 0
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -1131,7 +1138,7 @@ def test__repository__reconcile_default_rows__sets_timezone_before_locks() -> No
     move_result.rowcount = 1
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -1160,7 +1167,7 @@ def test__repository__reconcile_default_rows__no_ddl_timezone__skips_set_time_zo
     move_result.rowcount = 1
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -1176,8 +1183,8 @@ def test__repository__reconcile_default_rows__no_ddl_timezone__skips_set_time_zo
         to_value="2024-05-01",
     )
 
-    # Assert — only set_config + 2 LOCK TABLE + move; no timezone statement issued
-    assert conn.execute.call_count == 4
+    # Assert — only set_config + 2 LOCK TABLE + column lookup + move; no timezone statement
+    assert conn.execute.call_count == 5
     statements = [str(call.args[0]) for call in conn.execute.call_args_list]
     assert not any("time zone" in stmt.lower() for stmt in statements)
 
@@ -1223,7 +1230,7 @@ def test__repository__reconcile_default_rows__composite_key__leaves_null_trailin
     move_result.rowcount = 3
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)
@@ -1253,7 +1260,7 @@ def test__repository__reconcile_default_rows__single_column_key__adds_no_null_te
     move_result.rowcount = 3
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = MagicMock()
     begin_cm.__enter__ = MagicMock(return_value=conn)
     begin_cm.__exit__ = MagicMock(return_value=False)

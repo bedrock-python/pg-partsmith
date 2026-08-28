@@ -8,12 +8,21 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.catalog_queries import RELATION_COLUMNS_SQL
 from pg_partsmith.entities import HashBounds, ListBounds, PartitionInfo
-from pg_partsmith.exceptions import PartitionAlreadyExistsError
-from pg_partsmith.utils import build_ddl_statement, pg_sqlstate, qualify, quote_identifier, quote_literal
+from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionNotFoundError
+from pg_partsmith.utils import (
+    build_ddl_statement,
+    coerce_str,
+    pg_sqlstate,
+    qualify,
+    quote_identifier,
+    quote_literal,
+    to_regclass_argument,
+)
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
     from pg_partsmith.entities import SubpartitionBounds, SubpartitionSpec, TablePartitionConfig
 
@@ -112,6 +121,31 @@ class PartitionCreator:
                 await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             await conn.execute(stmt)
 
+    async def _relation_columns(self, conn: AsyncConnection, table_name: str) -> tuple[str, ...]:
+        """Read a relation's live column names, in its own physical order.
+
+        Args:
+            conn: Connection already inside the caller's transaction, so the
+                shape read here is the shape the move will run against.
+            table_name: Relation to inspect, schema-qualified.
+
+        Returns:
+            The column names, dropped columns excluded.
+
+        Raises:
+            PartitionNotFoundError: If the relation has no readable columns,
+                which means it is gone rather than empty.
+        """
+        result = await conn.execute(
+            text(RELATION_COLUMNS_SQL),
+            {"table_name": to_regclass_argument(table_name)},
+        )
+        columns = tuple(coerce_str(row[0]) or "" for row in result.fetchall())
+        if not columns:
+            msg = f"Relation {table_name!r} has no readable columns, so its rows cannot be moved."
+            raise PartitionNotFoundError(msg)
+        return columns
+
     async def reconcile_default_rows(
         self,
         *,
@@ -148,19 +182,6 @@ class PartitionCreator:
         # conflict this call exists to clear, so the retry would never converge.
         not_null = "".join(f" AND {quote_identifier(column)} IS NOT NULL" for column in trailing_columns)
 
-        # All identifiers and literals are properly quoted above, S608 is a false positive
-        move_sql = text(
-            f"WITH moved AS ("  # noqa: S608
-            f"DELETE FROM {default_quoted} "
-            f"WHERE {column_quoted} >= {from_quoted} "
-            f"AND {column_quoted} < {to_quoted}"
-            f"{not_null} "
-            f"RETURNING *"
-            f") "
-            f"INSERT INTO {target_quoted} "
-            f"SELECT * FROM moved"
-        )
-
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             # Boundary literals must be interpreted in the same timezone ATTACH uses,
             # otherwise a non-UTC server timezone moves the wrong row range.
@@ -169,6 +190,30 @@ class PartitionCreator:
             # Lock both tables to minimize race conditions
             await conn.execute(text(f"LOCK TABLE {default_quoted} IN SHARE ROW EXCLUSIVE MODE"))
             await conn.execute(text(f"LOCK TABLE {target_quoted} IN SHARE ROW EXCLUSIVE MODE"))
+
+            columns = await self._relation_columns(conn, default_partition_name)
+            column_list = ", ".join(quote_identifier(column) for column in columns)
+
+            # Both sides name their columns. ``RETURNING *`` emits the DEFAULT
+            # partition's own physical order, and an unqualified INSERT binds
+            # that order positionally to the target's -- silently transposing
+            # values whenever the two differ. They can differ: ATTACH PARTITION
+            # matches columns by name, so a DEFAULT partition created
+            # independently and attached need not share the order of one
+            # created with LIKE.
+            #
+            # All identifiers and literals are properly quoted, S608 is a false positive
+            move_sql = text(
+                f"WITH moved AS ("  # noqa: S608
+                f"DELETE FROM {default_quoted} "
+                f"WHERE {column_quoted} >= {from_quoted} "
+                f"AND {column_quoted} < {to_quoted}"
+                f"{not_null} "
+                f"RETURNING {column_list}"
+                f") "
+                f"INSERT INTO {target_quoted} ({column_list}) "
+                f"SELECT {column_list} FROM moved"
+            )
 
             result = await conn.execute(move_sql)
             moved_count = result.rowcount or 0

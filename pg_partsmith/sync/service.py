@@ -368,7 +368,19 @@ class PartitionLifecycleService:
                     if created:
                         all_partitions.extend(created)
 
-            partitions_to_prune = self._require_pruning().identify_partitions_to_prune(config, all_partitions)
+            try:
+                partitions_to_prune = self._require_pruning().identify_partitions_to_prune(config, all_partitions)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                # Deciding *what* to prune is as failable as pruning it --
+                # a boundary this run cannot read is enough. Left outside
+                # continue_on_error it would abort the run after create and
+                # reconcile had already committed their DDL.
+                if not continue_on_error:
+                    raise
+                _record_issue(MaintenanceIssueStep.DETACH, e)
+                partitions_to_prune = []
 
             # Reconcile before pruning so a branch that is on its way out is not
             # repaired just to be dropped moments later.

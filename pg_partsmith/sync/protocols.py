@@ -134,7 +134,6 @@ class PartitionRepository(Protocol):
         default_partition_name: str,
         target_partition_name: str,
         partition_column: str,
-        trailing_columns: tuple[str, ...] = (),
         from_value: str,
         to_value: str,
     ) -> int:
@@ -143,10 +142,7 @@ class PartitionRepository(Protocol):
         Args:
             default_partition_name: Qualified name of DEFAULT partition.
             target_partition_name: Qualified name of target partition.
-            partition_column: Leading column of the partition key.
-            trailing_columns: The remaining key columns, for a composite key.
-                Only ever passed for a composite config, so an implementation
-                predating composite keys keeps working without it.
+            partition_column: Column used for partitioning.
             from_value: Range start boundary (inclusive).
             to_value: Range end boundary (exclusive).
 
@@ -408,6 +404,41 @@ class CompositeKeyRepository(Protocol):
             from_value: Start boundary for the leading column.
             to_value: End boundary for the leading column.
             key_arity: Number of columns in the parent's partition key.
+        """
+        ...
+
+    def reconcile_default_rows(
+        self,
+        *,
+        default_partition_name: str,
+        target_partition_name: str,
+        partition_column: str,
+        trailing_columns: tuple[str, ...] = (),
+        from_value: str,
+        to_value: str,
+    ) -> int:
+        """Move conflicting rows from a DEFAULT partition, honouring the whole key.
+
+        The composite widening of :meth:`PartitionRepository.reconcile_default_rows`.
+        It is declared here rather than on the base protocol so an
+        implementation written against the single-column signature keeps
+        satisfying ``PartitionRepository`` -- for a type checker as much as at
+        runtime.
+
+        PostgreSQL adds an IS NOT NULL test for every key column to a range
+        partition's constraint, so a row with a NULL trailing key value belongs
+        in DEFAULT and has to be left there.
+
+        Args:
+            default_partition_name: Qualified name of DEFAULT partition.
+            target_partition_name: Qualified name of target partition.
+            partition_column: Leading column of the partition key.
+            trailing_columns: The remaining key columns, in key order.
+            from_value: Range start boundary (inclusive).
+            to_value: Range end boundary (exclusive).
+
+        Returns:
+            Number of rows moved.
         """
         ...
 

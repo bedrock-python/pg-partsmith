@@ -280,8 +280,12 @@ class PartitionCreationService(BasePartitionService):
         for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
                 await self._attach(config, qualified_parent, partition_name, from_value, to_value)
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 # Shielded so the compensating move-back completes even mid-cancellation.
+                # KeyboardInterrupt and SystemExit are caught alongside because
+                # they end the run just as abruptly, and the rows moved out of
+                # DEFAULT would otherwise be stranded in a detached table that
+                # no query against the parent can see.
                 await asyncio.shield(
                     self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
                 )
@@ -396,14 +400,30 @@ class PartitionCreationService(BasePartitionService):
                 to_value=to_value,
             )
 
-        return await self._repo.reconcile_default_rows(
-            default_partition_name=source,
-            target_partition_name=target,
-            partition_column=config.partition_column,
-            trailing_columns=config.trailing_partition_columns,
-            from_value=from_value,
-            to_value=to_value,
-        )
+        repo = self._repo
+        if not isinstance(repo, CompositeKeyRepository):
+            raise UnsupportedCapabilityError(
+                f"Repository {type(repo).__name__}", "composite partition keys", "CompositeKeyRepository"
+            )
+
+        try:
+            return await repo.reconcile_default_rows(
+                default_partition_name=source,
+                target_partition_name=target,
+                partition_column=config.partition_column,
+                trailing_columns=config.trailing_partition_columns,
+                from_value=from_value,
+                to_value=to_value,
+            )
+        except TypeError as exc:
+            # A runtime_checkable Protocol matches on method *names*, so a
+            # repository that added attach_composite_partition but kept the
+            # single-column reconcile_default_rows gets this far. Naming the
+            # missing capability beats a bare "unexpected keyword argument".
+            if "trailing_columns" not in str(exc):
+                raise
+            msg = f"Repository {type(repo).__name__}"
+            raise UnsupportedCapabilityError(msg, "composite partition keys", "CompositeKeyRepository") from exc
 
     async def _restore_reconciled_rows(
         self,

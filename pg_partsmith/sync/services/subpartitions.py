@@ -9,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, PG_CHECK_VIOLATION
 from pg_partsmith.entities import DefaultBounds, PartitionNode
-from pg_partsmith.exceptions import PartitionAlreadyExistsError, UnsupportedCapabilityError
+from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionTopologyError, UnsupportedCapabilityError
 from pg_partsmith.subpartition_plan import (
     SubpartitionAction,
     SubpartitionReconcileResult,
@@ -64,9 +64,24 @@ class PartitionSubpartitionService:
 
         Returns:
             Number of subpartitions created.
+
+        Raises:
+            PartitionTopologyError: If any part of the subtree could not be
+                created, so the caller does not attach an incomplete branch.
         """
         spec = self._require_spec(config)
-        return self.materialize(plan_new_subtree(spec, branch_name))
+        findings: list[TopologyFinding] = []
+        created = self.materialize(plan_new_subtree(spec, branch_name, findings), findings)
+        if findings:
+            for finding in findings:
+                _log_finding(finding)
+            # The caller attaches this branch to the root the moment we return.
+            # Returning a count for a subtree we could not complete would
+            # publish a branch that rejects part of its keyspace, and report
+            # success while doing it.
+            refusal = findings[0]
+            raise PartitionTopologyError(refusal.partition_name, refusal.reason.value, refusal.detail)
+        return created
 
     def converge_branch(self, config: TablePartitionConfig, branch_name: str) -> SubpartitionReconcileResult:
         """Reconcile one existing branch against the configured spec.
@@ -184,6 +199,11 @@ class PartitionSubpartitionService:
         created = 0
         for action in actions:
             created += self._materialize_one(action, collected)
+        if findings is None:
+            # Nobody is collecting, so logging is the only way these leave the
+            # call at all -- which is what this method's contract promises.
+            for finding in collected:
+                _log_finding(finding)
         return created
 
     def _apply(self, spec: SubpartitionSpec, node: PartitionNode) -> SubpartitionReconcileResult:
@@ -225,7 +245,16 @@ class PartitionSubpartitionService:
                 extra={"partition_name": action.child_name, "parent_name": action.parent_name},
             )
 
+        refused_before = len(findings)
         created += self.materialize(action.children, findings)
+
+        if len(findings) > refused_before:
+            # A child could not be created, so this node cannot route the whole
+            # slice it claims. Attaching it anyway would publish exactly the
+            # rejecting branch that attaching last exists to prevent; leaving it
+            # detached keeps it invisible until a later run can finish it.
+            findings.append(_incomplete_subtree_finding(action))
+            return created
 
         if self._attach(action, findings):
             created += 1
@@ -349,5 +378,17 @@ def _default_conflict_finding(action: SubpartitionAction, exc: Exception) -> Top
         detail=(
             f"{action.parent_name} cannot gain {action.child_name!r} while its DEFAULT partition holds rows "
             f"that belong to it; move them out and the next run will create it ({describe_exception(exc)})."
+        ),
+    )
+
+
+def _incomplete_subtree_finding(action: SubpartitionAction) -> TopologyFinding:
+    """Report a node left detached because one of its children was refused."""
+    return TopologyFinding(
+        partition_name=action.child_name,
+        reason=TopologyReason.UNCONVERGEABLE,
+        detail=(
+            f"{action.child_name} was left detached because a partition it needs could not be created; "
+            "attaching it would make it reject every row belonging to the missing child."
         ),
     )
