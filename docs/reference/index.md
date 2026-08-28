@@ -137,7 +137,7 @@ belongs to the time dimension at the root.
         - DropRetryExhaustedError
         - UnmanagedPartitionDropError
         - PartitionTopologyError
-        - SubpartitioningNotSupportedError
+        - UnsupportedCapabilityError
 
 ### Period strategies
 

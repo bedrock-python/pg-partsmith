@@ -410,7 +410,7 @@ scheduler.add_job(
 
 **Enums** — `PartitionType`, `PartitionGranularity`, `PartitionStrategy`
 
-**Exceptions** — `PartitionError`, `PartitionAlreadyExistsError`, `PartitionNotFoundError`, `PartitionAttachedError`, `PartitionDetachInProgressError`, `InvalidPartitionConfigError`, `LockAcquisitionError`, `DropRetryExhaustedError`, `UnmanagedPartitionDropError`, `PartitionTopologyError`, `SubpartitioningNotSupportedError`
+**Exceptions** — `PartitionError`, `PartitionAlreadyExistsError`, `PartitionNotFoundError`, `PartitionAttachedError`, `PartitionDetachInProgressError`, `InvalidPartitionConfigError`, `LockAcquisitionError`, `DropRetryExhaustedError`, `UnmanagedPartitionDropError`, `PartitionTopologyError`, `UnsupportedCapabilityError`
 
 **Protocols** — `PeriodCalculator`, `TimezoneAwareCalculator`, `DdlTimezoneAware`, `BoundaryDecoder`
 

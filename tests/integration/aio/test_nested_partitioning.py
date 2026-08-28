@@ -1665,7 +1665,7 @@ async def test__composite_key__config_disagreeing_with_the_table__refused(
     db_engine: AsyncEngine, composite_table: str
 ) -> None:
     # Arrange: the real key is (created_at, tenant_id).
-    config = composite_config(composite_table).model_copy(update={"partition_columns": ("created_at", "id")})
+    config = composite_config(composite_table).model_copy(update={"trailing_partition_columns": ("id",)})
 
     # Act / Assert
     with freezegun.freeze_time(FROZEN_WEEK), pytest.raises(InvalidPartitionConfigError, match="key mismatch"):

@@ -34,8 +34,8 @@ from .exceptions import (
     PartitionError,
     PartitionNotFoundError,
     PartitionTopologyError,
-    SubpartitioningNotSupportedError,
     UnmanagedPartitionDropError,
+    UnsupportedCapabilityError,
 )
 from .protocols import BoundaryDecoder, DdlTimezoneAware, PeriodCalculator, TimezoneAwareCalculator
 from .strategies import (
@@ -97,13 +97,13 @@ __all__ = [
     "SubpartitionPlan",
     "SubpartitionReconcileResult",
     "SubpartitionSpec",
-    "SubpartitioningNotSupportedError",
     "TablePartitionConfig",
     "TimezoneAwareCalculator",
     "TopologyFinding",
     "TopologyReason",
     "UUIDv7BoundaryCodec",
     "UnmanagedPartitionDropError",
+    "UnsupportedCapabilityError",
     "WeekPeriodCalculator",
     "YearPeriodCalculator",
     "__version__",

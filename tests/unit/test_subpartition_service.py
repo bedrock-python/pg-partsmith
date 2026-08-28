@@ -16,8 +16,8 @@ from pg_partsmith.entities import (
     RangeBounds,
     TablePartitionConfig,
 )
-from pg_partsmith.exceptions import PartitionAlreadyExistsError, SubpartitioningNotSupportedError
-from pg_partsmith.subpartition_plan import SubpartitionAction
+from pg_partsmith.exceptions import PartitionAlreadyExistsError, UnsupportedCapabilityError
+from pg_partsmith.subpartition_plan import SubpartitionAction, TopologyFinding, TopologyReason
 
 BRANCH = "public.events__2026_w35"
 
@@ -103,7 +103,7 @@ async def test__reconcile__repository_without_subpartition_ddl__refused_with_an_
     service = PartitionSubpartitionService(flat_repo, metadata)
 
     # Act / Assert
-    with pytest.raises(SubpartitioningNotSupportedError, match="SubpartitionRepository"):
+    with pytest.raises(UnsupportedCapabilityError, match="SubpartitionRepository"):
         await service.reconcile(_config(subpartition=_spec()))
 
 
@@ -115,7 +115,7 @@ async def test__reconcile__metadata_without_tree_introspection__refused_with_an_
     service = PartitionSubpartitionService(repo, flat_metadata)
 
     # Act / Assert
-    with pytest.raises(SubpartitioningNotSupportedError, match="NestedPartitionMetadata"):
+    with pytest.raises(UnsupportedCapabilityError, match="NestedPartitionMetadata"):
         await service.reconcile(_config(subpartition=_spec()))
 
 
@@ -228,22 +228,79 @@ async def test__materialize__concurrent_worker_won_the_attach__tolerated_without
     assert created == 0
 
 
-async def test__materialize__conflict_sqlstate_but_not_actually_attached__re_raised(
+async def test__materialize__conflict_on_a_relation_with_other_bounds__reported_not_swallowed(
     repo: MagicMock, metadata: MagicMock
 ) -> None:
-    # Arrange: 42809 also fires for object mismatches unrelated to a lost race.
+    # Arrange: 42809 fires whenever the name is taken, whether another worker
+    # just created this partition or an unrelated relation holds the name.
     conflict = SQLAlchemyError("wrong object type")
     conflict.orig = MagicMock(sqlstate="42809")  # type: ignore[attr-defined]
     repo.attach_subpartition = AsyncMock(side_effect=conflict)
-    metadata.is_partition_attached = AsyncMock(return_value=False)
+    metadata.is_partition_attached = AsyncMock(return_value=True)
+    metadata.get_partition_tree = AsyncMock(
+        return_value=PartitionNode(name=f"{BRANCH}__h0", bounds=HashBounds(modulus=4, remainder=0))
+    )
     service = PartitionSubpartitionService(repo, metadata)
     action = SubpartitionAction(
         parent_name=BRANCH, child_name=f"{BRANCH}__h0", bounds=HashBounds(modulus=2, remainder=0)
     )
+    findings: list[TopologyFinding] = []
 
-    # Act / Assert
-    with pytest.raises(SQLAlchemyError):
-        await service.materialize((action,))
+    # Act
+    created = await service.materialize((action,), findings)
+
+    # Assert: reporting it beats treating a real conflict as a won race, which
+    # left that slice of the keyspace rejecting rows and reported success.
+    assert created == 0
+    assert [f.reason for f in findings] == [TopologyReason.NAME_UNUSABLE]
+
+
+async def test__materialize__conflict_with_the_planned_bounds__treated_as_a_lost_race(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    conflict = SQLAlchemyError("already a partition")
+    conflict.orig = MagicMock(sqlstate="42809")  # type: ignore[attr-defined]
+    repo.attach_subpartition = AsyncMock(side_effect=conflict)
+    metadata.is_partition_attached = AsyncMock(return_value=True)
+    metadata.get_partition_tree = AsyncMock(
+        return_value=PartitionNode(name=f"{BRANCH}__h0", bounds=HashBounds(modulus=2, remainder=0))
+    )
+    service = PartitionSubpartitionService(repo, metadata)
+    action = SubpartitionAction(
+        parent_name=BRANCH, child_name=f"{BRANCH}__h0", bounds=HashBounds(modulus=2, remainder=0)
+    )
+    findings: list[TopologyFinding] = []
+
+    # Act
+    created = await service.materialize((action,), findings)
+
+    # Assert: same bounds means another worker genuinely got there first.
+    assert created == 0
+    assert findings == []
+
+
+async def test__materialize__default_partition_holding_the_rows__reported_not_raised(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange: PostgreSQL refuses the attach while a DEFAULT sibling holds rows
+    # belonging to the new partition.
+    conflict = SQLAlchemyError("updated partition constraint for default partition would be violated")
+    conflict.orig = MagicMock(sqlstate="23514")  # type: ignore[attr-defined]
+    repo.attach_subpartition = AsyncMock(side_effect=conflict)
+    service = PartitionSubpartitionService(repo, metadata)
+    action = SubpartitionAction(
+        parent_name=BRANCH, child_name=f"{BRANCH}__eu", bounds=HashBounds(modulus=2, remainder=0)
+    )
+    findings: list[TopologyFinding] = []
+
+    # Act
+    created = await service.materialize((action,), findings)
+
+    # Assert: raising here aborted reconcile for the whole table, which also
+    # blocked pruning because reconcile runs first.
+    assert created == 0
+    assert [f.reason for f in findings] == [TopologyReason.DEFAULT_HOLDS_ROWS]
 
 
 async def test__materialize__unrelated_database_error__propagates(repo: MagicMock, metadata: MagicMock) -> None:

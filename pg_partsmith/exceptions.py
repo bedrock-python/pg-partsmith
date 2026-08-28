@@ -55,21 +55,23 @@ class PartitionTopologyError(PartitionError):
         self.detail = detail
 
 
-class SubpartitioningNotSupportedError(PartitionError):
-    """Raised when a nested config is wired to components that cannot serve it.
+class UnsupportedCapabilityError(PartitionError):
+    """Raised when a config is wired to components that cannot serve it.
 
     Custom repositories and metadata providers written against the flat
     protocols keep working for flat configs; they are only refused when a
-    config actually asks for subpartitioning.
+    config actually asks for something they do not implement. The capability is
+    named rather than assumed, because more than one of them is optional.
     """
 
-    def __init__(self, component: str, expected: str) -> None:
+    def __init__(self, component: str, capability: str, expected: str) -> None:
         msg = (
-            f"{component} does not support subpartitioning: it must implement {expected}. "
+            f"{component} does not support {capability}: it must implement {expected}. "
             "Use the bundled PostgreSQL implementation, or extend yours with the missing methods."
         )
         super().__init__(msg)
         self.component = component
+        self.capability = capability
         self.expected = expected
 
 

@@ -224,13 +224,42 @@ class PartitionLifecycleService:
         """
         return self._subpartition_service.reconcile(config, exclude=exclude)
 
-    def _maintain_static_root(self, config: TablePartitionConfig) -> MaintenanceResult:
+    def _maintain_static_root(
+        self,
+        config: TablePartitionConfig,
+        *,
+        skip_create: bool,
+        continue_on_error: bool,
+    ) -> MaintenanceResult:
         """Converge a HASH_BASED / VALUE_BASED table's own partition set.
 
         ``created_count`` reports every partition this call created, at any
         level: a static root has no lifecycle stages to attribute them to.
+        Detach and drop are absent rather than skipped -- there is no retention
+        window without periods -- but ``skip_create`` and ``continue_on_error``
+        mean here exactly what they mean everywhere else.
         """
-        reconciled = self._subpartition_service.reconcile(config)
+        if skip_create:
+            return MaintenanceResult()
+
+        try:
+            reconciled = self._subpartition_service.reconcile(config)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            error = describe_exception(exc)
+            logger.warning(
+                "Maintenance step failed; continuing with the remaining steps",
+                extra={
+                    "table_name": qualify(config.db_schema, config.table_name),
+                    "step": MaintenanceIssueStep.RECONCILE.value,
+                    "error": error,
+                },
+            )
+            return MaintenanceResult(issues=(MaintenanceIssue(step=MaintenanceIssueStep.RECONCILE, error=error),))
+
         issues = tuple(to_maintenance_issue(f) for f in reconciled.findings if f.is_actionable)
         return MaintenanceResult(created_count=reconciled.created_count, issues=issues)
 
@@ -310,7 +339,7 @@ class PartitionLifecycleService:
                 # A static root has no periods: nothing is created ahead and
                 # nothing ages out, so converging its partition set is the
                 # whole of maintenance.
-                return self._maintain_static_root(config)
+                return self._maintain_static_root(config, skip_create=skip_create, continue_on_error=continue_on_error)
 
             # Optimization: fetch all partitions once
             all_partitions = self._metadata.list_partitions(qualified_parent)

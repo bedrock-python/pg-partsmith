@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES
+from pg_partsmith.aio.protocols import NestedPartitionMetadata, SubpartitionRepository
+from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, PG_CHECK_VIOLATION
 from pg_partsmith.entities import DefaultBounds, PartitionNode
-from pg_partsmith.exceptions import PartitionAlreadyExistsError, SubpartitioningNotSupportedError
+from pg_partsmith.exceptions import PartitionAlreadyExistsError, UnsupportedCapabilityError
 from pg_partsmith.subpartition_plan import (
     SubpartitionAction,
     SubpartitionReconcileResult,
@@ -18,12 +20,11 @@ from pg_partsmith.subpartition_plan import (
     plan_new_subtree,
     plan_subpartitions,
 )
-from pg_partsmith.utils import pg_sqlstate, qualify
+from pg_partsmith.utils import describe_exception, pg_sqlstate, qualify
 
 if TYPE_CHECKING:
     from collections.abc import Collection
 
-    from pg_partsmith.aio.protocols import NestedPartitionMetadata, SubpartitionRepository
     from pg_partsmith.entities import SubpartitionSpec, TablePartitionConfig
 
 logger = logging.getLogger(__name__)
@@ -134,22 +135,56 @@ class PartitionSubpartitionService:
         for branch in tree.children:
             if not self._is_reconcilable(branch, exclude):
                 continue
-            result = result.merge(await self._apply(spec, branch))
+            result = result.merge(await self._apply_isolated(spec, branch))
 
         return result
 
-    async def materialize(self, actions: tuple[SubpartitionAction, ...]) -> int:
+    async def _apply_isolated(self, spec: SubpartitionSpec, node: PartitionNode) -> SubpartitionReconcileResult:
+        """Converge one branch, keeping its failure from reaching its siblings.
+
+        Reconciliation runs before pruning, so letting one unconvergeable
+        branch propagate would also stop the table reclaiming disk -- on every
+        run, forever. A branch that cannot be converged is reported and the
+        others still get their turn.
+        """
+        try:
+            return await self._apply(spec, node)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Could not converge one branch; continuing with the rest of the table",
+                extra={"partition_name": node.name, "error": describe_exception(exc)},
+            )
+            return SubpartitionReconcileResult(
+                findings=(
+                    TopologyFinding(
+                        partition_name=node.name,
+                        reason=TopologyReason.UNCONVERGEABLE,
+                        detail=f"{node.name} could not be converged: {describe_exception(exc)}.",
+                    ),
+                )
+            )
+
+    async def materialize(
+        self,
+        actions: tuple[SubpartitionAction, ...],
+        findings: list[TopologyFinding] | None = None,
+    ) -> int:
         """Execute create-actions, deepest-first within each subtree.
 
         Args:
             actions: Actions from the planner.
+            findings: Collector for conflicts that are reported rather than
+                raised; omit it and such conflicts are only logged.
 
         Returns:
             Number of subpartitions attached.
         """
+        collected = [] if findings is None else findings
         created = 0
         for action in actions:
-            created += await self._materialize_one(action)
+            created += await self._materialize_one(action, collected)
         return created
 
     async def _apply(self, spec: SubpartitionSpec, node: PartitionNode) -> SubpartitionReconcileResult:
@@ -166,10 +201,13 @@ class PartitionSubpartitionService:
             "Creating missing subpartitions",
             extra={"partition_name": node.name, "subpartition_count": plan.count()},
         )
-        created = await self.materialize(plan.actions)
-        return SubpartitionReconcileResult(created_count=created, findings=plan.findings)
+        execution: list[TopologyFinding] = []
+        created = await self.materialize(plan.actions, execution)
+        for finding in execution:
+            _log_finding(finding)
+        return SubpartitionReconcileResult(created_count=created, findings=plan.findings + tuple(execution))
 
-    async def _materialize_one(self, action: SubpartitionAction) -> int:
+    async def _materialize_one(self, action: SubpartitionAction, findings: list[TopologyFinding]) -> int:
         """Create one node, build its children, then attach it.
 
         Attaching last is what makes an interrupted run recoverable rather than
@@ -188,14 +226,14 @@ class PartitionSubpartitionService:
                 extra={"partition_name": action.child_name, "parent_name": action.parent_name},
             )
 
-        created += await self.materialize(action.children)
+        created += await self.materialize(action.children, findings)
 
-        if await self._attach(action):
+        if await self._attach(action, findings):
             created += 1
         return created
 
-    async def _attach(self, action: SubpartitionAction) -> bool:
-        """Attach one node, tolerating a concurrent worker having won the race.
+    async def _attach(self, action: SubpartitionAction, findings: list[TopologyFinding]) -> bool:
+        """Attach one node, distinguishing a lost race from a real conflict.
 
         Returns:
             True when this call attached the node.
@@ -203,18 +241,43 @@ class PartitionSubpartitionService:
         try:
             await self._repo.attach_subpartition(action.parent_name, action.child_name, action.bounds)
         except SQLAlchemyError as exc:
-            if pg_sqlstate(exc) not in ATTACH_CONFLICT_SQLSTATES:
+            sqlstate = pg_sqlstate(exc)
+
+            if sqlstate == PG_CHECK_VIOLATION:
+                # Rows already sitting in a DEFAULT sibling belong to the
+                # partition being attached, and PostgreSQL will not let it in
+                # until they move. Reporting beats raising: one branch in this
+                # state must not stop the rest of the table being maintained.
+                findings.append(_default_conflict_finding(action, exc))
+                return False
+
+            if sqlstate not in ATTACH_CONFLICT_SQLSTATES:
                 raise
-            # A conflict SQLSTATE only proves a lost race if the postcondition
-            # actually holds; 42809 also fires for unrelated object mismatches.
-            if not await self._metadata.is_partition_attached(action.parent_name, action.child_name):
-                raise
+
+            # A conflict SQLSTATE alone proves nothing: PostgreSQL reports the
+            # same code whether another worker just created this partition or
+            # an unrelated relation happens to hold the name. Only matching
+            # bounds make it a lost race.
+            if not await self._matches_planned_bounds(action):
+                findings.append(_name_conflict_finding(action, exc))
+                return False
+
             logger.debug(
                 "Subpartition already attached (race with another worker)",
-                extra={"partition_name": action.child_name, "sqlstate": pg_sqlstate(exc)},
+                extra={"partition_name": action.child_name, "sqlstate": sqlstate},
             )
             return False
         return True
+
+    async def _matches_planned_bounds(self, action: SubpartitionAction) -> bool:
+        """True when the relation holding this name owns the bounds we planned.
+
+        Bounds are read from ``relpartbound``, which is only set on an attached
+        partition -- so matching bounds prove both that the name belongs to a
+        partition and that it is the one this action was going to create.
+        """
+        existing = await self._metadata.get_partition_tree(action.child_name)
+        return existing is not None and existing.bounds == action.bounds
 
     def _require_spec(self, config: TablePartitionConfig) -> SubpartitionSpec:
         """Return the config's subpartition spec, refusing an unsupported wiring."""
@@ -229,12 +292,14 @@ class PartitionSubpartitionService:
         """Refuse collaborators that cannot serve a nested configuration."""
         del config  # the check is about the wiring, not the config
 
-        for component, obj, expected in (
-            ("Repository", self._repo, "SubpartitionRepository"),
-            ("Metadata provider", self._metadata, "NestedPartitionMetadata"),
+        for component, obj, protocol in (
+            ("Repository", self._repo, SubpartitionRepository),
+            ("Metadata provider", self._metadata, NestedPartitionMetadata),
         ):
-            if not _supports(obj, expected):
-                raise SubpartitioningNotSupportedError(f"{component} {type(obj).__name__}", expected)
+            if not isinstance(obj, protocol):
+                raise UnsupportedCapabilityError(
+                    f"{component} {type(obj).__name__}", "subpartitioning", protocol.__name__
+                )
 
     @staticmethod
     def _is_reconcilable(branch: PartitionNode, exclude: Collection[str]) -> bool:
@@ -253,16 +318,6 @@ class PartitionSubpartitionService:
 # one-off decision worth seeing in the log.
 _QUIET_REASONS = frozenset({TopologyReason.LEGACY_LEAF})
 
-_REQUIRED_METHODS = {
-    "SubpartitionRepository": ("create_branch", "create_subpartition_table", "attach_subpartition"),
-    "NestedPartitionMetadata": ("get_partition_tree", "get_unique_constraint_columns", "is_partition_attached"),
-}
-
-
-def _supports(obj: object, protocol_name: str) -> bool:
-    """Check an injected component against the methods a nested config needs."""
-    return all(callable(getattr(obj, name, None)) for name in _REQUIRED_METHODS[protocol_name])
-
 
 def _log_finding(finding: TopologyFinding) -> None:
     """Log a planner finding at a level matching how much it matters."""
@@ -273,3 +328,27 @@ def _log_finding(finding: TopologyFinding) -> None:
         logger.debug(finding.detail, extra=extra)
     else:
         logger.info(finding.detail, extra=extra)
+
+
+def _name_conflict_finding(action: SubpartitionAction, exc: Exception) -> TopologyFinding:
+    """Report a name held by a relation that is not the one we planned."""
+    return TopologyFinding(
+        partition_name=action.parent_name,
+        reason=TopologyReason.NAME_UNUSABLE,
+        detail=(
+            f"{action.parent_name} already has a relation named {action.child_name!r} whose bounds are not "
+            f"the configured ones, so the partition could not be created ({describe_exception(exc)})."
+        ),
+    )
+
+
+def _default_conflict_finding(action: SubpartitionAction, exc: Exception) -> TopologyFinding:
+    """Report rows in a DEFAULT sibling blocking a new partition."""
+    return TopologyFinding(
+        partition_name=action.parent_name,
+        reason=TopologyReason.DEFAULT_HOLDS_ROWS,
+        detail=(
+            f"{action.parent_name} cannot gain {action.child_name!r} while its DEFAULT partition holds rows "
+            f"that belong to it; move them out and the next run will create it ({describe_exception(exc)})."
+        ),
+    )

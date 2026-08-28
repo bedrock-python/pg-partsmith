@@ -12,7 +12,7 @@ from pg_partsmith.entities import PartitionInfo, Period
 from pg_partsmith.exceptions import (
     InvalidPartitionConfigError,
     PartitionAlreadyExistsError,
-    SubpartitioningNotSupportedError,
+    UnsupportedCapabilityError,
 )
 from pg_partsmith.sync.protocols import (
     CompositeKeyRepository,
@@ -362,7 +362,9 @@ class PartitionCreationService(BasePartitionService):
 
         repo = self._repo
         if not isinstance(repo, CompositeKeyRepository):
-            raise SubpartitioningNotSupportedError(f"Repository {type(repo).__name__}", "CompositeKeyRepository")
+            raise UnsupportedCapabilityError(
+                f"Repository {type(repo).__name__}", "composite partition keys", "CompositeKeyRepository"
+            )
         repo.attach_composite_partition(
             qualified_parent, partition_name, from_value, to_value, key_arity=config.key_arity
         )
@@ -413,8 +415,16 @@ class PartitionCreationService(BasePartitionService):
         self, config: TablePartitionConfig, existing: PartitionInfo, from_value: str, to_value: str
     ) -> None:
         """Handle case where partition already exists in metadata."""
-        if config.auto_attach_after_create and not existing.is_attached:
-            self._attach_tolerating_lost_race(config, existing.name, from_value, to_value)
+        if not (config.auto_attach_after_create and not existing.is_attached):
+            return
+
+        # Converge before it becomes reachable, not after. Attaching first
+        # makes the branch live for row routing while its child set may still
+        # be short of what the spec asks for -- and if the process stops in
+        # that window, it stays live and rejecting. A detached branch is
+        # introspectable on its own, so there is no reason to attach first.
+        self._converge_existing_branch(config, existing.name)
+        self._attach_tolerating_lost_race(config, existing.name, from_value, to_value)
 
     def _is_attach_conflict_benign(self, qualified_parent: str, partition_name: str, exc: SQLAlchemyError) -> bool:
         """A conflict SQLSTATE proves a lost race only if the postcondition holds.
@@ -462,14 +472,32 @@ class PartitionCreationService(BasePartitionService):
         self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
     ) -> PartitionInfo:
         """Create the detached relation backing one period."""
+        # Every capability this config needs is checked before the first
+        # statement. Discovering a missing one after the relation exists would
+        # leave an unmarked detached table behind on every tick, and unmarked
+        # tables are never collected by orphan cleanup.
+        self._require_capabilities(config)
+
         if config.subpartition is None:
             return self._repo.create_partition(config, partition_name, from_value, to_value)
 
-        self._subpartition_service()
         repo = self._repo
-        if not isinstance(repo, SubpartitionRepository):
-            raise SubpartitioningNotSupportedError(f"Repository {type(repo).__name__}", "SubpartitionRepository")
+        assert isinstance(repo, SubpartitionRepository)  # guaranteed by _require_capabilities
         return repo.create_branch(config, partition_name, from_value, to_value, config.subpartition)
+
+    def _require_capabilities(self, config: TablePartitionConfig) -> None:
+        """Refuse a wiring that cannot serve this config, before any DDL runs."""
+        if config.subpartition is not None:
+            self._subpartition_service()
+            if not isinstance(self._repo, SubpartitionRepository):
+                raise UnsupportedCapabilityError(
+                    f"Repository {type(self._repo).__name__}", "subpartitioning", "SubpartitionRepository"
+                )
+
+        if config.key_arity > 1 and not isinstance(self._repo, CompositeKeyRepository):
+            raise UnsupportedCapabilityError(
+                f"Repository {type(self._repo).__name__}", "composite partition keys", "CompositeKeyRepository"
+            )
 
     def _converge_existing_branch(self, config: TablePartitionConfig, partition_name: str) -> None:
         """Complete the subtree of a branch left half-built by an earlier run."""
@@ -485,8 +513,10 @@ class PartitionCreationService(BasePartitionService):
     def _subpartition_service(self) -> PartitionSubpartitionService:
         """Return the wired subpartition service, or explain that there is none."""
         if self._subpartitions is None:
-            raise SubpartitioningNotSupportedError(
-                f"Creation service {type(self).__name__}", "a PartitionSubpartitionService collaborator"
+            raise UnsupportedCapabilityError(
+                f"Creation service {type(self).__name__}",
+                "subpartitioning",
+                "a PartitionSubpartitionService collaborator",
             )
         return self._subpartitions
 

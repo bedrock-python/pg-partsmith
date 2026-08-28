@@ -376,18 +376,6 @@ class NestedPartitionMetadata(Protocol):
         """
         ...
 
-    async def is_partition_attached(self, table_name: str, partition_name: str) -> bool:
-        """Check if a partition is currently attached to its parent table.
-
-        Args:
-            table_name: Parent table name.
-            partition_name: Partition table name.
-
-        Returns:
-            True if the partition is attached via pg_inherits.
-        """
-        ...
-
 
 @runtime_checkable
 class CompositeKeyRepository(Protocol):

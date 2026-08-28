@@ -74,6 +74,11 @@ class TopologyReason(StrEnum):
         NAME_UNUSABLE: The partition the configuration asks for cannot be given
             a usable name -- the name is taken by a relation that does not match
             it, or it exceeds PostgreSQL's identifier limit.
+        DEFAULT_HOLDS_ROWS: A DEFAULT sibling holds rows belonging to the
+            partition being created, so PostgreSQL refuses to attach it until
+            they move.
+        UNCONVERGEABLE: Converging this branch failed outright; the rest of the
+            table was still maintained.
     """
 
     LEGACY_LEAF = "legacy_leaf"
@@ -86,6 +91,8 @@ class TopologyReason(StrEnum):
     COVERAGE_UNKNOWN = "coverage_unknown"
     LIST_VALUES_CONFLICT = "list_values_conflict"
     NAME_UNUSABLE = "name_unusable"
+    DEFAULT_HOLDS_ROWS = "default_holds_rows"
+    UNCONVERGEABLE = "unconvergeable"
 
 
 # Reasons that describe a healthy, deliberate state (policy evolution) rather
