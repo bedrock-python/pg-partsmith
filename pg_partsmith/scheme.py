@@ -9,12 +9,14 @@ weekly event table divided by tenant inside each week.
 
 Levels come in two kinds, and the planner treats them differently:
 
-* a **progression level** — :class:`RangePartitioning` — divides an ordered,
-  open-ended axis into windows. It is the *lifecycle dimension*: partitions are
-  created ahead of a cursor and expire behind it, subtree included.
-* a **set level** — :class:`HashPartitioning`, :class:`ListPartitioning` —
-  divides a level into a fixed, complete set of members. It is reconciled
-  (missing members created) and never expires.
+* a **progression level** — :class:`RangePartitioning`, or a
+  :class:`ListPartitioning` over an :class:`~pg_partsmith.boundaries.IntegerSequence`
+  — divides an ordered, open-ended axis into windows. It is the *lifecycle
+  dimension*: partitions are created ahead of a cursor and expire behind it,
+  subtree included.
+* a **set level** — :class:`HashPartitioning`, :class:`ListPartitioning` with
+  explicit groups — divides a level into a fixed, complete set of members. It
+  is reconciled (missing members created) and never expires.
 
 Everything here is IO-free and serializable, apart from a custom
 :class:`~pg_partsmith.boundaries.RangeBoundaries` object a user may pass in.
@@ -29,7 +31,7 @@ from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .boundaries import RangeBoundaries, TimeBoundaries, parse_boundaries
+from .boundaries import IntegerSequence, RangeBoundaries, TimeBoundaries, Window, parse_boundaries
 from .constants import (
     DEFAULT_HASH_NAME_SUFFIX,
     DEFAULT_LIST_DEFAULT_NAME,
@@ -37,7 +39,15 @@ from .constants import (
     MAX_IDENTIFIER_LENGTH,
     MAX_SCHEME_DEPTH,
 )
-from .topology import DefaultBounds, HashBounds, ListBounds, PartitionType, validate_pg_identifier
+from .topology import (
+    DefaultBounds,
+    HashBounds,
+    ListBounds,
+    PartitionBounds,
+    PartitionType,
+    RangeBounds,
+    validate_pg_identifier,
+)
 from .types import PositiveInt, StrippedNonEmptyStr
 
 __all__ = [
@@ -115,6 +125,11 @@ class SchemeBase(BaseModel):
     def kind(self) -> LevelKind:
         """Whether this level is a progression or a set."""
         raise NotImplementedError
+
+    @property
+    def progression(self) -> RangeBoundaries | None:
+        """The rule dividing this level's axis into windows; None for a set level."""
+        return None
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -275,29 +290,43 @@ class ListGroup(BaseModel):
 
 
 class ListPartitioning(SchemeBase):
-    """Divide a level into named LIST partitions with explicit value sets.
+    """Divide a level into LIST partitions: named value sets, or a sliding sequence.
 
-    Unlike HASH, a LIST level is never "complete": there is always another
-    value the world could produce. That is what ``include_default`` is for — a
-    catch-all partition so an unknown value is stored rather than rejected.
+    With ``groups``, the level is a **set**: every group is a partition owning
+    an explicit set of values. Unlike HASH, such a level is never "complete" —
+    there is always another value the world could produce — which is what
+    ``include_default`` is for: a catch-all partition so an unknown value is
+    stored rather than rejected. Groups are matched by the values they own
+    rather than by name, so a tree built by another tool is recognised and left
+    alone instead of being duplicated under different names.
 
-    Because groups are matched by the values they own rather than by name, a
-    tree built by another tool is recognised and left alone instead of being
-    duplicated under different names.
+    With ``sequence``, the level is a **progression**: every partition owns one
+    integer value, the newest one is where the application writes, and the
+    lifecycle policy opens the next value and expires old ones — GitLab's
+    sliding list. The creation rule must be state-driven
+    (:class:`~pg_partsmith.lifecycle.CreateNextIf`) or a horizon
+    (:class:`~pg_partsmith.lifecycle.CreateUntil`): creating "ahead" of a
+    cursor that *is* the newest partition would never converge.
 
     Attributes:
         method_name: Discriminator; always ``"list"``.
         groups: The partitions to maintain, each owning an explicit value set.
-        include_default: Maintain a DEFAULT catch-all partition alongside them.
+            Mutually exclusive with ``sequence``.
+        sequence: The value sequence of a sliding list. Mutually exclusive
+            with ``groups``.
+        include_default: Maintain a DEFAULT catch-all partition alongside the
+            groups. Not available with ``sequence``.
         default_name: Identifier fragment for that DEFAULT partition.
-        name_suffix: Template appended to the parent's name; must contain
-            ``{name}`` and otherwise only lowercase identifier characters.
+        name_suffix: Template appended to the parent's name for a group; must
+            contain ``{name}`` and otherwise only lowercase identifier
+            characters. A sequence names its partitions itself.
     """
 
     _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{name\}[a-z0-9_]*$")
 
     method_name: Literal["list"] = Field(default="list", alias="method")
-    groups: tuple[ListGroup, ...]
+    groups: tuple[ListGroup, ...] = ()
+    sequence: IntegerSequence | None = None
     include_default: bool = False
     default_name: StrippedNonEmptyStr = DEFAULT_LIST_DEFAULT_NAME
     name_suffix: str = DEFAULT_LIST_NAME_SUFFIX
@@ -311,8 +340,27 @@ class ListPartitioning(SchemeBase):
 
     @property
     def kind(self) -> LevelKind:
-        """A set."""
-        return LevelKind.SET
+        """A progression over a sequence, a set of groups otherwise."""
+        return LevelKind.PROGRESSION if self.sequence is not None else LevelKind.SET
+
+    @property
+    def progression(self) -> RangeBoundaries | None:
+        """The sequence, when this is a sliding list."""
+        return self.sequence
+
+    def bounds_for(self, window: Window) -> PartitionBounds:
+        """The LIST bound of the partition owning ``window``'s value."""
+        assert self.sequence is not None  # only a progression level has windows
+        return ListBounds(values=(str(self.sequence.value_of(window)),))
+
+    def window_of(self, bounds: PartitionBounds) -> Window | None:
+        """The window a single-value LIST bound stands for, or None."""
+        if self.sequence is None or not isinstance(bounds, ListBounds) or bounds.includes_null:
+            return None
+        if len(bounds.values) != 1:
+            return None
+        value = self.sequence.decode(bounds.values[0])
+        return None if value is None else Window(start=value, end=value + 1)
 
     @field_validator("name_suffix")
     @classmethod
@@ -341,8 +389,19 @@ class ListPartitioning(SchemeBase):
                 "PostgreSQL rejects a composite LIST key."
             )
             raise ValueError(msg)
+        if self.sequence is not None:
+            if self.groups:
+                msg = "LIST partitioning takes either groups or a sequence, not both"
+                raise ValueError(msg)
+            if self.include_default:
+                msg = (
+                    "A sliding LIST has no DEFAULT partition: the application writes the newest value, "
+                    "which always has a partition"
+                )
+                raise ValueError(msg)
+            return self
         if not self.groups:
-            msg = "LIST partitioning requires at least one group"
+            msg = "LIST partitioning requires at least one group, or a sequence"
             raise ValueError(msg)
 
         names = [g.name for g in self.groups]
@@ -371,7 +430,9 @@ class ListPartitioning(SchemeBase):
         return DefaultBounds()
 
     def own_name_budget(self) -> int:
-        """Bytes this level adds, sized for the longest group name."""
+        """Bytes this level adds, sized for the longest group name (or the widest value)."""
+        if self.sequence is not None:
+            return self.sequence.own_name_budget()
         names = [g.name for g in self.groups]
         if self.include_default:
             names.append(self.default_name)
@@ -424,6 +485,25 @@ class RangePartitioning(SchemeBase):
     def range_boundaries(self) -> RangeBoundaries:
         """:attr:`boundaries`, typed."""
         return self.boundaries  # type: ignore[no-any-return]
+
+    @property
+    def progression(self) -> RangeBoundaries | None:
+        """:attr:`boundaries`."""
+        return self.range_boundaries
+
+    def bounds_for(self, window: Window) -> PartitionBounds:
+        """The RANGE bound of ``window``'s partition."""
+        from_value, to_value = self.range_boundaries.literals(window)
+        return RangeBounds(from_value=from_value, to_value=to_value)
+
+    def window_of(self, bounds: PartitionBounds) -> Window | None:
+        """The window a bounded, readable RANGE bound stands for, or None."""
+        if not isinstance(bounds, RangeBounds):
+            return None
+        boundaries = self.range_boundaries
+        start = boundaries.decode(bounds.from_value)
+        end = boundaries.decode(bounds.to_value)
+        return None if start is None or end is None else Window(start=start, end=end)
 
     @property
     def time_boundaries(self) -> TimeBoundaries | None:

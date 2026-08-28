@@ -5,9 +5,10 @@ and every convergence rule is unit-testable without a database.
 
 :func:`plan_maintenance` walks the configured :data:`~pg_partsmith.scheme.PartitionScheme`
 and the introspected :class:`~pg_partsmith.topology.ActualTree` side by side.
-At a **progression level** (RANGE) it decides which windows must exist ahead
-of the cursor, which existing ones have expired, and which orphans may be
-dropped; at a **set level** (HASH, LIST) it fills the gaps in the member set.
+At a **progression level** (RANGE, or a LIST over an integer sequence) it
+decides which windows must exist ahead of the cursor, which existing ones have
+expired, and which orphans may be dropped; at a **set level** (HASH, LIST with
+explicit groups) it fills the gaps in the member set.
 Either way it returns a :class:`~pg_partsmith.plan.MaintenancePlan`: what to
 do, in order, with a reason on every operation — and what it deliberately
 refused to touch, with a reason on every finding.
@@ -26,7 +27,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .boundaries import RangeBoundaries, Window
+from .boundaries import Axis, CursorSource, RangeBoundaries, Window
 from .constants import MAX_IDENTIFIER_LENGTH
 from .entities import MaintenanceIssue, MaintenanceIssueStep, TablePartitionConfig
 from .exceptions import PartitionTopologyError
@@ -134,7 +135,7 @@ def fact_targets(config: TablePartitionConfig, actual: ActualTree) -> tuple[str,
     targets: list[str] = []
 
     def visit(level: SchemeBase, node: PartitionNode) -> None:
-        if isinstance(level, RangePartitioning):
+        if level.progression is not None:
             targets.extend(child.name for child in node.children if not child.is_default)
             targets.extend(orphan.name for orphan in actual.orphans if orphan.parent_name == node.name)
         if level.child is not None:
@@ -166,12 +167,17 @@ _UNBOUNDED_UPPER = frozenset({"MAXVALUE", "INFINITY", "+INFINITY"})
 _UNBOUNDED_LOWER = frozenset({"MINVALUE", "-INFINITY"})
 
 
+_ProgressionLevel = RangePartitioning | ListPartitioning
+
+
 @dataclass(frozen=True)
 class _Member:
-    """One attached RANGE child, positioned on the level's axis.
+    """One attached child of a progression level, positioned on its axis.
 
     ``managed`` is True only for a bounded, readable window that lies on the
-    scheme's grid — the only kind the lifecycle may act on.
+    scheme's grid — the only kind the lifecycle may act on. A LIST member
+    owning several values has no window; the values it owns are kept in
+    ``claimed`` so a wanted value it holds is recognised as taken.
     """
 
     node: PartitionNode
@@ -179,9 +185,12 @@ class _Member:
     end: Any | None
     window: Window | None
     managed: bool
+    claimed: frozenset[Any] = frozenset()
 
     def overlaps(self, window: Window) -> bool:
         """True when this member covers any position of ``window``."""
+        if self.claimed:
+            return any(window.start <= value < window.end for value in self.claimed)
         if self.start is None and self.end is None and self.window is None:
             return False  # unreadable: unknown position, cannot be tested
         lower_ok = self.start is None or self.start < window.end
@@ -229,20 +238,22 @@ class _Planner:
             self.findings.append(incompatibility)
             return
 
-        if isinstance(level, RangePartitioning):
-            self._plan_range_level(level, node, depth=depth)
-        elif isinstance(level, HashPartitioning):
+        if isinstance(level, HashPartitioning):
             self._plan_hash_level(level, node, depth=depth)
-        elif isinstance(level, ListPartitioning):
+        elif isinstance(level, ListPartitioning) and level.sequence is None:
             self._plan_list_level(level, node, depth=depth)
+        else:
+            assert isinstance(level, (RangePartitioning, ListPartitioning))
+            self._plan_progression_level(level, node, depth=depth)
 
-    # ── RANGE: the progression level ────────────────────────────────────────────
+    # ── The progression level: RANGE windows, or a sliding LIST ────────────────
 
-    def _plan_range_level(self, level: RangePartitioning, node: PartitionNode, *, depth: int) -> None:
-        boundaries = level.range_boundaries
-        cursor_window = boundaries.window_at(self._cursor_position(level))
-        members = self._classify_range_children(level, node)
+    def _plan_progression_level(self, level: _ProgressionLevel, node: PartitionNode, *, depth: int) -> None:
+        boundaries = level.progression
+        assert boundaries is not None  # dispatch sends only progression levels here
+        members = self._classify_members(level, node)
         managed = {m.window: m for m in members if m.managed and m.window is not None}
+        cursor_window = self._cursor_window(level, managed)
 
         newest = max(managed.values(), key=lambda m: m.window.start, default=None)  # type: ignore[union-attr]
         newest_candidate = None if newest is None else self._candidate(newest, cursor_window, boundaries)
@@ -282,7 +293,7 @@ class _Planner:
                 self.attaches.append(self._reattach(level, node, orphan, window))
                 continue
 
-            op = self._new_range_partition(level, node, window, reason=self._creation_reason(), depth=depth)
+            op = self._new_member(level, node, window, reason=self._creation_reason(), depth=depth)
             if op is not None:
                 self.creates.append(op)
 
@@ -312,20 +323,36 @@ class _Planner:
             for child_node in recurse_into:
                 self._plan_level(level.child, child_node, depth=depth + 1)
 
-    def _cursor_position(self, level: RangePartitioning) -> Any:
+    def _cursor_window(self, level: _ProgressionLevel, managed: dict[Window, _Member]) -> Window:
+        """The window holding the level's "now".
+
+        The clock for a time axis, the recorded high-water mark for an integer
+        one -- or, for a level whose cursor is its newest member, that member's
+        own window; an empty level starts at the sequence's first value.
+        """
+        boundaries = level.progression
+        assert boundaries is not None
+        if boundaries.cursor_source is CursorSource.NEWEST_MEMBER:
+            newest = max(managed, default=None)
+            return boundaries.window_at(None if newest is None else newest.start)
+        return boundaries.window_at(self._cursor_position(level))
+
+    def _cursor_position(self, level: _ProgressionLevel) -> Any:
         """The level's "now": the clock for time, the recorded high-water mark otherwise."""
-        boundaries = level.range_boundaries
-        if boundaries.axis.value == "time":
+        boundaries = level.progression
+        assert boundaries is not None
+        if boundaries.axis is Axis.TIME:
             return self.ctx.now
         return self.ctx.cursors.get(level.leading_column)
 
     def _desired_windows(
         self,
-        level: RangePartitioning,
+        level: _ProgressionLevel,
         cursor_window: Window,
         newest: Candidate | None,
     ) -> list[Window]:
-        boundaries = level.range_boundaries
+        boundaries = level.progression
+        assert boundaries is not None
         if self.ctx.mode is PlanMode.RECONCILE:
             return []
         if self.ctx.mode is PlanMode.EXPLICIT:
@@ -346,13 +373,19 @@ class _Planner:
             "create_next_if": Reason.CREATE_NEXT,
         }.get(getattr(creation, "kind", ""), Reason.CREATE_AHEAD)
 
-    def _classify_range_children(self, level: RangePartitioning, node: PartitionNode) -> list[_Member]:
+    def _classify_members(self, level: _ProgressionLevel, node: PartitionNode) -> list[_Member]:
         """Position every attached child on the axis and decide which are ours."""
-        boundaries = level.range_boundaries
+        boundaries = level.progression
+        assert boundaries is not None
         members: list[_Member] = []
 
         for child in node.children:
-            if child.is_default or not isinstance(child.bounds, RangeBounds):
+            if child.is_default:
+                continue
+            if isinstance(level, RangePartitioning):
+                if not isinstance(child.bounds, RangeBounds):
+                    continue
+            elif not isinstance(child.bounds, ListBounds):
                 continue
 
             if child.detach_pending:
@@ -365,56 +398,85 @@ class _Planner:
                 )
                 continue
 
-            lower_unbounded = child.bounds.from_value.strip().upper() in _UNBOUNDED_LOWER
-            upper_unbounded = child.bounds.to_value.strip().upper() in _UNBOUNDED_UPPER
-            start = None if lower_unbounded else boundaries.decode(child.bounds.from_value)
-            end = None if upper_unbounded else boundaries.decode(child.bounds.to_value)
-
-            if child.is_foreign:
-                self._record(
-                    child.name,
-                    FindingReason.FOREIGN_PARTITION,
-                    f"{child.name} is a foreign table; it is inspected but never created, detached or dropped.",
-                )
-                bounded = start is not None and end is not None
-                members.append(
-                    _Member(child, start, end, Window(start=start, end=end) if bounded else None, managed=False)
-                )
-                continue
-
-            if (not lower_unbounded and start is None) or (not upper_unbounded and end is None):
-                self._record(
-                    child.name,
-                    FindingReason.UNREADABLE_BOUND,
-                    f"{child.name} has bounds {child.bounds.from_value!r} .. {child.bounds.to_value!r} that cannot "
-                    "be read on this level's axis; it is never pruned, because guessing risks dropping live data.",
-                )
-                members.append(_Member(child, None, None, None, managed=False))
-                continue
-
-            if lower_unbounded or upper_unbounded:
-                self._record(
-                    child.name,
-                    FindingReason.UNBOUNDED_PARTITION,
-                    f"{child.name} is open-ended ({child.bounds.from_value} .. {child.bounds.to_value}); it holds "
-                    "current data by definition and is never pruned.",
-                )
-                members.append(_Member(child, start, end, None, managed=False))
-                continue
-
-            window = Window(start=start, end=end)
-            if _on_grid(boundaries, window):
-                members.append(_Member(child, start, end, window, managed=True))
+            if isinstance(child.bounds, RangeBounds):
+                members.append(self._range_member(boundaries, child, child.bounds))
             else:
-                self._record(
-                    child.name,
-                    FindingReason.UNMANAGED_PARTITION,
-                    f"{child.name} covers {child.bounds.from_value} .. {child.bounds.to_value}, which is not a "
-                    "window of the configured scheme; it is not a lifecycle partition and is left alone.",
-                )
-                members.append(_Member(child, start, end, window, managed=False))
+                assert isinstance(child.bounds, ListBounds)
+                members.append(self._sequence_member(boundaries, child, child.bounds))
 
         return members
+
+    def _range_member(self, boundaries: RangeBoundaries, child: PartitionNode, bounds: RangeBounds) -> _Member:
+        lower_unbounded = bounds.from_value.strip().upper() in _UNBOUNDED_LOWER
+        upper_unbounded = bounds.to_value.strip().upper() in _UNBOUNDED_UPPER
+        start = None if lower_unbounded else boundaries.decode(bounds.from_value)
+        end = None if upper_unbounded else boundaries.decode(bounds.to_value)
+
+        if child.is_foreign:
+            self._record(
+                child.name,
+                FindingReason.FOREIGN_PARTITION,
+                f"{child.name} is a foreign table; it is inspected but never created, detached or dropped.",
+            )
+            bounded = start is not None and end is not None
+            return _Member(child, start, end, Window(start=start, end=end) if bounded else None, managed=False)
+
+        if (not lower_unbounded and start is None) or (not upper_unbounded and end is None):
+            self._record(
+                child.name,
+                FindingReason.UNREADABLE_BOUND,
+                f"{child.name} has bounds {bounds.from_value!r} .. {bounds.to_value!r} that cannot "
+                "be read on this level's axis; it is never pruned, because guessing risks dropping live data.",
+            )
+            return _Member(child, None, None, None, managed=False)
+
+        if lower_unbounded or upper_unbounded:
+            self._record(
+                child.name,
+                FindingReason.UNBOUNDED_PARTITION,
+                f"{child.name} is open-ended ({bounds.from_value} .. {bounds.to_value}); it holds "
+                "current data by definition and is never pruned.",
+            )
+            return _Member(child, start, end, None, managed=False)
+
+        window = Window(start=start, end=end)
+        if _on_grid(boundaries, window):
+            return _Member(child, start, end, window, managed=True)
+
+        self._record(
+            child.name,
+            FindingReason.UNMANAGED_PARTITION,
+            f"{child.name} covers {bounds.from_value} .. {bounds.to_value}, which is not a "
+            "window of the configured scheme; it is not a lifecycle partition and is left alone.",
+        )
+        return _Member(child, start, end, window, managed=False)
+
+    def _sequence_member(self, boundaries: RangeBoundaries, child: PartitionNode, bounds: ListBounds) -> _Member:
+        """Position a LIST child of a sliding list: one readable value is a window of the sequence."""
+        decoded = [boundaries.decode(value) for value in bounds.values]
+        readable = frozenset(value for value in decoded if value is not None)
+        single = len(bounds.values) == 1 and len(readable) == 1 and not bounds.includes_null
+        window = Window(start=next(iter(readable)), end=next(iter(readable)) + 1) if single else None
+
+        if child.is_foreign:
+            self._record(
+                child.name,
+                FindingReason.FOREIGN_PARTITION,
+                f"{child.name} is a foreign table; it is inspected but never created, detached or dropped.",
+            )
+            return _Member(child, None, None, window, managed=False, claimed=readable)
+
+        if window is not None:
+            return _Member(child, window.start, window.end, window, managed=True)
+
+        spelled = ", ".join(bounds.values) + (", NULL" if bounds.includes_null else "")
+        self._record(
+            child.name,
+            FindingReason.UNMANAGED_PARTITION,
+            f"{child.name} owns the values ({spelled}), which is not a single value of the configured "
+            "sequence; it is not a lifecycle partition and is left alone.",
+        )
+        return _Member(child, None, None, None, managed=False, claimed=readable)
 
     def _candidate(self, member: _Member, cursor_window: Window, boundaries: RangeBoundaries) -> Candidate:
         return Candidate(
@@ -428,7 +490,7 @@ class _Planner:
 
     def _expire(
         self,
-        level: RangePartitioning,
+        level: _ProgressionLevel,
         node: PartitionNode,
         member: _Member,
         cursor_window: Window,
@@ -481,7 +543,7 @@ class _Planner:
 
     def _reattachable_window(
         self,
-        level: RangePartitioning,
+        level: _ProgressionLevel,
         orphan: DetachedPartition,
         occupied: set[Window],
         cursor_window: Window,
@@ -573,33 +635,35 @@ class _Planner:
 
     def _reattach(
         self,
-        level: RangePartitioning,
+        level: _ProgressionLevel,
         node: PartitionNode,
         orphan: DetachedPartition,
         window: Window,
     ) -> AttachPartition:
-        from_value, to_value = level.range_boundaries.literals(window)
+        boundaries = level.progression
+        assert boundaries is not None
         return AttachPartition(
             target=orphan.name,
             oid=orphan.oid,
             parent_name=node.name,
-            bounds=RangeBounds(from_value=from_value, to_value=to_value),
+            bounds=level.bounds_for(window),
             key_columns=level.key,
             partition_by=_partition_by(level.child),
             reason=Reason.REATTACH,
-            detail=f"detached partition covers {level.range_boundaries.describe(window)}, which is wanted again",
+            detail=f"detached partition covers {boundaries.describe(window)}, which is wanted again",
         )
 
-    def _new_range_partition(
+    def _new_member(
         self,
-        level: RangePartitioning,
+        level: _ProgressionLevel,
         node: PartitionNode,
         window: Window,
         *,
         reason: Reason,
         depth: int,
     ) -> CreatePartition | None:
-        boundaries = level.range_boundaries
+        boundaries = level.progression
+        assert boundaries is not None
         schema, parent_relname = split_qualified_name(node.name)
         relname = boundaries.child_name(parent_relname, window)
         child_name = qualify(schema, relname)
@@ -610,11 +674,10 @@ class _Planner:
         if children is None:
             return None
 
-        from_value, to_value = boundaries.literals(window)
         return CreatePartition(
             target=child_name,
             parent_name=node.name,
-            bounds=RangeBounds(from_value=from_value, to_value=to_value),
+            bounds=level.bounds_for(window),
             partition_by=_partition_by(level.child),
             key_columns=level.key,
             children=children,
@@ -897,22 +960,21 @@ class _Planner:
                 reason=Reason.SUBTREE,
                 depth=-1,
             )
-        elif isinstance(level, ListPartitioning):
+        elif isinstance(level, ListPartitioning) and level.sequence is None:
             ops = self._list_members(
                 level, parent_name, level.groups, include_default=level.include_default, node=None, depth=-1
             )
         else:
-            assert isinstance(level, RangePartitioning)
-            boundaries = level.range_boundaries
-            cursor_window = boundaries.window_at(self._cursor_position(level))
+            assert isinstance(level, (RangePartitioning, ListPartitioning))
+            cursor_window = self._cursor_window(level, {})
             ops = []
             for window in self._windows_for_new_level(level, cursor_window):
-                op = self._new_range_partition(level, _phantom(parent_name), window, reason=Reason.SUBTREE, depth=-1)
+                op = self._new_member(level, _phantom(parent_name), window, reason=Reason.SUBTREE, depth=-1)
                 if op is not None:
                     ops.append(op)
         return tuple(op.model_copy(update={"counts_as": "subtree", "reason": Reason.SUBTREE}) for op in ops)
 
-    def _windows_for_new_level(self, level: RangePartitioning, cursor_window: Window) -> list[Window]:
+    def _windows_for_new_level(self, level: _ProgressionLevel, cursor_window: Window) -> list[Window]:
         """The windows a progression level gets inside a partition being created.
 
         Whatever the plan is for, a new branch must be able to route the rows
@@ -921,11 +983,10 @@ class _Planner:
         RECONCILE run included, since a branch created with no windows at all
         would reject everything until the next scheduled tick.
         """
+        boundaries = level.progression
+        assert boundaries is not None
         explicit = self.ctx.explicit_windows.get(level.leading_column)
-        if explicit:
-            windows = list(explicit)
-        else:
-            windows = self.policy.creation.desired_windows(cursor_window, level.range_boundaries, None)
+        windows = list(explicit) if explicit else self.policy.creation.desired_windows(cursor_window, boundaries, None)
         return sorted(dict.fromkeys(windows), key=lambda w: w.start)
 
     # ── Names ───────────────────────────────────────────────────────────────────

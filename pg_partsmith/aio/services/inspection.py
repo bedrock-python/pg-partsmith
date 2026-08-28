@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any
 
 from pg_partsmith.boundaries import Axis, CursorSource, Window
 from pg_partsmith.planner import PlanMode, PlanningContext, fact_targets
-from pg_partsmith.scheme import RangePartitioning
 
 if TYPE_CHECKING:
     from pg_partsmith.aio.protocols import PartitionMetadataProvider
@@ -70,11 +69,11 @@ class PartitionInspector:
 
         cursors: dict[str, Any] = {}
         for level in config.levels:
-            if not isinstance(level, RangePartitioning):
+            boundaries = level.progression
+            if boundaries is None or boundaries.axis is not Axis.INTEGER:
                 continue
-            boundaries = level.range_boundaries
-            if boundaries.axis is not Axis.INTEGER:
-                continue
+            if boundaries.cursor_source is CursorSource.NEWEST_MEMBER:
+                continue  # the planner reads it off the tree
             value = await self._metadata.get_key_high_water_mark(
                 config.qualified_name,
                 level.leading_column,

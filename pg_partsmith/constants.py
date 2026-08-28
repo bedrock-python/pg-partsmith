@@ -12,6 +12,7 @@ DEFAULT_HASH_NAME_SUFFIX = "__h{remainder}"
 DEFAULT_LIST_NAME_SUFFIX = "__{name}"
 DEFAULT_LIST_DEFAULT_NAME = "other"
 DEFAULT_NUMERIC_NAME_SUFFIX = "__{start}"
+DEFAULT_SEQUENCE_NAME_SUFFIX = "__{value}"
 # Depth of a declared partition scheme, root level included.
 MAX_SCHEME_DEPTH = 5
 # Largest least-common-multiple of hash moduli we will enumerate when checking

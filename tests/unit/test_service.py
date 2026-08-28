@@ -761,7 +761,7 @@ async def test__ensure_partitions__non_range_root__is_refused(
     config = TablePartitionConfig(table_name="tasks", scheme=scheme)
 
     # Act / Assert
-    with pytest.raises(InvalidPartitionConfigError, match="RANGE root"):
+    with pytest.raises(InvalidPartitionConfigError, match="progression root"):
         await service.ensure_partitions(config, [Period(year=2024, month=1)])
 
     metadata.get_partition_type.assert_not_awaited()

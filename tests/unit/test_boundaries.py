@@ -1233,7 +1233,7 @@ def test__parse_boundaries__integer_dict__builds_numeric_boundaries() -> None:
 
 def test__parse_boundaries__unknown_kind__raises_value_error() -> None:
     # Arrange / Act / Assert
-    with pytest.raises(ValueError, match="Unknown boundaries kind 'geo'; expected 'time' or 'integer'"):
+    with pytest.raises(ValueError, match="Unknown boundaries kind 'geo'; expected 'time', 'integer' or 'sequence'"):
         parse_boundaries({"kind": "geo"})
 
 

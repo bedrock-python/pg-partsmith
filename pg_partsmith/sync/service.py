@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pg_partsmith.boundaries import Window
 from pg_partsmith.entities import MaintenanceResult, PartitionInfo, Period, TablePartitionConfig
@@ -220,7 +220,7 @@ class PartitionLifecycleService:
         plan = self.plan(config, mode=PlanMode.RECONCILE)
         return self._executor.apply(config, plan)
 
-    def ensure_partition(self, config: TablePartitionConfig, period: Period | Window) -> PartitionInfo | None:
+    def ensure_partition(self, config: TablePartitionConfig, period: Period | Window | Any) -> PartitionInfo | None:
         """Create and attach the partition for one specific window (idempotent).
 
         Useful for writers that must guarantee a partition exists before an
@@ -230,8 +230,9 @@ class PartitionLifecycleService:
 
         Args:
             config: Table partitioning configuration.
-            period: The period (time axis) or :class:`~pg_partsmith.Window`
-                the partition must cover.
+            period: The period (time axis), the :class:`~pg_partsmith.Window`,
+                or a position on the root's axis -- an instant, an integer key
+                value, a sliding-list value -- the partition must cover.
 
         Returns:
             The created partition, or None when it already existed -- also when
@@ -243,7 +244,7 @@ class PartitionLifecycleService:
     def ensure_partitions(
         self,
         config: TablePartitionConfig,
-        periods: Iterable[Period | Window],
+        periods: Iterable[Period | Window | Any],
     ) -> list[PartitionInfo]:
         """Create and attach partitions for an explicit set of windows (idempotent).
 
@@ -257,8 +258,8 @@ class PartitionLifecycleService:
 
         Args:
             config: Table partitioning configuration.
-            periods: Periods (time axis) or windows that must have a partition.
-                Duplicates are ignored.
+            periods: Periods (time axis), windows, or positions on the root's
+                axis that must have a partition. Duplicates are ignored.
 
         Returns:
             The partitions created by this call, in chronological order;
@@ -266,8 +267,8 @@ class PartitionLifecycleService:
             the members created to complete an existing partition's subtree.
 
         Raises:
-            InvalidPartitionConfigError: If the root is not a RANGE level, or a
-                period is given for a non-time axis.
+            InvalidPartitionConfigError: If the root is not a progression
+                level, or a period is given for a non-time axis.
         """
         windows = self._windows_for(config, periods)
         plan = self.plan(config, mode=PlanMode.EXPLICIT, windows=windows)
@@ -381,21 +382,28 @@ class PartitionLifecycleService:
                 validate_timezone_alignment(self._repo, level.time_boundaries.period_calculator)
 
     @staticmethod
-    def _windows_for(config: TablePartitionConfig, periods: Iterable[Period | Window]) -> dict[str, tuple[Window, ...]]:
+    def _windows_for(
+        config: TablePartitionConfig, periods: Iterable[Period | Window | Any]
+    ) -> dict[str, tuple[Window, ...]]:
         root = config.scheme
-        if not isinstance(root, RangePartitioning):
-            msg = "ensure_partitions needs a RANGE root: a HASH or LIST root has a fixed partition set"
+        boundaries = root.progression
+        if boundaries is None:
+            msg = "ensure_partitions needs a progression root: a HASH or grouped LIST root has a fixed partition set"
             raise InvalidPartitionConfigError(msg)
-        time_boundaries = root.time_boundaries
+        time_boundaries = root.time_boundaries if isinstance(root, RangePartitioning) else None
         windows: list[Window] = []
         for item in periods:
             if isinstance(item, Window):
                 windows.append(item)
-            elif time_boundaries is not None:
+            elif isinstance(item, Period):
+                if time_boundaries is None:
+                    msg = (
+                        f"{config.qualified_name!r} is not partitioned by time; pass windows or key values, not periods"
+                    )
+                    raise InvalidPartitionConfigError(msg)
                 windows.append(time_boundaries.window_for(item))
             else:
-                msg = f"{config.qualified_name!r} is not partitioned by time; pass Window objects, not periods"
-                raise InvalidPartitionConfigError(msg)
+                windows.append(boundaries.window_at(item))
         return {root.leading_column: tuple(windows)}
 
 

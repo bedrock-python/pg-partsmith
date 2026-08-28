@@ -15,6 +15,7 @@ from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
+from testcontainers.redis import RedisContainer
 
 from tests.integration.aio.builder import PartitioningScenarioBuilder
 from tests.integration.sync.builder import PartitioningScenarioBuilder as SyncPartitioningScenarioBuilder
@@ -87,6 +88,23 @@ def _docker_is_available() -> bool:
         return False
     else:
         return True
+
+
+@pytest.fixture(scope="session")
+def redis_container() -> Generator[RedisContainer, None, None]:
+    """Start a Redis container for the test session."""
+    if not _docker_is_available():
+        pytest.skip("Docker is required for integration tests (testcontainers)")
+    with RedisContainer("redis:7-alpine") as container:
+        yield container
+
+
+@pytest.fixture(scope="session")
+def redis_url(redis_container: RedisContainer) -> str:
+    """``redis://host:port/0`` of the session's Redis container."""
+    host = redis_container.get_container_host_ip()
+    port = redis_container.get_exposed_port(redis_container.port)
+    return f"redis://{host}:{port}/0"
 
 
 @pytest_asyncio.fixture

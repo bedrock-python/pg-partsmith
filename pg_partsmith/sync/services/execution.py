@@ -43,7 +43,7 @@ from pg_partsmith.plan import (
     Operation,
 )
 from pg_partsmith.planner import PlanMode, PlanningContext, plan_maintenance, to_maintenance_issue
-from pg_partsmith.scheme import RangePartitioning
+from pg_partsmith.scheme import ListPartitioning, RangePartitioning
 from pg_partsmith.topology import ActualTree, PartitionBounds, PartitionType, RangeBounds, RelationKind
 from pg_partsmith.utils import describe_exception, is_default_partition_conflict, pg_sqlstate, split_qualified_name
 
@@ -576,21 +576,14 @@ def _depth_of(config: TablePartitionConfig, parent_name: str) -> int:
     if parent_name == config.qualified_name:
         return 0
     for index, level in enumerate(config.levels):
-        if index > 0 and isinstance(level, RangePartitioning):
+        if index > 0 and level.progression is not None:
             return index
     return 0
 
 
 def _windows_of(children: tuple[CreatePartition, ...], level: object) -> dict[str, tuple[Window, ...]]:
-    """The RANGE windows a planned subtree was going to create, for EXPLICIT planning."""
-    if not isinstance(level, RangePartitioning):
+    """The windows a planned subtree was going to create, for EXPLICIT planning."""
+    if not isinstance(level, (RangePartitioning, ListPartitioning)) or level.progression is None:
         return {}
-    boundaries = level.range_boundaries
-    windows: list[Window] = []
-    for child in children:
-        if isinstance(child.bounds, RangeBounds):
-            start = boundaries.decode(child.bounds.from_value)
-            end = boundaries.decode(child.bounds.to_value)
-            if start is not None and end is not None:
-                windows.append(Window(start=start, end=end))
+    windows = [window for window in (level.window_of(child.bounds) for child in children) if window is not None]
     return {level.leading_column: tuple(windows)} if windows else {}

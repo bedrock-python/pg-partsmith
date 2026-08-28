@@ -8,9 +8,11 @@ names the partition for a window. Two axes ship:
 
 * :class:`TimeBoundaries` — instants, divided into calendar periods by any
   :class:`~pg_partsmith.protocols.PeriodCalculator`; and
-* :class:`NumericBoundaries` — integers, divided into fixed-width steps.
+* :class:`NumericBoundaries` — integers, divided into fixed-width steps; and
+* :class:`IntegerSequence` — integers, one value per partition, for a sliding
+  ``LIST`` level rotated by application state rather than by the calendar.
 
-Both are IO-free. Whatever "now" means on an axis — the clock, the key's
+All three are IO-free. Whatever "now" means on an axis — the clock, the key's
 high-water mark — is resolved outside, by the introspector, and handed to the
 planner as the level's *cursor*.
 
@@ -38,7 +40,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
-from .constants import DEFAULT_NUMERIC_NAME_SUFFIX
+from .constants import DEFAULT_NUMERIC_NAME_SUFFIX, DEFAULT_SEQUENCE_NAME_SUFFIX
 from .partition_bounds import parse_boundary_literal
 from .periods import PartitionGranularity, Period
 from .protocols import PeriodCalculator
@@ -51,6 +53,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Axis",
     "CursorSource",
+    "IntegerSequence",
     "NumericBoundaries",
     "RangeBoundaries",
     "RangeBoundaryCodec",
@@ -81,11 +84,16 @@ class CursorSource(StrEnum):
             per leaf.
         SEQUENCE: The last value of the key's serial/identity sequence — one
             catalog read, right only for a key fed by that sequence.
+        NEWEST_MEMBER: The newest partition the level already has — the
+            *active* partition of a sliding ``LIST``, whose value the
+            application writes until the next one is opened. No query at all;
+            an empty level's cursor is the sequence's first value.
     """
 
     CLOCK = "clock"
     MAX_KEY = "max_key"
     SEQUENCE = "sequence"
+    NEWEST_MEMBER = "newest_member"
 
 
 @dataclass(frozen=True)
@@ -756,6 +764,115 @@ class NumericBoundaries(BaseModel):
         return re.compile(re.escape(self.name_suffix).replace(re.escape("{start}"), r"(?P<start>m?\d+)") + "$")
 
 
+class IntegerSequence(BaseModel):
+    """One integer value per partition, in sequence: the sliding ``LIST`` level.
+
+    The progression GitLab rotates ``ci_builds`` by: partition ``N`` owns the
+    rows whose key *is* ``N``, the application writes the newest value, and a
+    :class:`~pg_partsmith.lifecycle.CreateNextIf` rule opens ``N + 1`` once
+    the newest partition satisfies it. Windows are ``[value, value + 1)`` so
+    the same arithmetic serves every rule written for an integer axis.
+
+    Attributes:
+        kind: Discriminator; always ``"sequence"``.
+        start: The first value, used when the level has no partition yet.
+        name_suffix: Template appended to the parent's name; must contain
+            ``{value}`` and otherwise only lowercase identifier characters.
+        cursor_source: Where the level's "now" comes from. The newest member
+            by default; ``MAX_KEY`` / ``SEQUENCE`` read the data instead.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{value\}[a-z0-9_]*$")
+
+    kind: str = Field(default="sequence", frozen=True)
+    start: int = 1
+    name_suffix: StrippedNonEmptyStr = DEFAULT_SEQUENCE_NAME_SUFFIX
+    cursor_source: CursorSource = CursorSource.NEWEST_MEMBER
+
+    @field_validator("kind")
+    @classmethod
+    def validate_kind(cls, v: str) -> str:
+        """Refuse a foreign discriminator smuggled in from serialized data."""
+        if v != "sequence":
+            msg = f"IntegerSequence.kind must be 'sequence', got {v!r}"
+            raise ValueError(msg)
+        return v
+
+    @field_validator("name_suffix")
+    @classmethod
+    def validate_name_suffix(cls, v: str) -> str:
+        """Reject templates that could not produce a safe, unique identifier."""
+        if not cls._NAME_SUFFIX_PATTERN.match(v):
+            msg = (
+                f"name_suffix {v!r} must contain '{{value}}' and otherwise only lowercase letters, digits, "
+                "and underscores"
+            )
+            raise ValueError(msg)
+        return v
+
+    @field_validator("cursor_source")
+    @classmethod
+    def validate_cursor_source(cls, v: CursorSource) -> CursorSource:
+        """An integer sequence has no clock to read."""
+        if v is CursorSource.CLOCK:
+            msg = "IntegerSequence cannot read its cursor from the clock; use NEWEST_MEMBER, MAX_KEY or SEQUENCE"
+            raise ValueError(msg)
+        return v
+
+    @property
+    def axis(self) -> Axis:
+        """Integers."""
+        return Axis.INTEGER
+
+    def window_at(self, position: Any) -> Window:
+        """Return the window of the value ``position`` (the first value when None)."""
+        value = self.start if position is None else int(position)
+        return Window(start=value, end=value + 1)
+
+    def shift(self, window: Window, offset: int) -> Window:
+        """Return the window ``offset`` values away."""
+        value = int(window.start) + offset
+        return Window(start=value, end=value + 1)
+
+    def literals(self, window: Window) -> tuple[str, str]:
+        """Render the window's ends as plain integers."""
+        return str(int(window.start)), str(int(window.end))
+
+    def value_of(self, window: Window) -> int:
+        """The single value a window's partition owns."""
+        return int(window.start)
+
+    def decode(self, literal: str) -> int | None:
+        """Read an integer literal back; anything else is None."""
+        stripped = literal.strip()
+        return int(stripped) if _INTEGER_PATTERN.match(stripped) else None
+
+    def child_name(self, parent_relname: str, window: Window) -> str:
+        """Name the partition after the value it owns."""
+        return f"{parent_relname}{self.name_suffix.format(value=_spell_int(self.value_of(window)))}"
+
+    def parse_child_name(self, relname: str) -> Window | None:
+        """Read the value back out of a relation name."""
+        match = self._name_pattern().search(relname)
+        if not match:
+            return None
+        value = _unspell_int(match.group("value"))
+        return None if value is None else Window(start=value, end=value + 1)
+
+    def describe(self, window: Window) -> str:
+        """Render the window as its value."""
+        return f"value {self.value_of(window)}"
+
+    def own_name_budget(self) -> int:
+        """Bytes this level adds to a partition name, sized for a 19-digit value."""
+        return len(self.name_suffix) - len("{value}") + len("m") + 19
+
+    def _name_pattern(self) -> re.Pattern[str]:
+        return re.compile(re.escape(self.name_suffix).replace(re.escape("{value}"), r"(?P<value>m?\d+)") + "$")
+
+
 def _spell_int(value: int) -> str:
     """Spell an integer so it can live inside an identifier (``m`` for minus)."""
     return f"m{-value}" if value < 0 else str(value)
@@ -770,8 +887,9 @@ def _unspell_int(text: str) -> int | None:
 def parse_boundaries(value: object) -> RangeBoundaries:
     """Turn serialized boundaries into a strategy, passing instances through.
 
-    Dicts are dispatched on their ``kind`` (``"time"`` / ``"integer"``);
-    anything already implementing :class:`RangeBoundaries` is returned as-is.
+    Dicts are dispatched on their ``kind`` (``"time"`` / ``"integer"`` /
+    ``"sequence"``); anything already implementing :class:`RangeBoundaries` is
+    returned as-is.
 
     Raises:
         ValueError: If the dict names an unknown kind.
@@ -783,7 +901,9 @@ def parse_boundaries(value: object) -> RangeBoundaries:
             return TimeBoundaries.model_validate(value)
         if kind == "integer":
             return NumericBoundaries.model_validate(value)
-        msg = f"Unknown boundaries kind {kind!r}; expected 'time' or 'integer'"
+        if kind == "sequence":
+            return IntegerSequence.model_validate(value)
+        msg = f"Unknown boundaries kind {kind!r}; expected 'time', 'integer' or 'sequence'"
         raise ValueError(msg)
     if isinstance(value, RangeBoundaries):
         return value

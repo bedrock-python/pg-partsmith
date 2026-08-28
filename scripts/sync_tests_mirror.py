@@ -3,8 +3,8 @@
 The sync integration suite is a mechanical mirror of the aio one: plain test
 functions instead of coroutines, ``Engine`` instead of ``AsyncEngine``, the
 ``sync_db_engine`` / ``sync_db_session`` / ``sync_partition_builder`` fixtures
-instead of their aio twins. Run this after changing the aio suite and review
-the diff::
+instead of their aio twins, ``redis.Redis`` instead of ``redis.asyncio.Redis``.
+Run this after changing the aio suite and review the diff::
 
     uv run python scripts/sync_tests_mirror.py
     uv run ruff check --fix tests/integration/sync && uv run ruff format tests/integration/sync
@@ -44,6 +44,10 @@ RULES: list[tuple[str, str]] = [
     ),
     (r"from sqlalchemy\.ext\.asyncio import AsyncEngine", "from sqlalchemy import Engine"),
     (r"from sqlalchemy\.ext\.asyncio import AsyncConnection, AsyncEngine", "from sqlalchemy import Connection, Engine"),
+    # redis-py keeps its async client in ``redis.asyncio``; the sync one is at the package root.
+    (r"from redis\.asyncio import", "from redis import"),
+    # A mirror-able sleep is spelled ``from asyncio import sleep`` / ``await sleep(...)`` in the aio suite.
+    (r"from asyncio import sleep\b", "from time import sleep"),
     (r"\bcreate_async_engine\b", "create_engine"),
     (r"_create_async_engine\b", "_create_sync_engine"),
     (r"postgresql\+asyncpg://", "postgresql+psycopg2://"),
@@ -53,6 +57,10 @@ RULES: list[tuple[str, str]] = [
     (r"\bAsyncConnection\b", "Connection"),
     (r"\bAsyncGenerator\b", "Generator"),
     (r"\bAsyncIterator\b", "Iterator"),
+    # contextlib's async exit stack and its methods, for a context that must outlive a ``with`` block.
+    (r"\bAsyncExitStack\b", "ExitStack"),
+    (r"\benter_async_context\b", "enter_context"),
+    (r"\baclose\b", "close"),
     (r"import pytest_asyncio\n", ""),
     (r"@pytest_asyncio\.fixture", "@pytest.fixture"),
     (r"pg_partsmith\.aio\b", "pg_partsmith.sync"),

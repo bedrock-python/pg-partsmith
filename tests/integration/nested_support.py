@@ -11,9 +11,15 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import event
 
-from pg_partsmith.boundaries import CursorSource, NumericBoundaries, TimeBoundaries, UUIDv7BoundaryCodec
+from pg_partsmith.boundaries import (
+    CursorSource,
+    IntegerSequence,
+    NumericBoundaries,
+    TimeBoundaries,
+    UUIDv7BoundaryCodec,
+)
 from pg_partsmith.entities import PartitionGranularity, TablePartitionConfig
-from pg_partsmith.lifecycle import CreateAhead, KeepBehind, KeepNewest, LifecyclePolicy
+from pg_partsmith.lifecycle import CreateAhead, CreateNextIf, KeepBehind, KeepNewest, LifecyclePolicy, SqlPredicate
 from pg_partsmith.partition_bounds import parse_range_boundaries
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning
 from pg_partsmith.utils import orphan_table_comment
@@ -179,6 +185,16 @@ QUEUE_TABLE_DDL = """
         payload TEXT,
         PRIMARY KEY (msg_id)
     ) PARTITION BY RANGE (msg_id)
+"""
+
+# GitLab's sliding list: one integer value per partition, written by the application.
+SLIDING_LIST_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        partition_id BIGINT NOT NULL,
+        status TEXT,
+        PRIMARY KEY (id, partition_id)
+    ) PARTITION BY LIST (partition_id)
 """
 
 # An index-free parent: the only kind a foreign table can be a partition of.
@@ -395,6 +411,24 @@ def queue_config(
         table_name=table_name,
         scheme=RangePartitioning(key="msg_id", boundaries=NumericBoundaries(step=step, cursor_source=cursor_source)),
         lifecycle=LifecyclePolicy(creation=CreateAhead(count=create_ahead), retention=KeepBehind(distance=distance)),
+    )
+
+
+def sliding_list_config(
+    table_name: str,
+    *,
+    start: int = 100,
+    rotate_at: int = 3,
+    keep: int = 3,
+) -> TablePartitionConfig:
+    """Build a sliding LIST configuration: open the next value once the newest holds ``rotate_at`` rows."""
+    return TablePartitionConfig(
+        table_name=table_name,
+        scheme=ListPartitioning(key="partition_id", sequence=IntegerSequence(start=start)),
+        lifecycle=LifecyclePolicy(
+            creation=CreateNextIf(when=SqlPredicate(sql=f"SELECT count(*) >= {rotate_at} FROM {{partition}}")),  # noqa: S608
+            retention=KeepNewest(count=keep),
+        ),
     )
 
 

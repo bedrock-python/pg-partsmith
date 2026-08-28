@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from .boundaries import Axis, TimeBoundaries
+from .boundaries import Axis, CursorSource, TimeBoundaries
 from .lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
 from .periods import PartitionGranularity, Period
 from .scheme import HashPartitioning, ListPartitioning, PartitionScheme, RangePartitioning, SchemeBase, name_fits
@@ -351,6 +351,17 @@ class TablePartitionConfig(BaseModel):
                 "PostgreSQL truncates identifiers silently, which would collapse two partitions onto one name."
             )
             raise ValueError(msg)
+
+        if isinstance(self.lifecycle.creation, CreateAhead):
+            for level in self.levels:
+                progression = level.progression
+                if progression is not None and progression.cursor_source is CursorSource.NEWEST_MEMBER:
+                    msg = (
+                        f"{level.describe()} is a sliding list whose cursor is its newest partition, so "
+                        "CreateAhead would open another partition on every run; rotate it with "
+                        "CreateNextIf(...) or bound it with CreateUntil(...)"
+                    )
+                    raise ValueError(msg)
         return self
 
     # ── Derived views ───────────────────────────────────────────────────────────
@@ -441,8 +452,8 @@ class TablePartitionConfig(BaseModel):
 
     @property
     def is_progression_root(self) -> bool:
-        """True when the root is a RANGE level with a lifecycle."""
-        return isinstance(self.scheme, RangePartitioning)
+        """True when the root is a progression level: a RANGE, or a sliding LIST."""
+        return self.scheme.progression is not None
 
     @property
     def is_time_based(self) -> bool:
@@ -452,7 +463,7 @@ class TablePartitionConfig(BaseModel):
     @property
     def has_progression_level(self) -> bool:
         """True when any level of the scheme is a progression."""
-        return any(isinstance(level, RangePartitioning) for level in self.scheme.walk())
+        return any(level.progression is not None for level in self.scheme.walk())
 
     @property
     def levels(self) -> list[SchemeBase]:
