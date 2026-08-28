@@ -152,8 +152,20 @@ def _boundary_decoder(
         # the guard exists precisely for implementations that do not honour the
         # declared return type.
         decoded: object = decode_boundary(value)
-        if decoded is None or isinstance(decoded, datetime):
-            return decoded
+        if decoded is None:
+            return None
+        if isinstance(decoded, datetime):
+            if decoded.tzinfo is not None:
+                return decoded
+            # A naive datetime is exactly the non-comparable value this guard
+            # exists to keep out: comparing it with the aware cutoff raises from
+            # the middle of retention, where the codec that produced it is no
+            # longer in view. Fall back rather than propagate.
+            logger.debug(
+                "Calculator returned a naive datetime boundary; falling back to timestamp parsing",
+                extra={"boundary": value, "calculator": type(calculator).__name__},
+            )
+            return parse_boundary_literal(value, boundary_tz)
         # Quiet by design, matching validate_timezone_alignment: a boundary that
         # ends up uninterpretable is already reported where it affects a
         # decision, and this path fires per partition.

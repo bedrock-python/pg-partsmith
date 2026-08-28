@@ -204,7 +204,11 @@ def plan_subpartitions(spec: SubpartitionSpec, node: PartitionNode) -> Subpartit
     return SubpartitionPlan(actions=tuple(actions), findings=tuple(findings))
 
 
-def plan_new_subtree(spec: SubpartitionSpec, branch_name: str) -> tuple[SubpartitionAction, ...]:
+def plan_new_subtree(
+    spec: SubpartitionSpec,
+    branch_name: str,
+    findings: list[TopologyFinding] | None = None,
+) -> tuple[SubpartitionAction, ...]:
     """Plan the complete subtree of a branch that does not exist yet.
 
     Used on the creation path, where there is nothing to reconcile against and
@@ -213,13 +217,16 @@ def plan_new_subtree(spec: SubpartitionSpec, branch_name: str) -> tuple[Subparti
     Args:
         spec: The subpartitioning to materialise.
         branch_name: Schema-qualified name of the branch being created.
+        findings: Collector for children the planner refuses to name. Pass one:
+            without it a refusal is invisible, and a branch planned with fewer
+            children than the spec asks for is a branch that rejects rows.
 
     Returns:
         Actions creating every child described by ``spec``, nested.
     """
     if isinstance(spec, HashSubpartitionSpec):
-        return _hash_actions(spec, branch_name, range(spec.modulus))
-    return _list_actions(spec, branch_name, spec.groups, include_default=spec.include_default)
+        return _hash_actions(spec, branch_name, range(spec.modulus), findings=findings)
+    return _list_actions(spec, branch_name, spec.groups, include_default=spec.include_default, findings=findings)
 
 
 def _plan_into(
@@ -281,6 +288,16 @@ def _incompatibility(spec: SubpartitionSpec, node: PartitionNode) -> TopologyFin
                 f"{node.name} is {node.describe_topology()} but the configuration asks for "
                 f"{spec.partition_type.value.upper()} ({', '.join(spec.columns)}); leaving it as-is. "
                 "Repartitioning an existing branch requires a rewrite and is not attempted."
+            ),
+        )
+
+    if node.has_expression_key:
+        return TopologyFinding(
+            partition_name=node.name,
+            reason=TopologyReason.COLUMN_MISMATCH,
+            detail=(
+                f"{node.name} partitions on an expression, which cannot be compared against the "
+                f"configured key ({', '.join(spec.columns)}) or addressed by a bound; leaving it as-is."
             ),
         )
 
@@ -453,9 +470,11 @@ def _hash_actions(
     for remainder in remainders:
         relname = spec.child_name(parent_relname, remainder)
         child_name = qualify(schema, relname)
-        if _is_unusable_name(relname, child_name, node, findings):
+        if _is_unusable_name(relname, child_name, parent_name, node, findings):
             continue
-        actions.append(_action(spec, parent_name, child_name, HashBounds(modulus=effective, remainder=remainder)))
+        actions.append(
+            _action(spec, parent_name, child_name, HashBounds(modulus=effective, remainder=remainder), findings)
+        )
 
     return tuple(actions)
 
@@ -555,9 +574,9 @@ def _list_actions(
     actions = []
     for relname, bounds in planned:
         child_name = qualify(schema, relname)
-        if _is_unusable_name(relname, child_name, node, findings):
+        if _is_unusable_name(relname, child_name, parent_name, node, findings):
             continue
-        actions.append(_action(spec, parent_name, child_name, bounds))
+        actions.append(_action(spec, parent_name, child_name, bounds, findings))
 
     return tuple(actions)
 
@@ -567,6 +586,7 @@ def _action(
     parent_name: str,
     child_name: str,
     bounds: SubpartitionBounds,
+    findings: list[TopologyFinding] | None = None,
 ) -> SubpartitionAction:
     """Build one create-action, with the subtree that must exist inside it."""
     return SubpartitionAction(
@@ -574,7 +594,7 @@ def _action(
         child_name=child_name,
         bounds=bounds,
         subpartition=spec.subpartition,
-        children=plan_new_subtree(spec.subpartition, child_name) if spec.subpartition is not None else (),
+        children=(plan_new_subtree(spec.subpartition, child_name, findings) if spec.subpartition is not None else ()),
     )
 
 
@@ -617,6 +637,7 @@ def to_maintenance_issue(finding: TopologyFinding) -> MaintenanceIssue:
 def _is_unusable_name(
     relname: str,
     child_name: str,
+    parent_name: str,
     node: PartitionNode | None,
     findings: list[TopologyFinding] | None,
 ) -> bool:
@@ -632,9 +653,12 @@ def _is_unusable_name(
       *silently* -- so two children collapse onto one name and collide.
     """
     if len(relname.encode("utf-8")) > MAX_IDENTIFIER_LENGTH:
-        _record(
+        # Reported against the parent, which exists even when planning a
+        # subtree that does not: dropping this silently would build a
+        # partitioned relation with no children and attach it.
+        _record_for(
             findings,
-            node,
+            parent_name,
             TopologyReason.NAME_UNUSABLE,
             f"would need a partition named {relname!r}, which exceeds PostgreSQL's "
             f"{MAX_IDENTIFIER_LENGTH}-byte identifier limit and would be truncated into a collision",
@@ -661,6 +685,22 @@ def _record(
     detail: str,
 ) -> None:
     """Append a finding about ``node`` when the caller is collecting them."""
-    if findings is None or node is None:
+    if node is None:
         return
-    findings.append(TopologyFinding(partition_name=node.name, reason=reason, detail=f"{node.name} {detail}."))
+    _record_for(findings, node.name, reason, detail)
+
+
+def _record_for(
+    findings: list[TopologyFinding] | None,
+    partition_name: str,
+    reason: TopologyReason,
+    detail: str,
+) -> None:
+    """Append a finding about a relation named ``partition_name``.
+
+    Used where there is no node to point at -- planning a subtree that does not
+    exist yet -- so a refusal there is reported rather than dropped.
+    """
+    if findings is None:
+        return
+    findings.append(TopologyFinding(partition_name=partition_name, reason=reason, detail=f"{partition_name} {detail}."))

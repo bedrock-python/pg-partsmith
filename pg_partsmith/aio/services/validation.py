@@ -133,16 +133,23 @@ def _require_column_in_constraints(
     constraints: tuple[tuple[str, ...], ...],
     qualified_parent: str,
 ) -> None:
-    """Raise when a subpartition column is missing from any unique constraint."""
-    offenders = [columns for columns in constraints if spec.column not in columns]
+    """Raise when a subpartition key column is missing from any unique constraint.
+
+    Every column the level adds is checked, not only the leading one: a
+    composite subpartition key puts all of them into the branch's PARTITION BY,
+    and PostgreSQL requires all of them in every uniqueness constraint.
+    """
+    offenders = [columns for columns in constraints if any(column not in columns for column in spec.columns)]
     if not offenders:
         return
 
+    absent = sorted({column for column in spec.columns for cols in offenders if column not in cols})
+    named = ", ".join(repr(column) for column in absent)
     missing = ", ".join("(" + ", ".join(columns) + ")" for columns in offenders)
     msg = (
-        f"Subpartition column {spec.column!r} is missing from unique constraint(s) {missing} "
+        f"Subpartition column(s) {named} missing from unique constraint(s) {missing} "
         f"on table {qualified_parent!r}. PostgreSQL requires every UNIQUE/PRIMARY KEY on a "
-        f"partitioned table to include all partition key columns, so add {spec.column!r} to "
+        f"partitioned table to include all partition key columns, so add {named} to "
         "them before enabling this subpartitioning."
     )
     raise InvalidPartitionConfigError(msg)

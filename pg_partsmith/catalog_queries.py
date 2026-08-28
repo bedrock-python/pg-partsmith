@@ -45,8 +45,13 @@ PARTITION_TREE_SQL = """
         (
             SELECT array_agg(a.attname ORDER BY k.ord)
             FROM unnest(pt.partattrs) WITH ORDINALITY AS k(attnum, ord)
-            JOIN pg_attribute a ON a.attrelid = pt.partrelid AND a.attnum = k.attnum
-        ) AS partition_columns
+            LEFT JOIN pg_attribute a ON a.attrelid = pt.partrelid AND a.attnum = k.attnum
+        ) AS partition_columns,
+        -- A key position holding an expression is recorded as attnum 0, which
+        -- matches no column. Inner-joining it away would report a shorter key
+        -- than the relation has, and a shortened key compares *equal* to a
+        -- one-column spec -- so the mismatch guard would never fire.
+        pt.partnatts AS key_arity
     FROM pg_partition_tree(to_regclass(:table_name)) t
     JOIN pg_class cl ON cl.oid = t.relid
     JOIN pg_namespace ns ON ns.oid = cl.relnamespace
@@ -57,23 +62,69 @@ PARTITION_TREE_SQL = """
     ORDER BY t.level, ns.nspname, cl.relname
 """
 
-# Columns of every UNIQUE / PRIMARY KEY constraint on a relation.
+# A relation's live column names, in its own physical order.
 #
-# PostgreSQL requires such a constraint on a partitioned table to contain every
+# Two partitions of the same table always share column *names*, but not
+# necessarily their order: ATTACH PARTITION matches by name, so a partition
+# created independently and attached can sit in a different physical order than
+# one created with LIKE. Anything copying rows between them has to name the
+# columns rather than rely on position.
+RELATION_COLUMNS_SQL = """
+    SELECT a.attname
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass(:table_name)
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY a.attnum
+"""
+
+# Columns of every uniqueness-enforcing structure on a relation.
+#
+# PostgreSQL requires each of these on a partitioned table to contain every
 # partition-key column, so this is what decides whether a subpartition column is
 # usable before any DDL is attempted.
+#
+# Read from ``pg_index`` rather than ``pg_constraint``, because the rule applies
+# to bare ``CREATE UNIQUE INDEX`` as much as to a named UNIQUE/PRIMARY KEY --
+# and ``LIKE ... INCLUDING ALL`` copies the index either way, so a branch built
+# over one is refused just the same. EXCLUDE constraints carry the same
+# requirement but their backing index is not marked unique, so they are unioned
+# in separately.
+#
+# Only the *key* columns are read: a covering index's INCLUDE columns do not
+# satisfy the requirement, and counting them would let a config through that
+# PostgreSQL then rejects.
 UNIQUE_CONSTRAINT_COLUMNS_SQL = """
-    SELECT
-        c.conname AS constraint_name,
-        (
-            SELECT array_agg(a.attname ORDER BY a.attnum)
-            FROM unnest(c.conkey) AS k(attnum)
-            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
-        ) AS columns
-    FROM pg_constraint c
-    WHERE c.conrelid = to_regclass(:table_name)
-      AND c.contype IN ('p', 'u')
-    ORDER BY c.conname
+    SELECT constraint_name, columns
+    FROM (
+        SELECT
+            ic.relname AS constraint_name,
+            (
+                SELECT array_agg(a.attname ORDER BY k.ord)
+                FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                WHERE k.ord <= i.indnkeyatts
+            ) AS columns
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        WHERE i.indrelid = to_regclass(:table_name)
+          AND i.indisunique
+
+        UNION ALL
+
+        SELECT
+            c.conname AS constraint_name,
+            (
+                SELECT array_agg(a.attname ORDER BY k.ord)
+                FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+            ) AS columns
+        FROM pg_constraint c
+        WHERE c.conrelid = to_regclass(:table_name)
+          AND c.contype = 'x'
+    ) AS enforcing
+    WHERE columns IS NOT NULL
+    ORDER BY constraint_name
 """
 
 # Upper bound of an attached RANGE partition, as raw catalog text.

@@ -28,6 +28,7 @@ from pg_partsmith.utils import (
     orphan_comment_prefix,
     orphan_table_comment,
     qualify,
+    quote_literal,
     to_regclass_argument,
 )
 
@@ -56,6 +57,7 @@ class PostgresMetadataProvider:
         *,
         marker_prefix: str | None = None,
         boundary_codec: RangeBoundaryCodec | None = None,
+        ddl_timezone: str | None = None,
     ) -> None:
         """Initialize provider.
 
@@ -64,6 +66,12 @@ class PostgresMetadataProvider:
             marker_prefix: Optional COMMENT marker prefix for orphaned partitions.
                 When None, the library default prefix is used. Pass the same
                 value to both repository and metadata provider if you override it.
+            ddl_timezone: Session timezone to read naive boundary literals in.
+                Pass whatever the repository writes partitions with: a
+                ``timestamp``/``date`` key renders its bounds without an offset,
+                so reader and writer must agree or a partition is reported
+                closed at the wrong moment. A ``timestamptz`` key is unaffected
+                -- its literals carry an offset.
             boundary_codec: Codec used to read boundary literals back into
                 instants. Required only when the partition key is an encoded
                 identifier rather than a timestamp; pass the same codec the
@@ -72,6 +80,7 @@ class PostgresMetadataProvider:
         self._engine = engine
         self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
         self._boundary_codec = boundary_codec
+        self._ddl_timezone = ddl_timezone
 
     def get_partition_type(self, table_name: str) -> PartitionType | None:
         """Get partition type for a table."""
@@ -378,6 +387,12 @@ class PostgresMetadataProvider:
             boundaries that carry no instant this provider can read.
         """
         with self._engine.connect() as conn:
+            if self._ddl_timezone is not None:
+                # A naive bound is resolved by the session timezone, so this has
+                # to be the one the partition was written with. Without it the
+                # server default decides, and the two need not agree.
+                conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
+
             bound_result = conn.execute(
                 text(PARTITION_UPPER_BOUND_SQL),
                 {"partition_name": to_regclass_argument(partition_name)},
@@ -483,6 +498,7 @@ class PostgresMetadataProvider:
             parent_name = qualify(parent_schema, parent_relname) if parent_schema and parent_relname else None
 
             columns = row.partition_columns or ()
+            named = tuple(str(c) for c in columns if c is not None)
             tree_rows.append(
                 PartitionTreeRow(
                     level=row.level,
@@ -491,7 +507,11 @@ class PostgresMetadataProvider:
                     bounds=parse_partition_bounds(coerce_str(row.boundaries)),
                     is_attached=bool(row.is_attached),
                     partition_type=PartitionType.from_partstrat(coerce_str(row.partstrat, encoding="ascii")),
-                    partition_columns=tuple(str(c) for c in columns),
+                    partition_columns=named,
+                    # An expression key position comes back as NULL and has no
+                    # name to report; what matters is that the key is wider than
+                    # the names, so nothing compares it as if it were complete.
+                    has_expression_key=len(named) != (row.key_arity or len(named)),
                 )
             )
 

@@ -464,6 +464,11 @@ class PartitionNode(BaseModel):
             qualified-name DDL. The child set is then a subset of the real one,
             so nothing may be planned from it: a partition that looks missing
             may be one of the omitted ones.
+        has_expression_key: Whether any position of this relation's own
+            partition key is an expression rather than a column. Such a
+            position has no name, so :attr:`partition_columns` is shorter than
+            the real key and must not be compared against a spec as if it were
+            complete.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -477,6 +482,7 @@ class PartitionNode(BaseModel):
     is_attached: bool = True
     children: tuple[PartitionNode, ...] = ()
     has_unaddressable_children: bool = False
+    has_expression_key: bool = False
 
     @property
     def is_leaf(self) -> bool:
@@ -608,6 +614,7 @@ class PartitionTreeRow(BaseModel):
     is_attached: bool = True
     partition_type: PartitionType | None = None
     partition_columns: tuple[str, ...] = ()
+    has_expression_key: bool = False
 
 
 def build_partition_tree(
@@ -661,6 +668,7 @@ def _to_node(
         level=row.level,
         partition_type=row.partition_type,
         partition_columns=row.partition_columns,
+        has_expression_key=row.has_expression_key,
         bounds=row.bounds,
         is_attached=row.is_attached,
         children=children,
