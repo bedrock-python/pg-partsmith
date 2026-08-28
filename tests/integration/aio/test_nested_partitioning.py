@@ -673,21 +673,27 @@ async def test__nested__branch_created_but_never_attached__next_run_completes_an
     assert attached.scalar() is True
 
 
-async def test__nested__creation_interrupted_before_attach__root_never_sees_a_partial_branch(
-    db_engine: AsyncEngine, table: str
-) -> None:
+async def test__nested__branch_is_attached_only_after_all_its_buckets_exist(db_engine: AsyncEngine, table: str) -> None:
     # Arrange
-    await _build_branch(db_engine, table, modulus=2, remainders=(0,), attach=False)
+    config = nested_config(table, modulus=4)
+    branch = f"{table}{WEEK_SUFFIX}".upper()
 
-    # Act: before maintenance runs, the incomplete branch is not reachable.
-    async with db_engine.connect() as conn:
-        result = await conn.execute(
-            text("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass(:n)"),
-            {"n": f'"{table}"'},
-        )
+    # Act
+    with _count_ddl(db_engine) as ddl:
+        await _run(db_engine, config)
 
-    # Assert: attaching last is what buys this — no row can be rejected meanwhile.
-    assert result.scalar() == 0
+    # Assert: the ordering is the whole recovery story. A branch becomes
+    # reachable at the moment it is attached, and a reachable branch missing a
+    # bucket rejects every row that hashes into it -- so the attach has to come
+    # after the last bucket, not before the first.
+    attach = next(
+        index
+        for index, stmt in enumerate(ddl.statements)
+        if "ATTACH PARTITION" in stmt and branch in stmt and "__H" not in stmt.split("ATTACH PARTITION")[1]
+    )
+    buckets = [index for index, stmt in enumerate(ddl.statements) if f"{branch}__H" in stmt]
+    assert len(buckets) >= 4
+    assert max(buckets) < attach
 
 
 # ── J/K. UUIDv7 boundaries ──────────────────────────────────────────────────────
