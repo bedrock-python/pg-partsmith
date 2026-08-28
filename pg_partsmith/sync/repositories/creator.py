@@ -117,6 +117,7 @@ class PartitionCreator:
         default_partition_name: str,
         target_partition_name: str,
         partition_column: str,
+        trailing_columns: tuple[str, ...] = (),
         from_value: str,
         to_value: str,
     ) -> int:
@@ -125,7 +126,8 @@ class PartitionCreator:
         Args:
             default_partition_name: Qualified name of DEFAULT partition.
             target_partition_name: Qualified name of target partition.
-            partition_column: Column used for partitioning.
+            partition_column: Leading column of the partition key.
+            trailing_columns: The remaining key columns, for a composite key.
             from_value: Range start boundary (inclusive).
             to_value: Range end boundary (exclusive).
 
@@ -138,12 +140,20 @@ class PartitionCreator:
         from_quoted = quote_literal(from_value)
         to_quoted = quote_literal(to_value)
 
+        # PostgreSQL adds an IS NOT NULL test for *every* key column to a range
+        # partition's constraint, so a row with a NULL trailing key value
+        # belongs in DEFAULT whatever its leading value is. Moving it out would
+        # be rejected -- and the rejection would look exactly like the DEFAULT
+        # conflict this call exists to clear, so the retry would never converge.
+        not_null = "".join(f" AND {quote_identifier(column)} IS NOT NULL" for column in trailing_columns)
+
         # All identifiers and literals are properly quoted above, S608 is a false positive
         move_sql = text(
             f"WITH moved AS ("  # noqa: S608
             f"DELETE FROM {default_quoted} "
             f"WHERE {column_quoted} >= {from_quoted} "
-            f"AND {column_quoted} < {to_quoted} "
+            f"AND {column_quoted} < {to_quoted}"
+            f"{not_null} "
             f"RETURNING *"
             f") "
             f"INSERT INTO {target_quoted} "
@@ -258,6 +268,11 @@ class PartitionCreator:
         does not block reads or writes, where creating in place would take
         ACCESS EXCLUSIVE and stall every writer routing through it.
 
+        The parent's DEFAULT partition, if it has one, is the exception: ATTACH
+        takes ACCESS EXCLUSIVE on that one while scanning it for rows the new
+        partition would claim. A fully tiled parent has no DEFAULT partition and
+        pays nothing for it.
+
         Args:
             parent_name: Partitioned relation to attach to.
             child_name: Table to attach.
@@ -308,7 +323,11 @@ def _values_clause(bounds: SubpartitionBounds) -> tuple[str, dict[str, str]]:
 
     if isinstance(bounds, ListBounds):
         values = {f"value_{index}": value for index, value in enumerate(bounds.values)}
-        placeholders = ", ".join(f"[{name}]" for name in values)
-        return f"FOR VALUES IN ({placeholders})", values
+        elements = [f"[{name}]" for name in values]
+        if bounds.includes_null:
+            # NULL is a keyword here, not a value: quoting it would produce a
+            # partition for the three-character string instead.
+            elements.append("NULL")
+        return f"FOR VALUES IN ({', '.join(elements)})", values
 
     return "DEFAULT", {}

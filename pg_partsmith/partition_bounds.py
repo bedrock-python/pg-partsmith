@@ -160,8 +160,13 @@ def parse_partition_bounds(boundaries_expr: str | None) -> PartitionBounds | Non
     list_match = _LIST_BOUND_PATTERN.match(expr)
     if list_match:
         inner = _TRAILING_PAREN_PATTERN.sub("", list_match.group("values"))
-        values = tuple(_normalize(part) for part in _split_top_level(inner))
-        return ListBounds(values=values)
+        parts = _split_top_level(inner)
+        # A bare NULL keyword and the three-character string 'NULL' normalise to
+        # the same text, and they are not the same partition. Keeping them apart
+        # is what stops the planner proposing one PostgreSQL already has.
+        values = tuple(_normalize(part) for part in parts if not _is_null_keyword(part))
+        includes_null = any(_is_null_keyword(part) for part in parts)
+        return ListBounds(values=values, includes_null=includes_null)
 
     from_value, to_value = parse_range_boundaries(expr)
     if from_value is not None and to_value is not None:
@@ -250,3 +255,11 @@ def _leading_value(expr: str) -> str:
     """Normalise a bound element, taking the leading one of a composite tuple."""
     parts = _split_top_level(expr)
     return _normalize(parts[0]) if parts else _normalize(expr)
+
+
+def _is_null_keyword(part: str) -> bool:
+    """True when a list element is the NULL keyword rather than a string."""
+    stripped = _strip_outer_parens(part)
+    if "::" in stripped:
+        stripped = stripped.split("::", 1)[0].strip()
+    return _strip_outer_parens(stripped).upper() == "NULL"

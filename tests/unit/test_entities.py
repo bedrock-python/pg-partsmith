@@ -1040,3 +1040,69 @@ def test__parse_partition_bounds__range_literal_naming_modulus__stays_a_range_bo
 
     # Assert
     assert parsed == RangeBounds(from_value="modulus 2, remainder 0", to_value="z")
+
+
+# ── PartitionInfo bound derivation ──────────────────────────────────────────────
+
+
+def test__partition_info__validation__leaves_the_callers_dict_untouched() -> None:
+    # Arrange -- a dict the caller intends to reuse for a second partition.
+    payload = {
+        "name": "events__2024_01",
+        "partition_type": PartitionType.RANGE,
+        "from_value": "2024-01-01",
+        "to_value": "2024-02-01",
+    }
+    original = dict(payload)
+
+    # Act
+    PartitionInfo.model_validate(payload)
+
+    # Assert -- validating must not write a derived field back into the input.
+    assert payload == original
+
+
+def test__partition_info__round_trip_through_model_dump__keeps_both_spellings() -> None:
+    # Arrange
+    info = PartitionInfo(
+        name="events__2024_01",
+        partition_type=PartitionType.RANGE,
+        bounds=RangeBounds(from_value="2024-01-01", to_value="2024-02-01"),
+    )
+
+    # Act -- model_dump renders the bound as a plain dict, and the pair has to
+    # be derivable from that shape too or a dump-and-reload loses it.
+    reloaded = PartitionInfo.model_validate(info.model_dump())
+
+    # Assert
+    assert reloaded == info
+    assert reloaded.from_value == "2024-01-01"
+    assert reloaded.to_value == "2024-02-01"
+
+
+def test__parse_partition_bounds__null_keyword__is_not_the_string_null() -> None:
+    # Arrange / Act
+    keyword = parse_partition_bounds("FOR VALUES IN (NULL)")
+    literal = parse_partition_bounds("FOR VALUES IN ('NULL')")
+
+    # Assert -- reading them as the same bound would make the planner propose a
+    # partition PostgreSQL already has, and fail on the conflict every run.
+    assert keyword == ListBounds(values=(), includes_null=True)
+    assert literal == ListBounds(values=("NULL",))
+    assert keyword != literal
+
+
+def test__parse_partition_bounds__null_alongside_values__keeps_both() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES IN ('eu', NULL, 'us')")
+
+    # Assert
+    assert parsed == ListBounds(values=("eu", "us"), includes_null=True)
+
+
+def test__parse_partition_bounds__cast_null__is_still_the_keyword() -> None:
+    # Arrange / Act -- older servers render the element with its type cast.
+    parsed = parse_partition_bounds("FOR VALUES IN (NULL::text)")
+
+    # Assert
+    assert parsed == ListBounds(values=(), includes_null=True)

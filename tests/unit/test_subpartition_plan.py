@@ -645,3 +645,26 @@ def test__plan_subpartitions__repair_name_would_exceed_the_identifier_limit__rep
     assert plan.is_noop
     assert {f.reason for f in plan.findings} == {TopologyReason.MODULUS_REPAIRED, TopologyReason.NAME_UNUSABLE}
     assert any(f.reason is TopologyReason.NAME_UNUSABLE and f.is_actionable for f in plan.findings)
+
+
+def test__plan_subpartitions__branch_hiding_a_child__plans_nothing_and_says_so() -> None:
+    # Arrange -- the branch really has four buckets, but one of them has a dot
+    # in its name and was left out of the tree.
+    spec = _spec(modulus=4)
+    node = PartitionNode(
+        name=BRANCH,
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        has_unaddressable_children=True,
+        children=tuple(
+            PartitionNode(name=f"{BRANCH}__h{r}", bounds=HashBounds(modulus=4, remainder=r)) for r in range(3)
+        ),
+    )
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert -- the missing bucket may be the hidden one, so proposing it would
+    # conflict with a partition that already exists, on every single run.
+    assert plan.is_noop
+    assert [f.reason for f in plan.findings] == [TopologyReason.COVERAGE_UNKNOWN]

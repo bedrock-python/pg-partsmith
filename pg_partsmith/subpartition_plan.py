@@ -229,6 +229,20 @@ def _plan_into(
     findings: list[TopologyFinding],
 ) -> None:
     """Append the plan for one branch, recursing into children that match."""
+    if node.has_unaddressable_children:
+        # Some of this branch's children were left out of the tree because their
+        # names cannot be reached by qualified-name DDL. What is left is a subset
+        # of the real child set, so every apparent gap in it may already be
+        # filled -- planning from it would propose partitions that exist.
+        _record(
+            findings,
+            node,
+            TopologyReason.COVERAGE_UNKNOWN,
+            "has a child whose name cannot be addressed by qualified-name DDL, so its child set is "
+            "incomplete and nothing can be planned for it",
+        )
+        return
+
     incompatibility = _incompatibility(spec, node)
     if incompatibility is not None:
         findings.append(incompatibility)

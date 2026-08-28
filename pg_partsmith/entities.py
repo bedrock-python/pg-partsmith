@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .constants import (
     DEFAULT_CREATE_AHEAD_COUNT,
@@ -515,6 +515,11 @@ class PartitionInfo(BaseModel):
         if not isinstance(data, dict):
             return data
 
+        # A validator that wrote into ``data`` would be editing the caller's own
+        # dict -- one they may be about to reuse, or may have built from another
+        # model's dump. The copy is shallow: nothing below this level is touched.
+        data = dict(data)
+
         bounds = data.get("bounds")
         if bounds is None:
             from_value, to_value = data.get("from_value"), data.get("to_value")
@@ -522,9 +527,14 @@ class PartitionInfo(BaseModel):
                 data["bounds"] = RangeBounds(from_value=from_value, to_value=to_value)
             elif data.get("is_default"):
                 data["bounds"] = DefaultBounds()
-        elif isinstance(bounds, RangeBounds):
-            data.setdefault("from_value", bounds.from_value)
-            data.setdefault("to_value", bounds.to_value)
+        else:
+            # ``model_dump()`` renders the bound as a plain dict, so a round-trip
+            # through it must derive the pair from the same shape the model form
+            # does -- otherwise dumping and re-validating loses from/to_value.
+            range_bounds = _as_range_bounds(bounds)
+            if range_bounds is not None:
+                data.setdefault("from_value", range_bounds.from_value)
+                data.setdefault("to_value", range_bounds.to_value)
 
         return data
 
@@ -920,3 +930,16 @@ class MaintenanceResult(BaseModel):
     def success(self) -> bool:
         """True only when there is no fatal error (non-fatal ``issues`` may exist)."""
         return self.error is None
+
+
+def _as_range_bounds(bounds: object) -> RangeBounds | None:
+    """Read range boundaries out of either spelling of a bound."""
+    if isinstance(bounds, RangeBounds):
+        return bounds
+    if isinstance(bounds, dict) and bounds.get("kind") == "range":
+        try:
+            return RangeBounds.model_validate(bounds)
+        except ValidationError:
+            # Let the field's own validation report what is wrong with it.
+            return None
+    return None

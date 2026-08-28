@@ -536,3 +536,39 @@ def test__list_spec__nested_under_hash__depth_and_columns_accumulate() -> None:
     # Act / Assert
     assert spec.depth() == 2
     assert [s.column for s in spec.walk()] == ["tenant_id", "region"]
+
+
+# ── children the tree cannot show ───────────────────────────────────────────────
+
+
+def test__build_partition_tree__parent_named_unaddressable__marks_the_parent() -> None:
+    # Arrange -- the caller dropped a child whose name holds a dot.
+    rows = [
+        PartitionTreeRow(level=0, name="public.events", partition_type=PartitionType.HASH),
+        PartitionTreeRow(
+            level=1,
+            name="public.events__h0",
+            parent_name="public.events",
+            bounds=HashBounds(modulus=2, remainder=0),
+        ),
+    ]
+
+    # Act
+    tree = build_partition_tree(rows, {"public.events"})
+
+    # Assert
+    assert tree is not None
+    assert tree.has_unaddressable_children is True
+    assert tree.children[0].has_unaddressable_children is False
+
+
+def test__build_partition_tree__no_omissions__leaves_every_node_unmarked() -> None:
+    # Arrange
+    rows = [PartitionTreeRow(level=0, name="public.events", partition_type=PartitionType.HASH)]
+
+    # Act
+    tree = build_partition_tree(rows)
+
+    # Assert
+    assert tree is not None
+    assert tree.has_unaddressable_children is False

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from enum import StrEnum
 from typing import Annotated, ClassVar, Literal
 
@@ -80,12 +80,17 @@ class ListBounds(BaseModel):
 
     Attributes:
         values: The literal values routed to this partition.
+        includes_null: Whether ``NULL`` itself is one of them. It is kept apart
+            from :attr:`values` because ``IN (NULL)`` and ``IN ('NULL')`` are
+            different partitions, and reading them as the same one would make
+            the planner propose a partition PostgreSQL already has.
     """
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["list"] = "list"
     values: tuple[str, ...]
+    includes_null: bool = False
 
 
 class HashBounds(BaseModel):
@@ -451,6 +456,11 @@ class PartitionNode(BaseModel):
             parent are attached by construction — a detached relation is not in
             anyone's tree — so this is informative mainly for the root itself.
         children: Direct children, ordered by name.
+        has_unaddressable_children: Whether a child was left out of
+            :attr:`children` because its name cannot be addressed by
+            qualified-name DDL. The child set is then a subset of the real one,
+            so nothing may be planned from it: a partition that looks missing
+            may be one of the omitted ones.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -463,6 +473,7 @@ class PartitionNode(BaseModel):
     bounds: PartitionBounds | None = None
     is_attached: bool = True
     children: tuple[PartitionNode, ...] = ()
+    has_unaddressable_children: bool = False
 
     @property
     def is_leaf(self) -> bool:
@@ -596,7 +607,10 @@ class PartitionTreeRow(BaseModel):
     partition_columns: tuple[str, ...] = ()
 
 
-def build_partition_tree(rows: Sequence[PartitionTreeRow]) -> PartitionNode | None:
+def build_partition_tree(
+    rows: Sequence[PartitionTreeRow],
+    unaddressable_parents: Collection[str] = (),
+) -> PartitionNode | None:
     """Assemble flat catalog rows into a tree, rooted at the level-0 row.
 
     Rows whose parent is missing from the input are dropped rather than
@@ -605,6 +619,9 @@ def build_partition_tree(rows: Sequence[PartitionTreeRow]) -> PartitionNode | No
 
     Args:
         rows: Catalog rows for one tree, in any order.
+        unaddressable_parents: Names of parents whose child rows the caller
+            dropped before calling. Their nodes are marked so the planner can
+            refuse to read a shortened child set as a set of gaps.
 
     Returns:
         The root node with its descendants attached, or None when ``rows``
@@ -622,13 +639,18 @@ def build_partition_tree(rows: Sequence[PartitionTreeRow]) -> PartitionNode | No
     if root is None:
         return None
 
-    return _to_node(root, children_by_parent)
+    return _to_node(root, children_by_parent, frozenset(unaddressable_parents))
 
 
-def _to_node(row: PartitionTreeRow, children_by_parent: dict[str, list[PartitionTreeRow]]) -> PartitionNode:
+def _to_node(
+    row: PartitionTreeRow,
+    children_by_parent: dict[str, list[PartitionTreeRow]],
+    unaddressable_parents: frozenset[str],
+) -> PartitionNode:
     """Build one node and, recursively, everything below it."""
     children = tuple(
-        _to_node(child, children_by_parent) for child in sorted(children_by_parent.get(row.name, ()), key=_row_name)
+        _to_node(child, children_by_parent, unaddressable_parents)
+        for child in sorted(children_by_parent.get(row.name, ()), key=_row_name)
     )
     return PartitionNode(
         name=row.name,
@@ -639,6 +661,7 @@ def _to_node(row: PartitionTreeRow, children_by_parent: dict[str, list[Partition
         bounds=row.bounds,
         is_attached=row.is_attached,
         children=children,
+        has_unaddressable_children=row.name in unaddressable_parents,
     )
 
 
