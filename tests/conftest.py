@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
 
 from tests.integration.aio.builder import PartitioningScenarioBuilder
@@ -106,6 +107,13 @@ async def db_session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, Non
     """Create async database session for each test."""
     async_session_maker = async_sessionmaker(db_engine, expire_on_commit=False)
     async with async_session_maker() as session:
+        yield session
+
+
+@pytest.fixture
+def sync_db_session(sync_db_engine: Engine) -> Generator[Session, None, None]:
+    """Create sync database session for each test."""
+    with sessionmaker(sync_db_engine, expire_on_commit=False)() as session:
         yield session
 
 

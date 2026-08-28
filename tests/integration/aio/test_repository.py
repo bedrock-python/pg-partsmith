@@ -382,8 +382,12 @@ async def test__advisory_lock__two_sessions_same_table__second_raises_lock_acqui
     manager1 = PostgresAdvisoryLockManager(db_engine)
     manager2 = PostgresAdvisoryLockManager(db_engine)
 
+    async def contend() -> None:
+        async with manager2.acquire_lock("events_double"):
+            pytest.fail("the second session must not get the lock")
+
     # Act / Assert
     async with manager1.acquire_lock("events_double"):
+        assert await manager1.is_locked("events_double")
         with pytest.raises(LockAcquisitionError):
-            async with manager2.acquire_lock("events_double"):
-                pass
+            await contend()

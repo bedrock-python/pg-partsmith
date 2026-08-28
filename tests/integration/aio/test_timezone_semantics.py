@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import freezegun
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
@@ -30,12 +30,18 @@ def _create_async_engine(postgres_container: PostgresContainer, session_timezone
         _, rest = url.split("://", 1)
         url = f"postgresql+asyncpg://{rest}"
 
-    connect_args: dict[str, dict[str, str]] = {}
+    engine = create_async_engine(url, echo=False, pool_pre_ping=True)
     if session_timezone is not None:
-        # asyncpg startup parameter: pin the default session TimeZone.
-        connect_args["server_settings"] = {"TimeZone": session_timezone}
+        # Every pooled connection starts its life in the requested zone: the
+        # setting is a session default, which SQLAlchemy's rollback-on-return
+        # leaves in place.
+        @event.listens_for(engine.sync_engine, "connect")
+        def _pin_timezone(dbapi_connection: object, _record: object) -> None:
+            cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+            cursor.execute(f"SET TIME ZONE '{session_timezone}'")
+            cursor.close()
 
-    return create_async_engine(url, echo=False, pool_pre_ping=True, connect_args=connect_args)
+    return engine
 
 
 async def _create_parent_table(engine: AsyncEngine, parent: str) -> None:

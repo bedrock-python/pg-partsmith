@@ -88,9 +88,8 @@ async def test__scenario__detached_orphan__cleaned_on_next_run(
 ) -> None:
     # Arrange
     partition_name = f"{partition_builder._table_name}__2024_01"
-    ctx = await (
-        partition_builder.with_detached_partition(partition_name, "2024-01-01", "2024-02-01").with_retention(1).build()
-    )
+    builder = partition_builder.with_detached_partition(partition_name, "2024-01-01", "2024-02-01")
+    ctx = await builder.with_retention(1).build()
     await ctx.assert_partition_exists(partition_name)
     await ctx.assert_partition_detached(partition_name)
 

@@ -236,6 +236,7 @@ async def test__drop_partition__expected_oid_of_another_relation__refused_and_th
 # ── retry on lock contention ──────────────────────────────────────────────────────
 
 
+# sync-mirror: skip
 async def test__drop_partition__lock_contention__retries_and_succeeds_after_release(
     db_engine: AsyncEngine,
     partitioned_table: str,

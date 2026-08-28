@@ -277,6 +277,7 @@ async def test__maintainer__run_maintenance_safe__never_raises_and_reports_the_e
 # ── Two maintainers on the same table ────────────────────────────────────────────
 
 
+# sync-mirror: skip
 async def test__maintainer__two_concurrent_runs_on_one_table__one_wins_the_lock_and_the_tree_converges(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
