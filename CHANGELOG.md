@@ -15,7 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * add LIST subpartitioning alongside HASH ([1267b5b](https://github.com/bedrock-python/pg-partsmith/commit/1267b5b387d4ed79dc38c6baa248a40bd615d9c0))
 * manage HASH and LIST roots that have no time dimension ([59321d4](https://github.com/bedrock-python/pg-partsmith/commit/59321d42647440dce02f9f4e3e80b3984d9d7674))
 * manage nested RANGE -&gt; HASH partition trees ([0d98360](https://github.com/bedrock-python/pg-partsmith/commit/0d9836028e4d3956ce7285bc023c3c561813a8ae))
-* partition trees, boundary codecs, static roots and composite keys ([f150233](https://github.com/bedrock-python/pg-partsmith/commit/f150233beb516289ec86640846fde1ffdf319732))
 * partition trees, boundary codecs, static roots and composite keys ([#23](https://github.com/bedrock-python/pg-partsmith/issues/23)) ([f150233](https://github.com/bedrock-python/pg-partsmith/commit/f150233beb516289ec86640846fde1ffdf319732))
 * support composite partition keys ([184c55c](https://github.com/bedrock-python/pg-partsmith/commit/184c55c083d0abdb66b4e17e762d5840b6eb7b56))
 
