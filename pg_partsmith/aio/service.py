@@ -32,7 +32,7 @@ from .services.subpartitions import PartitionSubpartitionService
 from .services.validation import PartitionValidationService
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Iterable
 
     from pg_partsmith.aio.hooks import PartitionLifecycleHooks
     from pg_partsmith.protocols import PeriodCalculator
@@ -122,6 +122,28 @@ class PartitionLifecycleService:
             detached partition is re-attached when ``auto_attach_after_create``).
         """
         return await self._creation_service.ensure_partition(config, period)
+
+    async def ensure_partitions(
+        self,
+        config: TablePartitionConfig,
+        periods: Iterable[Period],
+    ) -> list[PartitionInfo]:
+        """Create and attach partitions for an explicit set of periods (idempotent).
+
+        The backfill counterpart of :meth:`create_future_partitions`: the caller
+        chooses the periods, so data that already sits in the table can be given
+        partitions without waiting for create-ahead to reach it.
+
+        Args:
+            config: Table partitioning configuration.
+            periods: Periods that must have a partition. Duplicates are ignored;
+                order is preserved.
+
+        Returns:
+            The partitions created by this call; periods that already had one
+            are absent from the list.
+        """
+        return await self._creation_service.ensure_partitions(config, periods)
 
     async def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Return partitions older than ``config.retention_count`` periods.

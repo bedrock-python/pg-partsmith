@@ -20,6 +20,8 @@ from pg_partsmith.utils import is_default_partition_conflict, pg_sqlstate, quali
 from .base import BasePartitionService
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from pg_partsmith.entities import TablePartitionConfig
     from pg_partsmith.protocols import PeriodCalculator
     from pg_partsmith.sync.hooks import PartitionLifecycleHooks
@@ -92,14 +94,70 @@ class PartitionCreationService(BasePartitionService):
             The created partition, or None when it already existed (an existing
             detached partition is re-attached when ``auto_attach_after_create``).
         """
+        created = self.ensure_partitions(config, (period,))
+        return created[0] if created else None
+
+    def ensure_partitions(
+        self,
+        config: TablePartitionConfig,
+        periods: Iterable[Period],
+    ) -> list[PartitionInfo]:
+        """Create and attach partitions for an explicit set of periods (idempotent).
+
+        Where :meth:`create_future_partitions` walks forward from the current
+        period, this takes the periods from the caller — which is what backfill
+        needs. Migrating onto this library usually means covering data that is
+        already in the table, and the periods it lives in are not the ones
+        create-ahead would produce::
+
+            current = calculator.current_period()
+            past = [calculator.period_before(current, n) for n in range(1, 53)]
+            await service.ensure_partitions(config, past)
+
+        The catalogue is read **once** for the whole batch rather than once per
+        period, so backfilling a year costs one listing instead of fifty-two.
+
+        Args:
+            config: Table partitioning configuration.
+            periods: Periods that must have a partition. Duplicates are ignored;
+                order is preserved.
+
+        Returns:
+            The partitions created by this call, in the order the periods were
+            given. Periods that already had one are absent from the list.
+        """
         qualified_parent = qualify(config.db_schema, config.table_name)
         existing_partitions = self._metadata.list_partitions(qualified_parent)
-        existing = self._map_partitions_to_periods(existing_partitions).get(period)
+        existing_by_period = self._map_partitions_to_periods(existing_partitions)
+
+        created: list[PartitionInfo] = []
+        # dict.fromkeys de-duplicates while preserving the caller's order; a
+        # repeated period would otherwise be looked up against a stale map.
+        for period in dict.fromkeys(periods):
+            info = self._ensure_period_with_subtree(config, period, existing_by_period.get(period))
+            if info is not None:
+                created.append(info)
+
+        return created
+
+    def _ensure_period_with_subtree(
+        self,
+        config: TablePartitionConfig,
+        period: Period,
+        existing: PartitionInfo | None,
+    ) -> PartitionInfo | None:
+        """Ensure one period's partition *and* its bucket set.
+
+        Kept separate from :meth:`_ensure_partition_for_period` because the
+        create-ahead path deliberately does not converge subtrees one period at
+        a time — maintenance reconciles the whole table once per run, from a
+        single tree query, which is far cheaper than one query per period.
+        """
         created = self._ensure_partition_for_period(config, period, existing)
 
         if created is None and existing is not None and config.subpartition is not None:
-            # The branch was already there; a writer calling this needs its
-            # buckets complete, not merely the branch present.
+            # The branch was already there; a caller that targets a period needs
+            # its buckets complete, not merely the branch present.
             self._converge_existing_branch(config, existing.name)
 
         return created

@@ -1030,3 +1030,81 @@ def _run_safe(
     """Run maintenance without raising, for the cases that are expected to fail."""
     with freezegun.freeze_time(at_time):
         return _maintainer(engine).run_maintenance_safe(config)
+
+
+# ── Backfill ────────────────────────────────────────────────────────────────────
+
+
+def test__backfill__past_periods__creates_each_branch_with_a_complete_bucket_set(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange: data already in the table predates create-ahead's window.
+    config = nested_config(table, modulus=2)
+    calculator = WeekPeriodCalculator()
+    service = PartitionLifecycleService(
+        repo=PostgresPartitionRepository(sync_db_engine),
+        metadata=PostgresMetadataProvider(sync_db_engine),
+        locks=PostgresAdvisoryLockManager(sync_db_engine),
+        period_calculator=calculator,
+    )
+
+    with freezegun.freeze_time(FROZEN_WEEK):
+        current = calculator.current_period()
+        past = [calculator.period_before(current, n) for n in (1, 2, 3)]
+
+    # Act
+    created = service.ensure_partitions(config, past)
+
+    # Assert
+    assert [p.relname for p in created] == [
+        f"{table}__2026_w34",
+        f"{table}__2026_w33",
+        f"{table}__2026_w32",
+    ]
+    for suffix in ("__2026_w34", "__2026_w33", "__2026_w32"):
+        branch = f"{table}{suffix}"
+        assert _relkind(sync_db_engine, branch) == "p"
+        assert len(_children(sync_db_engine, branch)) == 2
+
+
+def test__backfill__rerun__is_idempotent(sync_db_engine: Engine, table: str) -> None:
+    # Arrange
+    config = nested_config(table, modulus=2)
+    calculator = WeekPeriodCalculator()
+    service = PartitionLifecycleService(
+        repo=PostgresPartitionRepository(sync_db_engine),
+        metadata=PostgresMetadataProvider(sync_db_engine),
+        locks=PostgresAdvisoryLockManager(sync_db_engine),
+        period_calculator=calculator,
+    )
+    periods = [Period(year=2026, week=30), Period(year=2026, week=31)]
+    service.ensure_partitions(config, periods)
+
+    # Act
+    with _count_ddl(sync_db_engine) as counter:
+        created = service.ensure_partitions(config, periods)
+
+    # Assert
+    assert created == []
+    assert counter.statements == []
+
+
+def test__backfill__then_maintenance__past_and_future_coexist(sync_db_engine: Engine, table: str) -> None:
+    # Arrange
+    config = nested_config(table, modulus=2)
+    calculator = WeekPeriodCalculator()
+    service = PartitionLifecycleService(
+        repo=PostgresPartitionRepository(sync_db_engine),
+        metadata=PostgresMetadataProvider(sync_db_engine),
+        locks=PostgresAdvisoryLockManager(sync_db_engine),
+        period_calculator=calculator,
+    )
+    service.ensure_partitions(config, [Period(year=2026, week=34)])
+
+    # Act: create-ahead now runs over the current week.
+    result = _run(sync_db_engine, config)
+
+    # Assert: backfilled history is untouched, the current week is added.
+    assert result.success
+    assert _relkind(sync_db_engine, f"{table}__2026_w34") == "p"
+    assert _relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") == "p"

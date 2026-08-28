@@ -25,6 +25,7 @@ from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionAttachedError,
 )
+from pg_partsmith.strategies import MonthPeriodCalculator
 from pg_partsmith.utils import timezone_name
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────
@@ -1968,3 +1969,165 @@ def test__parse_boundary_to_utc_dt__calculator_without_tz__naive_date_interprete
 
     # Assert
     assert result == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+
+
+# ── ensure_partitions (backfill) ─────────────────────────────────────────────────
+
+
+def _real_calculator() -> MonthPeriodCalculator:
+    """A real calculator, so names and boundaries vary per period."""
+    return MonthPeriodCalculator()
+
+
+def _recording_repo(mock_repo: MagicMock) -> MagicMock:
+    """Make create_partition echo the name it was given."""
+
+    def _create(config: TablePartitionConfig, name: str, from_value: str, to_value: str) -> PartitionInfo:
+        return PartitionInfo(
+            name=name,
+            partition_type=PartitionType.RANGE,
+            from_value=from_value,
+            to_value=to_value,
+            is_attached=False,
+            parent_table="events",
+        )
+
+    mock_repo.create_partition.side_effect = _create
+    return mock_repo
+
+
+async def test__ensure_partitions__past_periods__creates_each_one(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange — nothing exists yet; backfill three historical months
+    _recording_repo(mock_repo)
+    service = _make_service(mock_repo, mock_metadata, mock_locks, _real_calculator())
+    periods = [Period(year=2024, month=1), Period(year=2024, month=2), Period(year=2024, month=3)]
+
+    # Act
+    created = await service.ensure_partitions(config, periods)
+
+    # Assert
+    assert [p.name for p in created] == ["events__2024_01", "events__2024_02", "events__2024_03"]
+
+
+async def test__ensure_partitions__batch__reads_the_catalogue_once(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    _recording_repo(mock_repo)
+    service = _make_service(mock_repo, mock_metadata, mock_locks, _real_calculator())
+    periods = [Period(year=2024, month=m) for m in range(1, 13)]
+
+    # Act
+    await service.ensure_partitions(config, periods)
+
+    # Assert: backfilling a year costs one listing, not twelve.
+    mock_metadata.list_partitions.assert_called_once_with("events")
+
+
+async def test__ensure_partitions__period_that_already_exists__is_skipped(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    _recording_repo(mock_repo)
+    mock_metadata.list_partitions.return_value = [
+        PartitionInfo(
+            name="events__2024_02",
+            partition_type=PartitionType.RANGE,
+            from_value="2024-02-01",
+            to_value="2024-03-01",
+            parent_table="events",
+        )
+    ]
+    service = _make_service(mock_repo, mock_metadata, mock_locks, _real_calculator())
+    periods = [Period(year=2024, month=1), Period(year=2024, month=2)]
+
+    # Act
+    created = await service.ensure_partitions(config, periods)
+
+    # Assert
+    assert [p.name for p in created] == ["events__2024_01"]
+    assert mock_repo.create_partition.call_count == 1
+
+
+async def test__ensure_partitions__repeated_period__creates_it_once(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    _recording_repo(mock_repo)
+    service = _make_service(mock_repo, mock_metadata, mock_locks, _real_calculator())
+    period = Period(year=2024, month=5)
+
+    # Act
+    created = await service.ensure_partitions(config, [period, period, period])
+
+    # Assert: a duplicate would otherwise be checked against a stale map.
+    assert [p.name for p in created] == ["events__2024_05"]
+    assert mock_repo.create_partition.call_count == 1
+
+
+async def test__ensure_partitions__no_periods__does_nothing(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    service = _make_service(mock_repo, mock_metadata, mock_locks, _real_calculator())
+
+    # Act
+    created = await service.ensure_partitions(config, [])
+
+    # Assert
+    assert created == []
+    mock_repo.create_partition.assert_not_called()
+
+
+async def test__ensure_partitions__preserves_the_order_it_was_given(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    _recording_repo(mock_repo)
+    service = _make_service(mock_repo, mock_metadata, mock_locks, _real_calculator())
+    periods = [Period(year=2024, month=6), Period(year=2024, month=2), Period(year=2024, month=4)]
+
+    # Act
+    created = await service.ensure_partitions(config, periods)
+
+    # Assert
+    assert [p.name for p in created] == ["events__2024_06", "events__2024_02", "events__2024_04"]
+
+
+async def test__ensure_partition__single_period__still_delegates_to_the_batch_path(
+    mock_repo: MagicMock,
+    mock_metadata: MagicMock,
+    mock_locks: MagicMock,
+    config: TablePartitionConfig,
+) -> None:
+    # Arrange
+    _recording_repo(mock_repo)
+    service = _make_service(mock_repo, mock_metadata, mock_locks, _real_calculator())
+
+    # Act
+    result = await service.ensure_partition(config, Period(year=2024, month=7))
+
+    # Assert
+    assert result is not None
+    assert result.name == "events__2024_07"
+    assert result.is_attached is True
