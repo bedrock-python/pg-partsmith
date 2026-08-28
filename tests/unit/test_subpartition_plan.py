@@ -668,3 +668,54 @@ def test__plan_subpartitions__branch_hiding_a_child__plans_nothing_and_says_so()
     # conflict with a partition that already exists, on every single run.
     assert plan.is_noop
     assert [f.reason for f in plan.findings] == [TopologyReason.COVERAGE_UNKNOWN]
+
+
+def test__plan_new_subtree__name_would_exceed_the_identifier_limit__reported_not_dropped() -> None:
+    # Arrange -- a repaired branch can need wider names than the config
+    # validator budgeted for, and there is no node to hang the finding on.
+    long_branch = "public." + "e" * 61
+    spec = HashSubpartitionSpec(column="tenant_id", modulus=2, subpartition=None)
+    findings: list[TopologyFinding] = []
+
+    # Act
+    actions = plan_new_subtree(spec, long_branch, findings)
+
+    # Assert -- dropping this silently produced a partitioned relation with no
+    # children at all, which was then attached and rejected every row.
+    assert actions == ()
+    assert [f.reason for f in findings] == [TopologyReason.NAME_UNUSABLE, TopologyReason.NAME_UNUSABLE]
+    assert all(f.partition_name == long_branch for f in findings)
+
+
+def test__plan_new_subtree__names_fit__plans_the_whole_subtree_with_no_findings() -> None:
+    # Arrange
+    spec = HashSubpartitionSpec(column="tenant_id", modulus=2)
+    findings: list[TopologyFinding] = []
+
+    # Act
+    actions = plan_new_subtree(spec, BRANCH, findings)
+
+    # Assert
+    assert [a.child_name for a in actions] == [f"{BRANCH}__h0", f"{BRANCH}__h1"]
+    assert findings == []
+
+
+def test__plan_subpartitions__branch_partitioned_on_an_expression__reported_not_matched() -> None:
+    # Arrange -- the catalog reports the named columns only, so a one-column
+    # spec would compare equal to a two-position key and the mismatch guard
+    # would never fire.
+    spec = _spec(modulus=2)
+    node = PartitionNode(
+        name=BRANCH,
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        has_expression_key=True,
+    )
+
+    # Act
+    plan = plan_subpartitions(spec, node)
+
+    # Assert
+    assert plan.is_noop
+    assert [f.reason for f in plan.findings] == [TopologyReason.COLUMN_MISMATCH]
+    assert "expression" in plan.findings[0].detail

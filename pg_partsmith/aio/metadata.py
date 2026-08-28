@@ -134,6 +134,10 @@ class PostgresMetadataProvider:
 
         Returns:
             The key columns in order; empty when the table is not partitioned.
+
+        Raises:
+            InvalidPartitionConfigError: If any key position is an expression
+                rather than a column, which this library cannot address.
         """
         key = await self._read_partition_key(table_name)
         for position, column in enumerate(key, start=1):
@@ -366,19 +370,24 @@ class PostgresMetadataProvider:
     async def is_partition_closed(self, partition_name: str, *, settle_seconds: int = 0) -> bool:
         """True when the partition's upper bound (+ settle buffer) has passed.
 
-        The comparison runs entirely server-side — ``now()`` and the bound come
-        from the same query — so it tolerates replica lag and app-clock skew.
-        Useful for export/archive pipelines that must only finalize partitions
-        that can no longer receive in-range rows.
+        ``now()`` is evaluated on the server rather than on the client, so the
+        answer tolerates app-clock skew. Useful for export/archive pipelines
+        that must only finalize partitions which can no longer receive
+        in-range rows.
+
+        Works for a subpartitioned branch exactly as for a plain leaf: what is
+        read is the branch's own RANGE bound in the root table, and its whole
+        subtree closes with it.
+
+        A naive bound -- which is what a ``timestamp`` or ``date`` key produces
+        -- is resolved under this provider's ``ddl_timezone``. Configure it with
+        the same value the repository writes partitions with, or the two
+        disagree about when the bound falls.
 
         Args:
             partition_name: Attached partition table name.
             settle_seconds: Extra buffer after the upper bound for late writers
                 still holding open transactions.
-
-        Works for a subpartitioned branch exactly as for a plain leaf: what is
-        read is the branch's own RANGE bound in the root table, and its whole
-        subtree closes with it.
 
         Returns:
             True when ``now() >= upper_bound + settle_seconds``. False for the

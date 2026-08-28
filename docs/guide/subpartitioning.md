@@ -339,6 +339,10 @@ Reads and writes routed to the other buckets continue; anything touching the DEF
 partition waits. A branch whose keyspace is fully tiled has no DEFAULT partition and pays
 nothing for this.
 
+> A converged tree issues no DDL at all, which is what keeps maintenance off the heavy
+> locks. It is not lock-free: reading the tree takes `ACCESS SHARE` on every relation in
+> it, the same as any `SELECT`.
+
 ## Reconciliation
 
 Maintenance is a convergent desired-state loop. Between creating and pruning, every
@@ -354,7 +358,7 @@ restores ingestion for that slice of tenants.
 | Actual state | Action |
 |---|---|
 | Branch missing some buckets at the configured modulus | Create exactly the missing ones |
-| Branch complete at the configured modulus | Nothing — **zero DDL, zero locks** |
+| Branch complete at the configured modulus | Nothing — **zero DDL** |
 | Branch complete at a *different* modulus | Leave it; it already tiles the keyspace |
 | Branch incomplete at a *different* modulus | Fill the gaps **at the branch's own modulus** |
 | Branch is a plain leaf from an older policy | Leave it; new periods use the new topology |

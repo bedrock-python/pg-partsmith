@@ -17,8 +17,17 @@ from pg_partsmith.entities import (
     RangeBounds,
     TablePartitionConfig,
 )
-from pg_partsmith.exceptions import PartitionAlreadyExistsError, UnsupportedCapabilityError
-from pg_partsmith.subpartition_plan import SubpartitionAction, TopologyFinding, TopologyReason
+from pg_partsmith.exceptions import (
+    PartitionAlreadyExistsError,
+    PartitionTopologyError,
+    UnsupportedCapabilityError,
+)
+from pg_partsmith.subpartition_plan import (
+    SubpartitionAction,
+    TopologyFinding,
+    TopologyReason,
+    plan_new_subtree,
+)
 
 BRANCH = "public.events__2026_w35"
 
@@ -430,3 +439,66 @@ async def test__reconcile__one_branch_fails__the_others_are_still_converged(
     assert result.created_count == 1
     assert [f.reason for f in result.findings] == [TopologyReason.UNCONVERGEABLE]
     assert result.findings[0].partition_name == BRANCH
+
+
+# ── A subtree that could not be completed ───────────────────────────────────────
+
+
+async def test__materialize__child_refused__parent_is_left_detached(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- a two-level spec where one grandchild's ATTACH hits a relation
+    # that is not the one we planned.
+    conflict = SQLAlchemyError("already a partition")
+    orig = MagicMock()
+    orig.sqlstate = "42P07"
+    conflict.orig = orig  # type: ignore[attr-defined]
+    repo.attach_subpartition = AsyncMock(side_effect=[conflict, None, None])
+    metadata.is_partition_attached = AsyncMock(return_value=False)
+
+    inner = HashSubpartitionSpec(column="shard_id", modulus=1)
+    spec = HashSubpartitionSpec(column="tenant_id", modulus=1, subpartition=inner)
+    service = PartitionSubpartitionService(repo, metadata)
+    findings: list[TopologyFinding] = []
+
+    # Act
+    created = await service.materialize(plan_new_subtree(spec, BRANCH), findings)
+
+    # Assert -- the branch that lost a child is reported and never attached.
+    # Attaching it would publish a relation that rejects every row belonging to
+    # the missing child, which is what attaching last exists to prevent.
+    assert created == 0
+    reasons = [f.reason for f in findings]
+    assert TopologyReason.UNCONVERGEABLE in reasons
+    attached = [call.args[1] for call in repo.attach_subpartition.call_args_list]
+    assert f"{BRANCH}__h0" not in attached
+
+
+async def test__build_new_branch__subtree_incomplete__raises_rather_than_returning_a_count(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the caller attaches the branch to the root the moment this
+    # returns, so a count is a promise the subtree is whole.
+    conflict = SQLAlchemyError("already a partition")
+    orig = MagicMock()
+    orig.sqlstate = "42P07"
+    conflict.orig = orig  # type: ignore[attr-defined]
+    repo.attach_subpartition = AsyncMock(side_effect=conflict)
+    metadata.is_partition_attached = AsyncMock(return_value=False)
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act / Assert
+    with pytest.raises(PartitionTopologyError) as excinfo:
+        await service.build_new_branch(_config(subpartition=_spec()), BRANCH)
+    assert excinfo.value.reason == TopologyReason.NAME_UNUSABLE.value
+
+
+async def test__build_new_branch__every_bucket_attaches__returns_the_count(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    service = PartitionSubpartitionService(repo, metadata)
+
+    # Act
+    created = await service.build_new_branch(_config(subpartition=_spec()), BRANCH)
+
+    # Assert
+    assert created == 2

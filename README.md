@@ -400,9 +400,9 @@ scheduler.add_job(
 
 **Entities** — `Period`, `PartitionInfo`, `TablePartitionConfig`, `MaintenanceResult`, `MaintenanceIssue`, `MaintenanceIssueStep`
 
-**Topology** — `HashSubpartitionSpec`, `ListSubpartitionSpec`, `ListGroup`, `SubpartitionSpec`, `SubpartitionSpecBase`, `PartitionNode`, `RangeBounds`, `HashBounds`, `ListBounds`, `DefaultBounds`, `PartitionBounds`, `SubpartitionBounds`
+**Topology** — `HashSubpartitionSpec`, `ListSubpartitionSpec`, `ListGroup`, `SubpartitionSpec`, `PartitionNode`, `RangeBounds`, `HashBounds`, `ListBounds`, `DefaultBounds`, `PartitionBounds`, `SubpartitionBounds`
 
-**Reconciliation** — `SubpartitionPlan`, `SubpartitionReconcileResult`, `TopologyFinding`, `TopologyReason`, `plan_subpartitions`
+**Reconciliation** — `SubpartitionPlan`, `SubpartitionAction`, `SubpartitionReconcileResult`, `TopologyFinding`, `TopologyReason`, `plan_subpartitions`
 
 **Boundary codecs** — `RangeBoundaryCodec`, `UUIDv7BoundaryCodec`
 

@@ -29,6 +29,7 @@ from pg_partsmith.subpartition_plan import SubpartitionReconcileResult, Topology
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks, PartitionLifecycleHooks
 from pg_partsmith.sync.service import PartitionLifecycleService
 from pg_partsmith.sync.services.pruning import PartitionPruningService
+from pg_partsmith.sync.services.validation import _require_column_in_constraints
 from pg_partsmith.utils import timezone_name
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────
@@ -2504,3 +2505,22 @@ def test__maintain_lifecycle__partitions_about_to_be_pruned__are_excluded_from_r
     # Assert -- repairing a branch on its way out costs DDL and locks on a
     # relation that will not exist by the end of the same run.
     assert reconcile.call_args.kwargs["exclude"] == {"events__2023_01"}
+
+
+def test__require_column_in_constraints__trailing_column_missing__is_refused() -> None:
+    # Arrange -- the leading column is in the constraint and the trailing one is
+    # not. Checking only the leading one let this reach the DDL and fail there
+    # with the very message this check exists to translate.
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=2)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="shard_id"):
+        _require_column_in_constraints(spec, (("id", "tenant_id", "created_at"),), "public.events")
+
+
+def test__require_column_in_constraints__every_key_column_present__accepted() -> None:
+    # Arrange
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=2)
+
+    # Act / Assert -- no exception
+    _require_column_in_constraints(spec, (("id", "tenant_id", "shard_id", "created_at"),), "public.events")

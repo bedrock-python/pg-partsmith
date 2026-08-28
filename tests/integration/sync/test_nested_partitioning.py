@@ -25,6 +25,7 @@ from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
 from pg_partsmith.topology import ListBounds
 from tests.integration.nested_support import (
+    BARE_UNIQUE_INDEX_TABLE_DDL,
     CHILD_BOUNDS_SQL,
     COMPOSITE_TABLE_DDL,
     EXPRESSION_TABLE_DDL,
@@ -34,6 +35,7 @@ from tests.integration.nested_support import (
     LIST_ROOT_TABLE_DDL,
     LIST_TABLE_DDL,
     NEXT_WEEK_SUFFIX,
+    NO_CONSTRAINT_TABLE_DDL,
     NULLABLE_COMPOSITE_TABLE_DDL,
     NULLABLE_LIST_TABLE_DDL,
     PREVIOUS_WEEK_BOUNDS,
@@ -41,6 +43,7 @@ from tests.integration.nested_support import (
     RELKIND_SQL,
     SORTABLE_ID_TABLE_DDL,
     TIMESTAMP_TABLE_DDL,
+    TRANSPOSED_DEFAULT_TABLE_DDL,
     TWO_LEVEL_TABLE_DDL,
     UNCONSTRAINED_TABLE_DDL,
     UUID7_TABLE_DDL,
@@ -143,6 +146,21 @@ def sortable_id_table(sync_db_engine: Engine) -> Generator[str, None, None]:
 @pytest.fixture
 def nullable_list_table(sync_db_engine: Engine) -> Generator[str, None, None]:
     yield from _make_table(sync_db_engine, NULLABLE_LIST_TABLE_DDL)
+
+
+@pytest.fixture
+def transposed_default_table(sync_db_engine: Engine) -> Generator[str, None, None]:
+    yield from _make_table(sync_db_engine, TRANSPOSED_DEFAULT_TABLE_DDL)
+
+
+@pytest.fixture
+def bare_unique_index_table(sync_db_engine: Engine) -> Generator[str, None, None]:
+    yield from _make_table(sync_db_engine, BARE_UNIQUE_INDEX_TABLE_DDL)
+
+
+@pytest.fixture
+def no_constraint_table(sync_db_engine: Engine) -> Generator[str, None, None]:
+    yield from _make_table(sync_db_engine, NO_CONSTRAINT_TABLE_DDL)
 
 
 def _maintainer(engine: Engine, *, codec: RangeBoundaryCodec | None = None) -> PartitionMaintainer:
@@ -1768,3 +1786,80 @@ def test__list_partition_holding_null__is_not_read_as_the_string_null(
     by_name = {c.name: c.bounds for c in tree.children}
     assert by_name[f"public.{nullable_list_table}__unknown"] == ListBounds(values=(), includes_null=True)
     assert by_name[f"public.{nullable_list_table}__literal"] == ListBounds(values=("NULL",))
+
+
+# ── Fixes confirmed against the server, not against a mock of it ────────────────
+
+
+def test__default_conflict__default_partition_ordered_differently__values_are_not_transposed(
+    sync_db_engine: Engine, transposed_default_table: str
+) -> None:
+    # Arrange: a DEFAULT partition whose physical column order differs from the
+    # root's. ATTACH permits it, because it matches columns by name.
+    table = transposed_default_table
+    with sync_db_engine.begin() as conn:
+        conn.execute(text(f'CREATE TABLE "{table}_default" (created_at TIMESTAMPTZ NOT NULL, note TEXT, label TEXT)'))
+        conn.execute(text(f'ALTER TABLE "{table}" ATTACH PARTITION "{table}_default" DEFAULT'))
+        conn.execute(
+            text(f'INSERT INTO "{table}" VALUES (:d, :label, :note)'),  # noqa: S608
+            {"d": datetime(2026, 8, 25, tzinfo=UTC), "label": "LABEL-A", "note": "NOTE-A"},
+        )
+
+    # Act: the DEFAULT holds a row belonging to the period being created, so
+    # the reconcile-and-retry path runs unattended.
+    result = _run(sync_db_engine, flat_config(table))
+
+    # Assert: moving by position would put NOTE-A in label with the source row
+    # already deleted, and report success while doing it.
+    assert result.success
+    with sync_db_engine.connect() as conn:
+        row = (conn.execute(text(f'SELECT label, note FROM "{table}{WEEK_SUFFIX}"'))).fetchone()  # noqa: S608
+    assert row is not None
+    assert (row[0], row[1]) == ("LABEL-A", "NOTE-A")
+
+
+def test__bare_unique_index__missing_the_hash_column__is_refused_before_any_ddl(
+    sync_db_engine: Engine, bare_unique_index_table: str
+) -> None:
+    # Arrange: uniqueness comes from an index with no constraint behind it.
+    table = bare_unique_index_table
+    with sync_db_engine.begin() as conn:
+        conn.execute(text(f'CREATE UNIQUE INDEX ON "{table}" (id, created_at)'))
+
+    # Act / Assert: LIKE ... INCLUDING ALL copies the index, so PostgreSQL
+    # rejects the branch exactly as it would a named constraint -- mid-run,
+    # after other tables have already been changed.
+    with pytest.raises(InvalidPartitionConfigError, match="tenant_id"):
+        _run(sync_db_engine, nested_config(table, modulus=2))
+
+    assert _relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") is None
+
+
+def test__expression_key_branch__is_reported_rather_than_treated_as_a_match(
+    sync_db_engine: Engine, no_constraint_table: str
+) -> None:
+    # Arrange: a branch partitioned by HASH over an expression as well as the
+    # configured column. The catalog names only the column, so a shortened key
+    # compares equal to a one-column spec.
+    branch = f"{no_constraint_table}{WEEK_SUFFIX}"
+    with sync_db_engine.begin() as conn:
+        conn.execute(
+            text(
+                f'CREATE TABLE "{branch}" (LIKE "{no_constraint_table}" INCLUDING ALL EXCLUDING IDENTITY) '
+                f"PARTITION BY HASH (tenant_id, (id + 1))"
+            )
+        )
+        conn.execute(
+            text(
+                f'ALTER TABLE "{no_constraint_table}" ATTACH PARTITION "{branch}" '
+                f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')"
+            )
+        )
+
+    # Act
+    result = _run(sync_db_engine, nested_config(no_constraint_table, modulus=2))
+
+    # Assert: planning against it would build bounds of the wrong arity.
+    assert result.success
+    reasons = {issue.error for issue in result.issues}
+    assert any("expression" in reason for reason in reasons)

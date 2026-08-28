@@ -22,19 +22,25 @@ Three things make it awkward for generic tooling, and all three are covered:
 
 ## The schema
 
-The root is `RANGE`-partitioned on a server-generated UUIDv7. Because a hash dimension is
-added below it, `tenant_id` must appear in the primary key
+The root is `RANGE`-partitioned on a UUIDv7. Because a hash dimension is added below it,
+`tenant_id` must appear in the primary key
 (see [Subpartitioning](subpartitioning.md#required-unique-constraints)):
 
 ```sql
 CREATE TABLE events (
-    id          UUID   NOT NULL DEFAULT uuid_generate_v7(),
+    id          UUID   NOT NULL,
     tenant_id   BIGINT NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL,
     payload     JSONB  NOT NULL,
     CONSTRAINT events_pkey PRIMARY KEY (id, tenant_id)
 ) PARTITION BY RANGE (id);
 ```
+
+> **Generating the key.** PostgreSQL gains `uuidv7()` in **18**; there is no built-in
+> UUIDv7 before that, and `uuid-ossp` stops at v5. On 17 and earlier, generate the value
+> in the application — Python's `uuid6` package, or any RFC 9562 implementation — or
+> install a UUIDv7 function of your own and default the column to it. Everything measured
+> on this page was measured against PostgreSQL 17.
 
 ## The configuration
 
@@ -102,6 +108,8 @@ questions:
 
   ```python
   import re
+  from datetime import date
+
   from pg_partsmith import Period, WeekPeriodCalculator
 
 
@@ -154,19 +162,26 @@ events_20260824   plain leaf, no buckets  → left as a valid legacy leaf
 events_20260831   absent                  → created with MODULUS 2 and both buckets
 ```
 
-Only the third and fourth lines involve DDL on the live tree, and none of it rewrites
-data. Re-running the tick is a no-op.
+Only the second and fourth lines involve DDL on the live tree, and none of it rewrites
+data. The third issues none at all: a legacy leaf is left exactly as it is. Re-running the tick is a no-op.
 
-### `issues` now fills up on a successful run
+### What reaches `issues`, and what only reaches the log
 
-The first two lines above are reported on `MaintenanceResult.issues`, and the run is
-still a success. Before subpartitioning existed, `issues` was only ever populated by a
-step that had *failed* under `continue_on_error`, so treating a non-empty `issues` as an
-alarm was reasonable. It no longer is: a topology finding is a description of something
-the run deliberately left alone, not a failure.
+None of the four lines above appears in `MaintenanceResult.issues`. A preserved older
+modulus and a legacy leaf are *expected steady states* — the run recognised them and
+chose correctly — so they are logged and marked non-actionable. Repairing a branch at its
+own modulus is likewise a success, not a complaint.
 
-`MaintenanceResult.success` is unchanged — it reports a fatal error and nothing else. If
-you page on `issues`, filter by `MaintenanceIssue.step`:
+What does reach `issues` is a divergence the planner refused to touch and you may want to
+act on: a branch partitioned by the wrong strategy or the wrong column, a LIST value
+another partition already owns, a name it cannot use, a DEFAULT partition holding rows
+that block an attach. Those carry `MaintenanceIssueStep.RECONCILE`.
+
+So `issues` stays a meaningful thing to alert on, with one change from 0.4.0 worth
+knowing: it used to be populated *only* by a step that had failed under
+`continue_on_error`. It can now also carry a reconciliation finding, which is not a
+failure — the run around it succeeded. `MaintenanceResult.success` is unchanged and still
+reports a fatal error and nothing else. To keep alerting only on failures:
 
 ```python
 failures = [i for i in result.issues if i.step is not MaintenanceIssueStep.RECONCILE]

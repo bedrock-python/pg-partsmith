@@ -186,6 +186,40 @@ NULLABLE_LIST_TABLE_DDL = """
 """
 
 
+# A root whose DEFAULT partition is attached with a different physical column
+# order. ATTACH PARTITION matches by name, so this is legal -- and anything
+# copying rows between the two has to name its columns or transpose them.
+TRANSPOSED_DEFAULT_TABLE_DDL = """
+    CREATE TABLE {table} (
+        created_at TIMESTAMPTZ NOT NULL,
+        label TEXT,
+        note TEXT
+    ) PARTITION BY RANGE (created_at)
+"""
+
+# A root whose only uniqueness guarantee is a bare index rather than a named
+# constraint. PostgreSQL applies the all-key-columns rule to it just the same.
+BARE_UNIQUE_INDEX_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        tenant_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+    ) PARTITION BY RANGE (created_at)
+"""
+
+
+# A root carrying no uniqueness constraint at all. PostgreSQL refuses a PRIMARY
+# KEY on a relation whose partition key holds an expression, so this is the only
+# shape an expression-keyed branch can be built on.
+NO_CONSTRAINT_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGSERIAL,
+        tenant_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+    ) PARTITION BY RANGE (created_at)
+"""
+
+
 def nested_config(
     table_name: str,
     *,

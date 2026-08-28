@@ -196,6 +196,39 @@ Async implementations: service, maintainer, repositories, lock managers, and hoo
         - run_maintenance
         - run_maintenance_safe
 
+### Protocols
+
+Implement these to swap in your own storage or locking. The flat pair is all a
+single-column, unnested config needs; the rest are opt-in and only required when a
+config actually asks for what they add.
+
+::: pg_partsmith.aio.protocols.PartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.PartitionMetadataProvider
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.SubpartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.NestedPartitionMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.CompositeKeyRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.CompositeKeyMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.LockManager
+    options:
+      heading_level: 4
 ### PostgreSQL implementations
 
 ::: pg_partsmith.aio.repositories.repository.PostgresPartitionRepository
@@ -242,6 +275,39 @@ built on the sync SQLAlchemy `Engine`.
         - run_maintenance
         - run_maintenance_safe
 
+### Protocols
+
+Implement these to swap in your own storage or locking. The flat pair is all a
+single-column, unnested config needs; the rest are opt-in and only required when a
+config actually asks for what they add.
+
+::: pg_partsmith.sync.protocols.PartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.PartitionMetadataProvider
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.SubpartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.NestedPartitionMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.CompositeKeyRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.CompositeKeyMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.LockManager
+    options:
+      heading_level: 4
 ### PostgreSQL implementations
 
 ::: pg_partsmith.sync.repositories.repository.PostgresPartitionRepository

@@ -128,6 +128,10 @@ class PartitionLifecycleService:
         Returns:
             The created partition, or None when it already existed (an existing
             detached partition is re-attached when ``auto_attach_after_create``).
+
+        Raises:
+            InvalidPartitionConfigError: If the service was built without a
+                period calculator, which every period-driven call needs.
         """
         return await self._require_periods().ensure_partition(config, period)
 
@@ -150,6 +154,10 @@ class PartitionLifecycleService:
         Returns:
             The partitions created by this call; periods that already had one
             are absent from the list.
+
+        Raises:
+            InvalidPartitionConfigError: If the service was built without a
+                period calculator, which every period-driven call needs.
         """
         return await self._require_periods().ensure_partitions(config, periods)
 
@@ -161,6 +169,10 @@ class PartitionLifecycleService:
 
         Returns:
             Partitions that are eligible for detach + drop, sorted oldest first.
+
+        Raises:
+            InvalidPartitionConfigError: If the service was built without a
+                period calculator, which every period-driven call needs.
         """
         return await self._require_pruning().get_partitions_for_pruning(config)
 
@@ -230,6 +242,10 @@ class PartitionLifecycleService:
 
         Returns:
             The subpartitions created and the divergences left alone.
+
+        Raises:
+            UnsupportedCapabilityError: If the repository or metadata provider
+                cannot serve a nested configuration.
         """
         return await self._subpartition_service.reconcile(config, exclude=exclude)
 
