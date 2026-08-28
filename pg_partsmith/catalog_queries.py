@@ -94,29 +94,18 @@ PARTITION_UPPER_BOUND_SQL = r"""
       AND pt.partstrat = 'r'
 """
 
-PARTITION_CLOSED_SQL = r"""
-    SELECT now() >= b.upper_bound + make_interval(secs => :settle_seconds)
-    FROM (
-        SELECT CASE
-                   WHEN raw ~ '^\d{4}-\d{2}-\d{2}' THEN raw::timestamptz
-               END AS upper_bound
-        FROM (
-            SELECT (regexp_match(
-                        pg_get_expr(c.relpartbound, c.oid),
-                        'TO \(''([^'']+)'''
-                   ))[1] AS raw
-            FROM pg_class c
-            JOIN pg_inherits i ON i.inhrelid = c.oid
-            JOIN pg_partitioned_table pt ON pt.partrelid = i.inhparent
-            WHERE c.oid = to_regclass(:partition_name)
-              AND pt.partstrat = 'r'
-        ) AS parsed
-    ) AS b
-    WHERE b.upper_bound IS NOT NULL
-"""
-
 INSTANT_HAS_PASSED_SQL = """
     SELECT now() >= CAST(:upper_bound AS timestamptz) + make_interval(secs => :settle_seconds)
+"""
+
+# The same comparison for a bound still in its catalog text form.
+#
+# The cast happens in SQL so the session's timezone decides how a naive literal
+# is read -- the same rule ATTACH used to write it. Casting the parameter to
+# text first keeps the driver from binding it as a timestamp and rejecting it
+# before PostgreSQL ever sees it.
+TEXT_INSTANT_HAS_PASSED_SQL = """
+    SELECT now() >= CAST(:upper_bound AS text)::timestamptz + make_interval(secs => :settle_seconds)
 """
 
 # The table's own partition key, in key order.
@@ -124,11 +113,15 @@ INSTANT_HAS_PASSED_SQL = """
 # ``partattrs`` is an ordered vector, and its order is the key order -- which is
 # not the column order. Unnesting WITH ORDINALITY preserves it; ordering by
 # attnum would silently transpose a composite key.
+# A key position holding an expression rather than a column is recorded as
+# attnum 0, which matches no pg_attribute row. The join is LEFT so that position
+# still comes back -- as NULL -- because dropping it would silently shorten the
+# key and every bound built from it would be the wrong arity.
 PARTITION_COLUMNS_SQL = """
     SELECT a.attname
     FROM pg_partitioned_table t
     CROSS JOIN LATERAL unnest(t.partattrs) WITH ORDINALITY AS k(attnum, ord)
-    JOIN pg_attribute a ON a.attrelid = t.partrelid AND a.attnum = k.attnum
+    LEFT JOIN pg_attribute a ON a.attrelid = t.partrelid AND a.attnum = k.attnum
     WHERE t.partrelid = to_regclass(:table_name)
     ORDER BY k.ord
 """

@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from pg_partsmith.catalog_queries import (
     INSTANT_HAS_PASSED_SQL,
-    PARTITION_CLOSED_SQL,
     PARTITION_COLUMNS_SQL,
     PARTITION_IS_ATTACHED_SQL,
     PARTITION_TREE_SQL,
     PARTITION_UPPER_BOUND_SQL,
     RELATION_EXISTS_SQL,
+    TEXT_INSTANT_HAS_PASSED_SQL,
     UNIQUE_CONSTRAINT_COLUMNS_SQL,
 )
 from pg_partsmith.entities import PartitionInfo, PartitionType
+from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.partition_bounds import is_addressable, parse_partition_bounds, parse_range_boundaries
 from pg_partsmith.topology import PartitionNode, PartitionTreeRow, build_partition_tree
 from pg_partsmith.utils import (
@@ -29,7 +32,7 @@ from pg_partsmith.utils import (
 )
 
 if TYPE_CHECKING:
-    from sqlalchemy import Connection, Engine
+    from sqlalchemy import Engine
 
     from pg_partsmith.boundaries import RangeBoundaryCodec
 
@@ -94,33 +97,21 @@ class PostgresMetadataProvider:
             ValueError: If the table uses a composite (multi-column) partition
                 key.  Only single-column keys are supported by this library.
         """
-        with self._engine.connect() as conn:
-            result = conn.execute(
-                text(
-                    """
-                    SELECT a.attname
-                    FROM pg_partitioned_table t
-                    JOIN pg_attribute a ON a.attrelid = t.partrelid AND a.attnum = ANY(t.partattrs)
-                    WHERE t.partrelid = to_regclass(:table_name)
-                    ORDER BY a.attnum
-                    """
-                ),
-                {"table_name": to_regclass_argument(table_name)},
-            )
-            rows = result.fetchall()
-
-        if not rows:
+        key = self._read_partition_key(table_name)
+        if not key:
             return None
 
-        if len(rows) > 1:
-            cols = [r[0] for r in rows]
+        if len(key) > 1:
             msg = (
-                f"Table {table_name!r} uses a composite partition key {cols!r}. "
+                f"Table {table_name!r} uses a composite partition key {list(key)!r}. "
                 "Only single-column partition keys are supported."
             )
             raise ValueError(msg)
 
-        return coerce_str(rows[0][0])
+        if key[0] is None:
+            raise ValueError(_expression_key_message(table_name, 1))
+
+        return key[0]
 
     def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
         """Return a table's own partition key columns, in key order.
@@ -135,6 +126,15 @@ class PostgresMetadataProvider:
         Returns:
             The key columns in order; empty when the table is not partitioned.
         """
+        key = self._read_partition_key(table_name)
+        for position, column in enumerate(key, start=1):
+            if column is None:
+                raise InvalidPartitionConfigError(_expression_key_message(table_name, position))
+
+        return tuple(column for column in key if column is not None)
+
+    def _read_partition_key(self, table_name: str) -> tuple[str | None, ...]:
+        """Read a table's partition key in key order, expressions included as None."""
         with self._engine.connect() as conn:
             result = conn.execute(
                 text(PARTITION_COLUMNS_SQL),
@@ -142,7 +142,7 @@ class PostgresMetadataProvider:
             )
             rows = result.fetchall()
 
-        return tuple(coerce_str(row[0]) or "" for row in rows)
+        return tuple(coerce_str(row[0]) for row in rows)
 
     def list_partitions(self, table_name: str) -> list[PartitionInfo]:
         """List all partitions for a table, including orphaned detached ones.
@@ -377,58 +377,6 @@ class PostgresMetadataProvider:
             (MAXVALUE / infinity), detached tables, unresolvable names, and
             boundaries that carry no instant this provider can read.
         """
-        if self._boundary_codec is not None:
-            return self._is_encoded_partition_closed(partition_name, settle_seconds=settle_seconds)
-
-        with self._engine.connect() as conn:
-            result = conn.execute(
-                text(PARTITION_CLOSED_SQL),
-                {
-                    "partition_name": to_regclass_argument(partition_name),
-                    "settle_seconds": settle_seconds,
-                },
-            )
-            closed = result.scalar()
-            if closed is not None:
-                return bool(closed)
-
-            self._warn_if_bound_needs_a_codec(conn, partition_name)
-            return False
-
-    def _warn_if_bound_needs_a_codec(self, conn: Connection, partition_name: str) -> None:
-        """Explain a partition that can never close for want of a codec.
-
-        Without one, an encoded upper bound is unreadable here and the answer is
-        always False — so an export pipeline gated on this would wait forever
-        with nothing to show for it. The bound is only re-read once the
-        timestamp path has already declined to answer, so a timestamp-keyed
-        table pays nothing for this.
-        """
-        result = conn.execute(
-            text(PARTITION_UPPER_BOUND_SQL),
-            {"partition_name": to_regclass_argument(partition_name)},
-        )
-        raw_bound = coerce_str(result.scalar())
-        if raw_bound is None:
-            # No upper bound to read: DEFAULT, non-RANGE, detached, or unknown.
-            return
-
-        logger.warning(
-            "Partition has an upper bound this provider cannot read, so it never reports as closed; "
-            "pass the boundary_codec its partitions were created with",
-            extra={"partition_name": partition_name, "upper_bound": raw_bound},
-        )
-
-    def _is_encoded_partition_closed(self, partition_name: str, *, settle_seconds: int) -> bool:
-        """Closure check for a partition whose upper bound is an encoded literal.
-
-        The bound is decoded client-side because only the codec knows how to
-        read it, but the comparison still runs server-side against ``now()`` —
-        so the check stays immune to app-clock skew and replica lag, exactly
-        like the timestamp path.
-        """
-        assert self._boundary_codec is not None  # guarded by the caller
-
         with self._engine.connect() as conn:
             bound_result = conn.execute(
                 text(PARTITION_UPPER_BOUND_SQL),
@@ -436,17 +384,46 @@ class PostgresMetadataProvider:
             )
             raw_bound = coerce_str(bound_result.scalar())
             if raw_bound is None:
+                # No upper bound to read: DEFAULT, non-RANGE, detached, or unknown.
                 return False
 
-            upper_bound = self._boundary_codec.decode(raw_bound)
-            if upper_bound is None:
+            if self._boundary_codec is not None:
+                instant = self._boundary_codec.decode(raw_bound)
+                if instant is None:
+                    self._warn_unreadable_bound(partition_name, raw_bound)
+                    return False
+                query = INSTANT_HAS_PASSED_SQL
+                upper_bound: datetime | str = instant
+            else:
+                query = TEXT_INSTANT_HAS_PASSED_SQL
+                upper_bound = raw_bound
+
+            try:
+                result = conn.execute(
+                    text(query),
+                    {"upper_bound": upper_bound, "settle_seconds": settle_seconds},
+                )
+            except DBAPIError:
+                # A bound can look like a date and still not be one -- a
+                # sortable identifier with a date-like prefix, say. Reporting
+                # "not closed" is the documented answer; raising out of a
+                # predicate is not.
+                self._warn_unreadable_bound(partition_name, raw_bound)
                 return False
 
-            result = conn.execute(
-                text(INSTANT_HAS_PASSED_SQL),
-                {"upper_bound": upper_bound, "settle_seconds": settle_seconds},
-            )
             return bool(result.scalar())
+
+    def _warn_unreadable_bound(self, partition_name: str, raw_bound: str) -> None:
+        """Explain a partition that can never report as closed.
+
+        The answer is always False while the bound cannot be read, so an export
+        pipeline gated on this would wait forever with nothing to show for it.
+        """
+        logger.warning(
+            "Partition has an upper bound this provider cannot read, so it never reports as closed; "
+            "pass the boundary_codec its partitions were created with",
+            extra={"partition_name": partition_name, "upper_bound": raw_bound},
+        )
 
     def get_default_partition(self, table_name: str) -> PartitionInfo | None:
         """Get DEFAULT partition for a table if it exists and is attached.
@@ -487,10 +464,18 @@ class PostgresMetadataProvider:
             rows = result.fetchall()
 
         tree_rows: list[PartitionTreeRow] = []
+        unaddressable_parents: set[str] = set()
         for row in rows:
             schema = coerce_str(row.partition_schema) or ""
             relname = coerce_str(row.partition_name) or ""
+            parent_schema_raw = coerce_str(row.parent_schema)
+            parent_relname_raw = coerce_str(row.parent_name)
             if not is_addressable(schema, relname):
+                # The parent keeps a child the tree cannot show. Recording that
+                # is what keeps the planner from reading the shortened child set
+                # as a set of gaps to fill.
+                if parent_schema_raw and parent_relname_raw:
+                    unaddressable_parents.add(qualify(parent_schema_raw, parent_relname_raw))
                 continue
 
             parent_schema = coerce_str(row.parent_schema)
@@ -510,7 +495,7 @@ class PostgresMetadataProvider:
                 )
             )
 
-        return build_partition_tree(tree_rows)
+        return build_partition_tree(tree_rows, unaddressable_parents)
 
     def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
         """Return the column tuples of every UNIQUE / PRIMARY KEY constraint.
@@ -535,3 +520,12 @@ class PostgresMetadataProvider:
             rows = result.fetchall()
 
         return tuple(tuple(str(c) for c in (row.columns or ())) for row in rows)
+
+
+def _expression_key_message(table_name: str, position: int) -> str:
+    """Explain a key this library has no way to address."""
+    return (
+        f"Table {table_name!r} partitions on an expression at key position {position}, which pg-partsmith "
+        "cannot address: it builds bounds from column values, and an expression's value is not one. "
+        "Partition on plain columns, or manage this table outside pg-partsmith."
+    )

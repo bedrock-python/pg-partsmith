@@ -1,8 +1,10 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from pg_partsmith.entities import PartitionType
+from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
@@ -360,38 +362,46 @@ def test__metadata_provider__is_partition_attached__uses_quoted_regclass_argumen
 # ── is_partition_closed ─────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("scalar,expected", [(True, True), (False, False), (None, False)])
-def test__metadata_provider__is_partition_closed__maps_scalar_to_bool(scalar: bool | None, expected: bool) -> None:
-    # Arrange — None covers the DEFAULT partition / detached / unresolvable-name
-    # cases, where the follow-up bound lookup also finds nothing to explain.
-    engine = _make_engine(scalar) if scalar is not None else _make_engine(None, None)
+@pytest.mark.parametrize("scalar,expected", [(True, True), (False, False)])
+def test__metadata_provider__is_partition_closed__maps_scalar_to_bool(scalar: bool, expected: bool) -> None:
+    # Arrange -- the bound is read first, then compared against now() in SQL.
+    engine = _make_engine("2024-02-01 00:00:00+00", scalar)
     provider = PostgresMetadataProvider(engine)
 
     # Act / Assert
     assert provider.is_partition_closed("events__2024_01") is expected
 
 
+def test__metadata_provider__is_partition_closed__no_upper_bound__is_not_closed() -> None:
+    # Arrange -- DEFAULT, detached, non-RANGE, or a name that resolves to nothing.
+    engine = _make_engine(None)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert -- and no comparison is attempted for want of anything to compare.
+    assert provider.is_partition_closed("events_default") is False
+
+
 def test__metadata_provider__is_partition_closed__passes_settle_seconds_and_quoted_regclass_name() -> None:
     # Arrange
-    engine = _make_engine(True)
+    engine = _make_engine("2024-04-01 00:00:00+00", True)
     provider = PostgresMetadataProvider(engine)
 
     # Act
     provider.is_partition_closed("events__2024_W12", settle_seconds=900)
 
-    # Assert — the comparison runs fully server-side against the passed settle buffer
+    # Assert -- the bound is looked up by regclass, then compared against the
+    # passed settle buffer with the clock staying server-side.
     conn = engine.connect.return_value.__enter__.return_value
-    sql = str(conn.execute.call_args.args[0])
-    params = conn.execute.call_args.args[1]
-    assert "make_interval(secs => :settle_seconds)" in sql
-    assert "to_regclass(:partition_name)" in sql
-    assert params["partition_name"] == '"events__2024_W12"'
-    assert params["settle_seconds"] == 900
+    lookup, compare = conn.execute.call_args_list
+    assert "to_regclass(:partition_name)" in str(lookup.args[0])
+    assert lookup.args[1]["partition_name"] == '"events__2024_W12"'
+    assert "make_interval(secs => :settle_seconds)" in str(compare.args[0])
+    assert compare.args[1] == {"upper_bound": "2024-04-01 00:00:00+00", "settle_seconds": 900}
 
 
 def test__metadata_provider__is_partition_closed__defaults_to_zero_settle_seconds() -> None:
     # Arrange
-    engine = _make_engine(True)
+    engine = _make_engine("2024-02-01 00:00:00+00", True)
     provider = PostgresMetadataProvider(engine)
 
     # Act
@@ -399,8 +409,7 @@ def test__metadata_provider__is_partition_closed__defaults_to_zero_settle_second
 
     # Assert
     conn = engine.connect.return_value.__enter__.return_value
-    params = conn.execute.call_args.args[1]
-    assert params["settle_seconds"] == 0
+    assert conn.execute.call_args.args[1]["settle_seconds"] == 0
 
 
 # ── get_partition_boundaries ────────────────────────────────────────────────────
@@ -502,10 +511,33 @@ def test__metadata_provider__get_default_partition__orphaned_default__returns_no
     assert provider.get_default_partition("events") is None
 
 
-def test__metadata_provider__is_partition_closed__unreadable_bound__warns_instead_of_staying_silent() -> None:
-    # Arrange — a UUIDv7 bound and no codec to read it with: the timestamp path
-    # declines, and the follow-up lookup finds a bound worth explaining.
-    engine = _make_engine(None, "0198f0e0-0000-7000-8000-000000000000")
+def test__metadata_provider__is_partition_closed__codec_cannot_read_the_bound__warns() -> None:
+    # Arrange -- an encoded bound the configured codec does not recognise.
+    engine = _make_engine("not-an-encoded-boundary")
+    codec = MagicMock()
+    codec.decode.return_value = None
+    provider = PostgresMetadataProvider(engine, boundary_codec=codec)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.metadata.logger", logger):
+        result = provider.is_partition_closed("events__2026_w35")
+
+    # Assert -- an export pipeline gated on this would otherwise wait forever
+    # with nothing in the log to say why.
+    assert result is False
+    logger.warning.assert_called_once()
+    assert "boundary_codec" in logger.warning.call_args.args[0]
+
+
+def test__metadata_provider__is_partition_closed__bound_is_not_a_timestamp__warns_instead_of_raising() -> None:
+    # Arrange -- a sortable identifier with a date-shaped prefix gets past any
+    # regex worth writing and still fails the cast.
+    engine = _make_engine("2026-08-28-a1b2c3")
+    conn = engine.connect.return_value.__enter__.return_value
+    bound = MagicMock()
+    bound.scalar.return_value = "2026-08-28-a1b2c3"
+    conn.execute.side_effect = [bound, DBAPIError("SELECT now() >= ...", {}, Exception("invalid input syntax"))]
     provider = PostgresMetadataProvider(engine)
     logger = MagicMock()
 
@@ -513,16 +545,15 @@ def test__metadata_provider__is_partition_closed__unreadable_bound__warns_instea
     with patch("pg_partsmith.sync.metadata.logger", logger):
         result = provider.is_partition_closed("events__2026_w35")
 
-    # Assert — an export pipeline gated on this would otherwise wait forever
-    # with nothing in the log to say why.
+    # Assert -- "not closed" is the documented answer for a bound this provider
+    # cannot read; raising out of a predicate is not.
     assert result is False
     logger.warning.assert_called_once()
-    assert "boundary_codec" in logger.warning.call_args.args[0]
 
 
 def test__metadata_provider__is_partition_closed__no_bound_at_all__stays_quiet() -> None:
-    # Arrange — DEFAULT, detached or non-RANGE: nothing to explain.
-    engine = _make_engine(None, None)
+    # Arrange -- DEFAULT, detached or non-RANGE: nothing to explain.
+    engine = _make_engine(None)
     provider = PostgresMetadataProvider(engine)
     logger = MagicMock()
 
@@ -533,3 +564,38 @@ def test__metadata_provider__is_partition_closed__no_bound_at_all__stays_quiet()
     # Assert
     assert result is False
     logger.warning.assert_not_called()
+
+
+# ── partition keys this library cannot address ──────────────────────────────────
+
+
+def test__metadata_provider__get_partition_columns__expression_key__is_refused() -> None:
+    # Arrange -- an expression key is recorded as attnum 0, which matches no
+    # column, so the row comes back with a NULL name.
+    engine = _make_engine([("created_at",), (None,)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert -- dropping the position instead would report a one-column
+    # key for a two-column table, and every bound built from it would be the
+    # wrong arity.
+    with pytest.raises(InvalidPartitionConfigError, match="key position 2"):
+        provider.get_partition_columns("public.events")
+
+
+def test__metadata_provider__get_partition_column__expression_key__is_refused() -> None:
+    # Arrange
+    engine = _make_engine([(None,)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="expression"):
+        provider.get_partition_column("public.events")
+
+
+def test__metadata_provider__get_partition_columns__plain_columns__reports_them_in_key_order() -> None:
+    # Arrange
+    engine = _make_engine([("created_at",), ("tenant_id",)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert provider.get_partition_columns("public.events") == ("created_at", "tenant_id")
