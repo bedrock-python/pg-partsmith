@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, tzinfo
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from pg_partsmith.entities import Period
 
 from .base import BasePeriodCalculator
+
+if TYPE_CHECKING:
+    from pg_partsmith.boundaries import RangeBoundaryCodec
 
 
 class HourPeriodCalculator(BasePeriodCalculator):
@@ -22,14 +25,14 @@ class HourPeriodCalculator(BasePeriodCalculator):
 
     _NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^(.+)__(\d{4})_(\d{2})_(\d{2})_(\d{2})$")
 
-    def __init__(self, tz: tzinfo = UTC) -> None:
+    def __init__(self, tz: tzinfo = UTC, *, boundary_codec: RangeBoundaryCodec | None = None) -> None:
         """Initialize calculator; only ``tz=datetime.UTC`` is accepted.
 
         Raises:
             ValueError: If ``tz`` is not UTC — local-time hour partition names
                 are ambiguous under DST transitions.
         """
-        super().__init__(tz=tz)
+        super().__init__(tz=tz, boundary_codec=boundary_codec)
         if self.timezone_name != "UTC":
             msg = (
                 f"HourPeriodCalculator supports only UTC, got {self.timezone_name!r}: "
@@ -63,5 +66,4 @@ class HourPeriodCalculator(BasePeriodCalculator):
             msg = "Month, day and hour are required for HourPeriodCalculator"
             raise ValueError(msg)
 
-        fmt = "%Y-%m-%d %H:00:00+00"
-        return (period.to_datetime().strftime(fmt), (period + 1).to_datetime().strftime(fmt))
+        return self._encoded_boundaries(period, lambda d: d.strftime("%Y-%m-%d %H:00:00+00"))

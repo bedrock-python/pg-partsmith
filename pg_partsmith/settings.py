@@ -33,7 +33,13 @@ except ImportError as _err:
 from pydantic import Field
 
 from .constants import DEFAULT_CREATE_AHEAD_COUNT, DEFAULT_RETENTION_COUNT
-from .entities import PartitionGranularity, PartitionStrategy, PartitionType, TablePartitionConfig
+from .entities import (
+    PartitionGranularity,
+    PartitionStrategy,
+    PartitionType,
+    SubpartitionSpec,
+    TablePartitionConfig,
+)
 from .strategies import BasePeriodCalculator, get_period_calculator
 
 
@@ -66,7 +72,11 @@ class PartitionTableSettings(BaseSettings):
         ...,
         description="Strategy: time_based, value_based, hash_based",
     )
-    partition_column: str = Field(..., description="Column used for partitioning")
+    partition_column: str = Field(..., description="Leading column used for partitioning")
+    trailing_partition_columns: tuple[str, ...] = Field(
+        default=(),
+        description='Rest of a composite partition key, as JSON: ["tenant_id"]',
+    )
     granularity: PartitionGranularity | None = Field(
         default=None,
         description="Time granularity: hour, day, week, month, quarter, year",
@@ -85,6 +95,20 @@ class PartitionTableSettings(BaseSettings):
         default=True,
         description="Attach new partitions immediately after creation",
     )
+    root_layout: SubpartitionSpec | None = Field(
+        default=None,
+        description=(
+            "For a HASH_BASED / VALUE_BASED table, the partitions it is divided into, as JSON: "
+            '{"strategy": "hash", "column": "tenant_id", "modulus": 16}'
+        ),
+    )
+    subpartition: SubpartitionSpec | None = Field(
+        default=None,
+        description=(
+            "Subpartitioning inside each time partition, as JSON: "
+            '{"strategy": "hash", "column": "tenant_id", "modulus": 4}'
+        ),
+    )
 
     def to_config(self) -> TablePartitionConfig:
         """Build a :class:`~pg_partsmith.TablePartitionConfig` from these settings."""
@@ -94,10 +118,13 @@ class PartitionTableSettings(BaseSettings):
             partition_type=self.partition_type,
             partition_strategy=self.partition_strategy,
             partition_column=self.partition_column,
+            trailing_partition_columns=self.trailing_partition_columns,
             granularity=self.granularity,
             create_ahead_count=self.create_ahead_count,
             retention_count=self.retention_count,
             auto_attach_after_create=self.auto_attach_after_create,
+            root_layout=self.root_layout,
+            subpartition=self.subpartition,
         )
 
     def get_period_calculator(self, tz: tzinfo = UTC) -> BasePeriodCalculator:

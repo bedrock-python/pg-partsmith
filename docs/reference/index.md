@@ -24,6 +24,107 @@ Top-level public API: entities, enums, exceptions, and period calculators.
     options:
       heading_level: 4
 
+::: pg_partsmith.entities.MaintenanceIssue
+    options:
+      heading_level: 4
+
+### Partition topology
+
+Bounds, subpartition specs, and the introspected tree.
+
+`PartitionBounds` is the discriminated union of every bound below
+(`RangeBounds | ListBounds | HashBounds | DefaultBounds`); `SubpartitionBounds`
+is the narrower one a subpartition can be attached with
+(`HashBounds | ListBounds | DefaultBounds`), which excludes RANGE because that
+belongs to the time dimension at the root.
+
+::: pg_partsmith.topology.HashSubpartitionSpec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.ListSubpartitionSpec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.ListGroup
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.SubpartitionSpecBase
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.PartitionNode
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.RangeBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.HashBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.ListBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology.DefaultBounds
+    options:
+      heading_level: 4
+
+::: pg_partsmith.topology
+    options:
+      heading_level: 4
+      members:
+        - uniform_modulus
+        - hash_keyspace_covered
+        - missing_remainders
+
+### Subpartition reconciliation
+
+::: pg_partsmith.subpartition_plan.SubpartitionPlan
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan.SubpartitionAction
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan.SubpartitionReconcileResult
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan.TopologyFinding
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan.TopologyReason
+    options:
+      heading_level: 4
+
+::: pg_partsmith.subpartition_plan
+    options:
+      heading_level: 4
+      members:
+        - plan_subpartitions
+        - plan_new_subtree
+
+### Boundary codecs
+
+::: pg_partsmith.boundaries.RangeBoundaryCodec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.boundaries.UUIDv7BoundaryCodec
+    options:
+      heading_level: 4
+
+::: pg_partsmith.protocols.BoundaryDecoder
+    options:
+      heading_level: 4
+
 ### Exceptions
 
 ::: pg_partsmith.exceptions
@@ -39,6 +140,8 @@ Top-level public API: entities, enums, exceptions, and period calculators.
         - LockAcquisitionError
         - DropRetryExhaustedError
         - UnmanagedPartitionDropError
+        - PartitionTopologyError
+        - UnsupportedCapabilityError
 
 ### Period strategies
 
@@ -93,6 +196,39 @@ Async implementations: service, maintainer, repositories, lock managers, and hoo
         - run_maintenance
         - run_maintenance_safe
 
+### Protocols
+
+Implement these to swap in your own storage or locking. The flat pair is all a
+single-column, unnested config needs; the rest are opt-in and only required when a
+config actually asks for what they add.
+
+::: pg_partsmith.aio.protocols.PartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.PartitionMetadataProvider
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.SubpartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.NestedPartitionMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.CompositeKeyRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.CompositeKeyMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.protocols.LockManager
+    options:
+      heading_level: 4
 ### PostgreSQL implementations
 
 ::: pg_partsmith.aio.repositories.repository.PostgresPartitionRepository
@@ -139,6 +275,39 @@ built on the sync SQLAlchemy `Engine`.
         - run_maintenance
         - run_maintenance_safe
 
+### Protocols
+
+Implement these to swap in your own storage or locking. The flat pair is all a
+single-column, unnested config needs; the rest are opt-in and only required when a
+config actually asks for what they add.
+
+::: pg_partsmith.sync.protocols.PartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.PartitionMetadataProvider
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.SubpartitionRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.NestedPartitionMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.CompositeKeyRepository
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.CompositeKeyMetadata
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.protocols.LockManager
+    options:
+      heading_level: 4
 ### PostgreSQL implementations
 
 ::: pg_partsmith.sync.repositories.repository.PostgresPartitionRepository

@@ -9,16 +9,28 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, DEFAULT_CONFLICT_MAX_RETRIES, MAX_IDENTIFIER_LENGTH
 from pg_partsmith.entities import PartitionInfo, Period
-from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionAlreadyExistsError
+from pg_partsmith.exceptions import (
+    InvalidPartitionConfigError,
+    PartitionAlreadyExistsError,
+    UnsupportedCapabilityError,
+)
+from pg_partsmith.sync.protocols import (
+    CompositeKeyRepository,
+    SubpartitionRepository,
+)
 from pg_partsmith.utils import is_default_partition_conflict, pg_sqlstate, qualify, split_qualified_name
 
 from .base import BasePartitionService
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from pg_partsmith.entities import TablePartitionConfig
     from pg_partsmith.protocols import PeriodCalculator
+    from pg_partsmith.subpartition_plan import SubpartitionReconcileResult
     from pg_partsmith.sync.hooks import PartitionLifecycleHooks
     from pg_partsmith.sync.protocols import PartitionMetadataProvider, PartitionRepository
+    from pg_partsmith.sync.services.subpartitions import PartitionSubpartitionService
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +44,33 @@ class PartitionCreationService(BasePartitionService):
         metadata: PartitionMetadataProvider,
         calculator: PeriodCalculator[Period],
         hooks: list[PartitionLifecycleHooks] | None = None,
+        subpartitions: PartitionSubpartitionService | None = None,
     ) -> None:
         super().__init__(hooks=hooks)
         self._repo = repo
         self._metadata = metadata
         self._calculator = calculator
+        self._subpartitions = subpartitions
 
     def create_future_partitions(
         self,
         config: TablePartitionConfig,
         *,
         existing_partitions: list[PartitionInfo] | None = None,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> list[PartitionInfo]:
         """Create partitions for future periods.
+
+        Args:
+            config: Table partitioning configuration.
+            existing_partitions: Partitions already read from the catalog, to
+                save a second listing.
+            converged: Collector for subtrees completed while finishing a branch
+                an earlier run left half-built. That work is real -- buckets get
+                created and attached -- but it happens under CREATE, where the
+                reconcile stage that normally counts it has not run yet. Pass a
+                list and the counts and findings survive; omit it and they are
+                only logged.
 
         Returns:
             List of newly created and attached partitions.
@@ -62,7 +88,7 @@ class PartitionCreationService(BasePartitionService):
         existing_by_period = self._map_partitions_to_periods(existing_partitions)
 
         for period in periods:
-            p_info = self._ensure_partition_for_period(config, period, existing_by_period.get(period))
+            p_info = self._ensure_partition_for_period(config, period, existing_by_period.get(period), converged)
             if p_info:
                 created.append(p_info)
 
@@ -76,14 +102,81 @@ class PartitionCreationService(BasePartitionService):
         insert (e.g. an hourly outbox buffer). Runs the same DEFAULT
         reconciliation and attach-race handling as the create-ahead path.
 
+        For a subpartitioned config this also completes the branch's bucket set,
+        so a writer that gets a successful return can rely on every row of that
+        period having somewhere to land.
+
         Returns:
             The created partition, or None when it already existed (an existing
             detached partition is re-attached when ``auto_attach_after_create``).
         """
+        created = self.ensure_partitions(config, (period,))
+        return created[0] if created else None
+
+    def ensure_partitions(
+        self,
+        config: TablePartitionConfig,
+        periods: Iterable[Period],
+    ) -> list[PartitionInfo]:
+        """Create and attach partitions for an explicit set of periods (idempotent).
+
+        Where :meth:`create_future_partitions` walks forward from the current
+        period, this takes the periods from the caller — which is what backfill
+        needs. Migrating onto this library usually means covering data that is
+        already in the table, and the periods it lives in are not the ones
+        create-ahead would produce::
+
+            current = calculator.current_period()
+            past = [calculator.period_before(current, n) for n in range(1, 53)]
+            await service.ensure_partitions(config, past)
+
+        The catalogue is read **once** for the whole batch rather than once per
+        period, so backfilling a year costs one listing instead of fifty-two.
+
+        Args:
+            config: Table partitioning configuration.
+            periods: Periods that must have a partition. Duplicates are ignored;
+                order is preserved.
+
+        Returns:
+            The partitions created by this call, in the order the periods were
+            given. Periods that already had one are absent from the list.
+        """
         qualified_parent = qualify(config.db_schema, config.table_name)
         existing_partitions = self._metadata.list_partitions(qualified_parent)
-        existing = self._map_partitions_to_periods(existing_partitions).get(period)
-        return self._ensure_partition_for_period(config, period, existing)
+        existing_by_period = self._map_partitions_to_periods(existing_partitions)
+
+        created: list[PartitionInfo] = []
+        # dict.fromkeys de-duplicates while preserving the caller's order; a
+        # repeated period would otherwise be looked up against a stale map.
+        for period in dict.fromkeys(periods):
+            info = self._ensure_period_with_subtree(config, period, existing_by_period.get(period))
+            if info is not None:
+                created.append(info)
+
+        return created
+
+    def _ensure_period_with_subtree(
+        self,
+        config: TablePartitionConfig,
+        period: Period,
+        existing: PartitionInfo | None,
+    ) -> PartitionInfo | None:
+        """Ensure one period's partition *and* its bucket set.
+
+        Kept separate from :meth:`_ensure_partition_for_period` because the
+        create-ahead path deliberately does not converge subtrees one period at
+        a time — maintenance reconciles the whole table once per run, from a
+        single tree query, which is far cheaper than one query per period.
+        """
+        created = self._ensure_partition_for_period(config, period, existing)
+
+        if created is None and existing is not None and config.subpartition is not None:
+            # The branch was already there; a caller that targets a period needs
+            # its buckets complete, not merely the branch present.
+            self._converge_existing_branch(config, existing.name)
+
+        return created
 
     def _map_partitions_to_periods(self, partitions: list[PartitionInfo]) -> dict[Period, PartitionInfo]:
         """Map partitions to periods, handling ambiguities."""
@@ -136,12 +229,13 @@ class PartitionCreationService(BasePartitionService):
         config: TablePartitionConfig,
         period: Period,
         existing: PartitionInfo | None,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> PartitionInfo | None:
         """Ensure a partition exists and is attached for a specific period."""
         partition_name, from_value, to_value = self._get_partition_metadata(config, period)
 
         if existing is not None:
-            self._handle_existing_partition(config, existing, from_value, to_value)
+            self._handle_existing_partition(config, existing, from_value, to_value, converged)
             return None
 
         # Hooks: before create
@@ -152,7 +246,7 @@ class PartitionCreationService(BasePartitionService):
         )
 
         # Creation and optional attachment
-        partition_info = self._create_and_attach_partition(config, partition_name, from_value, to_value)
+        partition_info = self._create_and_attach_partition(config, partition_name, from_value, to_value, converged)
 
         if partition_info:
             # Hooks: after create
@@ -198,7 +292,7 @@ class PartitionCreationService(BasePartitionService):
 
         for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
-                self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
+                self._attach(config, qualified_parent, partition_name, from_value, to_value)
             except (KeyboardInterrupt, SystemExit):
                 # Best-effort compensating move-back before the interrupt propagates.
                 self._restore_reconciled_rows(reconciled_from, config, partition_name, from_value, to_value)
@@ -242,10 +336,10 @@ class PartitionCreationService(BasePartitionService):
                     },
                 )
 
-                moved_count = self._repo.reconcile_default_rows(
-                    default_partition_name=default_partition.name,
-                    target_partition_name=partition_name,
-                    partition_column=config.partition_column,
+                moved_count = self._move_default_rows(
+                    config,
+                    source=default_partition.name,
+                    target=partition_name,
                     from_value=from_value,
                     to_value=to_value,
                 )
@@ -261,6 +355,82 @@ class PartitionCreationService(BasePartitionService):
                 )
             else:
                 return  # Success
+
+    def _attach(
+        self,
+        config: TablePartitionConfig,
+        qualified_parent: str,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+    ) -> None:
+        """Attach a partition, padding the bound when the key is composite.
+
+        A single-column key takes the long-standing path untouched; only a
+        multi-column one needs the trailing MINVALUE columns, and it is only
+        then that the repository has to support them.
+        """
+        if config.key_arity == 1:
+            self._repo.attach_partition(qualified_parent, partition_name, from_value, to_value)
+            return
+
+        repo = self._repo
+        if not isinstance(repo, CompositeKeyRepository):
+            raise UnsupportedCapabilityError(
+                f"Repository {type(repo).__name__}", "composite partition keys", "CompositeKeyRepository"
+            )
+        repo.attach_composite_partition(
+            qualified_parent, partition_name, from_value, to_value, key_arity=config.key_arity
+        )
+
+    def _move_default_rows(
+        self,
+        config: TablePartitionConfig,
+        *,
+        source: str,
+        target: str,
+        from_value: str,
+        to_value: str,
+    ) -> int:
+        """Move rows between a DEFAULT partition and one period's partition.
+
+        The trailing key columns are only passed for a composite key, so a
+        repository written against the single-column signature keeps serving
+        every config it could already serve.
+        """
+        if config.key_arity == 1:
+            return self._repo.reconcile_default_rows(
+                default_partition_name=source,
+                target_partition_name=target,
+                partition_column=config.partition_column,
+                from_value=from_value,
+                to_value=to_value,
+            )
+
+        repo = self._repo
+        if not isinstance(repo, CompositeKeyRepository):
+            raise UnsupportedCapabilityError(
+                f"Repository {type(repo).__name__}", "composite partition keys", "CompositeKeyRepository"
+            )
+
+        try:
+            return repo.reconcile_default_rows(
+                default_partition_name=source,
+                target_partition_name=target,
+                partition_column=config.partition_column,
+                trailing_columns=config.trailing_partition_columns,
+                from_value=from_value,
+                to_value=to_value,
+            )
+        except TypeError as exc:
+            # A runtime_checkable Protocol matches on method *names*, so a
+            # repository that added attach_composite_partition but kept the
+            # single-column reconcile_default_rows gets this far. Naming the
+            # missing capability beats a bare "unexpected keyword argument".
+            if "trailing_columns" not in str(exc):
+                raise
+            msg = f"Repository {type(repo).__name__}"
+            raise UnsupportedCapabilityError(msg, "composite partition keys", "CompositeKeyRepository") from exc
 
     def _restore_reconciled_rows(
         self,
@@ -280,10 +450,10 @@ class PartitionCreationService(BasePartitionService):
         if default_partition_name is None:
             return
         try:
-            restored = self._repo.reconcile_default_rows(
-                default_partition_name=partition_name,
-                target_partition_name=default_partition_name,
-                partition_column=config.partition_column,
+            restored = self._move_default_rows(
+                config,
+                source=partition_name,
+                target=default_partition_name,
                 from_value=from_value,
                 to_value=to_value,
             )
@@ -305,11 +475,24 @@ class PartitionCreationService(BasePartitionService):
             )
 
     def _handle_existing_partition(
-        self, config: TablePartitionConfig, existing: PartitionInfo, from_value: str, to_value: str
+        self,
+        config: TablePartitionConfig,
+        existing: PartitionInfo,
+        from_value: str,
+        to_value: str,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> None:
         """Handle case where partition already exists in metadata."""
-        if config.auto_attach_after_create and not existing.is_attached:
-            self._attach_tolerating_lost_race(config, existing.name, from_value, to_value)
+        if not (config.auto_attach_after_create and not existing.is_attached):
+            return
+
+        # Converge before it becomes reachable, not after. Attaching first
+        # makes the branch live for row routing while its child set may still
+        # be short of what the spec asks for -- and if the process stops in
+        # that window, it stays live and rejecting. A detached branch is
+        # introspectable on its own, so there is no reason to attach first.
+        self._converge_existing_branch(config, existing.name, converged)
+        self._attach_tolerating_lost_race(config, existing.name, from_value, to_value)
 
     def _is_attach_conflict_benign(self, qualified_parent: str, partition_name: str, exc: SQLAlchemyError) -> bool:
         """A conflict SQLSTATE proves a lost race only if the postcondition holds.
@@ -324,21 +507,104 @@ class PartitionCreationService(BasePartitionService):
         return self._metadata.is_partition_attached(qualified_parent, partition_name)
 
     def _create_and_attach_partition(
-        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
+        self,
+        config: TablePartitionConfig,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+        converged: list[SubpartitionReconcileResult] | None = None,
     ) -> PartitionInfo | None:
-        """Create partition and optionally attach it to parent."""
+        """Create the partition (or the whole branch) and attach it to the parent.
+
+        With a subpartition spec the partition is a branch: it is created
+        detached, filled with its buckets, and attached last, so the root never
+        sees a branch that cannot route part of its keyspace.
+        """
         try:
-            partition_info = self._repo.create_partition(config, partition_name, from_value, to_value)
+            partition_info = self._create_partition_relation(config, partition_name, from_value, to_value)
         except PartitionAlreadyExistsError:
+            # The relation exists but list_partitions did not report it, so it
+            # is not attached: almost always a previous run interrupted between
+            # creating a branch and attaching it. Finish that work rather than
+            # leaving an invisible table behind forever.
+            self._converge_existing_branch(config, partition_name, converged)
             if config.auto_attach_after_create:
                 self._attach_tolerating_lost_race(config, partition_name, from_value, to_value)
             return None
+
+        if config.subpartition is not None:
+            self._subpartition_service().build_new_branch(config, partition_name)
 
         if config.auto_attach_after_create:
             self._attach_tolerating_lost_race(config, partition_name, from_value, to_value)
             partition_info = partition_info.model_copy(update={"is_attached": True})
 
         return partition_info
+
+    def _create_partition_relation(
+        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
+    ) -> PartitionInfo:
+        """Create the detached relation backing one period."""
+        # Every capability this config needs is checked before the first
+        # statement. Discovering a missing one after the relation exists would
+        # leave an unmarked detached table behind on every tick, and unmarked
+        # tables are never collected by orphan cleanup.
+        self._require_capabilities(config)
+
+        if config.subpartition is None:
+            return self._repo.create_partition(config, partition_name, from_value, to_value)
+
+        repo = self._repo
+        assert isinstance(repo, SubpartitionRepository)  # guaranteed by _require_capabilities
+        return repo.create_branch(config, partition_name, from_value, to_value, config.subpartition)
+
+    def _require_capabilities(self, config: TablePartitionConfig) -> None:
+        """Refuse a wiring that cannot serve this config, before any DDL runs."""
+        if config.subpartition is not None:
+            self._subpartition_service()
+            if not isinstance(self._repo, SubpartitionRepository):
+                raise UnsupportedCapabilityError(
+                    f"Repository {type(self._repo).__name__}", "subpartitioning", "SubpartitionRepository"
+                )
+
+        if config.key_arity > 1 and not isinstance(self._repo, CompositeKeyRepository):
+            raise UnsupportedCapabilityError(
+                f"Repository {type(self._repo).__name__}", "composite partition keys", "CompositeKeyRepository"
+            )
+
+    def _converge_existing_branch(
+        self,
+        config: TablePartitionConfig,
+        partition_name: str,
+        converged: list[SubpartitionReconcileResult] | None = None,
+    ) -> None:
+        """Complete the subtree of a branch left half-built by an earlier run.
+
+        The result goes into ``converged`` when the caller is collecting. It has
+        to: the reconcile stage runs after this and finds the branch already
+        complete, so buckets created here are counted nowhere and the findings
+        that came with them are reported nowhere.
+        """
+        if config.subpartition is None:
+            return
+        result = self._subpartition_service().converge_branch(config, partition_name)
+        if converged is not None:
+            converged.append(result)
+        if result.created_count:
+            logger.info(
+                "Completed the subtree of a partition left behind by an earlier run",
+                extra={"partition_name": partition_name, "subpartition_count": result.created_count},
+            )
+
+    def _subpartition_service(self) -> PartitionSubpartitionService:
+        """Return the wired subpartition service, or explain that there is none."""
+        if self._subpartitions is None:
+            raise UnsupportedCapabilityError(
+                f"Creation service {type(self).__name__}",
+                "subpartitioning",
+                "a PartitionSubpartitionService collaborator",
+            )
+        return self._subpartitions
 
     def _attach_tolerating_lost_race(
         self,

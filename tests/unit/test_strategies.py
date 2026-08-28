@@ -1,10 +1,12 @@
-from datetime import UTC, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 from freezegun import freeze_time
 
+from pg_partsmith.boundaries import UUIDv7BoundaryCodec
 from pg_partsmith.entities import PartitionGranularity, Period
+from pg_partsmith.pruning_rules import _boundary_decoder
 from pg_partsmith.strategies import (
     BasePeriodCalculator,
     DayPeriodCalculator,
@@ -829,3 +831,62 @@ def test__year_calculator__current_period_utc_vs_moscow__crosses_year_boundary()
     # Act / Assert
     assert utc_calc.current_period() == Period(year=2024)
     assert moscow_calc.current_period() == Period(year=2025)
+
+
+def test__boundary_decoder__calculator_with_a_codec__is_used_instead_of_timestamp_parsing() -> None:
+    # Arrange -- without this branch a UUIDv7-keyed table never prunes anything,
+    # silently, because every bound reads as unparseable.
+    codec = UUIDv7BoundaryCodec()
+    calculator = WeekPeriodCalculator(boundary_codec=codec)
+    bound = str(codec.min_uuid_for(datetime(2026, 8, 24, tzinfo=UTC)))
+
+    # Act
+    decode = _boundary_decoder(calculator, UTC)
+
+    # Assert
+    assert decode(bound) == datetime(2026, 8, 24, tzinfo=UTC)
+
+
+def test__boundary_decoder__calculator_without_one__falls_back_to_timestamp_parsing() -> None:
+    # Arrange
+    calculator = WeekPeriodCalculator()
+
+    # Act
+    decode = _boundary_decoder(calculator, UTC)
+
+    # Assert
+    assert decode("2026-08-24 00:00:00+00") == datetime(2026, 8, 24, tzinfo=UTC)
+
+
+def test__boundary_decoder__naive_datetime_from_a_codec__falls_back_rather_than_raising() -> None:
+    # Arrange -- comparing a naive bound with the aware cutoff raises from the
+    # middle of retention, nowhere near the codec that produced it.
+    class NaiveCodec:
+        def encode(self, instant: datetime) -> str:
+            return instant.isoformat()
+
+        def decode(self, literal: str) -> datetime | None:
+            return datetime(2026, 8, 24)
+
+    calculator = WeekPeriodCalculator(boundary_codec=NaiveCodec())  # type: ignore[arg-type]
+
+    # Act
+    decode = _boundary_decoder(calculator, UTC)
+
+    # Assert -- the timestamp fallback answers instead.
+    assert decode("2026-08-24 00:00:00+00") == datetime(2026, 8, 24, tzinfo=UTC)
+
+
+def test__week_calculator__non_utc_timezone_with_a_codec__encodes_the_local_period_start() -> None:
+    # Arrange -- every existing codec test uses a default-UTC calculator, so a
+    # business-timezone calculator combined with a codec was unpinned.
+    berlin = ZoneInfo("Europe/Berlin")
+    codec = UUIDv7BoundaryCodec()
+    calculator = WeekPeriodCalculator(tz=berlin, boundary_codec=codec)
+
+    # Act
+    lower, _upper = calculator.get_boundaries(Period(year=2026, week=35))
+
+    # Assert -- Monday 00:00 in Berlin is 22:00 Sunday UTC; encoding the UTC
+    # instant instead would misroute every row in those two hours.
+    assert codec.decode(lower) == datetime(2026, 8, 24, tzinfo=berlin).astimezone(UTC)

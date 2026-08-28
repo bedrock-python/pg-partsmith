@@ -33,5 +33,4 @@ class YearPeriodCalculator(BasePeriodCalculator):
 
     def get_boundaries(self, period: Period) -> tuple[str, str]:
         """Get year boundaries as ``(start_date, end_date)`` in ISO format."""
-        fmt = "%Y-%m-%d"
-        return (period.to_date().strftime(fmt), (period + 1).to_date().strftime(fmt))
+        return self._encoded_boundaries(period, lambda d: d.strftime("%Y-%m-%d"))

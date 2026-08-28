@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import UTC, datetime, tzinfo
+
+from dateutil.parser import isoparse
+
+from .topology import DefaultBounds, HashBounds, ListBounds, PartitionBounds, RangeBounds
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +23,19 @@ _FROM_PREFIX_PATTERN = re.compile(r"^.*?FROM\s*\(", re.IGNORECASE | re.DOTALL)
 _TRAILING_PAREN_PATTERN = re.compile(r"\)\s*$", re.IGNORECASE | re.DOTALL)
 _CAST_PATTERN = re.compile(r"^CAST\((?P<inner>.*)\s+AS\s+.*\)$", re.IGNORECASE | re.DOTALL)
 _STR_LITERAL_PATTERN = re.compile(r"'(?P<s>(?:[^']|'')*)'")
+# Anchored, not searched: an unanchored search matches the same words *inside*
+# a LIST value or a RANGE literal, and a partition whose bounds were misread as
+# HASH is invisible to the planner, which then plans a duplicate.
+_HASH_BOUND_PATTERN = re.compile(
+    r"^\s*FOR\s+VALUES\s+WITH\s*\(\s*MODULUS\s+(?P<modulus>\d+)\s*,"
+    r"\s*REMAINDER\s+(?P<remainder>\d+)\s*\)\s*$",
+    re.IGNORECASE,
+)
+_LIST_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+IN\s*\((?P<values>.*)\)\s*$", re.IGNORECASE | re.DOTALL)
+_DATE_ONLY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# Bound spellings that carry no instant at all.
+_UNBOUNDED_LITERALS = frozenset({"MINVALUE", "MAXVALUE"})
 
 
 def parse_range_boundaries(boundaries_expr: str | None) -> tuple[str | None, str | None]:
@@ -27,11 +45,17 @@ def parse_range_boundaries(boundaries_expr: str | None) -> tuple[str | None, str
     on the PostgreSQL version and the partition key type. This parser extracts
     stable boundary values for the common cases without fully parsing SQL.
 
+    Under a composite key the leading element is returned: trailing columns are
+    bounded with MINVALUE at both ends, so the partition holds exactly the rows
+    whose leading column falls in that range, and that is the value retention
+    and pruning reason about.
+
     Examples:
       FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')
       FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)
       FOR VALUES FROM (1::bigint) TO (5::bigint)
       FOR VALUES FROM (MINVALUE) TO (MAXVALUE)
+      FOR VALUES FROM ('2024-01-01', MINVALUE) TO ('2024-02-01', MINVALUE)
     """
     if not boundaries_expr:
         return None, None
@@ -53,7 +77,7 @@ def parse_range_boundaries(boundaries_expr: str | None) -> tuple[str | None, str
     from_part = _FROM_PREFIX_PATTERN.sub("", parts[0])
     to_part = _TRAILING_PAREN_PATTERN.sub("", parts[1])
 
-    return _normalize(from_part), _normalize(to_part)
+    return _leading_value(from_part), _leading_value(to_part)
 
 
 def is_addressable(schema: str, relname: str) -> bool:
@@ -99,3 +123,143 @@ def _normalize(expr: str) -> str:
         expr = expr.split("::", 1)[0].strip()
 
     return expr.strip()
+
+
+def parse_partition_bounds(boundaries_expr: str | None) -> PartitionBounds | None:
+    """Parse ``pg_get_expr(relpartbound, oid)`` into a structured bound.
+
+    Recognises every spelling PostgreSQL emits for a partition bound; returns
+    ``None`` when the expression is absent or in a shape this parser does not
+    understand, so callers can fall back to the raw text rather than acting on
+    a guess.
+
+    Examples:
+      FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')
+      FOR VALUES WITH (modulus 4, remainder 1)
+      FOR VALUES IN ('eu', 'us')
+      DEFAULT
+    """
+    if not boundaries_expr:
+        return None
+
+    expr = boundaries_expr.strip()
+    if expr.upper() == "DEFAULT":
+        return DefaultBounds()
+
+    hash_match = _HASH_BOUND_PATTERN.match(expr)
+    if hash_match:
+        try:
+            return HashBounds(
+                modulus=int(hash_match.group("modulus")),
+                remainder=int(hash_match.group("remainder")),
+            )
+        except ValueError:
+            logger.warning("Unparseable hash bounds", extra={"boundaries_expr": expr})
+            return None
+
+    list_match = _LIST_BOUND_PATTERN.match(expr)
+    if list_match:
+        inner = _TRAILING_PAREN_PATTERN.sub("", list_match.group("values"))
+        parts = _split_top_level(inner)
+        # A bare NULL keyword and the three-character string 'NULL' normalise to
+        # the same text, and they are not the same partition. Keeping them apart
+        # is what stops the planner proposing one PostgreSQL already has.
+        values = tuple(_normalize(part) for part in parts if not _is_null_keyword(part))
+        includes_null = any(_is_null_keyword(part) for part in parts)
+        return ListBounds(values=values, includes_null=includes_null)
+
+    from_value, to_value = parse_range_boundaries(expr)
+    if from_value is not None and to_value is not None:
+        return RangeBounds(from_value=from_value, to_value=to_value)
+
+    return None
+
+
+def _split_top_level(values: str) -> list[str]:
+    """Split a comma-separated bound list, ignoring commas inside quotes.
+
+    Doubled quotes are how SQL escapes a quote inside a literal. Both
+    characters have to be consumed together: stepping over only the first would
+    leave the second to flip the in-quotes state, and every comma after it
+    would then be read as part of the value.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    index = 0
+
+    while index < len(values):
+        char = values[index]
+
+        if char == "'":
+            if in_quotes and values[index + 1 : index + 2] == "'":
+                # Keep both characters: _normalize unescapes them later.
+                current.append("''")
+                index += 2
+                continue
+            in_quotes = not in_quotes
+
+        if char == "," and not in_quotes:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+
+    parts.append("".join(current))
+    return [p for p in (part.strip() for part in parts) if p]
+
+
+def parse_boundary_literal(value: str | None, boundary_tz: tzinfo) -> datetime | None:
+    """Parse a timestamp partition boundary into a UTC instant.
+
+    Naive values (bare dates, timestamps without an offset) are interpreted in
+    ``boundary_tz``; values carrying an offset are converted as-is. Comparisons
+    downstream always happen between UTC instants.
+
+    This is the decoder for the default, timestamp-keyed case. Tables keyed by
+    an encoded identifier decode through their
+    :class:`~pg_partsmith.boundaries.RangeBoundaryCodec` instead.
+    """
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+
+    if v.upper() in _UNBOUNDED_LITERALS:
+        return None
+
+    if "-" not in v and ":" not in v:
+        return None
+
+    if _DATE_ONLY_PATTERN.fullmatch(v):
+        try:
+            return datetime.fromisoformat(v).replace(tzinfo=boundary_tz).astimezone(UTC)
+        except ValueError:
+            return None
+
+    try:
+        parsed = isoparse(v)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except (ValueError, TypeError):
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=boundary_tz).astimezone(UTC)
+    return parsed.astimezone(UTC)
+
+
+def _leading_value(expr: str) -> str:
+    """Normalise a bound element, taking the leading one of a composite tuple."""
+    parts = _split_top_level(expr)
+    return _normalize(parts[0]) if parts else _normalize(expr)
+
+
+def _is_null_keyword(part: str) -> bool:
+    """True when a list element is the NULL keyword rather than a string."""
+    stripped = _strip_outer_parens(part)
+    if "::" in stripped:
+        stripped = stripped.split("::", 1)[0].strip()
+    return _strip_outer_parens(stripped).upper() == "NULL"

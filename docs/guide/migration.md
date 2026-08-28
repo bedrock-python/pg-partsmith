@@ -46,6 +46,39 @@ Adoption is idempotent, refuses attached partitions (`PartitionAttachedError`), 
 `False` for names that do not resolve. The next maintenance tick collects adopted tables
 like any other orphan: `before_drop` hooks run, then they are dropped.
 
+## Backfilling partitions for data you already have
+
+`create_future_partitions` walks *forward* from the current period, which is the right
+behaviour for a scheduled tick and the wrong one for a migration: the rows already in the
+table live in periods create-ahead will never reach.
+
+`ensure_partitions` takes the periods from you instead:
+
+```python
+calculator = MonthPeriodCalculator()
+current = calculator.current_period()
+
+# every month of the last two years, oldest first
+past = [calculator.period_before(current, n) for n in reversed(range(1, 25))]
+
+created = await service.ensure_partitions(config, past)
+```
+
+It is idempotent — periods that already have a partition are skipped, and a second run
+creates nothing — so it is safe to call from a migration that may be retried. The
+catalogue is read once for the whole batch, not once per period.
+
+Two things worth knowing:
+
+- **Only create what you need.** Partitions outside `retention_count` are pruned by the
+  next maintenance tick. Backfilling further back than your retention window creates
+  tables that the following run immediately detaches and drops.
+- **Subpartitioned configs get complete branches.** Each backfilled period is built with
+  its full bucket set before it is attached, exactly as create-ahead does.
+
+For a single period — a writer that must guarantee its target partition exists before an
+insert — use `ensure_partition(config, period)`.
+
 ## Partition names are schema-qualified
 
 `list_partitions` returns names as `schema.relname` (e.g. `public.events__2024_01`) — a

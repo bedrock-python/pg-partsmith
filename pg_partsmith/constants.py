@@ -7,6 +7,17 @@ DEFAULT_RETENTION_COUNT = 12
 # PostgreSQL limits.
 MAX_IDENTIFIER_LENGTH = 63
 
+# Subpartitioning defaults and guard rails.
+DEFAULT_HASH_NAME_SUFFIX = "__h{remainder}"
+DEFAULT_LIST_NAME_SUFFIX = "__{name}"
+DEFAULT_LIST_DEFAULT_NAME = "other"
+# Depth of a declared subpartition tree (levels below the root table).
+MAX_SUBPARTITION_DEPTH = 4
+# Largest least-common-multiple of hash moduli we will enumerate when checking
+# whether a mixed-modulus hash set tiles the keyspace; beyond it coverage is
+# reported as unknown rather than guessed.
+MAX_HASH_KEYSPACE_LCM = 1 << 16
+
 # Repository defaults.
 DEFAULT_DDL_TIMEOUT_SECONDS = 30.0
 DEFAULT_DDL_TIMEZONE = "UTC"

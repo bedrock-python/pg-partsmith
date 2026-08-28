@@ -85,16 +85,21 @@ def build_ddl_statement(template: str, **params: str) -> TextClause:
         if key in params:
             format_params[key] = quote_literal(params[key])
 
-    # Convert literal placeholders [key] to standard {key} for .format()
-    formatted_template = _LIT_PLACEHOLDER_PATTERN.sub(r"{\1}", template)
+    # Convert literal placeholders [key] to standard {key} for .format().
+    # Only the keys the caller passed: rewriting every [word] would turn an
+    # `array[0]` in the SQL itself into a format field and fail on it.
+    def _to_format_field(match: re.Match[str]) -> str:
+        key = match.group(1)
+        return f"{{{key}}}" if key in format_params else match.group(0)
+
+    formatted_template = _LIT_PLACEHOLDER_PATTERN.sub(_to_format_field, template)
     statement = formatted_template.format(**format_params)
-    # Escape colons so identifiers/literals containing ":" (e.g. a pre-existing
-    # table comment) are not parsed by text() as bind parameters.
-    return text(statement.replace(":", r"\:"))
+    return _as_text(statement)
 
 
 def quote_identifier(identifier: str) -> str:
     """Quote SQL identifier to prevent injection and validate length."""
+    _reject_nul(identifier, "identifier")
     parts = identifier.split(".")
     if any(not p for p in parts):
         msg = f"Invalid qualified identifier: {identifier!r}"
@@ -114,13 +119,23 @@ def quote_identifier(identifier: str) -> str:
 def quote_literal(value: str) -> str:
     """Quote SQL string literal to prevent injection.
 
+    A backslash is an escape character only while ``standard_conforming_strings``
+    is off -- which any client can turn off on its own connection, and which
+    would let a backslash-terminated value swallow the closing quote. Values
+    carrying one are emitted as an E-string instead, where the escaping rules
+    are the same either way.
+
     Args:
         value: Value to quote.
 
     Returns:
         Quoted string literal.
     """
-    return "'" + value.replace("'", "''") + "'"
+    _reject_nul(value, "literal")
+    escaped = value.replace("'", "''")
+    if "\\" not in value:
+        return f"'{escaped}'"
+    return "E'" + escaped.replace("\\", "\\\\") + "'"
 
 
 def coerce_str(value: object, encoding: str = "utf-8") -> str | None:
@@ -385,3 +400,25 @@ def _orphan_comment_prefix() -> str:
     name = pkg.replace("_", "-").strip().lower()
 
     return f"{name}:orphan-parent="
+
+
+def _as_text(statement: str) -> TextClause:
+    """Wrap a fully-quoted statement, escaping colons for SQLAlchemy.
+
+    ``text()`` reads ``:word`` as a bind parameter, so an identifier or literal
+    carrying a colon -- a boundary format, a pre-existing table comment -- would
+    be mistaken for one and the statement would fail for want of a value.
+    """
+    return text(statement.replace(":", r"\:"))
+
+
+def _reject_nul(value: str, kind: str) -> None:
+    """Refuse a NUL byte, which PostgreSQL cannot carry in text at all.
+
+    The driver truncates at the NUL rather than escaping it, so what reaches the
+    server is a prefix of what was built -- an unterminated string, usually.
+    Failing here names the value instead of leaving a syntax error to explain.
+    """
+    if "\x00" in value:
+        msg = f"SQL {kind} contains a NUL byte, which PostgreSQL cannot represent: {value!r}"
+        raise ValueError(msg)

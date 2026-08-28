@@ -15,6 +15,10 @@ A single library that covers the full PostgreSQL partition lifecycle: creating p
 
 - **Async and sync** — `pg_partsmith.aio` on the SQLAlchemy async engine, `pg_partsmith.sync` on the classic sync engine
 - **Full lifecycle** — create ahead, detach expired, drop orphans in one call
+- **Nested partitioning** — `RANGE(time) → HASH(column)` and `→ LIST(column)` trees, reconciled towards the configured shape on every run
+- **Time-free tables** — HASH or LIST roots with a fixed partition set, managed by the same reconciler
+- **Composite keys** — multi-column partition keys, with trailing columns bounded by `MINVALUE`
+- **Encoded partition keys** — partition by time even when the key is a UUIDv7 or another sortable id
 - **Extensible hooks** — 6 hook points (`before`/`after` create, detach, drop)
 - **Multiple strategies** — hourly, daily, weekly, monthly, quarterly, yearly + fully custom
 - **Distributed locking** — PostgreSQL advisory locks (built-in) or Redis
@@ -89,6 +93,8 @@ async def run_maintenance(engine: AsyncEngine) -> None:
 
 > **Transaction semantics** — every DDL operation (CREATE, ATTACH, DETACH, DROP)
 > runs in its own connection and commits immediately. Use `AsyncEngine`, not `AsyncSession`.
+> A subpartitioned branch is built detached and attached last, so an interrupted run leaves
+> an unreachable table rather than a live partition that cannot route part of its keyspace.
 
 > **Timezones** — everything is UTC by default. For calendar partitions in a business
 > timezone pass the same zone to both sides: `MonthPeriodCalculator(tz=ZoneInfo("Europe/Moscow"))`
@@ -135,6 +141,94 @@ Hooks and custom lock managers implement the sync protocols from `pg_partsmith.s
   (per statement) rather than client-side around the whole operation.
 - The Redis lock renews its TTL from a background thread; on renewal failure it logs a
   warning but cannot cancel the running maintenance (the TTL bounds a stale holder).
+
+## Nested partitioning
+
+A time partition can itself be a partitioned table. Add a `subpartition` spec and each
+period is split along a second dimension:
+
+```python
+from pg_partsmith import HashSubpartitionSpec
+
+config = TablePartitionConfig(
+    schema="public",
+    table_name="events",
+    partition_type=PartitionType.RANGE,
+    partition_strategy=PartitionStrategy.TIME_BASED,
+    partition_column="created_at",
+    granularity=PartitionGranularity.WEEK,
+    create_ahead_count=3,
+    retention_count=12,
+    subpartition=HashSubpartitionSpec(column="tenant_id", modulus=4),
+)
+```
+
+```text
+events
+├── events__2026_w35            PARTITION BY HASH (tenant_id)
+│   ├── events__2026_w35__h0
+│   ├── events__2026_w35__h1
+│   ├── events__2026_w35__h2
+│   └── events__2026_w35__h3
+└── events__2026_w36 …
+```
+
+The two dimensions stay separate: **time is the lifecycle dimension** (create-ahead,
+retention, detach, drop, hooks all operate on the whole week) and the nested one is the
+distribution dimension. `retention_count=12` keeps twelve weeks, not twelve leaves.
+
+`ListSubpartitionSpec` splits a period into named value sets instead
+(`RANGE(time) → LIST(region)`), with an optional DEFAULT catch-all; the strategies also
+nest into each other.
+
+Maintenance converges the actual tree towards the configured one on every run: missing
+buckets are created, a converged tree costs **zero DDL**, and anything that cannot be
+repaired safely — a bucket set at an older modulus, a partition from a previous policy, a
+shape the config does not describe — is left intact and reported through
+`MaintenanceResult.issues`. See the
+[subpartitioning guide](https://bedrock-python.github.io/pg-partsmith/guide/subpartitioning/).
+
+## Tables partitioned without a time dimension
+
+A table divided only by tenant or region has a fixed set of partitions — nothing
+is created ahead and nothing ages out. Configure it with `root_layout`:
+
+```python
+config = TablePartitionConfig(
+    table_name="issue_index",
+    partition_type=PartitionType.HASH,
+    partition_strategy=PartitionStrategy.HASH_BASED,
+    partition_column="organization_id",
+    root_layout=HashSubpartitionSpec(column="organization_id", modulus=16),
+)
+```
+
+Such a table needs no period calculator, and maintenance is purely
+reconciliation: missing partitions are created, nothing is ever pruned.
+
+## Partitioning by an encoded key
+
+When the partition key is a time-sortable identifier rather than a timestamp — a UUIDv7, a
+ULID, an epoch bigint — a boundary codec keeps the lifecycle reasoning in calendar periods
+while the DDL speaks the key's own language:
+
+```python
+from pg_partsmith.boundaries import UUIDv7BoundaryCodec
+
+codec = UUIDv7BoundaryCodec()
+
+service = PartitionLifecycleService(
+    repo=PostgresPartitionRepository(engine),
+    metadata=PostgresMetadataProvider(engine, boundary_codec=codec),
+    locks=PostgresAdvisoryLockManager(engine),
+    period_calculator=WeekPeriodCalculator(boundary_codec=codec),
+)
+```
+
+Partition names, create-ahead, and retention are unchanged; only the `FOR VALUES FROM … TO
+…` literals become UUIDs. Codecs are bidirectional, so retention and `is_partition_closed`
+keep working. See the
+[boundary codec guide](https://bedrock-python.github.io/pg-partsmith/guide/boundary-codecs/).
 
 ## Multi-schema databases
 
@@ -306,19 +400,25 @@ scheduler.add_job(
 
 **Entities** — `Period`, `PartitionInfo`, `TablePartitionConfig`, `MaintenanceResult`, `MaintenanceIssue`, `MaintenanceIssueStep`
 
+**Topology** — `HashSubpartitionSpec`, `ListSubpartitionSpec`, `ListGroup`, `SubpartitionSpec`, `PartitionNode`, `RangeBounds`, `HashBounds`, `ListBounds`, `DefaultBounds`, `PartitionBounds`, `SubpartitionBounds`
+
+**Reconciliation** — `SubpartitionPlan`, `SubpartitionAction`, `SubpartitionReconcileResult`, `TopologyFinding`, `TopologyReason`, `plan_subpartitions`
+
+**Boundary codecs** — `RangeBoundaryCodec`, `UUIDv7BoundaryCodec`
+
 **Helpers** — `qualify`, `split_qualified_name`
 
 **Enums** — `PartitionType`, `PartitionGranularity`, `PartitionStrategy`
 
-**Exceptions** — `PartitionError`, `PartitionAlreadyExistsError`, `PartitionNotFoundError`, `PartitionAttachedError`, `PartitionDetachInProgressError`, `InvalidPartitionConfigError`, `LockAcquisitionError`, `DropRetryExhaustedError`, `UnmanagedPartitionDropError`
+**Exceptions** — `PartitionError`, `PartitionAlreadyExistsError`, `PartitionNotFoundError`, `PartitionAttachedError`, `PartitionDetachInProgressError`, `InvalidPartitionConfigError`, `LockAcquisitionError`, `DropRetryExhaustedError`, `UnmanagedPartitionDropError`, `PartitionTopologyError`, `UnsupportedCapabilityError`
 
-**Protocols** — `PeriodCalculator`, `TimezoneAwareCalculator`, `DdlTimezoneAware`
+**Protocols** — `PeriodCalculator`, `TimezoneAwareCalculator`, `DdlTimezoneAware`, `BoundaryDecoder`
 
 **Strategies** — `BasePeriodCalculator`, `HourPeriodCalculator`, `DayPeriodCalculator`, `WeekPeriodCalculator`, `MonthPeriodCalculator`, `QuarterPeriodCalculator`, `YearPeriodCalculator`, `get_period_calculator`
 
 ### `pg_partsmith.aio`
 
-**Protocols** — `PartitionRepository`, `PartitionMetadataProvider`, `LockManager`
+**Protocols** — `PartitionRepository`, `PartitionMetadataProvider`, `LockManager`, `SubpartitionRepository`, `NestedPartitionMetadata`, `CompositeKeyRepository`, `CompositeKeyMetadata`
 
 **Hooks** — `BasePartitionLifecycleHooks`
 
@@ -343,7 +443,13 @@ detached partitions are adopted with `repo.adopt_partition(...)` instead of disa
 safe-drop via `drop_allow_unmanaged`; writers that need one specific partition use
 `service.ensure_partition(config, period)`; scheduled ticks isolate step failures with
 `maintain_lifecycle(..., continue_on_error=True)` → `result.issues`; export pipelines
-check `metadata.is_partition_closed(name, settle_seconds=...)` before finalizing.
+check `metadata.is_partition_closed(name, settle_seconds=...)` before finalizing; data that
+predates the create-ahead window gets partitions via
+`service.ensure_partitions(config, periods)`.
+
+For a worked example of adopting a `RANGE(UUIDv7) → HASH(tenant)` event store — including a
+non-uniform bucket history and custom partition names — see
+[Example: an event store with TIME → HASH](https://bedrock-python.github.io/pg-partsmith/guide/nested-migration/).
 
 ## Development
 

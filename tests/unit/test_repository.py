@@ -6,6 +6,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.aio.repositories.fk_manager import PartitionForeignKeyManager
 from pg_partsmith.entities import (
+    DefaultBounds,
+    HashBounds,
+    HashSubpartitionSpec,
+    ListBounds,
     PartitionGranularity,
     PartitionStrategy,
     PartitionType,
@@ -22,6 +26,33 @@ from pg_partsmith.exceptions import (
 from pg_partsmith.utils import orphan_table_comment, pg_sqlstate
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
+
+
+def _columns_result(*names: str) -> MagicMock:
+    """A result standing in for the relation-columns lookup the move issues first."""
+    result = MagicMock()
+    result.fetchall.return_value = [(name,) for name in (names or ("created_at", "tenant_id", "data"))]
+    return result
+
+
+def _ddl_engine() -> tuple[MagicMock, AsyncMock]:
+    """An engine whose ``begin()`` yields a connection that records statements."""
+    engine = MagicMock()
+    conn = AsyncMock()
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    return engine, conn
+
+
+def _sqlstate_error(sqlstate: str) -> SQLAlchemyError:
+    """A driver error carrying a PostgreSQL SQLSTATE."""
+    orig = MagicMock()
+    orig.sqlstate = sqlstate
+    error = SQLAlchemyError("boom")
+    error.orig = orig  # type: ignore[attr-defined]
+    return error
 
 
 @pytest.fixture
@@ -978,7 +1009,7 @@ async def test__repository__reconcile_default_rows__matching_rows__returns_row_c
     move_result.rowcount = 42
     engine = MagicMock()
     conn = AsyncMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = AsyncMock()
     begin_cm.__aenter__ = AsyncMock(return_value=conn)
     begin_cm.__aexit__ = AsyncMock(return_value=False)
@@ -996,7 +1027,7 @@ async def test__repository__reconcile_default_rows__matching_rows__returns_row_c
 
     # Assert
     assert count == 42
-    assert conn.execute.call_count == 4  # SET TIME ZONE + 2 LOCK TABLE + move
+    assert conn.execute.call_count == 5  # SET TIME ZONE + 2 LOCK TABLE + column lookup + move
 
 
 async def test__repository__reconcile_default_rows__acquires_locks_on_both_tables() -> None:
@@ -1005,7 +1036,7 @@ async def test__repository__reconcile_default_rows__acquires_locks_on_both_table
     move_result.rowcount = 5
     engine = MagicMock()
     conn = AsyncMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = AsyncMock()
     begin_cm.__aenter__ = AsyncMock(return_value=conn)
     begin_cm.__aexit__ = AsyncMock(return_value=False)
@@ -1033,7 +1064,7 @@ async def test__repository__reconcile_default_rows__no_matching_rows__returns_ze
     move_result.rowcount = 0
     engine = MagicMock()
     conn = AsyncMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = AsyncMock()
     begin_cm.__aenter__ = AsyncMock(return_value=conn)
     begin_cm.__aexit__ = AsyncMock(return_value=False)
@@ -1059,7 +1090,7 @@ async def test__repository__reconcile_default_rows__sets_timezone_before_locks()
     move_result.rowcount = 1
     engine = MagicMock()
     conn = AsyncMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = AsyncMock()
     begin_cm.__aenter__ = AsyncMock(return_value=conn)
     begin_cm.__aexit__ = AsyncMock(return_value=False)
@@ -1087,7 +1118,7 @@ async def test__repository__reconcile_default_rows__no_ddl_timezone__skips_set_t
     move_result.rowcount = 1
     engine = MagicMock()
     conn = AsyncMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), move_result]
+    conn.execute.side_effect = [MagicMock(), MagicMock(), _columns_result(), move_result]
     begin_cm = AsyncMock()
     begin_cm.__aenter__ = AsyncMock(return_value=conn)
     begin_cm.__aexit__ = AsyncMock(return_value=False)
@@ -1103,8 +1134,8 @@ async def test__repository__reconcile_default_rows__no_ddl_timezone__skips_set_t
         to_value="2024-05-01",
     )
 
-    # Assert — only 2 LOCK TABLE + move; no timezone statement issued
-    assert conn.execute.call_count == 3
+    # Assert — only 2 LOCK TABLE + column lookup + move; no timezone statement issued
+    assert conn.execute.call_count == 4
     statements = [str(call.args[0]) for call in conn.execute.call_args_list]
     assert not any("time zone" in stmt.lower() for stmt in statements)
 
@@ -1142,3 +1173,200 @@ def test__repository__ddl_timezone_property__none_when_disabled() -> None:
 def _set_attr(obj: object, attr: str, value: object) -> object:
     setattr(obj, attr, value)
     return obj
+
+
+async def test__repository__reconcile_default_rows__composite_key__leaves_null_trailing_rows_in_default() -> None:
+    # Arrange
+    move_result = MagicMock()
+    move_result.rowcount = 3
+    engine = MagicMock()
+    conn = AsyncMock()
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        partition_column="created_at",
+        trailing_columns=("tenant_id",),
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert -- PostgreSQL adds an IS NOT NULL test for every key column, so a
+    # row with a NULL tenant belongs in DEFAULT and moving it would be rejected
+    # with the very error this call exists to clear.
+    move = str(conn.execute.call_args_list[-1].args[0])
+    assert '"tenant_id" IS NOT NULL' in move
+
+
+async def test__repository__reconcile_default_rows__single_column_key__adds_no_null_test() -> None:
+    # Arrange
+    move_result = MagicMock()
+    move_result.rowcount = 3
+    engine = MagicMock()
+    conn = AsyncMock()
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        partition_column="created_at",
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert -- the leading column already carries its own NOT NULL implicitly
+    # through the range test, so the statement stays what it always was.
+    assert "IS NOT NULL" not in str(conn.execute.call_args_list[-1].args[0])
+
+
+# ── rendered DDL for keys and bounds ────────────────────────────────────────────
+
+
+async def test__repository__attach_composite_partition__pads_every_trailing_column_with_minvalue() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_composite_partition("events", "events__2026_w35", "2026-08-24", "2026-08-31", key_arity=3)
+
+    # Assert -- one MINVALUE per trailing column, on both ends. Getting the
+    # count wrong makes PostgreSQL reject the bound outright.
+    stmt = str(conn.execute.call_args.args[0])
+    assert "FROM ('2026-08-24', MINVALUE, MINVALUE)" in stmt
+    assert "TO ('2026-08-31', MINVALUE, MINVALUE)" in stmt
+
+
+async def test__repository__attach_composite_partition__single_column_key__pads_nothing() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_composite_partition("events", "events__2026_w35", "2026-08-24", "2026-08-31", key_arity=1)
+
+    # Assert
+    stmt = str(conn.execute.call_args.args[0])
+    assert "FROM ('2026-08-24') TO ('2026-08-31')" in stmt
+
+
+async def test__repository__attach_subpartition__list_bounds_with_null__renders_null_as_a_keyword() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_subpartition(
+        "events__2026_w35",
+        "events__2026_w35__unknown",
+        ListBounds(values=("eu",), includes_null=True),
+    )
+
+    # Assert -- quoting NULL would create a partition for the three-character
+    # string, which is a different partition.
+    assert "FOR VALUES IN ('eu', NULL)" in str(conn.execute.call_args.args[0])
+
+
+async def test__repository__attach_subpartition__default_bounds__renders_default() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_subpartition("events__2026_w35", "events__2026_w35__rest", DefaultBounds())
+
+    # Assert
+    assert str(conn.execute.call_args.args[0]).rstrip().endswith("DEFAULT")
+
+
+async def test__repository__create_subpartition_table__composite_spec__partitions_by_every_column() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=4)
+
+    # Act
+    await repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", spec)
+
+    # Assert -- key order is the spec's order, and both columns are quoted.
+    stmt = str(conn.execute.call_args.args[0])
+    assert 'PARTITION BY HASH ("tenant_id", "shard_id")' in stmt
+
+
+async def test__repository__create_subpartition_table__name_already_taken__raises_already_exists() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    # The async creator wraps the whole transaction in asyncio.timeout rather
+    # than issuing a SET LOCAL, so the create is the first statement it sends.
+    conn.execute.side_effect = [_sqlstate_error("42P07")]
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- the planner reads this as a lost race rather than a fault.
+    with pytest.raises(PartitionAlreadyExistsError):
+        await repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", None)
+
+
+async def test__repository__attach_subpartition__hash_bounds__renders_modulus_then_remainder() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.attach_subpartition("events__2026_w35", "events__2026_w35__h1", HashBounds(modulus=4, remainder=1))
+
+    # Assert -- swapping the two is accepted by PostgreSQL whenever remainder
+    # < modulus, so it produces a differently-shaped tree rather than an error.
+    assert "FOR VALUES WITH (MODULUS 4, REMAINDER 1)" in str(conn.execute.call_args.args[0])
+
+
+async def test__repository__create_subpartition_table__copies_the_parent_but_not_its_identity() -> None:
+    # Arrange
+    engine, conn = _ddl_engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", None)
+
+    # Assert -- INCLUDING ALL copies an identity column, and PostgreSQL then
+    # refuses to attach the result; the parent's identity propagates on ATTACH.
+    stmt = str(conn.execute.call_args.args[0])
+    assert "INCLUDING ALL EXCLUDING IDENTITY" in stmt
+
+
+async def test__repository__reconcile_default_rows__relation_has_no_columns__is_reported_not_guessed() -> None:
+    # Arrange -- to_regclass resolved nothing, so the column lookup is empty.
+    move_result = MagicMock()
+    move_result.rowcount = 0
+    engine = MagicMock()
+    conn = AsyncMock()
+    empty = MagicMock()
+    empty.fetchall.return_value = []
+    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), empty, move_result]
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=conn)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    engine.begin.return_value = begin_cm
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- moving rows into a shape we cannot name would be a guess.
+    with pytest.raises(PartitionNotFoundError):
+        await repo.reconcile_default_rows(
+            default_partition_name="events_default",
+            target_partition_name="events__2024_04",
+            partition_column="created_at",
+            from_value="2024-04-01",
+            to_value="2024-05-01",
+        )

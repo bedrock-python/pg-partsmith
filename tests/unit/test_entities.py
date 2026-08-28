@@ -1,9 +1,15 @@
+import json
 from datetime import UTC, date, datetime
 
 import pytest
+from pydantic import ValidationError
 
 import pg_partsmith
 from pg_partsmith.entities import (
+    HashSubpartitionSpec,
+    ListBounds,
+    ListGroup,
+    ListSubpartitionSpec,
     MaintenanceIssue,
     MaintenanceIssueStep,
     MaintenanceResult,
@@ -12,8 +18,10 @@ from pg_partsmith.entities import (
     PartitionStrategy,
     PartitionType,
     Period,
+    RangeBounds,
     TablePartitionConfig,
 )
+from pg_partsmith.partition_bounds import parse_boundary_literal, parse_partition_bounds
 
 # ── Period ──────────────────────────────────────────────────────────────────────
 
@@ -463,11 +471,12 @@ def test__table_partition_config__time_based_with_list_type__raises_value_error(
         (PartitionStrategy.HASH_BASED, PartitionType.HASH),
     ],
 )
-def test__table_partition_config__unimplemented_strategy__raises_value_error(
+def test__table_partition_config__static_strategy_without_root_layout__raises_value_error(
     strategy: PartitionStrategy, partition_type: PartitionType
 ) -> None:
-    # Arrange / Act / Assert
-    with pytest.raises(ValueError, match="not yet implemented"):
+    # Arrange / Act / Assert: a static root has no periods to derive partitions
+    # from, so it has to say what it is divided into.
+    with pytest.raises(ValueError, match="requires root_layout"):
         TablePartitionConfig(
             table_name="events",
             partition_type=partition_type,
@@ -648,3 +657,520 @@ def test__package_root__migration_ergonomics_exports__importable_and_functional(
     assert pg_partsmith.qualify(None, "events") == "events"
     assert pg_partsmith.split_qualified_name("public.events") == ("public", "events")
     assert pg_partsmith.split_qualified_name("events") == (None, "events")
+
+
+# ── Subpartitioned configuration ────────────────────────────────────────────────
+
+
+def _config(**overrides: object) -> TablePartitionConfig:
+    base: dict[str, object] = {
+        "table_name": "events",
+        "partition_type": PartitionType.RANGE,
+        "partition_strategy": PartitionStrategy.TIME_BASED,
+        "partition_column": "created_at",
+        "granularity": PartitionGranularity.WEEK,
+    }
+    base.update(overrides)
+    return TablePartitionConfig(**base)  # type: ignore[arg-type]
+
+
+def test__config__without_subpartition__stays_none() -> None:
+    # Arrange / Act
+    config = _config()
+
+    # Assert
+    assert config.subpartition is None
+
+
+def test__config__with_hash_subpartition__accepted() -> None:
+    # Arrange / Act
+    config = _config(subpartition=HashSubpartitionSpec(column="tenant_id", modulus=4))
+
+    # Assert
+    assert config.subpartition is not None
+    assert config.subpartition.modulus == 4
+
+
+def test__config__subpartition_on_the_root_partition_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="distinct across levels"):
+        _config(subpartition=HashSubpartitionSpec(column="created_at", modulus=2))
+
+
+def test__config__repeated_subpartition_column_across_levels__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="distinct across levels"):
+        _config(
+            subpartition=HashSubpartitionSpec(
+                column="tenant_id",
+                modulus=2,
+                subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+            )
+        )
+
+
+def test__config__subpartition_suffix_pushes_name_over_the_identifier_limit__rejected() -> None:
+    # Arrange: 55 + len("__0000_w00") == 65 would already fail, so pick a name
+    # that only overflows once the bucket suffix is added.
+    table_name = "e" * 51
+
+    # Act: no subpartition still fits (51 + 10 == 61).
+    _config(table_name=table_name)
+
+    # Assert
+    with pytest.raises(ValidationError, match="subpartition suffix"):
+        _config(table_name=table_name, subpartition=HashSubpartitionSpec(column="tenant_id", modulus=4))
+
+
+def test__config__non_range_root_with_subpartition__rejected() -> None:
+    # Arrange / Act / Assert -- a bare `raises` passed here on a different
+    # rule's message. TIME_BASED already requires RANGE, so that is the one
+    # that fires first and the one worth asserting.
+    with pytest.raises(ValidationError, match="TIME_BASED strategy requires RANGE"):
+        _config(
+            partition_type=PartitionType.LIST,
+            subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+        )
+
+
+def test__config__static_root_with_a_subpartition_field__points_at_root_layout() -> None:
+    # Arrange / Act / Assert -- the other way a non-RANGE root can name a
+    # subpartition. Nesting belongs inside root_layout, not beside it.
+    with pytest.raises(ValidationError, match="root_layout"):
+        TablePartitionConfig(
+            table_name="events",
+            partition_type=PartitionType.HASH,
+            partition_strategy=PartitionStrategy.HASH_BASED,
+            partition_column="tenant_id",
+            root_layout=HashSubpartitionSpec(column="tenant_id", modulus=2),
+            subpartition=HashSubpartitionSpec(column="shard_id", modulus=2),
+        )
+
+
+# ── Composite partition keys ────────────────────────────────────────────────────
+
+
+def test__config__composite_partition_key__exposes_columns_and_arity() -> None:
+    # Arrange / Act
+    config = _config(trailing_partition_columns=("tenant_id",))
+
+    # Assert
+    assert config.partition_columns == ("created_at", "tenant_id")
+    assert config.partition_column == "created_at"
+    assert config.key_arity == 2
+
+
+def test__config__single_partition_column__still_accepted_and_normalised() -> None:
+    # Arrange / Act
+    config = _config()
+
+    # Assert: the historical spelling keeps working.
+    assert config.partition_columns == ("created_at",)
+    assert config.partition_column == "created_at"
+    assert config.key_arity == 1
+
+
+def test__config__repeated_partition_key_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="distinct"):
+        _config(trailing_partition_columns=("created_at",))
+
+
+def test__config__partition_column_is_a_real_field__so_it_type_checks_and_copies() -> None:
+    # Arrange
+    config = _config()
+
+    # Act
+    moved = config.model_copy(update={"partition_column": "occurred_at"})
+
+    # Assert: a derived value would have silently ignored the update and left
+    # `dict(model)` disagreeing with `model_dump()`.
+    assert moved.partition_column == "occurred_at"
+    assert dict(moved)["partition_column"] == "occurred_at"
+    assert moved.model_dump()["partition_column"] == "occurred_at"
+    assert "partition_column" in TablePartitionConfig.model_fields
+
+
+def test__config__composite_key_overlapping_a_subpartition_column__rejected() -> None:
+    # Arrange / Act / Assert: the lower level would have nothing left to divide.
+    with pytest.raises(ValidationError, match="distinct across levels"):
+        _config(
+            trailing_partition_columns=("tenant_id",),
+            subpartition=HashSubpartitionSpec(column="tenant_id", modulus=2),
+        )
+
+
+def test__config__composite_list_root__rejected() -> None:
+    # Arrange / Act / Assert: PostgreSQL has no composite LIST key.
+    with pytest.raises(ValidationError, match="exactly one column"):
+        TablePartitionConfig(
+            table_name="events",
+            partition_type=PartitionType.LIST,
+            partition_strategy=PartitionStrategy.VALUE_BASED,
+            partition_column="region",
+            trailing_partition_columns=("tier",),
+            root_layout=ListSubpartitionSpec(column="region", groups=(ListGroup(name="eu", values=("de",)),)),
+        )
+
+
+def test__hash_spec__composite_columns__accepted() -> None:
+    # Arrange / Act
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=4)
+
+    # Assert
+    assert spec.columns == ("tenant_id", "shard_id")
+
+
+def test__hash_spec__composite_columns__leading_column_still_readable() -> None:
+    # Arrange
+    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=4)
+
+    # Act / Assert: reading it must never raise — validation and diagnostics do
+    # exactly this, and `hasattr` only swallows AttributeError.
+    assert spec.column == "tenant_id"
+    assert hasattr(spec, "column")
+    assert spec.model_copy(update={"column": "account_id"}).column == "account_id"
+
+
+def test__hash_spec__repeated_key_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="distinct"):
+        HashSubpartitionSpec(column="tenant_id", trailing_columns=("tenant_id",), modulus=4)
+
+
+def test__list_spec__composite_columns__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="exactly one column"):
+        ListSubpartitionSpec(
+            column="region", trailing_columns=("tier",), groups=(ListGroup(name="eu", values=("de",)),)
+        )
+
+
+def test__parse_partition_bounds__composite_range__returns_the_leading_value() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds(
+        "FOR VALUES FROM ('2024-01-01 00:00:00+00', MINVALUE) TO ('2024-02-01 00:00:00+00', MINVALUE)"
+    )
+
+    # Assert: trailing columns are MINVALUE at both ends, so the leading value
+    # is what the partition actually selects on.
+    assert parsed == RangeBounds(from_value="2024-01-01 00:00:00+00", to_value="2024-02-01 00:00:00+00")
+
+
+def test__parse_partition_bounds__composite_numeric_range__returns_the_leading_value() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES FROM (100, MINVALUE) TO (200, MINVALUE)")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="100", to_value="200")
+
+
+# ── Static-root configuration refusals ──────────────────────────────────────────
+
+
+def _static(**overrides: object) -> TablePartitionConfig:
+    base: dict[str, object] = {
+        "table_name": "issue_index",
+        "partition_type": PartitionType.HASH,
+        "partition_strategy": PartitionStrategy.HASH_BASED,
+        "partition_column": "tenant_id",
+        "root_layout": HashSubpartitionSpec(column="tenant_id", modulus=4),
+    }
+    base.update(overrides)
+    return TablePartitionConfig(**base)  # type: ignore[arg-type]
+
+
+def test__config__static_root__accepted() -> None:
+    # Arrange / Act
+    config = _static()
+
+    # Assert
+    assert config.is_time_based is False
+    assert config.key_arity == 1
+
+
+def test__config__time_based_with_root_layout__rejected() -> None:
+    # Arrange / Act / Assert: a time-based table's partitions come from periods.
+    with pytest.raises(ValidationError, match="only for HASH_BASED"):
+        _config(root_layout=HashSubpartitionSpec(column="tenant_id", modulus=2))
+
+
+def test__config__static_root__partition_type_disagreeing_with_strategy__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="requires HASH partition type"):
+        _static(partition_type=PartitionType.RANGE)
+
+
+def test__config__static_root__layout_of_the_wrong_strategy__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="root_layout describes"):
+        TablePartitionConfig(
+            table_name="regions",
+            partition_type=PartitionType.LIST,
+            partition_strategy=PartitionStrategy.VALUE_BASED,
+            partition_column="region",
+            root_layout=HashSubpartitionSpec(column="region", modulus=2),
+        )
+
+
+def test__config__static_root__layout_on_another_column__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="must be the table's own partition key"):
+        _static(root_layout=HashSubpartitionSpec(column="other_col", modulus=2))
+
+
+def test__config__static_root__with_granularity__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="no periods"):
+        _static(granularity=PartitionGranularity.WEEK)
+
+
+def test__config__static_root__with_a_sibling_subpartition__rejected() -> None:
+    # Arrange / Act / Assert: deeper levels nest inside root_layout instead.
+    with pytest.raises(ValidationError, match="inside root_layout"):
+        _static(subpartition=HashSubpartitionSpec(column="shard_id", modulus=2))
+
+
+def test__config__static_root__name_too_long_for_its_buckets__rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="too long for this layout"):
+        _static(
+            table_name="i" * 60,
+            root_layout=HashSubpartitionSpec(column="tenant_id", modulus=100),
+        )
+
+
+def test__config__list_root__accepted() -> None:
+    # Arrange / Act
+    config = TablePartitionConfig(
+        table_name="regions",
+        partition_type=PartitionType.LIST,
+        partition_strategy=PartitionStrategy.VALUE_BASED,
+        partition_column="region",
+        root_layout=ListSubpartitionSpec(column="region", groups=(ListGroup(name="eu", values=("de",)),)),
+    )
+
+    # Assert
+    assert config.is_time_based is False
+
+
+# ── Bound parsing edge cases ────────────────────────────────────────────────────
+
+
+def test__parse_partition_bounds__quoted_comma_in_a_composite_bound__not_split() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES FROM ('a,b', MINVALUE) TO ('c,d', MINVALUE)")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="a,b", to_value="c,d")
+
+
+def test__parse_partition_bounds__doubled_quote_inside_a_value__preserved() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES IN ('O''Brien', 'other')")
+
+    # Assert
+    assert parsed == ListBounds(values=("O'Brien", "other"))
+
+
+def test__parse_partition_bounds__hash_bounds_with_an_unreadable_number__returns_none() -> None:
+    # Arrange / Act / Assert
+    assert parse_partition_bounds("FOR VALUES WITH (modulus x, remainder y)") is None
+
+
+# ── Serialization compatibility ─────────────────────────────────────────────────
+
+
+def test__config__dump__still_carries_partition_column() -> None:
+    # Arrange
+    config = _config()
+
+    # Act
+    dumped = config.model_dump()
+
+    # Assert: the dump is 0.4.0's shape plus one new key, so a consumer written
+    # against the old one still finds what it reads.
+    assert dumped["partition_column"] == "created_at"
+    assert dumped["trailing_partition_columns"] == ()
+    assert "partition_columns" not in dumped
+
+
+def test__config__dump__round_trips() -> None:
+    # Arrange
+    config = _config()
+
+    # Act / Assert: the dump carries both spellings, and reading it back is a no-op.
+    assert TablePartitionConfig(**config.model_dump()) == config
+
+
+def test__config__json_dump__round_trips() -> None:
+    # Arrange
+    config = _config()
+
+    # Act / Assert
+    assert TablePartitionConfig(**json.loads(config.model_dump_json())) == config
+
+
+def test__config__composite_dump__round_trips_without_collapsing_the_key() -> None:
+    # Arrange: the dump names both the whole key and its leading column.
+    config = _config(trailing_partition_columns=("tenant_id",))
+
+    # Act
+    restored = TablePartitionConfig(**config.model_dump())
+
+    # Assert: the explicit key wins over the derived single column.
+    assert restored.partition_columns == ("created_at", "tenant_id")
+
+
+def test__config__dump_from_before_composite_keys__still_parses() -> None:
+    # Arrange: exactly what 0.4.0 would have written.
+    legacy = {
+        "schema_name": None,
+        "table_name": "events",
+        "partition_type": "range",
+        "partition_strategy": "time_based",
+        "partition_column": "created_at",
+        "granularity": "month",
+        "create_ahead_count": 6,
+        "retention_count": 12,
+        "auto_attach_after_create": True,
+    }
+
+    # Act / Assert
+    assert TablePartitionConfig(**legacy).partition_columns == ("created_at",)
+
+
+def test__parse_partition_bounds__list_value_naming_modulus__stays_a_list_bound() -> None:
+    # Arrange / Act: the value spells out a whole hash bound, so an unanchored
+    # search finds one inside it. A partition whose bounds are misread is
+    # invisible to the planner, which then plans a duplicate PostgreSQL refuses
+    # on every run.
+    parsed = parse_partition_bounds("FOR VALUES IN ('FOR VALUES WITH (MODULUS 4, REMAINDER 1)')")
+
+    # Assert
+    assert parsed == ListBounds(values=("FOR VALUES WITH (MODULUS 4, REMAINDER 1)",))
+
+
+def test__parse_partition_bounds__range_literal_naming_modulus__stays_a_range_bound() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES FROM ('FOR VALUES WITH (MODULUS 2, REMAINDER 0)') TO ('z')")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="FOR VALUES WITH (MODULUS 2, REMAINDER 0)", to_value="z")
+
+
+# ── PartitionInfo bound derivation ──────────────────────────────────────────────
+
+
+def test__partition_info__validation__leaves_the_callers_dict_untouched() -> None:
+    # Arrange -- a dict the caller intends to reuse for a second partition.
+    payload = {
+        "name": "events__2024_01",
+        "partition_type": PartitionType.RANGE,
+        "from_value": "2024-01-01",
+        "to_value": "2024-02-01",
+    }
+    original = dict(payload)
+
+    # Act
+    PartitionInfo.model_validate(payload)
+
+    # Assert -- validating must not write a derived field back into the input.
+    assert payload == original
+
+
+def test__partition_info__round_trip_through_model_dump__keeps_both_spellings() -> None:
+    # Arrange
+    info = PartitionInfo(
+        name="events__2024_01",
+        partition_type=PartitionType.RANGE,
+        bounds=RangeBounds(from_value="2024-01-01", to_value="2024-02-01"),
+    )
+
+    # Act -- model_dump renders the bound as a plain dict, and the pair has to
+    # be derivable from that shape too or a dump-and-reload loses it.
+    reloaded = PartitionInfo.model_validate(info.model_dump())
+
+    # Assert
+    assert reloaded == info
+    assert reloaded.from_value == "2024-01-01"
+    assert reloaded.to_value == "2024-02-01"
+
+
+def test__parse_partition_bounds__null_keyword__is_not_the_string_null() -> None:
+    # Arrange / Act
+    keyword = parse_partition_bounds("FOR VALUES IN (NULL)")
+    literal = parse_partition_bounds("FOR VALUES IN ('NULL')")
+
+    # Assert -- reading them as the same bound would make the planner propose a
+    # partition PostgreSQL already has, and fail on the conflict every run.
+    assert keyword == ListBounds(values=(), includes_null=True)
+    assert literal == ListBounds(values=("NULL",))
+    assert keyword != literal
+
+
+def test__parse_partition_bounds__null_alongside_values__keeps_both() -> None:
+    # Arrange / Act
+    parsed = parse_partition_bounds("FOR VALUES IN ('eu', NULL, 'us')")
+
+    # Assert
+    assert parsed == ListBounds(values=("eu", "us"), includes_null=True)
+
+
+def test__parse_partition_bounds__cast_null__is_still_the_keyword() -> None:
+    # Arrange / Act -- older servers render the element with its type cast.
+    parsed = parse_partition_bounds("FOR VALUES IN (NULL::text)")
+
+    # Assert
+    assert parsed == ListBounds(values=(), includes_null=True)
+
+
+def test__parse_boundary_literal__unquoted_cast__reads_the_value_before_it() -> None:
+    # Arrange / Act -- the docstring lists FROM (1::bigint) TO (5::bigint), and
+    # nothing exercised the cast-stripping branch.
+    parsed = parse_partition_bounds("FOR VALUES FROM (1::bigint) TO (5::bigint)")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="1", to_value="5")
+
+
+def test__parse_partition_bounds__cast_function_form__reads_the_inner_value() -> None:
+    # Arrange / Act -- older servers render some bounds as CAST(x AS type).
+    parsed = parse_partition_bounds("FOR VALUES FROM (CAST(1 AS bigint)) TO (CAST(5 AS bigint))")
+
+    # Assert
+    assert parsed == RangeBounds(from_value="1", to_value="5")
+
+
+def test__parse_partition_bounds__extra_parentheses__are_stripped() -> None:
+    # Arrange / Act -- pg_get_expr sometimes wraps constants in extra parens.
+    parsed = parse_partition_bounds("FOR VALUES IN ((('eu')))")
+
+    # Assert
+    assert parsed == ListBounds(values=("eu",))
+
+
+def test__parse_boundary_literal__date_only_but_impossible__is_declined() -> None:
+    # Arrange / Act -- shaped like a date, and not one.
+    assert parse_boundary_literal("2026-02-31", UTC) is None
+
+
+def test__parse_boundary_literal__value_carrying_no_instant__is_declined() -> None:
+    # Arrange / Act / Assert -- no separator means nothing to parse.
+    assert parse_boundary_literal("42", UTC) is None
+    assert parse_boundary_literal("", UTC) is None
+    assert parse_boundary_literal("MAXVALUE", UTC) is None
+
+
+def test__parse_partition_bounds__hash_bound_with_an_unusable_modulus__declines() -> None:
+    # Arrange / Act -- shaped like a hash bound and not one the models accept.
+    parsed = parse_partition_bounds("FOR VALUES WITH (MODULUS 0, REMAINDER 0)")
+
+    # Assert -- returning a half-valid bound would have the planner compare
+    # against something PostgreSQL never wrote.
+    assert parsed is None
+
+
+def test__parse_boundary_literal__blank_value__is_declined() -> None:
+    # Arrange / Act / Assert
+    assert parse_boundary_literal("   ", UTC) is None

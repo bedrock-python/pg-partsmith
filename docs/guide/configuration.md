@@ -46,10 +46,10 @@ schema=None          # relies on search_path (not recommended)
 ### `partition_type`
 
 ```python
-class PartitionType(str, Enum):
-    RANGE = "RANGE"
-    LIST  = "LIST"
-    HASH  = "HASH"
+class PartitionType(StrEnum):
+    RANGE = "range"
+    LIST  = "list"
+    HASH  = "hash"
 ```
 
 Use `RANGE` for time-based partitioning.
@@ -57,11 +57,15 @@ Use `RANGE` for time-based partitioning.
 ### `partition_strategy`
 
 ```python
-class PartitionStrategy(str, Enum):
-    TIME_BASED  = "TIME_BASED"
-    VALUE_BASED = "VALUE_BASED"
-    HASH_BASED  = "HASH_BASED"
+class PartitionStrategy(StrEnum):
+    TIME_BASED  = "time_based"
+    VALUE_BASED = "value_based"
+    HASH_BASED  = "hash_based"
 ```
+
+The values matter when the config comes from the environment: a
+`PartitionTableSettings` subclass reads `…_PARTITION_STRATEGY=time_based`, not
+the member name.
 
 Use `TIME_BASED` for automatic period calculation via a `PeriodCalculator`.
 
@@ -74,6 +78,21 @@ Column used as the partition key. For `TIME_BASED` this is typically a `TIMESTAM
 partition_column="created_at"
 partition_column="event_date"
 ```
+
+### `trailing_partition_columns`
+
+The rest of a composite partition key, in key order, when the table partitions on
+more than one column. Empty by default, which is the single-column case.
+
+```python
+partition_column="created_at"
+trailing_partition_columns=("tenant_id",)   # PARTITION BY RANGE (created_at, tenant_id)
+```
+
+Only the leading column carries the period; the trailing ones are bounded with
+`MINVALUE`. Read the whole key back with `config.partition_columns` and its length
+with `config.key_arity`. See [Composite partition keys](subpartitioning.md#composite-partition-keys)
+for what a nullable trailing column does to row routing.
 
 ### `granularity`
 

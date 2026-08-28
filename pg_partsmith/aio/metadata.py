@@ -2,23 +2,43 @@
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
-from pg_partsmith.catalog_queries import PARTITION_IS_ATTACHED_SQL, RELATION_EXISTS_SQL
+from pg_partsmith.catalog_queries import (
+    INSTANT_HAS_PASSED_SQL,
+    PARTITION_COLUMNS_SQL,
+    PARTITION_IS_ATTACHED_SQL,
+    PARTITION_TREE_SQL,
+    PARTITION_UPPER_BOUND_SQL,
+    RELATION_EXISTS_SQL,
+    TEXT_INSTANT_HAS_PASSED_SQL,
+    UNIQUE_CONSTRAINT_COLUMNS_SQL,
+)
 from pg_partsmith.entities import PartitionInfo, PartitionType
-from pg_partsmith.partition_bounds import is_addressable, parse_range_boundaries
+from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.partition_bounds import is_addressable, parse_partition_bounds, parse_range_boundaries
+from pg_partsmith.topology import PartitionNode, PartitionTreeRow, build_partition_tree
 from pg_partsmith.utils import (
     coerce_str,
     orphan_comment_prefix,
     orphan_table_comment,
     qualify,
+    quote_literal,
     to_regclass_argument,
 )
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from pg_partsmith.boundaries import RangeBoundaryCodec
+
+
+logger = logging.getLogger(__name__)
 
 
 class PostgresMetadataProvider:
@@ -31,7 +51,14 @@ class PostgresMetadataProvider:
     is safe to call outside any existing transaction.
     """
 
-    def __init__(self, engine: AsyncEngine, *, marker_prefix: str | None = None) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        marker_prefix: str | None = None,
+        boundary_codec: RangeBoundaryCodec | None = None,
+        ddl_timezone: str | None = None,
+    ) -> None:
         """Initialize provider.
 
         Args:
@@ -39,9 +66,21 @@ class PostgresMetadataProvider:
             marker_prefix: Optional COMMENT marker prefix for orphaned partitions.
                 When None, the library default prefix is used. Pass the same
                 value to both repository and metadata provider if you override it.
+            ddl_timezone: Session timezone to read naive boundary literals in.
+                Pass whatever the repository writes partitions with: a
+                ``timestamp``/``date`` key renders its bounds without an offset,
+                so reader and writer must agree or a partition is reported
+                closed at the wrong moment. A ``timestamptz`` key is unaffected
+                -- its literals carry an offset.
+            boundary_codec: Codec used to read boundary literals back into
+                instants. Required only when the partition key is an encoded
+                identifier rather than a timestamp; pass the same codec the
+                period calculator was built with.
         """
         self._engine = engine
         self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
+        self._boundary_codec = boundary_codec
+        self._ddl_timezone = ddl_timezone
 
     async def get_partition_type(self, table_name: str) -> PartitionType | None:
         """Get partition type for a table."""
@@ -67,33 +106,56 @@ class PostgresMetadataProvider:
             ValueError: If the table uses a composite (multi-column) partition
                 key.  Only single-column keys are supported by this library.
         """
-        async with self._engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    """
-                    SELECT a.attname
-                    FROM pg_partitioned_table t
-                    JOIN pg_attribute a ON a.attrelid = t.partrelid AND a.attnum = ANY(t.partattrs)
-                    WHERE t.partrelid = to_regclass(:table_name)
-                    ORDER BY a.attnum
-                    """
-                ),
-                {"table_name": to_regclass_argument(table_name)},
-            )
-            rows = result.fetchall()
-
-        if not rows:
+        key = await self._read_partition_key(table_name)
+        if not key:
             return None
 
-        if len(rows) > 1:
-            cols = [r[0] for r in rows]
+        if len(key) > 1:
             msg = (
-                f"Table {table_name!r} uses a composite partition key {cols!r}. "
+                f"Table {table_name!r} uses a composite partition key {list(key)!r}. "
                 "Only single-column partition keys are supported."
             )
             raise ValueError(msg)
 
-        return coerce_str(rows[0][0])
+        if key[0] is None:
+            raise ValueError(_expression_key_message(table_name, 1))
+
+        return key[0]
+
+    async def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
+        """Return a table's own partition key columns, in key order.
+
+        Unlike :meth:`get_partition_column`, which predates composite keys and
+        refuses them, this reports the whole key. Key order is not column
+        order, so it comes from ``partattrs``' own ordering.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            The key columns in order; empty when the table is not partitioned.
+
+        Raises:
+            InvalidPartitionConfigError: If any key position is an expression
+                rather than a column, which this library cannot address.
+        """
+        key = await self._read_partition_key(table_name)
+        for position, column in enumerate(key, start=1):
+            if column is None:
+                raise InvalidPartitionConfigError(_expression_key_message(table_name, position))
+
+        return tuple(column for column in key if column is not None)
+
+    async def _read_partition_key(self, table_name: str) -> tuple[str | None, ...]:
+        """Read a table's partition key in key order, expressions included as None."""
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                text(PARTITION_COLUMNS_SQL),
+                {"table_name": to_regclass_argument(table_name)},
+            )
+            rows = result.fetchall()
+
+        return tuple(coerce_str(row[0]) for row in rows)
 
     async def list_partitions(self, table_name: str) -> list[PartitionInfo]:
         """List all partitions for a table, including orphaned detached ones.
@@ -140,10 +202,12 @@ class PostgresMetadataProvider:
                         ns.nspname AS partition_schema,
                         child.relname AS partition_name,
                         pg_get_expr(child.relpartbound, child.oid) AS boundaries,
-                        child.relispartition AS is_attached
+                        child.relispartition AS is_attached,
+                        child_pt.partstrat AS subpartstrat
                     FROM pg_inherits inh
                     JOIN pg_class child ON inh.inhrelid = child.oid
                     JOIN pg_namespace ns ON child.relnamespace = ns.oid
+                    LEFT JOIN pg_partitioned_table child_pt ON child_pt.partrelid = child.oid
                     WHERE inh.inhparent = to_regclass(:table_name)
                     ORDER BY ns.nspname, child.relname
                     """
@@ -202,8 +266,10 @@ class PostgresMetadataProvider:
                     from_value=from_val,
                     to_value=to_val,
                     boundaries_expr=boundaries_str if boundaries_str else None,
+                    bounds=parse_partition_bounds(boundaries_str),
                     is_attached=row.is_attached,
                     is_default=is_default,
+                    subpartition_type=PartitionType.from_partstrat(coerce_str(row.subpartstrat, encoding="ascii")),
                     parent_table=table_name,
                 )
             )
@@ -304,10 +370,19 @@ class PostgresMetadataProvider:
     async def is_partition_closed(self, partition_name: str, *, settle_seconds: int = 0) -> bool:
         """True when the partition's upper bound (+ settle buffer) has passed.
 
-        The comparison runs entirely server-side — ``now()`` and the bound come
-        from the same query — so it tolerates replica lag and app-clock skew.
-        Useful for export/archive pipelines that must only finalize partitions
-        that can no longer receive in-range rows.
+        ``now()`` is evaluated on the server rather than on the client, so the
+        answer tolerates app-clock skew. Useful for export/archive pipelines
+        that must only finalize partitions which can no longer receive
+        in-range rows.
+
+        Works for a subpartitioned branch exactly as for a plain leaf: what is
+        read is the branch's own RANGE bound in the root table, and its whole
+        subtree closes with it.
+
+        A naive bound -- which is what a ``timestamp`` or ``date`` key produces
+        -- is resolved under this provider's ``ddl_timezone``. Configure it with
+        the same value the repository writes partitions with, or the two
+        disagree about when the bound falls.
 
         Args:
             partition_name: Attached partition table name.
@@ -317,32 +392,62 @@ class PostgresMetadataProvider:
         Returns:
             True when ``now() >= upper_bound + settle_seconds``. False for the
             DEFAULT partition, non-RANGE partitions, unbounded upper bounds
-            (MAXVALUE / infinity), detached tables, and unresolvable names.
+            (MAXVALUE / infinity), detached tables, unresolvable names, and
+            boundaries that carry no instant this provider can read.
         """
         async with self._engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    """
-                    SELECT now() >= b.upper_bound + make_interval(secs => :settle_seconds)
-                    FROM (
-                        SELECT (regexp_match(
-                                    pg_get_expr(c.relpartbound, c.oid),
-                                    'TO \\(''([^'']+)'''
-                               ))[1]::timestamptz AS upper_bound
-                        FROM pg_class c
-                        JOIN pg_inherits i ON i.inhrelid = c.oid
-                        JOIN pg_partitioned_table pt ON pt.partrelid = i.inhparent
-                        WHERE c.oid = to_regclass(:partition_name)
-                          AND pt.partstrat = 'r'
-                    ) AS b
-                    """
-                ),
-                {
-                    "partition_name": to_regclass_argument(partition_name),
-                    "settle_seconds": settle_seconds,
-                },
+            if self._ddl_timezone is not None:
+                # A naive bound is resolved by the session timezone, so this has
+                # to be the one the partition was written with. Without it the
+                # server default decides, and the two need not agree.
+                await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
+
+            bound_result = await conn.execute(
+                text(PARTITION_UPPER_BOUND_SQL),
+                {"partition_name": to_regclass_argument(partition_name)},
             )
+            raw_bound = coerce_str(bound_result.scalar())
+            if raw_bound is None:
+                # No upper bound to read: DEFAULT, non-RANGE, detached, or unknown.
+                return False
+
+            if self._boundary_codec is not None:
+                instant = self._boundary_codec.decode(raw_bound)
+                if instant is None:
+                    self._warn_unreadable_bound(partition_name, raw_bound)
+                    return False
+                query = INSTANT_HAS_PASSED_SQL
+                upper_bound: datetime | str = instant
+            else:
+                query = TEXT_INSTANT_HAS_PASSED_SQL
+                upper_bound = raw_bound
+
+            try:
+                result = await conn.execute(
+                    text(query),
+                    {"upper_bound": upper_bound, "settle_seconds": settle_seconds},
+                )
+            except DBAPIError:
+                # A bound can look like a date and still not be one -- a
+                # sortable identifier with a date-like prefix, say. Reporting
+                # "not closed" is the documented answer; raising out of a
+                # predicate is not.
+                self._warn_unreadable_bound(partition_name, raw_bound)
+                return False
+
             return bool(result.scalar())
+
+    def _warn_unreadable_bound(self, partition_name: str, raw_bound: str) -> None:
+        """Explain a partition that can never report as closed.
+
+        The answer is always False while the bound cannot be read, so an export
+        pipeline gated on this would wait forever with nothing to show for it.
+        """
+        logger.warning(
+            "Partition has an upper bound this provider cannot read, so it never reports as closed; "
+            "pass the boundary_codec its partitions were created with",
+            extra={"partition_name": partition_name, "upper_bound": raw_bound},
+        )
 
     async def get_default_partition(self, table_name: str) -> PartitionInfo | None:
         """Get DEFAULT partition for a table if it exists and is attached.
@@ -356,3 +461,100 @@ class PostgresMetadataProvider:
         all_partitions = await self.list_partitions(table_name)
         defaults = [p for p in all_partitions if p.is_default and p.is_attached]
         return defaults[0] if defaults else None
+
+    async def get_partition_tree(self, table_name: str) -> PartitionNode | None:
+        """Return the whole partition tree rooted at ``table_name``.
+
+        Unlike :meth:`list_partitions`, which reports the direct children a
+        lifecycle acts on, this walks the hierarchy to the leaves — the shape
+        subpartition reconciliation needs to know which buckets exist. One
+        round-trip regardless of depth.
+
+        Detached partitions are absent by construction: a detached branch is no
+        longer part of its parent's tree. Query it by name to inspect it.
+
+        Args:
+            table_name: Root of the tree, schema-qualified.
+
+        Returns:
+            The root node with its descendants, or None when ``table_name`` is
+            not partitioned and is not itself a partition.
+        """
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                text(PARTITION_TREE_SQL),
+                {"table_name": to_regclass_argument(table_name)},
+            )
+            rows = result.fetchall()
+
+        tree_rows: list[PartitionTreeRow] = []
+        unaddressable_parents: set[str] = set()
+        for row in rows:
+            schema = coerce_str(row.partition_schema) or ""
+            relname = coerce_str(row.partition_name) or ""
+            parent_schema_raw = coerce_str(row.parent_schema)
+            parent_relname_raw = coerce_str(row.parent_name)
+            if not is_addressable(schema, relname):
+                # The parent keeps a child the tree cannot show. Recording that
+                # is what keeps the planner from reading the shortened child set
+                # as a set of gaps to fill.
+                if parent_schema_raw and parent_relname_raw:
+                    unaddressable_parents.add(qualify(parent_schema_raw, parent_relname_raw))
+                continue
+
+            parent_schema = coerce_str(row.parent_schema)
+            parent_relname = coerce_str(row.parent_name)
+            parent_name = qualify(parent_schema, parent_relname) if parent_schema and parent_relname else None
+
+            columns = row.partition_columns or ()
+            named = tuple(str(c) for c in columns if c is not None)
+            tree_rows.append(
+                PartitionTreeRow(
+                    level=row.level,
+                    name=qualify(schema, relname),
+                    parent_name=parent_name,
+                    bounds=parse_partition_bounds(coerce_str(row.boundaries)),
+                    is_attached=bool(row.is_attached),
+                    partition_type=PartitionType.from_partstrat(coerce_str(row.partstrat, encoding="ascii")),
+                    partition_columns=named,
+                    # An expression key position comes back as NULL and has no
+                    # name to report; what matters is that the key is wider than
+                    # the names, so nothing compares it as if it were complete.
+                    has_expression_key=len(named) != (row.key_arity or len(named)),
+                )
+            )
+
+        return build_partition_tree(tree_rows, unaddressable_parents)
+
+    async def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
+        """Return the column tuples of every UNIQUE / PRIMARY KEY constraint.
+
+        PostgreSQL requires such a constraint on a partitioned table to contain
+        all of its partition-key columns. Reading them lets a subpartitioning
+        config be refused with an explanation before any DDL is attempted,
+        instead of failing halfway through a maintenance run.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            One tuple of column names per constraint; empty when the table has
+            no unique constraints at all.
+        """
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                text(UNIQUE_CONSTRAINT_COLUMNS_SQL),
+                {"table_name": to_regclass_argument(table_name)},
+            )
+            rows = result.fetchall()
+
+        return tuple(tuple(str(c) for c in (row.columns or ())) for row in rows)
+
+
+def _expression_key_message(table_name: str, position: int) -> str:
+    """Explain a key this library has no way to address."""
+    return (
+        f"Table {table_name!r} partitions on an expression at key position {position}, which pg-partsmith "
+        "cannot address: it builds bounds from column values, and an expression's value is not one. "
+        "Partition on plain columns, or manage this table outside pg-partsmith."
+    )

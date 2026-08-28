@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pg_partsmith.entities import (
     MaintenanceIssue,
@@ -13,16 +13,27 @@ from pg_partsmith.entities import (
     Period,
     TablePartitionConfig,
 )
-from pg_partsmith.sync.protocols import LockManager, PartitionMetadataProvider, PartitionRepository
+from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.subpartition_plan import SubpartitionReconcileResult, to_maintenance_issue
+from pg_partsmith.sync.protocols import (
+    LockManager,
+    NestedPartitionMetadata,
+    PartitionMetadataProvider,
+    PartitionRepository,
+    SubpartitionRepository,
+)
 from pg_partsmith.utils import describe_exception, qualify, validate_timezone_alignment
 
 from .services.creation import PartitionCreationService
 from .services.deletion import PartitionDeletionService
 from .services.detachment import PartitionDetachmentService
 from .services.pruning import PartitionPruningService
+from .services.subpartitions import PartitionSubpartitionService
 from .services.validation import PartitionValidationService
 
 if TYPE_CHECKING:
+    from collections.abc import Collection, Iterable
+
     from pg_partsmith.protocols import PeriodCalculator
     from pg_partsmith.sync.hooks import PartitionLifecycleHooks
 
@@ -41,7 +52,7 @@ class PartitionLifecycleService:
         repo: PartitionRepository,
         metadata: PartitionMetadataProvider,
         locks: LockManager,
-        period_calculator: PeriodCalculator[Period],
+        period_calculator: PeriodCalculator[Period] | None = None,
         hooks: list[PartitionLifecycleHooks] | None = None,
     ) -> None:
         """Initialize the partition lifecycle service.
@@ -50,7 +61,9 @@ class PartitionLifecycleService:
             repo: DDL operations on partitions (create / attach / detach / drop).
             metadata: Read-only access to PostgreSQL catalog data.
             locks: Distributed lock manager preventing concurrent maintenance runs.
-            period_calculator: Strategy for determining partition names and boundaries.
+            period_calculator: Strategy for determining partition names and
+                boundaries. Required for a TIME_BASED table and meaningless for
+                a static HASH_BASED / VALUE_BASED one, which has no periods.
             hooks: Optional list of lifecycle hooks called around each step.
         """
         validate_timezone_alignment(repo, period_calculator)
@@ -60,8 +73,23 @@ class PartitionLifecycleService:
 
         # Component services
         self._validation_service = PartitionValidationService(metadata)
-        self._creation_service = PartitionCreationService(repo, metadata, period_calculator, hooks)
-        self._pruning_service = PartitionPruningService(metadata, period_calculator)
+        # Subpartitioning is optional, so the collaborators are typed loosely
+        # here and checked against the nested protocols only when a config
+        # actually asks for it — a flat setup with a custom repository or
+        # metadata provider keeps working unchanged.
+        self._subpartition_service = PartitionSubpartitionService(
+            cast("SubpartitionRepository", repo),
+            cast("NestedPartitionMetadata", metadata),
+        )
+        # The period-driven services exist only when there are periods.
+        self._creation_service = (
+            PartitionCreationService(repo, metadata, period_calculator, hooks, subpartitions=self._subpartition_service)
+            if period_calculator is not None
+            else None
+        )
+        self._pruning_service = (
+            PartitionPruningService(metadata, period_calculator) if period_calculator is not None else None
+        )
         self._detachment_service = PartitionDetachmentService(repo, hooks)
         self._deletion_service = PartitionDeletionService(repo, hooks)
 
@@ -82,7 +110,7 @@ class PartitionLifecycleService:
             PartitionAlreadyExistsError: If a partition exists with conflicting boundaries.
             InvalidPartitionConfigError: If ``config`` is incompatible with the parent table.
         """
-        return self._creation_service.create_future_partitions(config)
+        return self._require_periods().create_future_partitions(config)
 
     def ensure_partition(self, config: TablePartitionConfig, period: Period) -> PartitionInfo | None:
         """Create and attach the partition for one specific period (idempotent).
@@ -99,8 +127,38 @@ class PartitionLifecycleService:
         Returns:
             The created partition, or None when it already existed (an existing
             detached partition is re-attached when ``auto_attach_after_create``).
+
+        Raises:
+            InvalidPartitionConfigError: If the service was built without a
+                period calculator, which every period-driven call needs.
         """
-        return self._creation_service.ensure_partition(config, period)
+        return self._require_periods().ensure_partition(config, period)
+
+    def ensure_partitions(
+        self,
+        config: TablePartitionConfig,
+        periods: Iterable[Period],
+    ) -> list[PartitionInfo]:
+        """Create and attach partitions for an explicit set of periods (idempotent).
+
+        The backfill counterpart of :meth:`create_future_partitions`: the caller
+        chooses the periods, so data that already sits in the table can be given
+        partitions without waiting for create-ahead to reach it.
+
+        Args:
+            config: Table partitioning configuration.
+            periods: Periods that must have a partition. Duplicates are ignored;
+                order is preserved.
+
+        Returns:
+            The partitions created by this call; periods that already had one
+            are absent from the list.
+
+        Raises:
+            InvalidPartitionConfigError: If the service was built without a
+                period calculator, which every period-driven call needs.
+        """
+        return self._require_periods().ensure_partitions(config, periods)
 
     def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Return partitions older than ``config.retention_count`` periods.
@@ -110,8 +168,12 @@ class PartitionLifecycleService:
 
         Returns:
             Partitions that are eligible for detach + drop, sorted oldest first.
+
+        Raises:
+            InvalidPartitionConfigError: If the service was built without a
+                period calculator, which every period-driven call needs.
         """
-        return self._pruning_service.get_partitions_for_pruning(config)
+        return self._require_pruning().get_partitions_for_pruning(config)
 
     def detach_old_partitions(
         self,
@@ -152,6 +214,91 @@ class PartitionLifecycleService:
         """
         return self._deletion_service.drop_detached_partitions(table_name, partition_names)
 
+    def reconcile_subpartitions(
+        self,
+        config: TablePartitionConfig,
+        *,
+        exclude: Collection[str] = (),
+    ) -> SubpartitionReconcileResult:
+        """Converge the subtree of every attached partition towards the config.
+
+        Idempotent and safe to call on its own: it creates only the buckets a
+        branch is genuinely missing, and reports rather than "repairs" any
+        branch whose shape it cannot converge without risk.
+
+        It takes **no distributed lock of its own** -- unlike
+        :meth:`maintain_lifecycle`, which runs its whole sequence under one.
+        Two workers calling this concurrently is safe: a lost race on a bucket
+        is recognised by its bounds and reported, not retried into a failure.
+        But calling it while a maintainer is mid-run means both are converging
+        the same tree, and the wasted work is yours to weigh. Wrap it in your
+        own lock if you would rather they queued.
+
+        Args:
+            config: Table partitioning configuration. Without a subpartition
+                spec this is a no-op returning an empty result.
+            exclude: Schema-qualified partition names to skip.
+
+        Returns:
+            The subpartitions created and the divergences left alone.
+
+        Raises:
+            UnsupportedCapabilityError: If the repository or metadata provider
+                cannot serve a nested configuration.
+        """
+        return self._subpartition_service.reconcile(config, exclude=exclude)
+
+    def _maintain_static_root(
+        self,
+        config: TablePartitionConfig,
+        *,
+        skip_create: bool,
+        continue_on_error: bool,
+    ) -> MaintenanceResult:
+        """Converge a HASH_BASED / VALUE_BASED table's own partition set.
+
+        ``created_count`` reports every partition this call created, at any
+        level: a static root has no lifecycle stages to attribute them to.
+        Detach and drop are absent rather than skipped -- there is no retention
+        window without periods -- but ``skip_create`` and ``continue_on_error``
+        mean here exactly what they mean everywhere else.
+        """
+        if skip_create:
+            return MaintenanceResult()
+
+        try:
+            reconciled = self._subpartition_service.reconcile(config)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            error = describe_exception(exc)
+            logger.warning(
+                "Maintenance step failed; continuing with the remaining steps",
+                extra={
+                    "table_name": qualify(config.db_schema, config.table_name),
+                    "step": MaintenanceIssueStep.RECONCILE.value,
+                    "error": error,
+                },
+            )
+            return MaintenanceResult(issues=(MaintenanceIssue(step=MaintenanceIssueStep.RECONCILE, error=error),))
+
+        issues = tuple(to_maintenance_issue(f) for f in reconciled.findings if f.is_actionable)
+        return MaintenanceResult(created_count=reconciled.created_count, issues=issues)
+
+    def _require_periods(self) -> PartitionCreationService:
+        """Return the creation service, or explain that this wiring has no periods."""
+        if self._creation_service is None:
+            raise InvalidPartitionConfigError(_NO_CALCULATOR_MESSAGE)
+        return self._creation_service
+
+    def _require_pruning(self) -> PartitionPruningService:
+        """Return the pruning service, or explain that this wiring has no periods."""
+        if self._pruning_service is None:
+            raise InvalidPartitionConfigError(_NO_CALCULATOR_MESSAGE)
+        return self._pruning_service
+
     def maintain_lifecycle(
         self,
         config: TablePartitionConfig,
@@ -178,6 +325,12 @@ class PartitionLifecycleService:
                 are collected into ``MaintenanceResult.issues``. Validation and
                 lock failures are always fatal.
 
+        Subpartitioned configs additionally reconcile each branch's bucket set
+        between create and detach; branches whose shape cannot be converged
+        safely are reported through ``MaintenanceResult.issues`` regardless of
+        ``continue_on_error``, since leaving them silent would hide writes that
+        PostgreSQL is rejecting.
+
         Returns:
             ``MaintenanceResult`` with the per-step counters; ``error`` is unset
             because exceptions propagate from this method (the maintainer is
@@ -190,6 +343,7 @@ class PartitionLifecycleService:
         qualified_parent = qualify(config.db_schema, config.table_name)
 
         created_count = 0
+        repaired_count = 0
         detached_count = 0
         dropped_count = 0
         issues: list[MaintenanceIssue] = []
@@ -205,13 +359,23 @@ class PartitionLifecycleService:
         with self._locks.acquire_lock(qualified_parent):
             self._validation_service.validate_config(config)
 
+            if not config.is_time_based:
+                # A static root has no periods: nothing is created ahead and
+                # nothing ages out, so converging its partition set is the
+                # whole of maintenance.
+                return self._maintain_static_root(config, skip_create=skip_create, continue_on_error=continue_on_error)
+
             # Optimization: fetch all partitions once
             all_partitions = self._metadata.list_partitions(qualified_parent)
 
+            # Finishing a branch an earlier run left half-built happens during
+            # CREATE, before the reconcile stage that would otherwise count it.
+            converged: list[SubpartitionReconcileResult] = []
+
             if not skip_create:
                 try:
-                    created = self._creation_service.create_future_partitions(
-                        config, existing_partitions=all_partitions
+                    created = self._require_periods().create_future_partitions(
+                        config, existing_partitions=all_partitions, converged=converged
                     )
                 except (KeyboardInterrupt, SystemExit):
                     raise
@@ -224,10 +388,53 @@ class PartitionLifecycleService:
                     if created:
                         all_partitions.extend(created)
 
-            partitions_to_prune = self._pruning_service.identify_partitions_to_prune(config, all_partitions)
+            # Buckets built while completing a half-built branch are repairs of
+            # a pre-existing branch, which is exactly what repaired_count means.
+            repaired_count += sum(result.created_count for result in converged)
+            issues.extend(
+                to_maintenance_issue(finding)
+                for result in converged
+                for finding in result.findings
+                if finding.is_actionable
+            )
+
+            try:
+                partitions_to_prune = self._require_pruning().identify_partitions_to_prune(config, all_partitions)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                # Deciding *what* to prune is as failable as pruning it --
+                # a boundary this run cannot read is enough. Left outside
+                # continue_on_error it would abort the run after create and
+                # reconcile had already committed their DDL.
+                if not continue_on_error:
+                    raise
+                _record_issue(MaintenanceIssueStep.DETACH, e)
+                partitions_to_prune = []
+
+            # Reconcile before pruning so a branch that is on its way out is not
+            # repaired just to be dropped moments later.
+            if config.subpartition is not None:
+                try:
+                    reconciled = self._subpartition_service.reconcile(
+                        config, exclude={p.name for p in partitions_to_prune}
+                    )
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    if not continue_on_error:
+                        raise
+                    _record_issue(MaintenanceIssueStep.RECONCILE, e)
+                else:
+                    repaired_count += reconciled.created_count
+                    issues.extend(to_maintenance_issue(f) for f in reconciled.findings if f.is_actionable)
 
             if not partitions_to_prune:
-                return MaintenanceResult(created_count=created_count, issues=tuple(issues))
+                return MaintenanceResult(
+                    created_count=created_count,
+                    repaired_count=repaired_count,
+                    issues=tuple(issues),
+                )
 
             attached_to_detach = [p for p in partitions_to_prune if p.is_attached]
             orphan_names = [p.name for p in partitions_to_prune if not p.is_attached]
@@ -266,7 +473,16 @@ class PartitionLifecycleService:
 
         return MaintenanceResult(
             created_count=created_count,
+            repaired_count=repaired_count,
             detached_count=detached_count,
             dropped_count=dropped_count,
             issues=tuple(issues),
         )
+
+
+# Retention and create-ahead are period arithmetic, so both need a calculator;
+# a static root needs none, which is why the wiring allows it to be omitted.
+_NO_CALCULATOR_MESSAGE = (
+    "This service was built without a period_calculator, so it can only manage a static "
+    "HASH_BASED / VALUE_BASED table. Pass a calculator to manage a TIME_BASED one."
+)

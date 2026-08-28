@@ -40,5 +40,4 @@ class MonthPeriodCalculator(BasePeriodCalculator):
             msg = "Month is required for MonthPeriodCalculator"
             raise ValueError(msg)
 
-        fmt = "%Y-%m-%d"
-        return (period.to_date().strftime(fmt), (period + 1).to_date().strftime(fmt))
+        return self._encoded_boundaries(period, lambda d: d.strftime("%Y-%m-%d"))

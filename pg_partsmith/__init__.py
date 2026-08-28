@@ -1,15 +1,27 @@
 """PostgreSQL partition lifecycle management with extensible hooks."""
 
 from .__version__ import __version__
+from .boundaries import RangeBoundaryCodec, UUIDv7BoundaryCodec
 from .entities import (
+    DefaultBounds,
+    HashBounds,
+    HashSubpartitionSpec,
+    ListBounds,
+    ListGroup,
+    ListSubpartitionSpec,
     MaintenanceIssue,
     MaintenanceIssueStep,
     MaintenanceResult,
+    PartitionBounds,
     PartitionGranularity,
     PartitionInfo,
+    PartitionNode,
     PartitionStrategy,
     PartitionType,
     Period,
+    RangeBounds,
+    SubpartitionBounds,
+    SubpartitionSpec,
     TablePartitionConfig,
 )
 from .exceptions import (
@@ -21,9 +33,11 @@ from .exceptions import (
     PartitionDetachInProgressError,
     PartitionError,
     PartitionNotFoundError,
+    PartitionTopologyError,
     UnmanagedPartitionDropError,
+    UnsupportedCapabilityError,
 )
-from .protocols import DdlTimezoneAware, PeriodCalculator, TimezoneAwareCalculator
+from .protocols import BoundaryDecoder, DdlTimezoneAware, PeriodCalculator, TimezoneAwareCalculator
 from .strategies import (
     BasePeriodCalculator,
     DayPeriodCalculator,
@@ -34,15 +48,30 @@ from .strategies import (
     YearPeriodCalculator,
     get_period_calculator,
 )
+from .subpartition_plan import (
+    SubpartitionAction,
+    SubpartitionPlan,
+    SubpartitionReconcileResult,
+    TopologyFinding,
+    TopologyReason,
+    plan_subpartitions,
+)
 from .utils import qualify, split_qualified_name
 
 __all__ = [
     "BasePeriodCalculator",
+    "BoundaryDecoder",
     "DayPeriodCalculator",
     "DdlTimezoneAware",
+    "DefaultBounds",
     "DropRetryExhaustedError",
+    "HashBounds",
+    "HashSubpartitionSpec",
     "HourPeriodCalculator",
     "InvalidPartitionConfigError",
+    "ListBounds",
+    "ListGroup",
+    "ListSubpartitionSpec",
     "LockAcquisitionError",
     "MaintenanceIssue",
     "MaintenanceIssueStep",
@@ -50,23 +79,38 @@ __all__ = [
     "MonthPeriodCalculator",
     "PartitionAlreadyExistsError",
     "PartitionAttachedError",
+    "PartitionBounds",
     "PartitionDetachInProgressError",
     "PartitionError",
     "PartitionGranularity",
     "PartitionInfo",
+    "PartitionNode",
     "PartitionNotFoundError",
     "PartitionStrategy",
+    "PartitionTopologyError",
     "PartitionType",
     "Period",
     "PeriodCalculator",
     "QuarterPeriodCalculator",
+    "RangeBoundaryCodec",
+    "RangeBounds",
+    "SubpartitionAction",
+    "SubpartitionBounds",
+    "SubpartitionPlan",
+    "SubpartitionReconcileResult",
+    "SubpartitionSpec",
     "TablePartitionConfig",
     "TimezoneAwareCalculator",
+    "TopologyFinding",
+    "TopologyReason",
+    "UUIDv7BoundaryCodec",
     "UnmanagedPartitionDropError",
+    "UnsupportedCapabilityError",
     "WeekPeriodCalculator",
     "YearPeriodCalculator",
     "__version__",
     "get_period_calculator",
+    "plan_subpartitions",
     "qualify",
     "split_qualified_name",
 ]

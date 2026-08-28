@@ -5,13 +5,25 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
-from pg_partsmith.entities import MaintenanceResult, PartitionInfo, PartitionType, TablePartitionConfig
+from pg_partsmith.entities import (
+    MaintenanceResult,
+    PartitionInfo,
+    PartitionNode,
+    PartitionType,
+    SubpartitionBounds,
+    SubpartitionSpec,
+    TablePartitionConfig,
+)
 
 __all__ = [
+    "CompositeKeyMetadata",
+    "CompositeKeyRepository",
     "LockManager",
+    "NestedPartitionMetadata",
     "PartitionLifecycle",
     "PartitionMetadataProvider",
     "PartitionRepository",
+    "SubpartitionRepository",
 ]
 
 
@@ -270,5 +282,178 @@ class LockManager(Protocol):
 
         Returns:
             True if table is locked.
+        """
+        ...
+
+
+@runtime_checkable
+class SubpartitionRepository(Protocol):
+    """DDL for partitions that are themselves partitioned tables.
+
+    Kept separate from :class:`PartitionRepository` on purpose: a repository
+    written against the flat protocol keeps satisfying it, and is only required
+    to grow these three methods once a config actually asks for subpartitioning.
+    """
+
+    def create_branch(
+        self,
+        config: TablePartitionConfig,
+        branch_name: str,
+        from_value: str,
+        to_value: str,
+        spec: SubpartitionSpec,
+    ) -> PartitionInfo:
+        """Create a detached time partition that is itself partitioned.
+
+        Args:
+            config: Table partition configuration.
+            branch_name: Name for the new branch table.
+            from_value: Start boundary value.
+            to_value: End boundary value.
+            spec: Subpartitioning the branch applies to its own children.
+
+        Returns:
+            Info about the created (still detached) branch.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
+        ...
+
+    def create_subpartition_table(self, parent_name: str, child_name: str, spec: SubpartitionSpec | None) -> None:
+        """Create a detached table shaped like ``parent_name``.
+
+        Args:
+            parent_name: Relation the table will later be attached to.
+            child_name: Name for the new table.
+            spec: Subpartitioning the table applies to its own children, or None.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
+        ...
+
+    def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
+        """Attach one subpartition to its parent.
+
+        Args:
+            parent_name: Partitioned relation to attach to.
+            child_name: Table to attach.
+            bounds: What the child owns — a hash bucket, a set of LIST values,
+                or DEFAULT.
+        """
+        ...
+
+
+@runtime_checkable
+class NestedPartitionMetadata(Protocol):
+    """Structural introspection a nested configuration needs.
+
+    Also separate from :class:`PartitionMetadataProvider` so flat setups keep
+    working with providers that predate subpartitioning.
+    """
+
+    def get_partition_tree(self, table_name: str) -> PartitionNode | None:
+        """Return the whole partition tree rooted at ``table_name``.
+
+        Args:
+            table_name: Root of the tree, schema-qualified.
+
+        Returns:
+            The root node with its descendants, or None when the relation is
+            neither partitioned nor a partition.
+        """
+        ...
+
+    def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:
+        """Return the column tuples of every UNIQUE / PRIMARY KEY constraint.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            One tuple of column names per constraint.
+        """
+        ...
+
+
+@runtime_checkable
+class CompositeKeyRepository(Protocol):
+    """DDL for a parent whose partition key spans several columns.
+
+    Separate from :class:`PartitionRepository` for the same reason as the
+    nested protocols: a repository written before composite keys keeps
+    satisfying the flat one, and is only required to grow this method once a
+    config actually declares a multi-column key.
+    """
+
+    def attach_composite_partition(
+        self,
+        table_name: str,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+        *,
+        key_arity: int,
+    ) -> None:
+        """Attach a partition, padding the trailing key columns with MINVALUE.
+
+        Args:
+            table_name: Parent table name.
+            partition_name: Partition table name.
+            from_value: Start boundary for the leading column.
+            to_value: End boundary for the leading column.
+            key_arity: Number of columns in the parent's partition key.
+        """
+        ...
+
+    def reconcile_default_rows(
+        self,
+        *,
+        default_partition_name: str,
+        target_partition_name: str,
+        partition_column: str,
+        trailing_columns: tuple[str, ...] = (),
+        from_value: str,
+        to_value: str,
+    ) -> int:
+        """Move conflicting rows from a DEFAULT partition, honouring the whole key.
+
+        The composite widening of :meth:`PartitionRepository.reconcile_default_rows`.
+        It is declared here rather than on the base protocol so an
+        implementation written against the single-column signature keeps
+        satisfying ``PartitionRepository`` -- for a type checker as much as at
+        runtime.
+
+        PostgreSQL adds an IS NOT NULL test for every key column to a range
+        partition's constraint, so a row with a NULL trailing key value belongs
+        in DEFAULT and has to be left there.
+
+        Args:
+            default_partition_name: Qualified name of DEFAULT partition.
+            target_partition_name: Qualified name of target partition.
+            partition_column: Leading column of the partition key.
+            trailing_columns: The remaining key columns, in key order.
+            from_value: Range start boundary (inclusive).
+            to_value: Range end boundary (exclusive).
+
+        Returns:
+            Number of rows moved.
+        """
+        ...
+
+
+@runtime_checkable
+class CompositeKeyMetadata(Protocol):
+    """Introspection of a partition key that spans several columns."""
+
+    def get_partition_columns(self, table_name: str) -> tuple[str, ...]:
+        """Return a table's own partition key columns, in key order.
+
+        Args:
+            table_name: Table to inspect, schema-qualified.
+
+        Returns:
+            The key columns in order; empty when the table is not partitioned.
         """
         ...

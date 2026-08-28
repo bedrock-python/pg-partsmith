@@ -28,7 +28,7 @@ from .resolver import PartitionRelationResolver
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from pg_partsmith.entities import PartitionInfo, TablePartitionConfig
+    from pg_partsmith.entities import PartitionInfo, SubpartitionBounds, SubpartitionSpec, TablePartitionConfig
 
 
 class PostgresPartitionRepository:
@@ -94,6 +94,53 @@ class PostgresPartitionRepository:
     async def attach_partition(self, table_name: str, partition_name: str, from_value: str, to_value: str) -> None:
         await self._creator.attach(table_name, partition_name, from_value, to_value)
 
+    async def create_branch(
+        self,
+        config: TablePartitionConfig,
+        branch_name: str,
+        from_value: str,
+        to_value: str,
+        spec: SubpartitionSpec,
+    ) -> PartitionInfo:
+        """Create a detached time partition that is itself partitioned.
+
+        See :meth:`PartitionCreator.create_branch`. Its buckets are created
+        separately and the branch is attached last, so an interrupted run can
+        never leave a partially-covering branch reachable from the root.
+        """
+        return await self._creator.create_branch(config, branch_name, from_value, to_value, spec)
+
+    async def create_subpartition_table(self, parent_name: str, child_name: str, spec: SubpartitionSpec | None) -> None:
+        """Create a detached table shaped like ``parent_name``.
+
+        See :meth:`PartitionCreator.create_subpartition_table`.
+        """
+        await self._creator.create_subpartition_table(parent_name, child_name, spec)
+
+    async def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
+        """Attach one subpartition to its parent.
+
+        See :meth:`PartitionCreator.attach_subpartition`.
+        """
+        await self._creator.attach_subpartition(parent_name, child_name, bounds)
+
+    async def attach_composite_partition(
+        self,
+        table_name: str,
+        partition_name: str,
+        from_value: str,
+        to_value: str,
+        *,
+        key_arity: int,
+    ) -> None:
+        """Attach a partition to a parent with a composite partition key.
+
+        See :meth:`PartitionCreator.attach_composite_partition`.
+        """
+        await self._creator.attach_composite_partition(
+            table_name, partition_name, from_value, to_value, key_arity=key_arity
+        )
+
     async def detach_partition(self, table_name: str, partition_name: str, *, concurrent: bool = True) -> None:
         await self._remover.detach(table_name, partition_name, concurrent=concurrent)
 
@@ -114,6 +161,7 @@ class PostgresPartitionRepository:
         default_partition_name: str,
         target_partition_name: str,
         partition_column: str,
+        trailing_columns: tuple[str, ...] = (),
         from_value: str,
         to_value: str,
     ) -> int:
@@ -121,6 +169,7 @@ class PostgresPartitionRepository:
             default_partition_name=default_partition_name,
             target_partition_name=target_partition_name,
             partition_column=partition_column,
+            trailing_columns=trailing_columns,
             from_value=from_value,
             to_value=to_value,
         )
