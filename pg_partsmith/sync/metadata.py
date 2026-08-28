@@ -262,6 +262,7 @@ class PostgresMetadataProvider:
                     parent_name=parent_name,
                     relkind=RelationKind.from_relkind(coerce_str(row.relkind, encoding="ascii")),
                     bounds=parse_partition_bounds(coerce_str(row.boundaries)),
+                    bounds_expr=coerce_str(row.boundaries) or None,
                     is_attached=bool(row.is_attached),
                     detach_pending=bool(row.detach_pending),
                     partition_type=PartitionType.from_partstrat(coerce_str(row.partstrat, encoding="ascii")),
@@ -611,7 +612,9 @@ def _with_facts(node: PartitionNode, measured: dict[str, PartitionFacts]) -> Par
 
 
 def _render_bounds(node: PartitionNode) -> str | None:
-    """Spell a node's bounds the way ``pg_get_expr`` would, for ``boundaries_expr``."""
+    """The bound expression for ``boundaries_expr``: the catalog's own text when it was kept."""
+    if node.bounds_expr is not None:
+        return node.bounds_expr
     bounds = node.bounds
     if bounds is None:
         return None

@@ -244,6 +244,8 @@ class PartitionNode(BaseModel):
             the equivalent of this field there is ``subpartition_type``.
         partition_columns: This relation's own partition key columns.
         bounds: How this relation is bound inside its parent; None for the root.
+        bounds_expr: The bound as ``pg_get_expr(relpartbound, oid)`` rendered it,
+            kept for the shapes the parser does not understand.
         is_attached: ``pg_class.relispartition``. Descendants reached through a
             parent are attached by construction — a detached relation is not in
             anyone's tree — so this is informative mainly for the root itself.
@@ -274,6 +276,7 @@ class PartitionNode(BaseModel):
     partition_type: PartitionType | None = None
     partition_columns: tuple[str, ...] = ()
     bounds: PartitionBounds | None = None
+    bounds_expr: str | None = None
     is_attached: bool = True
     detach_pending: bool = False
     children: tuple[PartitionNode, ...] = ()
@@ -468,6 +471,7 @@ class PartitionTreeRow(BaseModel):
         parent_name: Schema-qualified parent name; None for the queried root.
         relkind: What the relation physically is.
         bounds: How this relation is bound inside its parent.
+        bounds_expr: The bound as the catalog rendered it.
         is_attached: ``pg_class.relispartition``.
         detach_pending: ``pg_inherits.inhdetachpending``.
         partition_type: How this relation partitions its own children.
@@ -484,6 +488,7 @@ class PartitionTreeRow(BaseModel):
     parent_name: StrippedNonEmptyStr | None = None
     relkind: RelationKind = RelationKind.TABLE
     bounds: PartitionBounds | None = None
+    bounds_expr: str | None = None
     is_attached: bool = True
     detach_pending: bool = False
     partition_type: PartitionType | None = None
@@ -547,6 +552,7 @@ def _to_node(
         partition_columns=row.partition_columns,
         has_expression_key=row.has_expression_key,
         bounds=row.bounds,
+        bounds_expr=row.bounds_expr,
         is_attached=row.is_attached,
         detach_pending=row.detach_pending,
         children=children,

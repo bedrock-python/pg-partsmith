@@ -97,8 +97,10 @@ class MyCalculator:
     def get_boundaries(self, period: Period) -> tuple[str, str]: ...
 ```
 
-A calculator that lacks `period_at` still works: `TimeBoundaries` walks from the current
-period one step at a time, which is slow only for positions very far from now.
+`period_at` is optional for a protocol implementation (it is the separate
+`PositionedCalculator` protocol): a calculator that lacks it still works, `TimeBoundaries`
+walks from the current period one step at a time, which is slow only for positions very
+far from now.
 
 `PeriodCalculator` is `@runtime_checkable`:
 

@@ -433,9 +433,9 @@ class RangePartitioning(SchemeBase):
     def own_name_budget(self) -> int:
         """Bytes this level adds to a partition name.
 
-        Built-in boundaries know their widest suffix; a custom strategy is
-        asked through ``own_name_budget`` when it has one and otherwise assumed
-        to fit in a generous fixed allowance.
+        Built-in boundaries know their suffix; a custom strategy is asked
+        through ``own_name_budget`` when it has one and otherwise assumed to
+        fit in a generous fixed allowance.
         """
         budget = getattr(self.boundaries, "own_name_budget", None)
         if callable(budget):

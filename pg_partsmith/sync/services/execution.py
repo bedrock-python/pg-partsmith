@@ -44,7 +44,7 @@ from pg_partsmith.plan import (
 )
 from pg_partsmith.planner import PlanMode, PlanningContext, plan_maintenance, to_maintenance_issue
 from pg_partsmith.scheme import RangePartitioning
-from pg_partsmith.topology import ActualTree, PartitionBounds, PartitionType, RangeBounds
+from pg_partsmith.topology import ActualTree, PartitionBounds, PartitionType, RangeBounds, RelationKind
 from pg_partsmith.utils import describe_exception, is_default_partition_conflict, pg_sqlstate, split_qualified_name
 
 if TYPE_CHECKING:
@@ -245,8 +245,11 @@ class PlanExecutor:
 
         created = 0
         for child in sub_plan.creates:
+            # Gaps filled inside a relation that already exists are repairs:
+            # they count as such and, like every other repair, fire no hooks.
+            repair = child.model_copy(update={"counts_as": "repaired"})
             nested = _Tally()
-            self._create(config, plan, child, depth=depth + 1, tally=nested, issues=issues)
+            self._create(config, plan, repair, depth=depth + 1, tally=nested, issues=issues)
             created += child.count()
         return created
 
@@ -437,15 +440,7 @@ class PlanExecutor:
         if not self._metadata.is_partition_attached(op.parent_name, op.target):
             raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
 
-        info = PartitionInfo(
-            name=op.target,
-            oid=op.oid,
-            partition_type=_parent_method(op.bounds),
-            bounds=op.bounds,
-            boundaries_expr=None if op.bounds is None else op.bounds.kind,
-            is_attached=True,
-            parent_table=op.parent_name,
-        )
+        info = _detach_info(op)
         self._run_hooks(lambda h: h.before_detach(table_name, info), "before_detach", partition_name=op.target)
         self._repo.detach_partition(op.parent_name, op.target, mode=op.mode)
         self._run_hooks(lambda h: h.after_detach(table_name, op.target), "after_detach", partition_name=op.target)
@@ -520,6 +515,34 @@ def _step_of(op: Operation) -> MaintenanceIssueStep:
     if isinstance(op, DetachPartition):
         return MaintenanceIssueStep.DETACH
     return MaintenanceIssueStep.DROP
+
+
+def _detach_info(op: DetachPartition) -> PartitionInfo:
+    """What hooks see of a partition about to be detached.
+
+    Built without validation: the plan may know the partition only by name and
+    OID (a caller handing in a listing that carried a raw bound, say), and a
+    hook context must not be refused for lacking a bound the operation does
+    not need.
+    """
+    bounds = op.bounds
+    from_value = to_value = None
+    if isinstance(bounds, RangeBounds):
+        from_value, to_value = bounds.from_value, bounds.to_value
+    return PartitionInfo.model_construct(
+        name=op.target,
+        oid=op.oid,
+        partition_type=_parent_method(bounds),
+        from_value=from_value,
+        to_value=to_value,
+        boundaries_expr=None if bounds is None else bounds.kind,
+        bounds=bounds,
+        is_attached=True,
+        is_default=bounds is not None and bounds.kind == "default",
+        relkind=RelationKind.TABLE,
+        subpartition_type=None,
+        parent_table=op.parent_name,
+    )
 
 
 def _partition_info(config: TablePartitionConfig, op: CreatePartition) -> PartitionInfo:

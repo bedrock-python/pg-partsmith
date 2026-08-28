@@ -11,6 +11,7 @@ __all__ = [
     "BoundaryDecoder",
     "DdlTimezoneAware",
     "PeriodCalculator",
+    "PositionedCalculator",
     "TimezoneAwareCalculator",
 ]
 
@@ -30,17 +31,6 @@ class PeriodCalculator(Protocol[PeriodT]):
 
         Returns:
             Current period.
-        """
-        ...
-
-    def period_at(self, instant: datetime) -> PeriodT:
-        """Return the period holding ``instant``.
-
-        Args:
-            instant: A timezone-aware datetime.
-
-        Returns:
-            The period it falls in.
         """
         ...
 
@@ -99,6 +89,27 @@ class PeriodCalculator(Protocol[PeriodT]):
 
         Returns:
             Tuple of (from_value, to_value) as SQL-compatible strings.
+        """
+        ...
+
+
+@runtime_checkable
+class PositionedCalculator(Protocol):
+    """Calculator that can place an arbitrary instant in a period directly.
+
+    Optional on top of :class:`PeriodCalculator`: a calculator without it is
+    walked from its current period one step at a time, which is only slow for
+    a position far from now. Every built-in calculator implements it.
+    """
+
+    def period_at(self, instant: datetime) -> Period:
+        """Return the period holding ``instant``.
+
+        Args:
+            instant: A timezone-aware datetime.
+
+        Returns:
+            The period it falls in.
         """
         ...
 

@@ -550,6 +550,20 @@ class TimeBoundaries(BaseModel):
         """Render the period compactly."""
         return str(self._period_of(window))
 
+    def own_name_budget(self) -> int:
+        """Bytes a partition name grows by at this level.
+
+        A built-in granularity has a fixed suffix (``__2026_w35`` is ten bytes);
+        a custom calculator is asked for ``own_name_budget`` when it has one and
+        otherwise granted the widest built-in suffix.
+        """
+        if self.granularity is not None:
+            return _TIME_SUFFIX_LENGTH[self.granularity]
+        budget = getattr(self.calculator, "own_name_budget", None)
+        if callable(budget):
+            return int(budget())
+        return max(_TIME_SUFFIX_LENGTH.values())
+
     @property
     def timezone(self) -> tzinfo:
         """Timezone the calendar is computed in."""
@@ -569,6 +583,18 @@ class TimeBoundaries(BaseModel):
         # A window read back from the catalog carries no period; the one that
         # starts where it starts is the same window.
         return _period_at(self.period_calculator, window.start)
+
+
+# Partition-name suffix lengths per built-in granularity; they track the
+# calculators' ``format_partition_name`` and ``_NAME_PATTERN``.
+_TIME_SUFFIX_LENGTH: dict[PartitionGranularity, int] = {
+    PartitionGranularity.HOUR: len("__0000_00_00_00"),
+    PartitionGranularity.DAY: len("__0000_00_00"),
+    PartitionGranularity.WEEK: len("__0000_w00"),
+    PartitionGranularity.MONTH: len("__0000_00"),
+    PartitionGranularity.QUARTER: len("__0000_q0"),
+    PartitionGranularity.YEAR: len("__0000"),
+}
 
 
 def _calculator_for(boundaries: TimeBoundaries) -> PeriodCalculator[Period]:

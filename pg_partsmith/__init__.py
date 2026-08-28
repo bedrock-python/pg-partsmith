@@ -85,7 +85,13 @@ from .plan import (
     Severity,
 )
 from .planner import PlanMode, PlanningContext, plan_maintenance
-from .protocols import BoundaryDecoder, DdlTimezoneAware, PeriodCalculator, TimezoneAwareCalculator
+from .protocols import (
+    BoundaryDecoder,
+    DdlTimezoneAware,
+    PeriodCalculator,
+    PositionedCalculator,
+    TimezoneAwareCalculator,
+)
 from .scheme import HashPartitioning, LevelKind, ListGroup, ListPartitioning, PartitionScheme, RangePartitioning
 from .strategies import (
     BasePeriodCalculator,
@@ -175,6 +181,7 @@ __all__ = [
     "PlanMode",
     "PlanStaleError",
     "PlanningContext",
+    "PositionedCalculator",
     "Predicate",
     "QuarterPeriodCalculator",
     "RangeBoundaries",
