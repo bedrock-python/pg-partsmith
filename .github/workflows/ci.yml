@@ -41,14 +41,15 @@ jobs:
         continue-on-error: true
 
   test-integration:
-    name: Integration tests
+    name: Integration tests & coverage gate
     needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
       - run: uv sync --group dev --extra pydantic-settings
-      - run: uv run pytest -m integration --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
+      # Both suites together: the gate is on the whole library, not on one half of it.
+      - run: uv run pytest --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
       - uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
