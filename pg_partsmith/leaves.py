@@ -52,7 +52,7 @@ class LocalLeaves(BaseModel):
             but a role that addresses leaves directly does.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["local"] = "local"
     tablespace: StrippedNonEmptyStr | None = None
@@ -112,7 +112,7 @@ class ForeignLeaves(BaseModel):
         options: Foreign table options, values templated as above.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["foreign"] = "foreign"
     server: StrippedNonEmptyStr

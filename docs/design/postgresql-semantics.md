@@ -140,6 +140,22 @@ drops foreign leaves with the statements above.
 The library translates `23503` on detach into `PartitionReferencedError`, records it as an
 issue and goes on; `Unreferenced()` keeps such partitions out of the plan.
 
+### Referential actions on single-statement moves (verified on 15, 16, 17)
+
+Moving a row with `WITH moved AS (DELETE … RETURNING …) INSERT …` in one statement:
+
+- `NO ACTION`'s trigger runs at the end of the statement, finds the key re-inserted (in
+  another partition of the same referenced table), and passes.
+- `RESTRICT` fires immediately and fails the statement — safe, everything rolls back.
+- `CASCADE`, `SET NULL` and `SET DEFAULT` act on the DELETE alone: the referencing rows
+  are deleted or rewritten even though the parent row is re-inserted in the same
+  statement. The movers refuse to run when an incoming key declares one of these.
+
+`GENERATED ALWAYS AS … STORED` columns refuse explicit values (`428C9`), so the movers
+list only writable columns (`attgenerated = ''`) and let the target recompute; a
+`GENERATED ALWAYS AS IDENTITY` column on the target needs `OVERRIDING SYSTEM VALUE` for
+the moved values to survive, which the movers add when one is present.
+
 ## Overlaps and gaps
 
 - Overlapping RANGE siblings (`ATTACH` or `CREATE … PARTITION OF`), overlapping LIST values,

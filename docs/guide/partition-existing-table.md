@@ -25,7 +25,11 @@ DEFAULT partition until monthly partitions exist.
     before the swap, or `ATTACH` fails with `unique constraint … must include all
     partitioning columns`. Sequences, indexes and constraints come across with `LIKE …
     INCLUDING ALL`; foreign keys *to* the old table need to be recreated against the new
-    parent.
+    parent — **`ON DELETE NO ACTION` for the duration of the migration**. A `CASCADE`,
+    `SET NULL` or `SET DEFAULT` action would fire on every batch as rows are deleted from
+    their old partition, so the movers refuse to run under one; add the action back once
+    the drain is done. See
+    [Row moves and ON DELETE actions](foreign-keys.md#row-moves-and-on-delete-actions).
 
 ## 2. Configure, plan, run the tick
 
@@ -79,9 +83,12 @@ finds it, finishes it and attaches it.
     tolerate a month's rows appearing a little later. Rows already in real partitions, and
     rows still in DEFAULT for other windows, stay visible throughout.
 
-`partition_data` takes the table's lock, so it does not race the scheduled tick; it does
-refuse a window it cannot create (an unmanaged partition overlaps it) with a `move` issue
-and `complete=False` rather than loop.
+`partition_data` takes the table's lock, so it does not race the scheduled tick. It
+refuses a window it cannot create (an unmanaged partition overlaps it), and any move an
+incoming foreign key's `ON DELETE` action would corrupt, with a `move` issue and
+`complete=False` rather than loop. A window whose partition already exists *detached*
+with this library's marker — retention retired it, and late rows for it landed in
+DEFAULT — is filled and re-attached rather than given up on.
 
 ## 4. Afterwards
 
@@ -107,9 +114,17 @@ hooks, revalidation:
 result = await service.unpartition(config, "public.events_flat", batch_rows=50_000, drop_emptied=True)
 ```
 
-`events_flat` is created `LIKE` the root when it does not exist. Foreign partitions are
-skipped and reported: their rows are not this database's to move. Rows already moved are
-in `events_flat` at every commit point, never in two places.
+`events_flat` is created `LIKE` the root when it does not exist; it must be a plain
+table outside the tree — the root itself, one of its partitions or one of its detached
+partitions is refused (rows moved "into" the root would route straight back to where they
+came from). With `drop_emptied` a partition is detached once its last batch comes up
+short, the rows that arrived in the meantime are moved, and the drop moves whatever is
+left **in the same transaction, under the drop's own lock** — a row committed between the
+last batch and the drop ends in `events_flat`, never in the dropped table. Detached
+partitions this library owns (orphans waiting out a grace) are emptied too; under
+`DropNever` they belong to another process and are reported instead. Foreign partitions
+are skipped and reported: their rows are not this database's to move. Rows already moved
+are in `events_flat` at every commit point, never in two places.
 
 ## Nested schemes
 

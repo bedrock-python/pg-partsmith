@@ -693,3 +693,35 @@ def test__orphan__not_wanted_again__waits_out_its_grace_then_drops(sync_db_engin
     assert pending.dropped_count == 0
     assert dropped.dropped_count == 1
     assert relkind(sync_db_engine, june) is None
+
+
+def test__orphan_reattach__marker_removed_and_a_later_detach_starts_a_fresh_grace(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange: July detached under KeepNewest(1) with a week of grace
+    narrow = monthly_config(table, lifecycle=_grace_config(table, timedelta(days=7)))
+    run_maintenance(sync_db_engine, narrow, at_time="2026-07-15")
+    run_maintenance(sync_db_engine, narrow, at_time="2026-08-01")
+    july = f"{table}__2026_07"
+    assert (table_comment(sync_db_engine, july) or "").startswith(orphan_marker(f"public.{table}"))
+
+    # Act 1: retention grows; the orphan comes back and stops being an orphan
+    wide = monthly_config(
+        table,
+        lifecycle=LifecyclePolicy(
+            creation=CreateAhead(count=1), retention=KeepNewest(count=3), drop=DropAfter(grace=timedelta(days=7))
+        ),
+    )
+    run_maintenance(sync_db_engine, wide, at_time="2026-08-02")
+    assert is_attached(sync_db_engine, july)
+    assert table_comment(sync_db_engine, july) is None
+
+    # Act 2: it expires again weeks later -- the grace runs from the *new* detach
+    run_maintenance(sync_db_engine, narrow, at_time="2026-08-20")
+    comment = table_comment(sync_db_engine, july) or ""
+    assert f"{DETACHED_AT_MARKER}2026-08-20" in comment
+    pending = run_maintenance(sync_db_engine, narrow, at_time="2026-08-21")
+    assert pending.dropped_count == 0
+    assert relkind(sync_db_engine, july) == "r"
+    dropped = run_maintenance(sync_db_engine, narrow, at_time="2026-08-28")
+    assert dropped.dropped_count == 1

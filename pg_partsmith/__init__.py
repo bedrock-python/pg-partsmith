@@ -43,6 +43,7 @@ from .exceptions import (
     PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
+    RowMoveRefusedError,
     UnmanagedPartitionDropError,
 )
 from .leaves import ForeignLeaves, LeafBackend, LocalLeaves
@@ -201,6 +202,7 @@ __all__ = [
     "Reason",
     "RelationKind",
     "RetentionPolicy",
+    "RowMoveRefusedError",
     "RowsAbove",
     "Severity",
     "SizeAbove",

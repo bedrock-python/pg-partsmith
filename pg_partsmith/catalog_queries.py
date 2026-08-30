@@ -196,7 +196,48 @@ RELATION_COLUMNS_SQL = """
     WHERE a.attrelid = to_regclass(:table_name)
       AND a.attnum > 0
       AND NOT a.attisdropped
+      AND a.attgenerated = ''
     ORDER BY a.attnum
+"""
+
+# Whether a relation has a ``GENERATED ALWAYS AS IDENTITY`` column.
+#
+# Moving rows spells their values out, and PostgreSQL refuses an explicit
+# value for such a column unless the INSERT says ``OVERRIDING SYSTEM VALUE``.
+# A moved row keeps its identity value either way -- that is the point.
+RELATION_HAS_IDENTITY_ALWAYS_SQL = """
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_attribute a
+        WHERE a.attrelid = to_regclass(:table_name)
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attidentity = 'a'
+    )
+"""
+
+# Foreign keys referencing a relation whose ON DELETE action would fire on
+# a row move.
+#
+# A move deletes the row from one partition and inserts it into another in
+# a single statement. The NO ACTION check sees the row again and passes,
+# RESTRICT refuses the statement outright; CASCADE, SET NULL and SET DEFAULT
+# act on the DELETE alone and would delete or rewrite the referencing rows.
+# A foreign key referencing a partitioned table is cloned onto each of its
+# partitions with ``confrelid`` pointing at the partition, so one lookup by
+# the source relation finds what would fire on it.
+DESTRUCTIVE_INCOMING_FOREIGN_KEYS_SQL = """
+    SELECT
+        con.conname AS constraint_name,
+        quote_ident(ns.nspname) || '.' || quote_ident(c.relname) AS referencing,
+        con.confdeltype AS on_delete
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    WHERE con.contype = 'f'
+      AND con.confrelid = to_regclass(:table_name)
+      AND con.confdeltype IN ('c', 'n', 'd')
+    ORDER BY con.conname, referencing
 """
 
 # A relation's live columns with their types, for a foreign table shaped like it.

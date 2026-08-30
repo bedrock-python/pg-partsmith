@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import freezegun
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.entities import (
@@ -16,6 +17,7 @@ from pg_partsmith.entities import (
     PartitionType,
     TablePartitionConfig,
 )
+from pg_partsmith.exceptions import PlanStaleError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
@@ -25,7 +27,12 @@ from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
 from pg_partsmith.topology import RangeBounds
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
-from tests.integration.sync.support import count_ddl, make_table
+from tests.integration.sync.support import (
+    count_ddl,
+    is_attached,
+    make_table,
+    table_comment,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -264,3 +271,51 @@ def test__maintainer__run_maintenance_safe__never_raises_and_reports_the_error(
 
 
 # ── Two maintainers on the same table ────────────────────────────────────────────
+
+
+# ── An interrupted DETACH CONCURRENTLY ──────────────────────────────────────────
+
+
+# ── A hook must not be able to redirect a detach ────────────────────────────────
+
+
+class _SwapHooks(BasePartitionLifecycleHooks):
+    """Replaces the partition at the planned name from inside ``before_detach``."""
+
+    def __init__(self, engine: Engine, parent: str) -> None:
+        self._engine = engine
+        self._parent = parent
+
+    def before_detach(self, table_name: str, partition: object) -> None:
+        name = partition.relname  # type: ignore[attr-defined]
+        lower, upper = partition.from_value, partition.to_value  # type: ignore[attr-defined]
+        with self._engine.begin() as conn:
+            conn.execute(text(f'ALTER TABLE "{self._parent}" DETACH PARTITION "{name}"'))
+            conn.execute(text(f'DROP TABLE "{name}"'))
+            conn.execute(text(f'CREATE TABLE "{name}" (LIKE "{self._parent}" INCLUDING ALL)'))
+            conn.execute(
+                text(
+                    f'ALTER TABLE "{self._parent}" ATTACH PARTITION "{name}" '
+                    f"FOR VALUES FROM ('{lower}') TO ('{upper}')"
+                )
+            )
+
+
+def test__maintainer__relation_swapped_by_a_hook__detach_refused_as_stale(
+    sync_db_engine: Engine, partitioned_table: str
+) -> None:
+    # Arrange: April expired; a hook swaps in a different relation under its name
+    config = monthly_config(partitioned_table, create_ahead=1, retention=1)
+    hook = _SwapHooks(sync_db_engine, partitioned_table)
+    service = PartitionLifecycleService(*_make_components(sync_db_engine), hooks=[hook])
+    with freezegun.freeze_time("2026-04-15"):
+        service.maintain(config)
+
+    # Act / Assert: the repository re-checks identity under its own lock and refuses
+    with freezegun.freeze_time("2026-08-26"), pytest.raises(PlanStaleError):
+        service.maintain(config)
+
+    # The replacement is untouched: still attached, never marked
+    april = f"{partitioned_table}__2026_04"
+    assert is_attached(sync_db_engine, april)
+    assert table_comment(sync_db_engine, april) is None

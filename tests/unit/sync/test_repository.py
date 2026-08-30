@@ -18,6 +18,7 @@ from pg_partsmith.exceptions import (
     PartitionNotFoundError,
     PartitionReferencedError,
     PlanStaleError,
+    RowMoveRefusedError,
     UnmanagedPartitionDropError,
 )
 from pg_partsmith.leaves import LocalLeaves
@@ -50,6 +51,8 @@ class _Catalog:
     privileges: list[tuple[str | None, str | None, str | None, bool]] = field(default_factory=list)
     relkind: str = "r"
     moved_rows: int | None = 0
+    identity_always: object = False
+    destructive_fks: list[tuple[str, str, str]] = field(default_factory=list)
     failures: dict[str, object] = field(default_factory=dict)
 
 
@@ -81,6 +84,10 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
                 raise error  # type: ignore[misc]
     if "inhdetachpending" in sql:
         return _scalar(catalog.detach_pending)
+    if "confdeltype IN" in sql:
+        return _rows(list(catalog.destructive_fks))
+    if "attidentity" in sql:
+        return _scalar(_next(catalog.identity_always))
     if "obj_description" in sql:
         return _scalar(_next(catalog.comment))
     if "relispartition = true" in sql:
@@ -135,6 +142,18 @@ def _is_timeout_bookkeeping(sql: str) -> bool:
 def _statements(conn: MagicMock) -> list[str]:
     """Every statement except the server-side ``statement_timeout`` bookkeeping the sync mirror adds."""
     return [sql for sql in _all_statements(conn) if not _is_timeout_bookkeeping(sql)]
+
+
+def _locks(conn: MagicMock) -> list[str]:
+    return [s for s in _statements(conn) if s.startswith("LOCK TABLE")]
+
+
+def _attach_statement(conn: MagicMock) -> str:
+    return next(s for s in _statements(conn) if "ATTACH PARTITION" in s)
+
+
+# The comment read every attach ends with: a re-attached relation must not keep the marker.
+_MARKER_LOOKUP = "SELECT obj_description(to_regclass(:partition_name), 'pg_class')"
 
 
 def _sqlstate_error(sqlstate: str, message: str = "pg error") -> SQLAlchemyError:
@@ -288,6 +307,7 @@ def test__attach_partition__range_bounds__sets_the_ddl_timezone_then_attaches() 
     assert _statements(conn) == [
         "SET LOCAL TIME ZONE 'UTC'",
         "ALTER TABLE \"events\" ATTACH PARTITION \"events__2024_01\" FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+        _MARKER_LOOKUP,
     ]
 
 
@@ -311,9 +331,9 @@ def test__attach_partition__no_ddl_timezone__attaches_without_touching_the_sessi
     # Act
     repo.attach_partition("events", "events__2024_01", RangeBounds(from_value="2024-01-01", to_value="2024-02-01"))
 
-    # Assert
-    assert len(_statements(conn)) == 1
+    # Assert -- the attach, then the marker lookup; no session setting
     assert _statements(conn)[0].startswith("ALTER TABLE")
+    assert not any("TIME ZONE" in s for s in _statements(conn))
 
 
 def test__attach_partition__composite_key__pads_every_trailing_column_with_minvalue() -> None:
@@ -327,7 +347,7 @@ def test__attach_partition__composite_key__pads_every_trailing_column_with_minva
     )
 
     # Assert -- one MINVALUE per trailing column, on both ends
-    stmt = _statements(conn)[-1]
+    stmt = _attach_statement(conn)
     assert "FROM ('2026-08-24', MINVALUE, MINVALUE)" in stmt
     assert "TO ('2026-08-31', MINVALUE, MINVALUE)" in stmt
 
@@ -352,7 +372,7 @@ def test__attach_partition__range_literals__unbounded_ends_are_keywords_and_valu
     repo.attach_partition("events", "events__x", bounds)
 
     # Assert
-    assert _statements(conn)[-1].endswith(expected)
+    assert _attach_statement(conn).endswith(expected)
 
 
 def test__attach_partition__hash_bounds__renders_modulus_then_remainder_without_a_timezone() -> None:
@@ -366,7 +386,8 @@ def test__attach_partition__hash_bounds__renders_modulus_then_remainder_without_
     # Assert
     assert _statements(conn) == [
         'ALTER TABLE "events__2026_w35" ATTACH PARTITION "events__2026_w35__h1" '
-        "FOR VALUES WITH (MODULUS 4, REMAINDER 1)"
+        "FOR VALUES WITH (MODULUS 4, REMAINDER 1)",
+        _MARKER_LOOKUP,
     ]
 
 
@@ -380,7 +401,8 @@ def test__attach_partition__list_bounds__quotes_values_and_keeps_null_a_keyword(
 
     # Assert
     assert _statements(conn) == [
-        "ALTER TABLE \"regions\" ATTACH PARTITION \"regions__eu\" FOR VALUES IN ('de', 'l''x', NULL)"
+        "ALTER TABLE \"regions\" ATTACH PARTITION \"regions__eu\" FOR VALUES IN ('de', 'l''x', NULL)",
+        _MARKER_LOOKUP,
     ]
 
 
@@ -393,7 +415,7 @@ def test__attach_partition__list_bounds_with_the_string_null__quotes_it() -> Non
     repo.attach_partition("regions", "regions__x", ListBounds(values=("NULL",)))
 
     # Assert
-    assert _statements(conn)[-1].endswith("FOR VALUES IN ('NULL')")
+    assert _attach_statement(conn).endswith("FOR VALUES IN ('NULL')")
 
 
 def test__attach_partition__default_bounds__renders_default() -> None:
@@ -405,7 +427,7 @@ def test__attach_partition__default_bounds__renders_default() -> None:
     repo.attach_partition("regions", "regions__other", DefaultBounds())
 
     # Assert
-    assert _statements(conn) == ['ALTER TABLE "regions" ATTACH PARTITION "regions__other" DEFAULT']
+    assert _statements(conn) == ['ALTER TABLE "regions" ATTACH PARTITION "regions__other" DEFAULT', _MARKER_LOOKUP]
 
 
 def test__attach_partition__database_error__propagates() -> None:
@@ -439,10 +461,11 @@ def test__reconcile_default_rows__names_the_columns_on_both_sides_and_returns_th
     assert moved == 42
     statements = _statements(conn)
     assert statements[0] == "SET LOCAL TIME ZONE 'UTC'"
-    assert statements[1] == 'LOCK TABLE "events_default" IN SHARE ROW EXCLUSIVE MODE'
-    assert statements[2] == 'LOCK TABLE "events__2024_04" IN SHARE ROW EXCLUSIVE MODE'
-    assert "pg_attribute" in statements[3]
-    assert statements[4] == (
+    assert _locks(conn) == [
+        'LOCK TABLE "events_default" IN SHARE ROW EXCLUSIVE MODE',
+        'LOCK TABLE "events__2024_04" IN SHARE ROW EXCLUSIVE MODE',
+    ]
+    assert statements[-1] == (
         'WITH moved AS (DELETE FROM "events_default" '
         "WHERE \"created_at\" >= '2024-04-01' AND \"created_at\" < '2024-05-01' "
         'RETURNING "created_at", "tenant_id", "data") '
@@ -542,7 +565,7 @@ def test__reconcile_default_rows__no_ddl_timezone__skips_the_session_setting() -
 
     # Assert
     assert not any("TIME ZONE" in s for s in _statements(conn))
-    assert _statements(conn)[0].startswith("LOCK TABLE")
+    assert _locks(conn)[0].startswith('LOCK TABLE "events_default"')
 
 
 def test__reconcile_default_rows__unknown_rowcount__reads_as_zero() -> None:
@@ -1595,8 +1618,10 @@ def test__move_rows__locks_both_sides_and_moves_a_batch_of_any_rows() -> None:
     # Assert
     assert moved == 4
     statements = _statements(conn)
-    assert statements[0] == 'LOCK TABLE "public"."events__2024_01" IN SHARE ROW EXCLUSIVE MODE'
-    assert statements[1] == 'LOCK TABLE "public"."events_flat" IN SHARE ROW EXCLUSIVE MODE'
+    assert _locks(conn) == [
+        'LOCK TABLE "public"."events__2024_01" IN SHARE ROW EXCLUSIVE MODE',
+        'LOCK TABLE "public"."events_flat" IN SHARE ROW EXCLUSIVE MODE',
+    ]
     assert statements[-1] == (
         'WITH moved AS (DELETE FROM "public"."events__2024_01" WHERE (tableoid, ctid) IN ('
         'SELECT tableoid, ctid FROM "public"."events__2024_01" LIMIT 4) '
@@ -1646,3 +1671,157 @@ def test__detach_partition__rows_still_referenced__raises_partition_referenced(m
 
     assert excinfo.value.partition_name == "events__2024_01"
     assert "violates foreign key constraint" in excinfo.value.detail
+
+
+# ── review follow-ups: markers, identities, refused moves, guarded detaches ─────
+
+
+def test__attach_partition__marked_orphan__loses_the_marker_and_keeps_the_user_comment() -> None:
+    # Arrange
+    marked = orphan_comment("public.events", detached_at=datetime(2026, 6, 1, tzinfo=UTC), existing_comment="keep me")
+    engine, conn = _engine(_Catalog(comment=marked))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", HashBounds(modulus=2, remainder=0))
+
+    # Assert -- ATTACH and the comment rewrite share the transaction
+    assert _statements(conn)[-1] == "COMMENT ON TABLE \"events__2024_01\" IS 'keep me'"
+    engine.begin.assert_called_once()
+
+
+def test__attach_partition__marker_only_comment__is_removed_entirely() -> None:
+    # Arrange
+    marked = orphan_comment("public.events", detached_at=None, existing_comment=None)
+    engine, conn = _engine(_Catalog(comment=marked))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", HashBounds(modulus=2, remainder=0))
+
+    # Assert
+    assert _statements(conn)[-1] == 'COMMENT ON TABLE "events__2024_01" IS NULL'
+
+
+def test__attach_partition__no_marker__writes_no_comment() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment="just a note"))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", HashBounds(modulus=2, remainder=0))
+
+    # Assert
+    assert not any(s.startswith("COMMENT ON") for s in _statements(conn))
+
+
+def test__move_rows__cascading_foreign_key__is_refused_before_any_row_moves() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(destructive_fks=[("fk_orders_event", '"public"."orders"', "c")]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="ON DELETE CASCADE"):
+        repo.move_rows("public.events__2024_01", "public.events_flat")
+    assert not any("WITH moved AS" in s for s in _statements(conn))
+
+
+def test__reconcile_default_rows__set_null_foreign_key__is_refused() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(destructive_fks=[("fk_ref", '"public"."refs"', "n")]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="ON DELETE SET NULL"):
+        repo.reconcile_default_rows(
+            default_partition_name="events_default",
+            target_partition_name="events__2024_04",
+            key_columns=("created_at",),
+            from_value="2024-04-01",
+            to_value="2024-05-01",
+        )
+
+
+def test__move_rows__identity_always_on_the_target__overrides_the_system_value() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(identity_always=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert -- moved rows keep their identity values
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    assert ') OVERRIDING SYSTEM VALUE SELECT "created_at"' in statement
+
+
+def test__detach_partition__expected_oid_differs__is_stale_and_nothing_is_marked() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=9999, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING, expected_oid=4242)
+    statements = _statements(conn)
+    assert not any("COMMENT ON" in s for s in statements)
+    assert not any("DETACH PARTITION" in s for s in statements)
+
+
+def test__detach_partition__expected_oid_matches__locks_checks_marks_and_detaches_in_one_transaction() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=4242, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING, expected_oid=4242)
+
+    # Assert -- lock first, then identity, marker, statement, all on one transaction
+    statements = _statements(conn)
+    lock_at = statements.index('LOCK TABLE "events__2024_01" IN ACCESS EXCLUSIVE MODE')
+    oid_at = next(i for i, s in enumerate(statements) if "SELECT c.oid" in s)
+    comment_at = next(i for i, s in enumerate(statements) if s.startswith("COMMENT ON TABLE"))
+    assert lock_at < oid_at < comment_at
+    assert statements[-1] == 'ALTER TABLE "events" DETACH PARTITION "events__2024_01"'
+    engine.begin.assert_called_once()
+
+
+def test__detach_partition__concurrent_form__rechecks_the_oid_after_the_statement() -> None:
+    # Arrange -- the pre-check passes, the post-check sees another relation under the name
+    engine, conn = _engine(_Catalog(oid=[4242, 9999], attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.detach_partition("events", "events__2024_01", mode=DetachMode.CONCURRENT, expected_oid=4242)
+    assert any("DETACH PARTITION" in s and "CONCURRENTLY" in s for s in _statements(conn))
+
+
+def test__detach_partition__no_expected_oid__skips_the_identity_checks() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING)
+
+    # Assert
+    assert not any("SELECT c.oid" in s for s in _statements(conn))
+
+
+def test__drop_partition__drain_into__moves_the_tail_in_the_drop_transaction() -> None:
+    # Arrange
+    marked = orphan_table_comment("public.events")
+    engine, conn = _engine(_Catalog(comment=[marked, marked], moved_rows=3))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01", drain_into="public.events_flat")
+
+    # Assert -- the move precedes the drop, under the same lock
+    statements = _statements(conn)
+    move_at = next(i for i, s in enumerate(statements) if s.startswith("WITH moved AS"))
+    drop_at = next(i for i, s in enumerate(statements) if s.startswith("DROP TABLE"))
+    lock_at = next(i for i, s in enumerate(statements) if "ACCESS EXCLUSIVE" in s)
+    assert lock_at < move_at < drop_at
+    assert '"public"."events_flat"' in statements[move_at]

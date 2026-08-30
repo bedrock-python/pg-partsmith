@@ -9,22 +9,27 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.catalog_queries import (
+    DESTRUCTIVE_INCOMING_FOREIGN_KEYS_SQL,
     RELATION_COLUMN_DEFINITIONS_SQL,
     RELATION_COLUMNS_SQL,
+    RELATION_HAS_IDENTITY_ALWAYS_SQL,
     RELATION_PRIVILEGES_SQL,
 )
-from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionNotFoundError
+from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionNotFoundError, RowMoveRefusedError
 from pg_partsmith.topology import HashBounds, ListBounds, RangeBounds
 from pg_partsmith.utils import (
     _as_text,
     build_ddl_statement,
     coerce_str,
+    comment_without_markers,
+    parse_orphan_comment,
     pg_sqlstate,
     quote_identifier,
     quote_literal,
     to_regclass_argument,
 )
 
+from .resolver import relation_kind
 from .timeouts import apply_local_statement_timeout
 
 if TYPE_CHECKING:
@@ -37,14 +42,20 @@ if TYPE_CHECKING:
 # Privilege names ``aclexplode`` reports; anything else is not spliced into a GRANT.
 _PRIVILEGE_PATTERN = re.compile(r"^[A-Z]+$")
 
+# ``pg_constraint.confdeltype`` codes of the actions a row move must not trigger.
+_ON_DELETE_ACTIONS = {"c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
+
 
 class PartitionCreator:
-    """Helper for partition creation and attachment."""
+    """Helper for partition creation, attachment and row movement."""
 
-    def __init__(self, *, engine: Engine, ddl_timeout: float, ddl_timezone: str | None) -> None:
+    def __init__(
+        self, *, engine: Engine, ddl_timeout: float, ddl_timezone: str | None, marker_prefix: str | None = None
+    ) -> None:
         self._engine = engine
         self._ddl_timeout = ddl_timeout
         self._ddl_timezone = ddl_timezone
+        self._marker_prefix = marker_prefix
 
     def create_table_like(
         self,
@@ -216,6 +227,12 @@ class PartitionCreator:
         key only the leading column carries the window; the trailing ones are
         bounded with ``MINVALUE`` at both ends.
 
+        A table that carries the orphan marker -- one this library detached
+        and is now bringing back -- loses it in the same transaction: an
+        attached partition is nobody's orphan, and a marker left on it would
+        hand its old detach instant to the next detach, cutting that grace
+        period short. The rest of the comment is kept.
+
         Args:
             parent_name: Partitioned relation to attach to.
             partition_name: Table to attach.
@@ -234,6 +251,26 @@ class PartitionCreator:
             if isinstance(bounds, RangeBounds) and self._ddl_timezone is not None:
                 conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             conn.execute(stmt)
+            self._clear_orphan_marker(conn, partition_name)
+
+    def _clear_orphan_marker(self, conn: Connection, partition_name: str) -> None:
+        """Take this library's marker lines off a relation that is attached again."""
+        result = conn.execute(
+            text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
+            {"partition_name": to_regclass_argument(partition_name)},
+        )
+        existing = coerce_str(result.scalar())
+        if parse_orphan_comment(existing, marker_prefix=self._marker_prefix) is None:
+            return
+        rest = comment_without_markers(existing, marker_prefix=self._marker_prefix)
+        relation = "FOREIGN TABLE" if relation_kind(conn, partition_name) == "f" else "TABLE"
+        if rest:
+            stmt = build_ddl_statement(
+                f"COMMENT ON {relation} {{partition}} IS [comment]", partition=partition_name, comment=rest
+            )
+        else:
+            stmt = build_ddl_statement(f"COMMENT ON {relation} {{partition}} IS NULL", partition=partition_name)
+        conn.execute(stmt)
 
     def _relation_columns(self, conn: Connection, table_name: str) -> tuple[str, ...]:
         """Read a relation's live column names, in its own physical order.
@@ -280,8 +317,6 @@ class PartitionCreator:
             msg = "reconcile_default_rows needs the parent's partition key"
             raise ValueError(msg)
 
-        default_quoted = quote_identifier(default_partition_name)
-        target_quoted = quote_identifier(target_partition_name)
         column_quoted = quote_identifier(key_columns[0])
         from_quoted = quote_literal(from_value)
         to_quoted = quote_literal(to_value)
@@ -299,29 +334,10 @@ class PartitionCreator:
             # otherwise a non-UTC server timezone moves the wrong row range.
             if self._ddl_timezone is not None:
                 conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
-            # Lock both tables to minimize race conditions
-            conn.execute(text(f"LOCK TABLE {default_quoted} IN SHARE ROW EXCLUSIVE MODE"))
-            conn.execute(text(f"LOCK TABLE {target_quoted} IN SHARE ROW EXCLUSIVE MODE"))
-
-            columns = self._relation_columns(conn, default_partition_name)
-            column_list = ", ".join(quote_identifier(column) for column in columns)
-
-            # Both sides name their columns. ``RETURNING *`` emits the DEFAULT
-            # partition's own physical order, and an unqualified INSERT binds
-            # that order positionally to the target's -- silently transposing
-            # values whenever the two differ. They can differ: ATTACH PARTITION
-            # matches columns by name, so a DEFAULT partition created
-            # independently and attached need not share the order of one
-            # created with LIKE.
-            #
+            self._lock_for_move(conn, default_partition_name, target_partition_name)
             # All identifiers and literals are properly quoted, S608 is a false positive
             condition = f"{column_quoted} >= {from_quoted} AND {column_quoted} < {to_quoted}{not_null}"
-            move_sql = _as_text(_move_statement(default_quoted, target_quoted, column_list, condition, limit))
-
-            result = conn.execute(move_sql)
-            moved_count = result.rowcount or 0
-
-        return moved_count
+            return self._move(conn, default_partition_name, target_partition_name, condition=condition, limit=limit)
 
     def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:
         """Move rows from one relation into another, whatever their keys.
@@ -334,20 +350,96 @@ class PartitionCreator:
 
         Returns:
             Number of rows moved.
+
+        Raises:
+            RowMoveRefusedError: If a foreign key's ``ON DELETE`` action would
+                fire on the rows as they leave ``source_name``.
         """
-        source_quoted = quote_identifier(source_name)
-        target_quoted = quote_identifier(target_name)
         with self._engine.begin() as conn:
             apply_local_statement_timeout(conn, self._ddl_timeout)
-            conn.execute(text(f"LOCK TABLE {source_quoted} IN SHARE ROW EXCLUSIVE MODE"))
-            conn.execute(text(f"LOCK TABLE {target_quoted} IN SHARE ROW EXCLUSIVE MODE"))
-            columns = self._relation_columns(conn, source_name)
-            column_list = ", ".join(quote_identifier(column) for column in columns)
-            result = conn.execute(_as_text(_move_statement(source_quoted, target_quoted, column_list, None, limit)))
-            return result.rowcount or 0
+            self._lock_for_move(conn, source_name, target_name)
+            return self._move(conn, source_name, target_name, condition=None, limit=limit)
+
+    def move_rows_conn(self, conn: Connection, source_name: str, target_name: str) -> int:
+        """Move every row of ``source_name`` into ``target_name`` on an open transaction.
+
+        For callers that need the move and what follows it -- a drop, say --
+        to commit together. Locks are the caller's.
+        """
+        return self._move(conn, source_name, target_name, condition=None, limit=None)
+
+    def _lock_for_move(self, conn: Connection, *names: str) -> None:
+        """Take SHARE ROW EXCLUSIVE on every local relation involved in a move.
+
+        A foreign table cannot be locked (``LOCK TABLE is not supported for
+        foreign tables``); it is written through its wrapper like any other
+        INSERT, and a detached one is reachable by nobody else anyway.
+        """
+        for name in names:
+            if relation_kind(conn, name) != "f":
+                conn.execute(text(f"LOCK TABLE {quote_identifier(name)} IN SHARE ROW EXCLUSIVE MODE"))
+
+    def _move(
+        self, conn: Connection, source_name: str, target_name: str, *, condition: str | None, limit: int | None
+    ) -> int:
+        """Run one move statement once it is known to be safe."""
+        self._refuse_referential_actions(conn, source_name)
+        columns = self._relation_columns(conn, source_name)
+        # Both sides name their columns. ``RETURNING *`` emits the source's
+        # own physical order, and an unqualified INSERT binds that order
+        # positionally to the target's -- silently transposing values whenever
+        # the two differ. They can differ: ATTACH PARTITION matches columns by
+        # name, so a DEFAULT partition created independently and attached need
+        # not share the order of one created with LIKE.
+        column_list = ", ".join(quote_identifier(column) for column in columns)
+        overriding = self._has_identity_always(conn, target_name)
+        statement = _move_statement(
+            quote_identifier(source_name),
+            quote_identifier(target_name),
+            column_list,
+            condition,
+            limit,
+            overriding=overriding,
+        )
+        result = conn.execute(_as_text(statement))
+        return result.rowcount or 0
+
+    def _refuse_referential_actions(self, conn: Connection, source_name: str) -> None:
+        """Refuse a move that a foreign key's ``ON DELETE`` action would turn into data loss.
+
+        The move is one statement: ``DELETE ... RETURNING`` into ``INSERT``.
+        PostgreSQL's NO ACTION check runs at the end of it, finds the row in
+        its new partition and passes; RESTRICT refuses the statement, which is
+        safe. CASCADE, SET NULL and SET DEFAULT act on the DELETE alone and
+        would delete or rewrite the referencing rows while the moved row lives
+        on -- verified on PostgreSQL 15, 16 and 17.
+        """
+        result = conn.execute(
+            text(DESTRUCTIVE_INCOMING_FOREIGN_KEYS_SQL), {"table_name": to_regclass_argument(source_name)}
+        )
+        rows = result.fetchall()
+        if not rows:
+            return
+        described = ", ".join(
+            f"{coerce_str(row[0])} on {coerce_str(row[1])} (ON DELETE "
+            f"{_ON_DELETE_ACTIONS.get(coerce_str(row[2], encoding='ascii') or '', '?')})"
+            for row in rows
+        )
+        raise RowMoveRefusedError(
+            source_name,
+            f"foreign key {described} would act on the rows as they are deleted from their old partition, "
+            "deleting or rewriting the rows that reference them; re-create it ON DELETE NO ACTION "
+            "(or after the move) and retry",
+        )
+
+    def _has_identity_always(self, conn: Connection, table_name: str) -> bool:
+        result = conn.execute(text(RELATION_HAS_IDENTITY_ALWAYS_SQL), {"table_name": to_regclass_argument(table_name)})
+        return bool(result.scalar())
 
 
-def _move_statement(source: str, target: str, column_list: str, condition: str | None, limit: int | None) -> str:
+def _move_statement(
+    source: str, target: str, column_list: str, condition: str | None, limit: int | None, *, overriding: bool = False
+) -> str:
     """One ``DELETE ... RETURNING`` / ``INSERT`` statement moving rows from ``source`` to ``target``.
 
     Both sides name their columns: ``RETURNING *`` would emit the source's
@@ -355,17 +447,20 @@ def _move_statement(source: str, target: str, column_list: str, condition: str |
     transposing values whenever the two relations were created independently.
     A batch is bounded through ``(tableoid, ctid)`` rather than ``ctid`` alone
     so a partitioned source, whose leaves each number their own tuples, is
-    addressed unambiguously. Every identifier and literal is already quoted.
+    addressed unambiguously. ``overriding`` keeps the values of a
+    ``GENERATED ALWAYS AS IDENTITY`` column on the target. Every identifier
+    and literal is already quoted.
     """
     where = f" WHERE {condition}" if condition else ""
     if limit is not None:
         picked = f"SELECT tableoid, ctid FROM {source}{where} LIMIT {int(limit):d}"  # noqa: S608
         where = f" WHERE (tableoid, ctid) IN ({picked})"
+    override = " OVERRIDING SYSTEM VALUE" if overriding else ""
     return (
         f"WITH moved AS ("  # noqa: S608
         f"DELETE FROM {source}{where} RETURNING {column_list}"
         f") "
-        f"INSERT INTO {target} ({column_list}) "
+        f"INSERT INTO {target} ({column_list}){override} "
         f"SELECT {column_list} FROM moved"
     )
 

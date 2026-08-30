@@ -22,7 +22,7 @@ from pg_partsmith.entities import MaintenanceResult, PartitionInfo, TablePartiti
 from pg_partsmith.leaves import LocalLeaves
 from pg_partsmith.lifecycle import DetachMode, SqlPredicate
 from pg_partsmith.plan import PartitionBy
-from pg_partsmith.topology import ActualTree, FactKind, PartitionBounds, PartitionNode, PartitionType
+from pg_partsmith.topology import ActualTree, FactKind, PartitionBounds, PartitionNode, PartitionType, RelationKind
 
 __all__ = [
     "LockManager",
@@ -143,7 +143,12 @@ class PartitionRepository(Protocol):
         ...
 
     async def detach_partition(
-        self, parent_name: str, partition_name: str, *, mode: DetachMode = DetachMode.AUTO
+        self,
+        parent_name: str,
+        partition_name: str,
+        *,
+        mode: DetachMode = DetachMode.AUTO,
+        expected_oid: int | None = None,
     ) -> None:
         """Detach a partition, writing the orphan marker first.
 
@@ -151,25 +156,35 @@ class PartitionRepository(Protocol):
             parent_name: Parent table name.
             partition_name: Partition table name.
             mode: Concurrent, blocking, or concurrent with a blocking fallback.
+            expected_oid: The catalog identity the caller decided on, checked
+                again right before the marker and the statement. When the
+                relation now holding the name has another, or is no longer
+                attached, nothing is detached.
 
         Raises:
             PartitionNotFoundError: If partition doesn't exist.
             PartitionDetachInProgressError: If another detach is pending.
+            PlanStaleError: If the relation is not the one ``expected_oid`` named.
         """
         ...
 
-    async def drop_partition(self, partition_name: str, *, expected_oid: int | None = None) -> None:
+    async def drop_partition(
+        self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None
+    ) -> None:
         """Drop a detached, marker-tagged partition table.
 
         Args:
             partition_name: Partition table name.
             expected_oid: The catalog identity the caller decided on. When the
                 relation now holding the name has another, nothing is dropped.
+            drain_into: Move the rows the table still holds into this relation
+                in the same transaction as the drop, under the drop's lock.
 
         Raises:
             PartitionAttachedError: If partition is still attached.
             UnmanagedPartitionDropError: If the table carries no orphan marker.
             PlanStaleError: If the relation is not the one ``expected_oid`` named.
+            RowMoveRefusedError: If the remaining rows cannot be moved safely.
         """
         ...
 
@@ -300,6 +315,10 @@ class PartitionMetadataProvider(Protocol):
 
     async def get_relation_oid(self, name: str) -> int | None:
         """Return the OID of the relation currently holding ``name``, or None."""
+        ...
+
+    async def get_relation_kind(self, name: str) -> RelationKind | None:
+        """What the relation holding ``name`` physically is, or None when there is none."""
         ...
 
     async def get_unique_constraint_columns(self, table_name: str) -> tuple[tuple[str, ...], ...]:

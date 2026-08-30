@@ -2372,3 +2372,36 @@ def test__to_maintenance_issue__any_finding__keeps_its_partition_name() -> None:
     # Assert
     assert issue.partition_name == f"{ROOT}__2026_04"
     assert issue.error == "PartitionTopologyError: kept a while"
+
+
+# ── review follow-ups: DropNever orphans, pending windows ──────────────────────
+
+
+def test__plan_maintenance__drop_never_orphan_holding_a_wanted_name__reported_never_attached_or_recreated() -> None:
+    # Arrange -- the current window's name is held by a detached table DropNever handed away
+    config = _config(lifecycle=_policy(drop=DropNever()))
+    orphan = _orphan("events__2026_08", oid=9, detached_at=NOW - timedelta(days=1))
+
+    # Act
+    plan = _plan(config, _root(), orphans=(orphan,))
+
+    # Assert -- neither re-attached nor collided with; a finding says whose it is
+    assert plan.attaches == ()
+    assert plan.creates == ()
+    assert _reasons(plan) == [FindingReason.NAME_UNUSABLE]
+    assert "never drop" in plan.findings[0].detail
+    assert "events__2026_08" in plan.findings[0].detail
+
+
+def test__plan_maintenance__detach_pending_child_in_a_wanted_window__finalized_without_a_name_collision() -> None:
+    # Arrange -- the current month itself was left half-detached
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=12)))
+    root = _root(_month(2026, 8, oid=8, detach_pending=True))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert -- the finalize is planned; the window is not filled while the table owns the name
+    assert [op.reason for op in plan.detaches] == [Reason.DETACH_FINALIZE]
+    assert plan.creates == ()
+    assert _reasons(plan) == [FindingReason.DETACH_PENDING]

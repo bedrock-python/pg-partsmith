@@ -50,6 +50,12 @@ line is what a grace period is measured from.
 Writing the marker first means an interrupted run leaves a *marked* detached table, which
 the next run finds and finishes, rather than an unmarked one nobody will ever collect.
 
+The attach is the marker's other end: a relation that comes back — retention grew, a
+backfill named its window — loses the marker in the transaction that attaches it. An
+attached partition is nobody's orphan, and a marker left on it would hand its old detach
+instant to the *next* detach, cutting that grace period short; with the marker gone, the
+next detach stamps a fresh one.
+
 The marker survives `pg_dump` and restore (comments are dumped by default), so a restored
 copy of a marked table is again eligible for dropping. When repurposing such a table,
 clear its comment (`COMMENT ON TABLE … IS NULL`), or restore with `--no-comments`.
@@ -90,9 +96,12 @@ the executor checks that the relation is still the one the plan decided about:
 - for a drop, it is **not attached** to anything and **still carries the marker**.
 
 The drop's checks run under `ACCESS EXCLUSIVE` in the same transaction as `DROP TABLE`,
-closing the window in which a concurrently re-attached or replaced relation could be
-dropped. `DROP` is never issued with `CASCADE`, so a drop that would take something else
-with it fails instead.
+and the detach's under the lock the detach itself takes, in the same transaction as its
+marker and its statement — closing the window in which a concurrently replaced relation
+(a `before_detach` hook swapping the table at its name, say) could be acted on in the
+plan's stead. The concurrent detach form, which cannot run inside a transaction, checks
+the identity immediately before the statement and once more after it. `DROP` is never
+issued with `CASCADE`, so a drop that would take something else with it fails instead.
 
 ## What the library will never do
 

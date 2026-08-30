@@ -988,3 +988,13 @@ def test__package_root__migration_ergonomics_exports__importable_and_functional(
     assert pg_partsmith.qualify(None, "events") == "events"
     assert pg_partsmith.split_qualified_name("public.events") == ("public", "events")
     assert pg_partsmith.split_qualified_name("events") == (None, "events")
+
+
+def test__config__misspelled_field__refused_not_ignored() -> None:
+    with pytest.raises(ValidationError, match="retention_cout"):
+        TablePartitionConfig(
+            table_name="events",
+            partition_column="created_at",
+            granularity=PartitionGranularity.MONTH,
+            retention_cout=12,  # type: ignore[call-arg]
+        )

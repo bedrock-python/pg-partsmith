@@ -55,6 +55,23 @@ class PartitionReferencedError(PartitionError):
         self.detail = detail
 
 
+class RowMoveRefusedError(PartitionError):
+    """Raised when rows are not moved because the move would not be safe.
+
+    A move is a ``DELETE`` and an ``INSERT`` in one statement. A foreign key
+    referencing the source with ``ON DELETE CASCADE``, ``SET NULL`` or
+    ``SET DEFAULT`` acts on the ``DELETE`` alone: the referencing rows would
+    be deleted or rewritten while the moved row lives on in its new
+    partition. Such a foreign key has to be re-created without the action
+    (or after the move) before rows can be moved.
+    """
+
+    def __init__(self, relation_name: str, detail: str) -> None:
+        super().__init__(f"Rows of {relation_name} were not moved: {detail}")
+        self.relation_name = relation_name
+        self.detail = detail
+
+
 class PartitionTopologyError(PartitionError):
     """Raised when an existing partition tree diverges from the configured one.
 

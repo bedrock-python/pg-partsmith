@@ -426,7 +426,7 @@ class TimeBoundaries(BaseModel):
         calculator: A ready-made calculator, for custom calendars.
     """
 
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True, extra="forbid")
 
     kind: str = Field(default="time", frozen=True)
     granularity: PartitionGranularity | None = None
@@ -673,7 +673,7 @@ class NumericBoundaries(BaseModel):
         cursor_source: Where the level's high-water mark is read from.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{start\}[a-z0-9_]*$")
 
@@ -782,7 +782,7 @@ class IntegerSequence(BaseModel):
             by default; ``MAX_KEY`` / ``SEQUENCE`` read the data instead.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     _NAME_SUFFIX_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^[a-z0-9_]*\{value\}[a-z0-9_]*$")
 

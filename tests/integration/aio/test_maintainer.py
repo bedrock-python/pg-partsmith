@@ -26,11 +26,20 @@ from pg_partsmith.entities import (
     PartitionType,
     TablePartitionConfig,
 )
-from pg_partsmith.exceptions import LockAcquisitionError
+from pg_partsmith.exceptions import LockAcquisitionError, PlanStaleError
 from pg_partsmith.lifecycle import DetachMode
-from pg_partsmith.plan import FindingReason, Reason, Severity
+from pg_partsmith.plan import Reason
 from pg_partsmith.topology import RangeBounds
-from tests.integration.aio.support import count_ddl, exec_sql_autocommit, is_attached, make_table, relkind, scalar
+from tests.integration.aio.support import (
+    count_ddl,
+    exec_sql,
+    exec_sql_autocommit,
+    is_attached,
+    make_table,
+    relkind,
+    scalar,
+    table_comment,
+)
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
 
 if TYPE_CHECKING:
@@ -315,6 +324,7 @@ async def test__maintainer__two_concurrent_runs_on_one_table__one_wins_the_lock_
 # ── An interrupted DETACH CONCURRENTLY ──────────────────────────────────────────
 
 
+# sync-mirror: skip
 async def _leave_detach_pending(engine: AsyncEngine, parent: str, partition: str) -> None:
     """Reproduce a cancelled ``DETACH CONCURRENTLY``.
 
@@ -357,10 +367,10 @@ async def _leave_detach_pending(engine: AsyncEngine, parent: str, partition: str
 
 
 # sync-mirror: skip
-async def test__maintainer__interrupted_concurrent_detach__finalized_by_the_next_tick_and_then_dropped(
+async def test__maintainer__interrupted_concurrent_detach__finalized_and_retired_in_one_call(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
-    # Arrange: April exists, and a cancelled DETACH CONCURRENTLY left it half-detached
+    # Arrange: April exists, expired, and a cancelled DETACH CONCURRENTLY left it half-detached
     config = monthly_config(partitioned_table, create_ahead=1, retention=2)
     maintainer = PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine)))
     with freezegun.freeze_time("2026-04-15"):
@@ -371,23 +381,90 @@ async def test__maintainer__interrupted_concurrent_detach__finalized_by_the_next
         db_engine, "SELECT inhdetachpending FROM pg_inherits WHERE inhrelid = to_regclass(:name)", name=april
     )
 
-    # Act: the next tick finds April pending
+    # Act: one tick
     with freezegun.freeze_time("2026-08-26"):
         result = await maintainer.run_maintenance(config)
 
-    # Assert: the detach was completed with FINALIZE, reported as informational
-    assert [op.reason for op in result.plan.detaches] == [Reason.DETACH_FINALIZE]
+    # Assert: the detach was completed with FINALIZE, and the same call retired the orphan
     assert result.detached_count == 1
-    assert result.dropped_count == 0
+    assert result.dropped_count == 1
     assert result.issues == ()
-    pending = [f for f in result.plan.findings if f.reason is FindingReason.DETACH_PENDING]
-    assert len(pending) == 1
-    assert pending[0].severity is Severity.INFO
-    assert not await is_attached(db_engine, april)
-    assert await relkind(db_engine, april) == "r"
-
-    # And the orphan follows the drop policy on the tick after
-    with freezegun.freeze_time("2026-08-26"):
-        again = await maintainer.run_maintenance(config)
-    assert again.dropped_count == 1
+    assert [op.reason for op in result.plan.drops] == [Reason.GRACE_ELAPSED]
     assert await relkind(db_engine, april) is None
+
+
+# sync-mirror: skip
+async def test__maintainer__interrupted_detach_of_a_wanted_window__reattached_in_the_same_call(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    # Arrange: the current month itself was left half-detached, with a row in it
+    config = monthly_config(partitioned_table, create_ahead=1, retention=12)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine)))
+    with freezegun.freeze_time("2026-08-10"):
+        await maintainer.run_maintenance(config)
+    august = f"{partitioned_table}__2026_08"
+    await exec_sql(
+        db_engine,
+        f"INSERT INTO \"{partitioned_table}\" (created_at, payload) VALUES ('2026-08-05T12:00:00+00:00', 'kept')",  # noqa: S608
+    )
+    await _leave_detach_pending(db_engine, partitioned_table, august)
+    assert await scalar(
+        db_engine, "SELECT inhdetachpending FROM pg_inherits WHERE inhrelid = to_regclass(:name)", name=august
+    )
+
+    # Act: one tick
+    with freezegun.freeze_time("2026-08-26"):
+        result = await maintainer.run_maintenance(config)
+
+    # Assert: finalized, then re-attached with its data; the marker went with the attach
+    assert result.detached_count == 1
+    assert result.attached_count == 1
+    assert result.dropped_count == 0
+    assert await is_attached(db_engine, august)
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{august}"')) == 1  # noqa: S608
+    assert await table_comment(db_engine, august) is None
+
+
+# ── A hook must not be able to redirect a detach ────────────────────────────────
+
+
+class _SwapHooks(BasePartitionLifecycleHooks):
+    """Replaces the partition at the planned name from inside ``before_detach``."""
+
+    def __init__(self, engine: AsyncEngine, parent: str) -> None:
+        self._engine = engine
+        self._parent = parent
+
+    async def before_detach(self, table_name: str, partition: object) -> None:
+        name = partition.relname  # type: ignore[attr-defined]
+        lower, upper = partition.from_value, partition.to_value  # type: ignore[attr-defined]
+        async with self._engine.begin() as conn:
+            await conn.execute(text(f'ALTER TABLE "{self._parent}" DETACH PARTITION "{name}"'))
+            await conn.execute(text(f'DROP TABLE "{name}"'))
+            await conn.execute(text(f'CREATE TABLE "{name}" (LIKE "{self._parent}" INCLUDING ALL)'))
+            await conn.execute(
+                text(
+                    f'ALTER TABLE "{self._parent}" ATTACH PARTITION "{name}" '
+                    f"FOR VALUES FROM ('{lower}') TO ('{upper}')"
+                )
+            )
+
+
+async def test__maintainer__relation_swapped_by_a_hook__detach_refused_as_stale(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    # Arrange: April expired; a hook swaps in a different relation under its name
+    config = monthly_config(partitioned_table, create_ahead=1, retention=1)
+    hook = _SwapHooks(db_engine, partitioned_table)
+    service = PartitionLifecycleService(*_make_components(db_engine), hooks=[hook])
+    with freezegun.freeze_time("2026-04-15"):
+        await service.maintain(config)
+
+    # Act / Assert: the repository re-checks identity under its own lock and refuses
+    with freezegun.freeze_time("2026-08-26"), pytest.raises(PlanStaleError):
+        await service.maintain(config)
+
+    # The replacement is untouched: still attached, never marked
+    april = f"{partitioned_table}__2026_04"
+    assert await is_attached(db_engine, april)
+    assert await table_comment(db_engine, april) is None

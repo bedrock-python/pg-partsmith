@@ -65,12 +65,17 @@ The name the scheme produces is either taken by a relation with *other* bounds, 
 PostgreSQL's 63-byte limit (which truncates silently and would make two partitions
 collide). Rename the stray relation, or shorten the table name / `name_suffix`.
 
+It is also reported when a wanted window's name is held by a detached table under
+`DropNever`: that table was handed to another process, so it is neither re-attached nor
+collided with. Attach it yourself, or rename it and the next run creates the partition.
+
 ## `detach_pending` (INFO)
 
 An earlier `DETACH … CONCURRENTLY` was interrupted. The partition is still attached in the
-catalog, invisible through the parent, and rejects its own rows. The same plan completes
-it (`DETACH … FINALIZE`, reason `detach_finalize`) and its drop follows the drop policy.
-To finish it by hand instead:
+catalog, invisible through the parent, and rejects its own rows. The same `maintain()`
+call completes it (`DETACH … FINALIZE`, reason `detach_finalize`), re-plans, and
+re-attaches the table when its window is still wanted — or retires it under the drop
+policy. To finish it by hand instead:
 
 ```sql
 ALTER TABLE events DETACH PARTITION events__2026_08 FINALIZE;
@@ -134,6 +139,16 @@ Rows of another table reference rows of this partition through a foreign key on 
 parent; PostgreSQL will not detach it. The run goes on; the issue repeats until the
 referencing rows are gone. Put `Unreferenced()` in the retention rule to keep such
 partitions out of the plan — see [Handle foreign keys](foreign-keys.md).
+
+## `RowMoveRefusedError` — a move was refused by an ON DELETE action
+
+A foreign key referencing the table declares `ON DELETE CASCADE`, `SET NULL` or
+`SET DEFAULT`. A move is a DELETE and an INSERT in one statement, and such an action
+fires on the DELETE alone — the referencing rows would be deleted or rewritten while the
+moved row lives on in its new partition. The movers fail closed and record a `move` issue
+naming the constraint. Re-create the key `ON DELETE NO ACTION` for the duration of the
+move, or move first and add the action after. See
+[Row moves and ON DELETE actions](foreign-keys.md#row-moves-and-on-delete-actions).
 
 ## `InvalidPartitionConfigError`
 

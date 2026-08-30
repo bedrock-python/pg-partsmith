@@ -103,7 +103,7 @@ class PredicateBase(BaseModel):
             predicate to be answerable.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     # The field a single positional argument fills; None for rules without one.
     _positional: ClassVar[str | None] = None
@@ -193,6 +193,12 @@ class WindowAgeAbove(PredicateBase):
 
     kind: Literal["window_age_above"] = "window_age_above"
     age: timedelta
+
+    @field_validator("age")
+    @classmethod
+    def validate_age(cls, v: timedelta) -> timedelta:
+        """A negative age is a sign error, and it would hold for every window at once."""
+        return _non_negative_duration(v, "age")
 
     def evaluate(self, candidate: Candidate) -> bool:
         """Compare the window's end against ``now - age``."""
@@ -569,6 +575,12 @@ class KeepFor(PredicateBase):
     kind: Literal["keep_for"] = "keep_for"
     age: timedelta
 
+    @field_validator("age")
+    @classmethod
+    def validate_age(cls, v: timedelta) -> timedelta:
+        """A negative age is a sign error, and it would expire every window at once."""
+        return _non_negative_duration(v, "age")
+
     def evaluate(self, candidate: Candidate) -> bool:
         """True when the window ended more than ``age`` ago."""
         return WindowAgeAbove(age=self.age).evaluate(candidate)
@@ -694,7 +706,7 @@ class DropAfter(BaseModel):
             on a weekday", say — evaluated when the grace has passed.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     _positional: ClassVar[str | None] = "grace"
 
@@ -709,10 +721,7 @@ class DropAfter(BaseModel):
     @classmethod
     def validate_grace(cls, v: timedelta) -> timedelta:
         """A negative grace is a typo."""
-        if v < timedelta(0):
-            msg = f"grace must not be negative, got {v}"
-            raise ValueError(msg)
-        return v
+        return _non_negative_duration(v, "grace")
 
     @property
     def required_facts(self) -> frozenset[FactKind]:
@@ -737,7 +746,7 @@ class DropAfter(BaseModel):
 class DropNever(BaseModel):
     """Detach expired partitions and keep them: something else owns the drop."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["drop_never"] = "drop_never"
 
@@ -770,7 +779,7 @@ class LifecyclePolicy(BaseModel):
         drop: What happens to it afterwards.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     creation: CreationPolicy = Field(default_factory=CreateAhead)
     retention: RetentionPolicy = Field(default_factory=KeepNewest)
@@ -791,6 +800,14 @@ class LifecyclePolicy(BaseModel):
     def needs_facts(self) -> bool:
         """True when planning has to measure something beyond the catalog."""
         return bool(self.required_facts or self.sql_predicates)
+
+
+def _non_negative_duration(value: timedelta, name: str) -> timedelta:
+    """Refuse a negative duration on a rule that measures elapsed time."""
+    if value < timedelta(0):
+        msg = f"{name} must not be negative, got {value}"
+        raise ValueError(msg)
+    return value
 
 
 def _positional_data(cls: type, args: tuple[Any, ...], data: dict[str, Any]) -> dict[str, Any]:

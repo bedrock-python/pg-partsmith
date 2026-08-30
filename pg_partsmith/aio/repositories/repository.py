@@ -68,6 +68,7 @@ class PostgresPartitionRepository:
             engine=engine,
             ddl_timeout=ddl_timeout_seconds,
             ddl_timezone=self._ddl_timezone,
+            marker_prefix=marker_prefix,
         )
         self._remover = PartitionRemover(
             engine=engine,
@@ -79,6 +80,7 @@ class PostgresPartitionRepository:
             marker_prefix=marker_prefix,
             resolver=self._resolver,
             fk_manager=self._fk_manager,
+            creator=self._creator,
             allow_unmanaged=bool(drop_allow_unmanaged),
         )
 
@@ -133,20 +135,27 @@ class PostgresPartitionRepository:
         await self._creator.attach(parent_name, partition_name, bounds, key_arity=key_arity)
 
     async def detach_partition(
-        self, parent_name: str, partition_name: str, *, mode: DetachMode = DetachMode.AUTO
+        self,
+        parent_name: str,
+        partition_name: str,
+        *,
+        mode: DetachMode = DetachMode.AUTO,
+        expected_oid: int | None = None,
     ) -> None:
         """Detach a partition, writing the orphan marker first.
 
         See :meth:`PartitionRemover.detach`.
         """
-        await self._remover.detach(parent_name, partition_name, mode=mode)
+        await self._remover.detach(parent_name, partition_name, mode=mode, expected_oid=expected_oid)
 
-    async def drop_partition(self, partition_name: str, *, expected_oid: int | None = None) -> None:
+    async def drop_partition(
+        self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None
+    ) -> None:
         """Drop a detached, marker-tagged partition.
 
         See :meth:`PartitionRemover.drop`.
         """
-        await self._remover.drop(partition_name, expected_oid=expected_oid)
+        await self._remover.drop(partition_name, expected_oid=expected_oid, drain_into=drain_into)
 
     async def adopt_partition(self, table_name: str, partition_name: str) -> bool:
         """Mark a detached legacy table as owned by this library (orphan marker).

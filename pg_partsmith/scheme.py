@@ -87,7 +87,7 @@ class SchemeBase(BaseModel):
             this one.
     """
 
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True, extra="forbid")
 
     key: tuple[StrippedNonEmptyStr, ...]
     child: PartitionScheme | None = None
@@ -262,7 +262,7 @@ class ListGroup(BaseModel):
             textual keys are both written as strings here.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: StrippedNonEmptyStr
     values: tuple[StrippedNonEmptyStr, ...]

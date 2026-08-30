@@ -21,9 +21,10 @@ from pg_partsmith.entities import (
     RangeBounds,
     TablePartitionConfig,
 )
-from pg_partsmith.exceptions import InvalidPartitionConfigError
-from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.exceptions import InvalidPartitionConfigError, RowMoveRefusedError
+from pg_partsmith.lifecycle import DetachMode, DropNever, LifecyclePolicy
 from pg_partsmith.plan import (
+    AttachPartition,
     CreatePartition,
     DetachPartition,
     DropPartition,
@@ -33,7 +34,7 @@ from pg_partsmith.plan import (
     Reason,
 )
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning
-from pg_partsmith.topology import ActualTree, RelationKind
+from pg_partsmith.topology import ActualTree, DetachedPartition, RelationKind
 
 NOW = datetime(2026, 8, 28, tzinfo=UTC)
 ROOT = "public.events"
@@ -58,6 +59,8 @@ def metadata() -> MagicMock:
     metadata.get_leading_key_minimum = AsyncMock(return_value=None)
     metadata.get_actual_tree = AsyncMock(return_value=None)
     metadata.partition_exists = AsyncMock(return_value=True)
+    metadata.get_relation_oid = AsyncMock(return_value=None)
+    metadata.get_relation_kind = AsyncMock(return_value=RelationKind.TABLE)
     return metadata
 
 
@@ -69,6 +72,7 @@ def executor() -> MagicMock:
         return True if fill is None else await fill(op.target)
 
     executor.create_partition = AsyncMock(side_effect=create_partition)
+    executor.attach_partition = AsyncMock(side_effect=create_partition)
     executor.detach_single_partition = AsyncMock(return_value=None)
     executor.drop_single_partition = AsyncMock(return_value=True)
     return executor
@@ -365,6 +369,8 @@ async def test__unpartition__drop_emptied__detaches_and_drops_through_the_execut
     assert drop == DropPartition(
         target=f"{ROOT}__2026_06", oid=66, reason=Reason.EXPLICIT, detail="emptied by unpartition"
     )
+    # A row that slips in after the last batch is moved in the drop's own transaction.
+    assert executor.drop_single_partition.await_args.kwargs == {"drain_into": "public.events_flat"}
 
 
 async def test__unpartition__batch_budget_runs_out__stops_before_the_next_partition(
@@ -415,3 +421,140 @@ async def test__unpartition__nested_scheme__branches_are_drained_as_a_whole(
     # Assert
     assert result.partitions == (f"{ROOT}__2026_06",)
     repo.move_rows.assert_awaited_once_with(f"{ROOT}__2026_06", "public.events_flat", limit=10_000)
+
+
+# ── review follow-ups: destinations, orphans, refused moves, matching orphans ───
+
+
+async def test__unpartition__into_the_root_itself__refused(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange
+    root = PartitionNode(
+        name=ROOT, oid=7, partition_type=PartitionType.RANGE, partition_columns=("created_at",), children=(_month(6),)
+    )
+    metadata.get_actual_tree.return_value = ActualTree(root=root)
+    metadata.get_relation_oid.return_value = 7
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="itself"):
+        await mover.unpartition(_config(), ROOT)
+    repo.move_rows.assert_not_awaited()
+
+
+async def test__unpartition__into_one_of_the_partitions__refused(mover: DataMover, metadata: MagicMock) -> None:
+    # Arrange
+    metadata.get_actual_tree.return_value = _tree(_month(6, oid=66))
+    metadata.get_relation_oid.return_value = 66
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="one of its"):
+        await mover.unpartition(_config(), f"{ROOT}__2026_06")
+
+
+async def test__unpartition__into_a_partitioned_relation__refused(mover: DataMover, metadata: MagicMock) -> None:
+    # Arrange
+    metadata.get_actual_tree.return_value = _tree(_month(6))
+    metadata.get_relation_oid.return_value = 12345
+    metadata.get_relation_kind.return_value = RelationKind.PARTITIONED
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="plain table"):
+        await mover.unpartition(_config(), "public.other_tree")
+
+
+async def test__unpartition__owned_detached_partition__is_emptied_too(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock, executor: MagicMock
+) -> None:
+    # Arrange -- one attached month, one marker-tagged orphan with rows
+    orphan = DetachedPartition(name=f"{ROOT}__2026_01", oid=11, parent_name=ROOT)
+    metadata.get_actual_tree.return_value = ActualTree(root=_tree(_month(6)).root, orphans=(orphan,))
+    repo.move_rows.side_effect = [0, 4, 0]
+
+    # Act
+    result = await mover.unpartition(_config(), "public.events_flat", batch_rows=10, drop_emptied=True)
+
+    # Assert -- the orphan's rows are the table's rows
+    assert result.complete
+    assert result.partitions == (f"{ROOT}__2026_06", f"{ROOT}__2026_01")
+    assert result.rows_moved == 4
+    drops = [call.args[1].target for call in executor.drop_single_partition.await_args_list]
+    assert f"{ROOT}__2026_01" in drops
+
+
+async def test__unpartition__drop_never_orphan__reported_and_left_alone(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange
+    orphan = DetachedPartition(name=f"{ROOT}__2026_01", oid=11, parent_name=ROOT)
+    metadata.get_actual_tree.return_value = ActualTree(root=_tree().root, orphans=(orphan,))
+    config = _config().model_copy(update={"lifecycle": LifecyclePolicy(drop=DropNever())})
+
+    # Act
+    result = await mover.unpartition(config, "public.events_flat")
+
+    # Assert -- its rows belong to whatever process DropNever handed it to
+    assert not result.complete
+    assert [issue.partition_name for issue in result.issues] == [f"{ROOT}__2026_01"]
+    assert "hands to another process" in result.issues[0].error
+    repo.move_rows.assert_not_awaited()
+
+
+async def test__unpartition__move_refused_by_a_foreign_key_action__issue_and_incomplete(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_actual_tree.return_value = _tree(_month(6))
+    repo.move_rows.side_effect = RowMoveRefusedError(f"{ROOT}__2026_06", "fk_orders (ON DELETE CASCADE) would act")
+
+    # Act
+    result = await mover.unpartition(_config(), "public.events_flat")
+
+    # Assert
+    assert not result.complete
+    assert [issue.partition_name for issue in result.issues] == [f"{ROOT}__2026_06"]
+    assert "ON DELETE CASCADE" in result.issues[0].error
+
+
+async def test__partition_data__window_owned_by_a_matching_orphan__is_filled_and_reattached(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock, executor: MagicMock
+) -> None:
+    # Arrange -- the plan re-attaches an orphan instead of creating a partition
+    metadata.get_leading_key_minimum.side_effect = [datetime(2026, 3, 5, tzinfo=UTC), None]
+    attach = AttachPartition(
+        target=f"{ROOT}__2026_03",
+        oid=33,
+        parent_name=ROOT,
+        bounds=RangeBounds(from_value="2026-03-01", to_value="2026-04-01"),
+        key_columns=("created_at",),
+        reason=Reason.REATTACH,
+    )
+    plan_for = _plans(_plan(attach))
+    repo.reconcile_default_rows.side_effect = [2, 0]
+
+    # Act
+    result = await mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert
+    assert result.complete
+    assert result.partitions == (f"{ROOT}__2026_03",)
+    assert result.rows_moved == 2
+    executor.attach_partition.assert_awaited_once()
+    executor.create_partition.assert_not_awaited()
+
+
+async def test__partition_data__move_refused_by_a_foreign_key_action__issue_and_incomplete(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    executor.create_partition.side_effect = RowMoveRefusedError(DEFAULT, "fk_orders (ON DELETE CASCADE) would act")
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act
+    result = await mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert
+    assert not result.complete
+    assert [issue.partition_name for issue in result.issues] == [DEFAULT]
+    assert "ON DELETE CASCADE" in result.issues[0].error

@@ -33,6 +33,7 @@ from pg_partsmith.exceptions import (
     PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
+    RowMoveRefusedError,
 )
 from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
 from pg_partsmith.plan import (
@@ -117,7 +118,7 @@ class PlanExecutor:
                 if isinstance(op, CreatePartition):
                     self._create(config, plan, op, depth=0, tally=tally, issues=issues)
                 elif isinstance(op, AttachPartition):
-                    self._reattach(config, plan, op, tally=tally, issues=issues)
+                    self._attach_detached(config, plan, op, tally=tally, issues=issues)
                 elif isinstance(op, DetachPartition):
                     self.detach_single_partition(config.qualified_name, op)
                     detached.add(op.target)
@@ -325,7 +326,29 @@ class PlanExecutor:
             created += child.count()
         return created
 
-    def _reattach(
+    def attach_partition(
+        self,
+        config: TablePartitionConfig,
+        plan: MaintenancePlan,
+        op: AttachPartition,
+        *,
+        issues: list[MaintenanceIssue],
+        fill: Callable[[str], bool] | None = None,
+    ) -> bool:
+        """Bring one detached relation back, filling it in between.
+
+        The attach twin of :meth:`create_partition`: the relation's identity
+        is checked, its subtree is completed, and ``fill`` is called with its
+        name before it goes live. False from ``fill`` leaves it detached for
+        a later call to finish.
+
+        Returns:
+            True when the relation is attached; False when ``fill`` stopped
+            short of it.
+        """
+        return self._attach_detached(config, plan, op, tally=_Tally(), issues=issues, fill=fill)
+
+    def _attach_detached(
         self,
         config: TablePartitionConfig,
         plan: MaintenancePlan,
@@ -333,13 +356,17 @@ class PlanExecutor:
         *,
         tally: _Tally,
         issues: list[MaintenanceIssue],
-    ) -> None:
+        fill: Callable[[str], bool] | None = None,
+    ) -> bool:
         """Bring a detached orphan back, completing its subtree first."""
         self._require_same_relation(op.target, op.oid)
         depth = _depth_of(config, op.parent_name)
         tally.repaired += self._converge_detached(config, plan, op, depth=depth, issues=issues)
+        if fill is not None and not fill(op.target):
+            return False
         self._attach_with_reconcile(config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns)
         tally.attached += 1
+        return True
 
     def _attach_with_reconcile(
         self,
@@ -426,13 +453,23 @@ class PlanExecutor:
                         "attempt": attempt,
                     },
                 )
-                moved = self._repo.reconcile_default_rows(
-                    default_partition_name=default_partition.name,
-                    target_partition_name=partition_name,
-                    key_columns=key_columns,
-                    from_value=window.from_value,
-                    to_value=window.to_value,
-                )
+                try:
+                    moved = self._repo.reconcile_default_rows(
+                        default_partition_name=default_partition.name,
+                        target_partition_name=partition_name,
+                        key_columns=key_columns,
+                        from_value=window.from_value,
+                        to_value=window.to_value,
+                    )
+                except RowMoveRefusedError as refusal:
+                    # Rows of DEFAULT belong to the new partition but cannot be
+                    # moved safely; the partition stays out, the run goes on.
+                    raise PartitionTopologyError(
+                        parent_name,
+                        FindingReason.DEFAULT_HOLDS_ROWS.value,
+                        f"{parent_name} cannot gain {partition_name!r} while its DEFAULT partition holds rows that "
+                        f"belong to it, and they cannot be moved: {refusal.detail}",
+                    ) from refusal
                 if moved:
                     reconciled_from = default_partition.name
                 logger.info("Reconciliation completed", extra={"partition_name": partition_name, "moved_rows": moved})
@@ -503,6 +540,10 @@ class PlanExecutor:
         """Detach one partition, running the detach hooks around it.
 
         Extension point for callers that manage partitions one at a time.
+        Identity is checked twice: here, before the hooks run, and again by
+        the repository under the detach's own lock -- so neither a hook nor a
+        concurrent session can swap another relation in under the planned
+        name and have it detached in the plan's stead.
 
         Raises:
             PlanStaleError: If the relation is no longer the one the plan saw,
@@ -514,13 +555,17 @@ class PlanExecutor:
 
         info = _detach_info(op)
         self._run_hooks(lambda h: h.before_detach(table_name, info), "before_detach", partition_name=op.target)
-        self._repo.detach_partition(op.parent_name, op.target, mode=op.mode)
+        self._repo.detach_partition(op.parent_name, op.target, mode=op.mode, expected_oid=op.oid)
         self._run_hooks(lambda h: h.after_detach(table_name, op.target), "after_detach", partition_name=op.target)
 
-    def drop_single_partition(self, table_name: str, op: DropPartition) -> bool:
+    def drop_single_partition(self, table_name: str, op: DropPartition, *, drain_into: str | None = None) -> bool:
         """Drop one detached partition, running the drop hooks around it.
 
         Extension point for callers that manage partitions one at a time.
+        With ``drain_into`` the rows the table still holds move there in the
+        transaction that drops it, under the drop's own lock -- what
+        ``unpartition`` uses so a row that arrived after its last batch is
+        moved rather than dropped.
 
         Returns:
             True when the partition was dropped; False when it is still
@@ -528,7 +573,7 @@ class PlanExecutor:
         """
         self._run_hooks(lambda h: h.before_drop(table_name, op.target), "before_drop", partition_name=op.target)
         try:
-            self._repo.drop_partition(op.target, expected_oid=op.oid)
+            self._repo.drop_partition(op.target, expected_oid=op.oid, drain_into=drain_into)
         except PartitionAttachedError:
             logger.warning("Refusing to drop attached partition", extra={"partition_name": op.target})
             return False

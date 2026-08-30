@@ -584,3 +584,11 @@ def test__partition_by__no_columns_allowed_but_blank_column_rejected() -> None:
 def test__operation_kind__values__spell_the_four_ddl_families() -> None:
     # Arrange / Act / Assert
     assert [kind.value for kind in OperationKind] == ["create", "attach", "detach", "drop"]
+
+
+def test__create_and_attach_capabilities__name_the_locks_on_referencing_tables() -> None:
+    # PostgreSQL takes SHARE ROW EXCLUSIVE on every table with a foreign key to
+    # the parent during ATTACH; an operator picking a window must see that.
+    expected = "SHARE ROW EXCLUSIVE on every table referencing the parent"
+    assert expected in _create().capabilities.lock
+    assert expected in _attach().capabilities.lock

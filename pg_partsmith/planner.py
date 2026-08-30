@@ -263,7 +263,7 @@ class _Planner:
     def _plan_progression_level(self, level: _ProgressionLevel, node: PartitionNode, *, depth: int) -> None:
         boundaries = level.progression
         assert boundaries is not None  # dispatch sends only progression levels here
-        members = self._classify_members(level, node)
+        members, pending = self._classify_members(level, node)
         managed = {m.window: m for m in members if m.managed and m.window is not None}
         cursor_window = self._cursor_window(level, managed)
 
@@ -276,6 +276,13 @@ class _Planner:
         recurse_into: list[PartitionNode] = []
 
         for window in desired:
+            if window in pending:
+                # The window's partition is half-detached: this plan finalizes
+                # the detach, and the same maintenance call re-plans -- the
+                # finalized table comes back as an orphan and is re-attached
+                # or retired. Creating another partition under its name now
+                # would only collide with it.
+                continue
             existing = managed.get(window)
             if existing is not None:
                 recurse_into.append(existing.node)
@@ -302,7 +309,21 @@ class _Planner:
             orphan = self._matching_orphan(orphans, consumed, boundaries, window)
             if orphan is not None:
                 consumed.add(orphan.name)
-                self.attaches.append(self._reattach(level, node, orphan, window))
+                if isinstance(self.policy.drop, DropAfter):
+                    self.attaches.append(self._reattach(level, node, orphan, window))
+                else:
+                    # Under DropNever a detached table belongs to whatever
+                    # process the policy handed it to; neither re-attaching it
+                    # nor creating a partition under its name is this
+                    # library's call.
+                    self._record(
+                        node.name,
+                        FindingReason.NAME_UNUSABLE,
+                        f"{node.name} needs a partition for {boundaries.describe(window)}, but the detached table "
+                        f"{orphan.name} holds that name and, under '{self.policy.drop.describe()}', belongs to "
+                        "whatever process the policy hands detached tables to; attach it yourself, or rename it "
+                        "and the next run creates the partition.",
+                    )
                 continue
 
             op = self._new_member(level, node, window, reason=self._creation_reason(), depth=depth)
@@ -385,11 +406,16 @@ class _Planner:
             "create_next_if": Reason.CREATE_NEXT,
         }.get(getattr(creation, "kind", ""), Reason.CREATE_AHEAD)
 
-    def _classify_members(self, level: _ProgressionLevel, node: PartitionNode) -> list[_Member]:
-        """Position every attached child on the axis and decide which are ours."""
+    def _classify_members(self, level: _ProgressionLevel, node: PartitionNode) -> tuple[list[_Member], set[Window]]:
+        """Position every attached child on the axis and decide which are ours.
+
+        Returns the members, and the windows of half-detached children whose
+        finalize this plan carries -- windows nothing else may claim yet.
+        """
         boundaries = level.progression
         assert boundaries is not None
         members: list[_Member] = []
+        pending: set[Window] = set()
 
         for child in node.children:
             if child.is_default:
@@ -401,7 +427,9 @@ class _Planner:
                 continue
 
             if child.detach_pending:
-                self._finalize_pending(node, child)
+                window = self._finalize_pending(level, node, child)
+                if window is not None:
+                    pending.add(window)
                 continue
 
             if isinstance(child.bounds, RangeBounds):
@@ -410,15 +438,18 @@ class _Planner:
                 assert isinstance(child.bounds, ListBounds)
                 members.append(self._sequence_member(boundaries, child, child.bounds))
 
-        return members
+        return members, pending
 
-    def _finalize_pending(self, node: PartitionNode, child: PartitionNode) -> None:
+    def _finalize_pending(self, level: _ProgressionLevel, node: PartitionNode, child: PartitionNode) -> Window | None:
         """Complete a detach an interrupted ``DETACH CONCURRENTLY`` left half-done.
 
         The partition is still in the catalog but invisible through the parent
         and rejecting its own rows; the decision to detach it was already
         taken, so the maintenance tick finishes it rather than waiting for a
-        human. Its drop follows the drop policy like any other orphan's.
+        human. The same call then re-plans: the finalized table is an orphan
+        that is re-attached when its window is still wanted, and otherwise
+        retired under the drop policy. Returns the window the child held, so
+        the plan does not try to fill it while the table still owns the name.
         """
         self._record(
             child.name,
@@ -426,8 +457,9 @@ class _Planner:
             f"{child.name} is pending detach: a DETACH CONCURRENTLY was interrupted, so it rejects its own rows "
             "and is invisible through the parent; the detach is completed with FINALIZE.",
         )
+        window = None if child.bounds is None else level.window_of(child.bounds)
         if self.ctx.mode is not PlanMode.MAINTAIN:
-            return
+            return window
         self.detaches.append(
             DetachPartition(
                 target=child.name,
@@ -439,6 +471,7 @@ class _Planner:
                 detail="an interrupted DETACH CONCURRENTLY is completed with FINALIZE",
             )
         )
+        return window
 
     def _range_member(self, boundaries: RangeBoundaries, child: PartitionNode, bounds: RangeBounds) -> _Member:
         lower_unbounded = bounds.from_value.strip().upper() in _UNBOUNDED_LOWER

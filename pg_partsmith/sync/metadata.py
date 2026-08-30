@@ -21,6 +21,7 @@ from pg_partsmith.catalog_queries import (
     PARTITION_TREE_SQL,
     PARTITION_UPPER_BOUND_SQL,
     RELATION_EXISTS_SQL,
+    RELATION_KIND_SQL,
     RELATION_OID_SQL,
     SEQUENCE_LAST_VALUE_SQL,
     TEXT_INSTANT_HAS_PASSED_SQL,
@@ -542,6 +543,13 @@ class PostgresMetadataProvider:
             result = conn.execute(text(RELATION_OID_SQL), {"name": to_regclass_argument(name)})
             value = result.scalar()
         return None if value is None else int(value)
+
+    def get_relation_kind(self, name: str) -> RelationKind | None:
+        """What the relation holding ``name`` physically is, or None when there is none."""
+        with self._engine.connect() as conn:
+            result = conn.execute(text(RELATION_KIND_SQL), {"name": to_regclass_argument(name)})
+            value = coerce_str(result.scalar(), encoding="ascii")
+        return None if value is None else RelationKind.from_relkind(value)
 
     def get_partition_boundaries(self, partition_name: str) -> tuple[str, str] | None:
         """Get a RANGE partition's ``(from_value, to_value)``, or None."""

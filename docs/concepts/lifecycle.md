@@ -134,12 +134,13 @@ referencing rows are gone. See [Handle foreign keys](../guide/foreign-keys.md).
 | `DropAfter()` (default: no grace) | dropped in the same run as the detach |
 | `DropAfter(grace=timedelta(days=7))` | kept detached for a week, then dropped. The detach instant is recorded on the table's marker; an orphan marked by an older version, or adopted, has no instant and is treated as past its grace |
 | `DropAfter(grace=…, when=predicate)` | dropped only once the grace has passed *and* the predicate holds — "not while bigger than 150 GB on a weekday" is a `Callback` over the size fact |
-| `DropNever()` | detached partitions are left alone; something else owns the drop — an archive pipeline, a DBA |
+| `DropNever()` | detached partitions are left alone; something else owns the drop — an archive pipeline, a DBA. They are never re-attached, and a wanted window whose name such a table holds is reported (`name_unusable`), not recreated over it |
 
 While a detached partition waits it is an **orphan**: still in the database, no longer
 reachable through the parent, carrying the marker that makes it the library's to drop. If
 retention grows again before the grace runs out and the orphan's window is wanted, it is
-**re-attached** — the data comes back rather than being recreated empty. Under
+**re-attached** — the data comes back rather than being recreated empty — and the marker
+comes off in the attach's transaction, so a later detach starts a fresh grace period. Under
 `DropNever` orphans belong to whatever process the policy hands them to and are never
 brought back.
 

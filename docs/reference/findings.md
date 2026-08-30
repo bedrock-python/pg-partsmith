@@ -27,7 +27,7 @@ issues too, with the exception's name in front of the message.
 | `unreadable_bound` | WARNING | A bound the level's axis cannot read; never pruned. | Check the codec and the key. |
 | `unbounded_partition` | INFO | A partition open on one side (`MINVALUE`/`MAXVALUE`); never pruned. | Nothing. |
 | `foreign_partition` | INFO | A foreign table under a local-leaves configuration; never touched. | Configure `ForeignLeaves` if it should be managed. |
-| `detach_pending` | INFO | An interrupted `DETACH CONCURRENTLY`; the partition rejects its rows until finalized. The same plan completes it with `DETACH … FINALIZE`. | Nothing; check that the run went through. |
+| `detach_pending` | INFO | An interrupted `DETACH CONCURRENTLY`; the partition rejects its rows until finalized. `maintain()` completes it with `DETACH … FINALIZE` and re-plans in the same call. | Nothing; check that the run went through. |
 | `grace_pending` | INFO | A detached orphan still within its grace period. | Nothing. |
 | `drop_deferred` | INFO | An orphan past its grace whose drop condition does not hold yet. | Nothing. |
 
@@ -64,6 +64,7 @@ finding, or a gap filled inside an existing branch), `attach`, `detach`, `drop`,
 | `LockAcquisitionError` | `apply()`, `maintain()`, the movers | another maintainer holds the table's lock |
 | `PartitionTopologyError` | recorded as an issue | a topology conflict met while executing |
 | `PartitionReferencedError` | recorded as an issue | a detach PostgreSQL refused because rows are still referenced |
+| `RowMoveRefusedError` | recorded as an issue | a row move an incoming foreign key's `ON DELETE` action would corrupt |
 | `PlanStaleError` | detach and drop | the relation is not the one the plan decided about |
 | `PartitionAlreadyExistsError` | `create_table_like` | the name is taken (handled by the executor as a race or a conflict) |
 | `PartitionNotFoundError` | detach, moves | the relation does not exist |

@@ -263,7 +263,7 @@ class TablePartitionConfig(BaseModel):
             foreign tables (:class:`~pg_partsmith.leaves.ForeignLeaves`).
     """
 
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True, populate_by_name=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True, populate_by_name=True, extra="forbid")
 
     # NOTE: We store the value under a different field name to avoid Pydantic's
     # warning about shadowing BaseModel.schema(). Externally, the public API is

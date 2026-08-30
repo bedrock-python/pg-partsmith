@@ -247,7 +247,7 @@ def orphan_comment(
     if detached_at is not None:
         lines.append(f"{DETACHED_AT_MARKER}{detached_at.astimezone(UTC).isoformat()}")
 
-    rest = _comment_without_markers(existing_comment, marker_prefix=marker_prefix)
+    rest = comment_without_markers(existing_comment, marker_prefix=marker_prefix)
     if rest:
         lines.append(rest)
     return "\n".join(lines)
@@ -288,8 +288,13 @@ def parse_orphan_comment(
     return parent, detached_at
 
 
-def _comment_without_markers(comment: str | None, *, marker_prefix: str | None) -> str:
-    """The user's own comment, with this library's marker lines removed."""
+def comment_without_markers(comment: str | None, *, marker_prefix: str | None = None) -> str:
+    """The user's own comment, with this library's marker lines removed.
+
+    What a relation's comment goes back to when it is attached again: an
+    attached partition is nobody's orphan, and a marker left on it would hand
+    its old detach instant to the next detach.
+    """
     if not comment:
         return ""
     prefix = _resolve_marker_prefix(marker_prefix)

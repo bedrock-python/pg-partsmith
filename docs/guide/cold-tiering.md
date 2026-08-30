@@ -90,5 +90,6 @@ policy from there. `pg_clickhouse`'s `offload-partition.sql` is exactly this dan
 - Under `LocalLeaves`, the same foreign partition is inspected and left alone. An archive
   someone attached behind `postgres_fdw` is never touched.
 - A foreign partition never holds rows PostgreSQL moves: DEFAULT reconciliation into a
-  foreign leaf inserts through the wrapper like any `INSERT`; `unpartition` skips foreign
-  partitions and reports them.
+  foreign leaf inserts through the wrapper like any `INSERT` — `partition_data` drains a
+  DEFAULT partition into foreign leaves this way — while `unpartition` skips foreign
+  partitions and reports them, because their rows are not this database's to move.

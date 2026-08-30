@@ -329,3 +329,31 @@ def test__foreign_leaves__parent_with_a_primary_key__refused_before_any_ddl(
     with pytest.raises(InvalidPartitionConfigError, match="refuses a foreign table as a partition"):
         make_service(sync_db_engine).plan(config)
     assert range_children_of(sync_db_engine, events) == {}
+
+
+def test__partition_data__foreign_leaves__drains_default_through_the_wrapper(
+    sync_db_engine: Engine, metrics: str, loopback: str
+) -> None:
+    # Arrange: history in DEFAULT; the window's leaf will be a foreign table
+    hist = f"{metrics}_hist"
+    exec_sql(sync_db_engine, f'CREATE TABLE "{hist}" (LIKE "{metrics}" INCLUDING ALL)')
+    exec_sql(
+        sync_db_engine,
+        f"INSERT INTO \"{hist}\" SELECT make_timestamptz(2026, 8, 15, 12, 0, 0, 'UTC'), g "  # noqa: S608
+        f"FROM generate_series(1, 6) g",
+    )
+    exec_sql(sync_db_engine, f'ALTER TABLE "{metrics}" ATTACH PARTITION "{hist}" DEFAULT')
+    leaf = f"{metrics}__2026_08"
+    _remote(sync_db_engine, leaf)
+    config = _foreign_config(metrics, loopback)
+
+    # Act
+    result = make_service(sync_db_engine).partition_data(config)
+
+    # Assert: the rows went through the wrapper; the mapping is attached; DEFAULT is empty
+    assert result.complete
+    assert result.rows_moved == 6
+    assert relkind(sync_db_engine, leaf) == "f"
+    assert is_attached(sync_db_engine, leaf)
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{leaf}_remote"')) == 6  # noqa: S608
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{hist}"')) == 0  # noqa: S608

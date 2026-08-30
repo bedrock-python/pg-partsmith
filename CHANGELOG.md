@@ -42,6 +42,10 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   `SubpartitionPlan` / `TopologyFinding` / `TopologyReason` / `plan_subpartitions` become
   `MaintenancePlan` / `Finding` / `FindingReason` / `plan_maintenance`.
   `service.reconcile_subpartitions()` is `service.reconcile()`.
+- Removed with their feature: `SubpartitionAction`, `SubpartitionBounds` and
+  `SubpartitionReconcileResult` (root imports), `SubpartitionSpecBase`
+  (`pg_partsmith.entities`); `ListGroup` moved to `pg_partsmith.scheme` and stays
+  exported from `pg_partsmith`.
 - `Period` and `PartitionGranularity` moved to `pg_partsmith.periods` (still re-exported from
   `pg_partsmith` and `pg_partsmith.entities`). Custom calculators implement `period_at(instant)`
   (`current_period()` is derived from it; a calculator without it still works, slower).
@@ -54,8 +58,9 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   `UnsupportedCapabilityError` is removed with the capability protocols it served.
 - Repository protocol additions a custom implementation has to provide:
   `create_table_like(..., physical=)`, `create_foreign_table_like`, `move_rows`,
-  `reconcile_default_rows(..., limit=)`; metadata protocol: `get_leading_key_minimum`.
-  `partition_exists` now reports foreign tables too.
+  `reconcile_default_rows(..., limit=)`, `detach_partition(..., expected_oid=)`,
+  `drop_partition(..., drain_into=)`; metadata protocol: `get_leading_key_minimum`,
+  `get_relation_kind`. `partition_exists` now reports foreign tables too.
 
 ### Added
 
@@ -84,10 +89,35 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   `PartitionTableSettings` accepts `scheme` / `lifecycle` JSON, `tz`, `boundary_codec`.
 - Every lifecycle rule with one defining value takes it positionally: `KeepNewest(12)`,
   `CreateAhead(3)`, `DropAfter(timedelta(days=7))`, `ExpireIf(SqlPredicate(...))`.
-- An interrupted `DETACH CONCURRENTLY` is completed by the next tick (`detach_finalize`). The
-  tree is read with a recursive walk over `pg_inherits` instead of `pg_partition_tree`, which
-  omits such a partition and takes `ACCESS SHARE` on every member; inspection now takes no
-  relation lock.
+- An interrupted `DETACH CONCURRENTLY` is completed by the next `maintain()` call, which
+  re-plans under the same lock and re-attaches the finalized table when its window is still
+  wanted — or retires it under the drop policy (`detach_finalize`). The tree is read with a
+  recursive walk over `pg_inherits` instead of `pg_partition_tree`, which omits such a
+  partition and takes `ACCESS SHARE` on every member; inspection now takes no relation lock.
+- Row moves (DEFAULT reconciliation, `partition_data`, `unpartition`) fail closed when an
+  incoming foreign key declares `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`
+  (`RowMoveRefusedError`, recorded as a `move` issue): the action would fire on the rows as
+  they leave their old partition. Generated columns are recomputed rather than copied, and
+  identity values survive a move (`OVERRIDING SYSTEM VALUE`).
+- `unpartition` refuses a destination inside the tree (the root, a partition, an orphan),
+  empties this library's detached partitions too, and — under `drop_emptied` — detaches,
+  drains the tail, and lets the drop move whatever arrived late in the same transaction
+  under the drop's lock, so a row committed between the last batch and the drop is moved,
+  never dropped. `partition_data` fills and re-attaches a matching detached partition
+  instead of giving up on its window, and drains DEFAULT into foreign leaves.
+- A detach re-checks the relation's identity and attachment under its own lock, after the
+  `before_detach` hooks ran (`detach_partition(expected_oid=)`): a hook or concurrent
+  session that swaps another relation in under the planned name gets `PlanStaleError`.
+  Re-attaching removes the orphan marker in the attach's transaction, so a later detach
+  starts a fresh grace period instead of inheriting the old instant.
+- Under `DropNever` a matching detached table is never re-attached; a wanted window whose
+  name it holds is reported (`name_unusable`) instead of recreated over it.
+- User-authored models — `TablePartitionConfig`, schemes, boundaries, leaves, lifecycle
+  rules — refuse unknown fields (`extra="forbid"`): a misspelled `garce` or `retentoin` no
+  longer validates into a destructive default. `KeepFor` / `WindowAgeAbove` refuse
+  negative ages.
+- `CreatePartition.capabilities` and `AttachPartition.capabilities` name the
+  `SHARE ROW EXCLUSIVE` locks PostgreSQL takes on tables referencing the parent.
 - Sliding `LIST`: `ListPartitioning(key, sequence=IntegerSequence(start))` is a progression
   level — one integer value per partition, the cursor read off the newest member
   (`CursorSource.NEWEST_MEMBER`), rotated with `CreateNextIf` or bounded with `CreateUntil`;

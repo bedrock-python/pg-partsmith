@@ -7,13 +7,15 @@ into one plain table.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
 
+from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
-from pg_partsmith.entities import MaintenanceIssueStep
+from pg_partsmith.entities import MaintenanceIssueStep, Period
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from tests.integration.aio.support import (
     exec_sql,
@@ -24,8 +26,10 @@ from tests.integration.aio.support import (
     range_children_of,
     relkind,
     scalar,
+    table_comment,
 )
 from tests.integration.nested_support import (
+    IDENTITY_TABLE_DDL,
     MONTHLY_TABLE_DDL,
     NULLABLE_COMPOSITE_TABLE_DDL,
     TIMESTAMP_TABLE_DDL,
@@ -293,3 +297,135 @@ async def test__unpartition__batch_budget__stops_and_resumes(db_engine: AsyncEng
     assert (first.rows_moved, first.complete) == (4, False)
     assert (second.rows_moved, second.complete) == (5, True)
     assert await _count(db_engine, flat) == 9
+
+
+# ── review follow-ups: FK actions, late rows, generated columns, destinations ───
+
+
+@pytest_asyncio.fixture
+async def ledger(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in make_table(db_engine, IDENTITY_TABLE_DDL, prefix="gmig"):
+        yield name
+
+
+async def test__partition_data__cascading_foreign_key__refused_with_nothing_deleted(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange: rows in DEFAULT are referenced ON DELETE CASCADE
+    await _default_with_rows(db_engine, events, months=(3,), per_month=5)
+    ref = f"{events}_ref"
+    await exec_sql(
+        db_engine,
+        f'CREATE TABLE "{ref}" (event_id BIGINT, created_at TIMESTAMPTZ, '
+        f'FOREIGN KEY (event_id, created_at) REFERENCES "{events}" (id, created_at) ON DELETE CASCADE)',
+    )
+    await exec_sql(db_engine, f'INSERT INTO "{ref}" SELECT id, created_at FROM "{events}" LIMIT 2')  # noqa: S608
+
+    # Act
+    result = await make_service(db_engine).partition_data(monthly_config(events, create_ahead=1))
+
+    # Assert: fail closed -- no parent row moved, no referencing row cascaded away
+    assert not result.complete
+    assert any("ON DELETE CASCADE" in issue.error for issue in result.issues)
+    assert await _count(db_engine, events) == 5
+    assert await _count(db_engine, ref) == 2
+
+
+class _LateWriter(BasePartitionLifecycleHooks):
+    """Commits one more row through the root just before each partition detaches."""
+
+    def __init__(self, engine: AsyncEngine, table: str, when: datetime) -> None:
+        self._engine = engine
+        self._table = table
+        self._when = when
+
+    async def before_detach(self, table_name: str, partition: object) -> None:
+        await exec_sql(
+            self._engine,
+            f"INSERT INTO \"{self._table}\" (created_at, payload) VALUES (:ts, 'late')",  # noqa: S608
+            ts=self._when,
+        )
+
+
+async def test__unpartition__row_committed_between_the_last_batch_and_the_drop__is_moved_not_dropped(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange: nine March rows, and a writer that lands one more at every detach
+    await _default_with_rows(db_engine, events, months=(3,), per_month=9)
+    config = monthly_config(events, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    flat = f"{events}_flat"
+    late = _LateWriter(db_engine, events, datetime(2026, 3, 15, 12, tzinfo=UTC))
+
+    # Act
+    result = await make_service(db_engine, hooks=[late]).unpartition(config, flat, batch_rows=4, drop_emptied=True)
+
+    # Assert: both late rows (March partition, then DEFAULT) end in the flat table
+    assert result.complete
+    assert result.rows_moved == 11
+    assert await _count(db_engine, flat) == 11
+    assert await relkind(db_engine, f"{events}__2026_03") is None
+    assert await _count(db_engine, events) == 0
+
+
+async def test__movers__generated_and_identity_columns__recomputed_not_copied(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    # Arrange: the legacy table carries GENERATED ALWAYS columns (identity and stored)
+    legacy = f"{ledger}_legacy"
+    await exec_sql(db_engine, f'CREATE TABLE "{legacy}" (LIKE "{ledger}" INCLUDING ALL EXCLUDING IDENTITY)')
+    await exec_sql(
+        db_engine,
+        f'INSERT INTO "{legacy}" (id, tenant_id, created_at, amount) '  # noqa: S608
+        f"SELECT g, 1, make_timestamptz(2026, 4, 1 + (g % 27), 12, 0, 0, 'UTC'), g FROM generate_series(1, 6) g",
+    )
+    await exec_sql(db_engine, f'ALTER TABLE "{ledger}" ATTACH PARTITION "{legacy}" DEFAULT')
+    config = monthly_config(ledger, create_ahead=1)
+
+    # Act
+    forward = await make_service(db_engine).partition_data(config)
+    flat = f"{ledger}_flat"
+    back = await make_service(db_engine).unpartition(config, flat)
+
+    # Assert: rows moved twice, ids kept, the stored column recomputed each time
+    assert forward.complete and back.complete
+    assert forward.rows_moved == 6 and back.rows_moved == 6
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{flat}" WHERE doubled = amount * 2')) == 6  # noqa: S608
+    assert int(await scalar(db_engine, f'SELECT sum(id) FROM "{flat}"')) == 21  # noqa: S608
+
+
+async def test__unpartition__into_the_root_itself__refused_before_any_row_moves(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange
+    await _default_with_rows(db_engine, events, months=(5,), per_month=3)
+    config = monthly_config(events, create_ahead=1)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="itself"):
+        await make_service(db_engine).unpartition(config, f"public.{events}")
+    assert await _count(db_engine, events) == 3
+
+
+async def test__partition_data__window_of_a_detached_owned_partition__filled_and_reattached(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange: March exists, was detached by the library, and new March rows sit in DEFAULT
+    config = monthly_config(events, create_ahead=1)
+    service = make_service(db_engine)
+    await service.ensure_partitions(config, [Period(year=2026, month=3)])
+    march = f"{events}__2026_03"
+    listed = await PostgresMetadataProvider(db_engine).list_partitions(events)
+    await service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    assert await is_attached(db_engine, march) is False
+    await _default_with_rows(db_engine, events, months=(3,), per_month=4)
+
+    # Act
+    result = await service.partition_data(config)
+
+    # Assert: the orphan is filled and re-attached, not recreated or given up on
+    assert result.complete
+    assert result.partitions == (f"public.{march}",)
+    assert await is_attached(db_engine, march)
+    assert await _count(db_engine, march) == 4
+    assert await table_comment(db_engine, march) is None

@@ -63,13 +63,18 @@ A DEFAULT sibling holding rows for a hash or list member is reported
 `DetachMode.AUTO` runs `DETACH … CONCURRENTLY` on an autocommit connection —
 `SHARE UPDATE EXCLUSIVE` on the parent, readers and writers untouched — and falls back to
 the blocking form when PostgreSQL refuses the concurrent one, which it does when a DEFAULT
-partition exists. The marker is written *before* the detach.
+partition exists. The marker is written *before* the detach, and the relation's identity
+(OID) and attachment are re-checked under the detach's own lock, after the
+`before_detach` hooks ran — a hook or a concurrent session that swaps another relation in
+under the planned name gets a `PlanStaleError`, not a detached replacement.
 
 A `DETACH CONCURRENTLY` interrupted mid-way (a statement timeout, a killed connection)
 leaves the partition in a **pending** state: still attached in the catalog, invisible
-through the parent, rejecting its own rows. The next tick's plan reports it as
-`detach_pending` and completes it with `DETACH … FINALIZE` (reason `detach_finalize`);
-its drop then follows the drop policy.
+through the parent, rejecting its own rows. The next `maintain()` call reports it as
+`detach_pending`, completes it with `DETACH … FINALIZE` first (reason `detach_finalize`),
+and re-plans under the same lock: the finalized table comes back as an orphan that the
+same call re-attaches — its window still wanted, its data intact — or retires under the
+drop policy.
 
 Detaching a branch keeps its subtree intact and readable through the branch.
 

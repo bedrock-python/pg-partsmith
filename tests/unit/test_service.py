@@ -571,7 +571,7 @@ async def test__maintain__end_to_end__returns_counters_and_the_plan_it_executed(
     assert [op.target for op in result.plan.creates] == ["events__2024_03"]
     repo.create_table_like.assert_awaited_once_with("events", "events__2024_03", None)
     repo.attach_partition.assert_awaited_once_with("events", "events__2024_03", MARCH, key_arity=1)
-    repo.detach_partition.assert_awaited_once_with("events", "events__2024_01", mode=DetachMode.AUTO)
+    repo.detach_partition.assert_awaited_once_with("events", "events__2024_01", mode=DetachMode.AUTO, expected_oid=1)
     assert [call.args[0] for call in repo.drop_partition.call_args_list] == ["events__2024_01", "events__2023_12"]
 
 
@@ -1040,7 +1040,9 @@ async def test__detach_old_partitions__attached_partition__is_detached_via_its_o
 
     # Assert
     assert detached == ["public.events__2024_01"]
-    repo.detach_partition.assert_awaited_once_with("public.events", "public.events__2024_01", mode=DetachMode.AUTO)
+    repo.detach_partition.assert_awaited_once_with(
+        "public.events", "public.events__2024_01", mode=DetachMode.AUTO, expected_oid=None
+    )
     metadata.is_partition_attached.assert_awaited_once_with("public.events", "public.events__2024_01")
 
 
@@ -1061,7 +1063,7 @@ async def test__detach_old_partitions__no_parent_on_the_partition__falls_back_to
     await service.detach_old_partitions("events", [partition])
 
     # Assert
-    repo.detach_partition.assert_awaited_once_with("events", "events__2024_01", mode=DetachMode.AUTO)
+    repo.detach_partition.assert_awaited_once_with("events", "events__2024_01", mode=DetachMode.AUTO, expected_oid=None)
 
 
 async def test__detach_old_partitions__already_detached_input__counted_without_ddl(
@@ -1146,7 +1148,7 @@ async def test__detach_old_partitions__attached_partition_with_only_a_raw_bound_
 
     # Assert
     assert detached == ["events__weird"]
-    repo.detach_partition.assert_awaited_once_with("events", "events__weird", mode=DetachMode.AUTO)
+    repo.detach_partition.assert_awaited_once_with("events", "events__weird", mode=DetachMode.AUTO, expected_oid=None)
 
 
 async def test__drop_detached_partitions__drops_each_and_counts(
@@ -1158,7 +1160,7 @@ async def test__drop_detached_partitions__drops_each_and_counts(
     # Assert
     assert count == 2
     assert [call.args[0] for call in repo.drop_partition.call_args_list] == ["events__2023_11", "events__2023_12"]
-    assert repo.drop_partition.call_args.kwargs == {"expected_oid": None}
+    assert repo.drop_partition.call_args.kwargs == {"expected_oid": None, "drain_into": None}
 
 
 async def test__drop_detached_partitions__still_attached__is_skipped(

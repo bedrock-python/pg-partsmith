@@ -1074,3 +1074,33 @@ def test__rules__value_given_twice__refused() -> None:
 def test__rules__without_a_defining_value__refuse_a_positional_argument() -> None:
     with pytest.raises(TypeError, match="at most one positional argument"):
         Unreferenced(True)  # type: ignore[call-arg]
+
+
+# ── review follow-ups: negative durations, misspelled fields ────────────────────
+
+
+@pytest.mark.parametrize("rule", [KeepFor, WindowAgeAbove])
+def test__age_rules__negative_age__refused(rule: Any) -> None:
+    with pytest.raises(ValidationError, match="must not be negative"):
+        rule(age=timedelta(days=-90))
+
+
+@pytest.mark.parametrize("rule", [KeepFor, WindowAgeAbove])
+def test__age_rules__zero_age__allowed(rule: Any) -> None:
+    assert rule(age=timedelta(0)).age == timedelta(0)
+
+
+def test__lifecycle_policy__misspelled_field__refused_not_defaulted() -> None:
+    # 'retentoin' silently ignored would mean KeepNewest(12) instead of 120 kept partitions.
+    with pytest.raises(ValidationError, match="retentoin"):
+        LifecyclePolicy.model_validate({"retentoin": {"kind": "keep_newest", "count": 120}})
+
+
+def test__drop_after__misspelled_grace__refused_not_dropped_immediately() -> None:
+    with pytest.raises(ValidationError, match="garce"):
+        LifecyclePolicy.model_validate({"drop": {"kind": "drop_after", "garce": "P7D"}})
+
+
+def test__rules__misspelled_field__refused() -> None:
+    with pytest.raises(ValidationError):
+        KeepNewest.model_validate({"kind": "keep_newest", "coutn": 3})

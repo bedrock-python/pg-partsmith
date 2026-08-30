@@ -348,7 +348,8 @@ class CreatePartition(OperationBase):
         return OperationCapabilities(
             transactional=True,
             lock="ACCESS SHARE on the template during CREATE; SHARE UPDATE EXCLUSIVE on the parent "
-            "and ACCESS EXCLUSIVE on the new partition (and on a DEFAULT sibling) during ATTACH",
+            "and ACCESS EXCLUSIVE on the new partition (and on a DEFAULT sibling) during ATTACH; "
+            "SHARE ROW EXCLUSIVE on every table referencing the parent through a foreign key",
         )
 
     def count(self) -> int:
@@ -392,7 +393,8 @@ class AttachPartition(OperationBase):
         """Transactional; SHARE UPDATE EXCLUSIVE on the parent."""
         return OperationCapabilities(
             transactional=True,
-            lock="SHARE UPDATE EXCLUSIVE on the parent; ACCESS EXCLUSIVE on the partition and on a DEFAULT sibling",
+            lock="SHARE UPDATE EXCLUSIVE on the parent; ACCESS EXCLUSIVE on the partition and on a DEFAULT "
+            "sibling; SHARE ROW EXCLUSIVE on every table referencing the parent through a foreign key",
         )
 
 

@@ -156,9 +156,11 @@ another.
 
 ## What is checked, and when
 
-**At construction** — no database involved: identifiers are lowercased and checked, a
-LIST key is one column, every level partitions on a fresh column, a sliding list has no
-`CreateAhead`, every generated name fits 63 bytes at every level:
+**At construction** — no database involved: an unknown or misspelled field is refused
+rather than silently dropped (a `retention_cout` typo must not shrink retention to its
+default), identifiers are lowercased and checked, a LIST key is one column, every level
+partitions on a fresh column, a sliding list has no `CreateAhead`, a retention age is
+never negative, every generated name fits 63 bytes at every level:
 
 ```text
 table_name 'a_very_long_table_name_for_an_events_store_that_goes_on_and_on' is too long for

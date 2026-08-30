@@ -23,16 +23,18 @@ from typing import TYPE_CHECKING, Any
 from pg_partsmith.boundaries import Window
 from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MigrationResult
-from pg_partsmith.exceptions import InvalidPartitionConfigError
-from pg_partsmith.plan import DetachPartition, DropPartition, MaintenancePlan, Reason
+from pg_partsmith.exceptions import InvalidPartitionConfigError, RowMoveRefusedError
+from pg_partsmith.lifecycle import DropAfter
+from pg_partsmith.plan import AttachPartition, CreatePartition, DetachPartition, DropPartition, MaintenancePlan, Reason
 from pg_partsmith.planner import to_maintenance_issue
 from pg_partsmith.scheme import RangePartitioning
-from pg_partsmith.topology import DefaultBounds, PartitionNode, RangeBounds
+from pg_partsmith.topology import DefaultBounds, PartitionNode, RangeBounds, RelationKind
 
 if TYPE_CHECKING:
     from pg_partsmith.entities import TablePartitionConfig
     from pg_partsmith.sync.protocols import PartitionMetadataProvider, PartitionRepository
     from pg_partsmith.sync.services.execution import PlanExecutor
+    from pg_partsmith.topology import ActualTree, DetachedPartition
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +97,12 @@ class DataMover:
             window = boundaries.window_at(probe if position is None else position)
             plan = plan_for(window)
             tally.issues.extend(to_maintenance_issue(f) for f in plan.actionable_findings)
-            op = next((c for c in plan.creates if c.counts_as == "created" and isinstance(c.bounds, RangeBounds)), None)
+            op = self._window_operation(plan)
             if op is None:
                 tally.issue(
                     default.name,
-                    f"rows for {boundaries.describe(window)} stay in {default.name}: no partition can be created for "
-                    "that window (see the findings above)",
+                    f"rows for {boundaries.describe(window)} stay in {default.name}: no partition can be created or "
+                    "re-attached for that window (see the findings above)",
                 )
                 return tally.result(complete=False)
 
@@ -108,7 +110,16 @@ class DataMover:
             bounds = op.bounds
             assert isinstance(bounds, RangeBounds)
             fill = partial(self._drain_window, default.name, root.key, bounds, batch_rows, tally)
-            attached = self._executor.create_partition(config, plan, op, issues=tally.issues, fill=fill)
+            try:
+                if isinstance(op, CreatePartition):
+                    attached = self._executor.create_partition(config, plan, op, issues=tally.issues, fill=fill)
+                else:
+                    attached = self._executor.attach_partition(config, plan, op, issues=tally.issues, fill=fill)
+            except RowMoveRefusedError as exc:
+                tally.issue(
+                    default.name, f"rows for {boundaries.describe(window)} stay in {default.name}: {exc.detail}"
+                )
+                return tally.result(complete=False)
             if not attached:
                 logger.info(
                     "Batch budget exhausted; the partition stays detached until the next call",
@@ -127,6 +138,14 @@ class DataMover:
                     f"bounds {bounds.from_value!r} .. {bounds.to_value!r}; left in place",
                 )
                 return tally.result(complete=False)
+
+    @staticmethod
+    def _window_operation(plan: MaintenancePlan) -> CreatePartition | AttachPartition | None:
+        """The operation that gives the window its partition: a creation, or a matching orphan's re-attach."""
+        create = next((c for c in plan.creates if c.counts_as == "created" and isinstance(c.bounds, RangeBounds)), None)
+        if create is not None:
+            return create
+        return next((a for a in plan.attaches if isinstance(a.bounds, RangeBounds)), None)
 
     def _drain_window(
         self,
@@ -163,11 +182,16 @@ class DataMover:
     ) -> MigrationResult:
         """Move every partition's rows into one plain table, oldest partition first.
 
-        ``into`` is created ``LIKE`` the root when it does not exist. A
-        partition is emptied in batches of ``batch_rows``; with
-        ``drop_emptied`` it is then detached and dropped through the ordinary
-        path (marker, hooks, revalidation). Foreign partitions are skipped and
-        reported: their rows are not this database's to move.
+        ``into`` must be a plain table outside the tree; it is created ``LIKE``
+        the root when it does not exist. A partition is emptied in batches of
+        ``batch_rows``; with ``drop_emptied`` it is then detached (marker,
+        hooks, revalidation), its tail -- rows that arrived after the last
+        batch -- is moved, and the drop moves whatever is left in the same
+        transaction, under the drop's own lock, so a late row is moved rather
+        than dropped. This library's own detached partitions are emptied too;
+        under ``DropNever`` they belong to another process and are reported
+        instead. Foreign partitions are skipped and reported: their rows are
+        not this database's to move.
 
         Args:
             config: The table's configuration.
@@ -178,34 +202,78 @@ class DataMover:
             drop_emptied: Detach and drop each partition once it is empty.
 
         Returns:
-            What was moved and emptied, and whether every partition is empty.
+            What was moved and emptied, and whether every row is in ``into``.
+
+        Raises:
+            InvalidPartitionConfigError: If the table is not partitioned, or
+                ``into`` is the root, a member or an orphan of its tree, or
+                not a plain table.
         """
         _require_positive(batch_rows, "batch_rows")
         tree = self._metadata.get_actual_tree(config.qualified_name)
         if tree is None:
             msg = f"Table {config.qualified_name!r} is not partitioned"
             raise InvalidPartitionConfigError(msg)
+        self._require_destination(config, tree, into)
         if not self._metadata.partition_exists(into):
             self._repo.create_table_like(config.qualified_name, into, None)
 
         tally = _Tally(max_batches)
-        for child in _oldest_first(config, tree.root.children):
-            if child.is_foreign:
-                tally.issue(child.name, f"{child.name} is a foreign table; its rows live elsewhere and are not moved")
-                continue
-            while True:
-                if tally.exhausted:
+        try:
+            for child in _oldest_first(config, tree.root.children):
+                if child.is_foreign:
+                    tally.issue(
+                        child.name, f"{child.name} is a foreign table; its rows live elsewhere and are not moved"
+                    )
+                    continue
+                if not self._drain(child.name, into, batch_rows, tally):
                     return tally.result(complete=False)
-                moved = self._repo.move_rows(child.name, into, limit=batch_rows)
-                tally.batch(moved)
-                if moved < batch_rows:
-                    break
-            tally.partitions.append(child.name)
-            if drop_emptied:
-                self._remove(config, child)
-        return tally.result(complete=True)
+                tally.partitions.append(child.name)
+                if drop_emptied:
+                    self._remove(config, child, into, tally)
+            complete = self._move_orphans(config, tree, into, batch_rows, tally, drop_emptied=drop_emptied)
+        except RowMoveRefusedError as exc:
+            tally.issue(exc.relation_name, exc.detail)
+            return tally.result(complete=False)
+        return tally.result(complete=complete)
 
-    def _remove(self, config: TablePartitionConfig, child: PartitionNode) -> None:
+    def _require_destination(self, config: TablePartitionConfig, tree: ActualTree, into: str) -> None:
+        """``into`` must be a plain table outside the tree it receives rows from.
+
+        The root itself would route every "moved" row straight back into the
+        partition it came from -- a loop that reports progress and makes
+        none; a partition or an orphan of the tree would later be emptied
+        into itself.
+        """
+        oid = self._metadata.get_relation_oid(into)
+        if oid is None:
+            return  # created LIKE the root by the caller
+        taken = {node.oid for node in tree.root.walk() if node.oid is not None}
+        taken.update(orphan.oid for orphan in tree.orphans if orphan.oid is not None)
+        if oid in taken:
+            msg = (
+                f"unpartition cannot move rows into {into!r}: it is {config.qualified_name} itself, one of its "
+                "partitions, or one of its detached partitions"
+            )
+            raise InvalidPartitionConfigError(msg)
+        kind = self._metadata.get_relation_kind(into)
+        if kind is not RelationKind.TABLE:
+            described = "no relation at all" if kind is None else f"a {kind.value} relation"
+            msg = f"unpartition moves rows into a plain table; {into!r} is {described}"
+            raise InvalidPartitionConfigError(msg)
+
+    def _drain(self, source: str, into: str, batch_rows: int, tally: _Tally) -> bool:
+        """Empty ``source`` into ``into`` in batches; False when the budget ran out first."""
+        while True:
+            if tally.exhausted:
+                return False
+            moved = self._repo.move_rows(source, into, limit=batch_rows)
+            tally.batch(moved)
+            if moved < batch_rows:
+                return True
+
+    def _remove(self, config: TablePartitionConfig, child: PartitionNode, into: str, tally: _Tally) -> None:
+        """Detach an emptied partition, move its tail, and drop it without losing a late row."""
         detail = "emptied by unpartition"
         detach = DetachPartition(
             target=child.name,
@@ -217,8 +285,57 @@ class DataMover:
             detail=detail,
         )
         self._executor.detach_single_partition(config.qualified_name, detach)
+        # Rows routed into the partition between its last batch and the
+        # detach. Nothing routes into it any more, so one pass takes them
+        # all; it runs outside the batch budget -- a detached table must not
+        # linger half-full, an orphan's drop is only a tick away.
+        tail = self._repo.move_rows(child.name, into, limit=None)
+        if tail:
+            tally.batch(tail)
         drop = DropPartition(target=child.name, oid=child.oid, reason=Reason.EXPLICIT, detail=detail)
-        self._executor.drop_single_partition(config.qualified_name, drop)
+        self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
+
+    def _move_orphans(
+        self,
+        config: TablePartitionConfig,
+        tree: ActualTree,
+        into: str,
+        batch_rows: int,
+        tally: _Tally,
+        *,
+        drop_emptied: bool,
+    ) -> bool:
+        """Empty this library's detached partitions too; their rows are the table's rows.
+
+        Under ``DropNever`` a detached table was handed to another process --
+        an archiver, say -- and its rows are not this call's to move; it is
+        reported and the result is incomplete.
+        """
+        complete = True
+        for orphan in sorted(tree.orphans, key=lambda candidate: candidate.name):
+            if orphan.relkind is RelationKind.FOREIGN:
+                tally.issue(orphan.name, f"{orphan.name} is a foreign table; its rows live elsewhere and are not moved")
+                continue
+            if not isinstance(config.lifecycle.drop, DropAfter):
+                tally.issue(
+                    orphan.name,
+                    f"{orphan.name} is a detached table that '{config.lifecycle.drop.describe()}' hands to another "
+                    "process; its rows were not moved",
+                )
+                complete = False
+                continue
+            if not self._drain(orphan.name, into, batch_rows, tally):
+                return False
+            tally.partitions.append(orphan.name)
+            if drop_emptied:
+                self._drop_orphan(config, orphan, into)
+        return complete
+
+    def _drop_orphan(self, config: TablePartitionConfig, orphan: DetachedPartition, into: str) -> None:
+        drop = DropPartition(
+            target=orphan.name, oid=orphan.oid, reason=Reason.EXPLICIT, detail="emptied by unpartition"
+        )
+        self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
 
 
 class _Tally:

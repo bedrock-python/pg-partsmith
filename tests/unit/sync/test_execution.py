@@ -28,6 +28,7 @@ from pg_partsmith.exceptions import (
     PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
+    RowMoveRefusedError,
 )
 from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
 from pg_partsmith.lifecycle import DetachMode
@@ -1024,7 +1025,9 @@ def test__apply__detach_op__revalidates_then_detaches_with_hooks_around_it(
     result = executor.apply(_config(), _plan(_detach_op(mode=DetachMode.BLOCKING)))
 
     # Assert
-    repo.detach_partition.assert_called_once_with("events", "events__2024_03", mode=DetachMode.BLOCKING)
+    repo.detach_partition.assert_called_once_with(
+        "events", "events__2024_03", mode=DetachMode.BLOCKING, expected_oid=77
+    )
     assert hooks.names() == ["before_detach", "after_detach"]
     table_name, info = hooks.calls[0][1]
     assert table_name == "events"
@@ -1130,7 +1133,7 @@ def test__apply__drop_op__drops_with_the_expected_oid_and_hooks_around_it(
     result = executor.apply(_config(), _plan(_drop_op(oid=55)))
 
     # Assert
-    repo.drop_partition.assert_called_once_with("events__2023_12", expected_oid=55)
+    repo.drop_partition.assert_called_once_with("events__2023_12", expected_oid=55, drain_into=None)
     assert hooks.calls == [
         ("before_drop", ("events", "events__2023_12")),
         ("after_drop", ("events", "events__2023_12")),
@@ -1180,7 +1183,7 @@ def test__apply__drop_following_a_failed_detach__is_skipped(
 
     # Assert -- the pre-existing orphan is still dropped; the would-be-detached partition is not
     assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.DETACH]
-    repo.drop_partition.assert_called_once_with("events__2023_12", expected_oid=55)
+    repo.drop_partition.assert_called_once_with("events__2023_12", expected_oid=55, drain_into=None)
     assert result.dropped_count == 1
     assert any("did not happen" in call.args[0] for call in logger.info.call_args_list)
 
@@ -1211,7 +1214,7 @@ def test__apply__drop_following_a_successful_detach__is_dropped(
     result = executor.apply(_config(), plan)
 
     # Assert
-    repo.drop_partition.assert_called_once_with("events__2024_03", expected_oid=77)
+    repo.drop_partition.assert_called_once_with("events__2024_03", expected_oid=77, drain_into=None)
     assert result.detached_count == 1
     assert result.dropped_count == 1
 
@@ -1719,3 +1722,83 @@ def test__apply__detach_refused_by_a_foreign_key__recorded_and_the_run_goes_on(
     assert result.issues[0].partition_name == "events__2024_06"
     assert "still referenced by rows of another table" in result.issues[0].error
     assert hooks.names().count("after_detach") == 1
+
+
+# ── review follow-ups: identity under the detach lock, refused moves, filled attaches ─
+
+
+def test__detach_single_partition__passes_the_expected_oid_to_the_repository(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 77
+    metadata.is_partition_attached.return_value = True
+
+    # Act
+    executor.detach_single_partition("events", _detach_op(oid=77))
+
+    # Assert -- the repository re-checks the identity under its own lock
+    repo.detach_partition.assert_called_once_with("events", "events__2024_03", mode=DetachMode.AUTO, expected_oid=77)
+
+
+def test__attach_partition__fill_returns_false__stays_detached(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 9
+    metadata.get_partition_tree.return_value = None
+    op = _attach_op(oid=9)
+    seen: list[str] = []
+
+    def fill(name: str) -> bool:
+        seen.append(name)
+        return False
+
+    # Act
+    attached = executor.attach_partition(_config(), _plan(op), op, issues=[], fill=fill)
+
+    # Assert
+    assert attached is False
+    assert seen == [op.target]
+    repo.attach_partition.assert_not_called()
+
+
+def test__attach_partition__fill_returns_true__is_attached(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 9
+    metadata.get_partition_tree.return_value = None
+    op = _attach_op(oid=9)
+
+    def fill(name: str) -> bool:
+        return True
+
+    # Act
+    attached = executor.attach_partition(_config(), _plan(op), op, issues=[], fill=fill)
+
+    # Assert
+    assert attached is True
+    repo.attach_partition.assert_called_once_with("events", "events__2024_04", APRIL, key_arity=1)
+
+
+def test__apply__reconcile_refused_by_a_foreign_key_action__recorded_and_the_run_goes_on(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the attach hits the DEFAULT conflict, and the move out of DEFAULT is refused
+    repo.attach_partition.side_effect = _default_conflict()
+    metadata.is_partition_attached.return_value = False
+    metadata.get_default_partition.return_value = PartitionInfo(
+        name="events_default", partition_type=PartitionType.RANGE, is_default=True, parent_table="events"
+    )
+    repo.reconcile_default_rows.side_effect = RowMoveRefusedError(
+        "events_default", "foreign key fk_orders (ON DELETE CASCADE) would act on the rows"
+    )
+
+    # Act
+    result = executor.apply(_config(), _plan(_create_op()))
+
+    # Assert -- an issue, not an abort
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
+    assert "ON DELETE CASCADE" in result.issues[0].error
+    assert result.created_count == 0

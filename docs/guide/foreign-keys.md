@@ -94,6 +94,21 @@ does not ask.
 
 A partition that could not be measured reads as referenced, so it is kept.
 
+## Row moves and ON DELETE actions
+
+The movers — DEFAULT reconciliation at attach, `partition_data`, `unpartition` — move a
+row with one statement: `DELETE … RETURNING` piped into `INSERT`. PostgreSQL's
+`NO ACTION` check runs at the end of that statement, finds the row again in its new
+partition, and passes: an ordinary foreign key never notices a move. `RESTRICT` fires
+immediately and fails the whole statement, which is safe — everything stays where it was.
+
+`ON DELETE CASCADE`, `SET NULL` and `SET DEFAULT` are different: they act on the DELETE
+alone, deleting or rewriting the referencing rows while the moved row lives on in its new
+partition. The movers refuse to run under one — `RowMoveRefusedError`, surfaced as a
+`move` issue naming the constraint — rather than let a migration silently eat the
+referencing tables. Re-create such a key `ON DELETE NO ACTION` for the duration of the
+move, or move first and add the action after. Verified on PostgreSQL 15, 16 and 17.
+
 ## Locks
 
 Either form of `DETACH` takes `ACCESS EXCLUSIVE` on every table that references the parent

@@ -186,7 +186,22 @@ class PartitionLifecycleService:
 
         async with self._locks.acquire_lock(config.qualified_name):
             plan = await self.plan(config)
-            return await self._executor.apply(config, plan.without(*excluded), continue_on_error=continue_on_error)
+            finalized: MaintenanceResult | None = None
+            if not skip_detach and any(op.reason is Reason.DETACH_FINALIZE for op in plan.detaches):
+                # An interrupted DETACH CONCURRENTLY is completed first and the
+                # run re-planned: the finalized table is an orphan this same
+                # call re-attaches (its window is still wanted) or retires
+                # under the drop policy, instead of waiting one more tick.
+                pending_only = plan.model_copy(
+                    update={
+                        "operations": tuple(op for op in plan.detaches if op.reason is Reason.DETACH_FINALIZE),
+                        "findings": (),
+                    }
+                )
+                finalized = await self._executor.apply(config, pending_only, continue_on_error=continue_on_error)
+                plan = await self.plan(config)
+            result = await self._executor.apply(config, plan.without(*excluded), continue_on_error=continue_on_error)
+            return result if finalized is None else _merged(finalized, result)
 
     async def maintain_lifecycle(
         self,
@@ -524,3 +539,17 @@ def _created_info(config: TablePartitionConfig, op: CreatePartition) -> Partitio
 
 def _failed(result: MaintenanceResult) -> set[str]:
     return {issue.partition_name for issue in result.issues if issue.partition_name is not None}
+
+
+def _merged(first: MaintenanceResult, second: MaintenanceResult) -> MaintenanceResult:
+    """One result over two applies of the same call: counters add up, the last plan stands."""
+    return second.model_copy(
+        update={
+            "created_count": first.created_count + second.created_count,
+            "repaired_count": first.repaired_count + second.repaired_count,
+            "attached_count": first.attached_count + second.attached_count,
+            "detached_count": first.detached_count + second.detached_count,
+            "dropped_count": first.dropped_count + second.dropped_count,
+            "issues": first.issues + second.issues,
+        }
+    )

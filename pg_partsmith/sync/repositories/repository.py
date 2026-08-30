@@ -68,6 +68,7 @@ class PostgresPartitionRepository:
             engine=engine,
             ddl_timeout=ddl_timeout_seconds,
             ddl_timezone=self._ddl_timezone,
+            marker_prefix=marker_prefix,
         )
         self._remover = PartitionRemover(
             engine=engine,
@@ -79,6 +80,7 @@ class PostgresPartitionRepository:
             marker_prefix=marker_prefix,
             resolver=self._resolver,
             fk_manager=self._fk_manager,
+            creator=self._creator,
             allow_unmanaged=bool(drop_allow_unmanaged),
         )
 
@@ -132,19 +134,28 @@ class PostgresPartitionRepository:
         """
         self._creator.attach(parent_name, partition_name, bounds, key_arity=key_arity)
 
-    def detach_partition(self, parent_name: str, partition_name: str, *, mode: DetachMode = DetachMode.AUTO) -> None:
+    def detach_partition(
+        self,
+        parent_name: str,
+        partition_name: str,
+        *,
+        mode: DetachMode = DetachMode.AUTO,
+        expected_oid: int | None = None,
+    ) -> None:
         """Detach a partition, writing the orphan marker first.
 
         See :meth:`PartitionRemover.detach`.
         """
-        self._remover.detach(parent_name, partition_name, mode=mode)
+        self._remover.detach(parent_name, partition_name, mode=mode, expected_oid=expected_oid)
 
-    def drop_partition(self, partition_name: str, *, expected_oid: int | None = None) -> None:
+    def drop_partition(
+        self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None
+    ) -> None:
         """Drop a detached, marker-tagged partition.
 
         See :meth:`PartitionRemover.drop`.
         """
-        self._remover.drop(partition_name, expected_oid=expected_oid)
+        self._remover.drop(partition_name, expected_oid=expected_oid, drain_into=drain_into)
 
     def adopt_partition(self, table_name: str, partition_name: str) -> bool:
         """Mark a detached legacy table as owned by this library (orphan marker).
