@@ -107,8 +107,11 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   recomputed rather than copied; identity values survive a move (`OVERRIDING SYSTEM
   VALUE`) and the target's identity sequences are advanced past the ids they could still
   reissue — along the sequence's own path and direction, inside its declared range. A
-  destination whose sequence cycles onto those ids, or would have nothing left to issue,
-  is refused instead of quietly broken.
+  destination whose sequence cycles (any id in its range: a wraparound restarts it at the
+  far end and can move it onto values its increments skipped), would have nothing left to
+  issue, or has handed cached blocks out to sessions — which keep them where no `setval`
+  reaches, while PostgreSQL publishes only the newest allocation, so everything issued
+  since `START` counts — is refused instead of quietly broken.
 - `unpartition` refuses a destination that is the root, a member or an orphan of its tree,
   or a partition of any other table; empties this library's detached partitions too; and —
   under `drop_emptied` — detaches, drains the tail, and lets the drop move whatever

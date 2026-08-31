@@ -68,8 +68,9 @@ class _Catalog:
         }
     )
     extreme_value: object = None
-    # Whether a row carries a value the sequence's cached block still holds.
-    cached_hit: object = False
+    # Whether a row carries a value one of the sequence probes asks about
+    # (a cached block, or anything inside a cycling sequence's range).
+    holds_value: object = False
     destructive_fks: list[tuple[str, str, str]] = field(default_factory=list)
     failures: dict[str, object] = field(default_factory=dict)
 
@@ -117,7 +118,7 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
     if "seqincrement" in sql:
         return _first(SimpleNamespace(**catalog.sequence))
     if sql.startswith("SELECT EXISTS (SELECT 1 FROM"):
-        return _scalar(catalog.cached_hit)
+        return _scalar(catalog.holds_value)
     if sql.startswith(("SELECT MAX(", "SELECT MIN(")):
         return _scalar(catalog.extreme_value)
     if "obj_description" in sql:
@@ -2049,7 +2050,9 @@ def test__move_rows__cycling_identity_sequence__refuses_the_move() -> None:
         "start_value": 1,
         "last_value": None,
     }
-    engine, _ = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5))
+    engine, _ = _engine(
+        _Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5, holds_value=True)
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
@@ -2087,7 +2090,7 @@ def test__move_rows__identity_sequence_with_a_cache__refuses_what_a_session_may_
         "start_value": 1,
         "last_value": 5,
     }
-    catalog = _Catalog(moved_rows=2, identity_columns=["id"], sequence=sequence, extreme_value=2, cached_hit=True)
+    catalog = _Catalog(moved_rows=2, identity_columns=["id"], sequence=sequence, extreme_value=2, holds_value=True)
     engine, _ = _engine(catalog)
     repo = PostgresPartitionRepository(engine)
 
@@ -2130,7 +2133,7 @@ def test__move_rows__identity_cache_block_below_the_newest__still_refuses() -> N
         "start_value": 1,
         "last_value": 10,
     }
-    catalog = _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, cached_hit=True)
+    catalog = _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, holds_value=True)
     engine, conn = _engine(catalog)
     repo = PostgresPartitionRepository(engine)
 
@@ -2139,3 +2142,50 @@ def test__move_rows__identity_cache_block_below_the_newest__still_refuses() -> N
         repo.move_rows("a", "b")
     (probe,) = [s for s in _statements(conn) if s.startswith("SELECT EXISTS (SELECT 1 FROM")]
     assert "BETWEEN 1 AND 10" in probe
+
+
+def test__move_rows__cached_identity__values_before_its_start_are_not_refused() -> None:
+    # Arrange -- the sequence began at 100; 50 was never handed out by anyone
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 100,
+        "last_value": 109,
+    }
+    engine, conn = _engine(
+        _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, holds_value=False)
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert -- the allocated region runs from the start, not from the declared minimum
+    assert moved == 1
+    (probe,) = [s for s in _statements(conn) if s.startswith("SELECT EXISTS (SELECT 1 FROM")]
+    assert "BETWEEN 100 AND 109" in probe
+
+
+def test__move_rows__cycling_identity__asks_about_the_whole_range_not_one_residue() -> None:
+    # Arrange -- a wraparound restarts the sequence at the far end of its range,
+    # which can put it on values its increments skipped before
+    sequence = {
+        "increment": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "cycles": True,
+        "cache": 2,
+        "start_value": 2,
+        "last_value": 4,
+    }
+    engine, _ = _engine(
+        _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, holds_value=True)
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="skipped before"):
+        repo.move_rows("a", "b")

@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
+from sqlalchemy import text
 
 from pg_partsmith.entities import MaintenanceIssueStep, Period
 from pg_partsmith.exceptions import InvalidPartitionConfigError
@@ -692,3 +693,74 @@ def test__unpartition__into_a_cached_identity_table__refused_while_a_session_may
     assert any("caches 5 values" in issue.error for issue in result.issues)
     assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
     assert _count(sync_db_engine, ledger) == 1
+
+
+def test__unpartition__cached_identity_block_held_by_an_older_session__still_refused(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    """The newest allocation is not the only one a session may still be holding."""
+    # Arrange: session A draws 1..5 and keeps it; session B draws 6..10, moving the catalog to 10
+    _identity_rows(sync_db_engine, ledger, ids=(2,))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(sync_db_engine, ledger, "twoback", "CACHE 5")
+    sequence_of = f"pg_get_serial_sequence('public.{dest}', 'id')"
+    with sync_db_engine.connect() as session_a, sync_db_engine.connect() as session_b:
+        first = (session_a.execute(text(f"SELECT nextval({sequence_of})"))).scalar()
+        second = (session_b.execute(text(f"SELECT nextval({sequence_of})"))).scalar()
+        assert (first, second) == (1, 6)
+        assert int(scalar(sync_db_engine, f"SELECT pg_sequence_last_value({sequence_of})")) == 10
+
+        # Act: id 2 is below the newest block, still live in session A
+        result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert not result.complete
+    assert any("already handed out" in issue.error for issue in result.issues)
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert _count(sync_db_engine, ledger) == 1
+
+
+def test__unpartition__cycling_cached_identity_that_wrapped__refused(sync_db_engine: Engine, ledger: str) -> None:
+    """A wraparound moves the catalog behind a block a session is still holding."""
+    # Arrange: INCREMENT 3 over 1..10 with CYCLE; A keeps 5, B wraps the catalog to 4
+    _identity_rows(sync_db_engine, ledger, ids=(5,))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(
+        sync_db_engine, ledger, "wrapped", "START WITH 2 INCREMENT BY 3 MINVALUE 1 MAXVALUE 10 CYCLE CACHE 2"
+    )
+    sequence_of = f"pg_get_serial_sequence('public.{dest}', 'id')"
+    with sync_db_engine.connect() as session_a, sync_db_engine.connect() as session_b:
+        assert (session_a.execute(text(f"SELECT nextval({sequence_of})"))).scalar() == 2
+        for _ in range(2):
+            session_b.execute(text(f"SELECT nextval({sequence_of})"))
+        assert int(scalar(sync_db_engine, f"SELECT pg_sequence_last_value({sequence_of})")) < 5
+
+        # Act: 5 is behind the catalog now, and still session A's to issue
+        result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert not result.complete
+    assert any("cycles" in issue.error for issue in result.issues)
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert _count(sync_db_engine, ledger) == 1
+
+
+def test__unpartition__cached_identity__ids_before_its_start_move(sync_db_engine: Engine, ledger: str) -> None:
+    # Arrange: the destination's identity begins at 100; nobody was ever handed 50
+    _identity_rows(sync_db_engine, ledger, ids=(50,))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(sync_db_engine, ledger, "afterstart", "START WITH 100 MINVALUE 1 CACHE 5")
+    sequence_of = f"pg_get_serial_sequence('public.{dest}', 'id')"
+    with sync_db_engine.connect() as holder:
+        holder.execute(text(f"SELECT nextval({sequence_of})"))
+
+        # Act
+        result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert: a value the sequence never issued is nobody's to reissue
+    assert result.complete
+    assert result.rows_moved == 1
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 1  # noqa: S608

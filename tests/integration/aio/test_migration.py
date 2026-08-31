@@ -916,3 +916,48 @@ async def test__unpartition__cached_identity_block_held_by_an_older_session__sti
     assert any("already handed out" in issue.error for issue in result.issues)
     assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
     assert await _count(db_engine, ledger) == 1
+
+
+async def test__unpartition__cycling_cached_identity_that_wrapped__refused(db_engine: AsyncEngine, ledger: str) -> None:
+    """A wraparound moves the catalog behind a block a session is still holding."""
+    # Arrange: INCREMENT 3 over 1..10 with CYCLE; A keeps 5, B wraps the catalog to 4
+    await _identity_rows(db_engine, ledger, ids=(5,))
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = await _identity_destination(
+        db_engine, ledger, "wrapped", "START WITH 2 INCREMENT BY 3 MINVALUE 1 MAXVALUE 10 CYCLE CACHE 2"
+    )
+    sequence_of = f"pg_get_serial_sequence('public.{dest}', 'id')"
+    async with db_engine.connect() as session_a, db_engine.connect() as session_b:
+        assert (await session_a.execute(text(f"SELECT nextval({sequence_of})"))).scalar() == 2
+        for _ in range(2):
+            await session_b.execute(text(f"SELECT nextval({sequence_of})"))
+        assert int(await scalar(db_engine, f"SELECT pg_sequence_last_value({sequence_of})")) < 5
+
+        # Act: 5 is behind the catalog now, and still session A's to issue
+        result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert not result.complete
+    assert any("cycles" in issue.error for issue in result.issues)
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert await _count(db_engine, ledger) == 1
+
+
+async def test__unpartition__cached_identity__ids_before_its_start_move(db_engine: AsyncEngine, ledger: str) -> None:
+    # Arrange: the destination's identity begins at 100; nobody was ever handed 50
+    await _identity_rows(db_engine, ledger, ids=(50,))
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = await _identity_destination(db_engine, ledger, "afterstart", "START WITH 100 MINVALUE 1 CACHE 5")
+    sequence_of = f"pg_get_serial_sequence('public.{dest}', 'id')"
+    async with db_engine.connect() as holder:
+        await holder.execute(text(f"SELECT nextval({sequence_of})"))
+
+        # Act
+        result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert: a value the sequence never issued is nobody's to reissue
+    assert result.complete
+    assert result.rows_moved == 1
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 1  # noqa: S608

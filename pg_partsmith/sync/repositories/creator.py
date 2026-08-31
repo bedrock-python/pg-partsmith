@@ -571,71 +571,70 @@ class PartitionCreator:
 
         increment = int(parameters.increment)
         minimum, maximum = int(parameters.minimum), int(parameters.maximum)
-        cache = int(parameters.cache)
+        cache, start_value = int(parameters.cache), int(parameters.start_value)
         last = parameters.last_value
         # The next value the sequence would issue: its start until it has been
         # read once, one increment past the last value afterwards.
-        upcoming = int(parameters.start_value) if last is None else int(last) + increment
+        upcoming = start_value if last is None else int(last) + increment
         ascending = increment > 0
-
-        # The furthest value the sequence could still reach that a row already
-        # owns. ``BETWEEN`` bounds it to the declared range; the modulus keeps
-        # to the values the sequence actually lands on.
-        aggregate = "MAX" if ascending else "MIN"
-        ahead = ">=" if ascending else "<="
+        sequence_name = f"the identity sequence of {target_name}.{column}"
         # Every identifier is quoted and every number is a catalog integer
         # rendered with ``:d``; ``_as_text`` escapes the colons an identifier
         # may carry, which is why the numbers are formatted rather than bound.
         quoted_column, quoted_target = quote_identifier(column), quote_identifier(target_name)
+        in_range = f"{quoted_column} BETWEEN {minimum:d} AND {maximum:d}"
+        on_path = f"({quoted_column} - {upcoming:d}) % {increment:d} = 0"
+
+        if parameters.cycles:
+            # A cycling sequence comes back around, and the wrap restarts it at
+            # the far end of its range -- which can land it on values its
+            # pre-wrap increments never touched. Anything inside the range is
+            # therefore something it may hand out again, whatever its residue.
+            if self._holds(conn, quoted_target, in_range):
+                raise RowMoveRefusedError(
+                    target_name,
+                    f"{sequence_name} cycles, so it comes back around to the ids these rows carry and hands one "
+                    "out again -- a wraparound can even move it onto values its increments skipped before; move "
+                    "into a destination whose identity does not cycle, or take the identity off the column for "
+                    "the migration",
+                )
+            return
+
+        if last is not None and cache > 1:
+            # A cache hands whole blocks to sessions, and a session keeps its
+            # block in memory until it is used up. PostgreSQL publishes only
+            # the newest allocation (``last_value``); an older block, drawn
+            # before another session moved the catalog on, is invisible and
+            # still live. So everything the sequence has issued since it
+            # started -- its path from ``seqstart`` to ``last_value`` -- counts
+            # as possibly held, and no ``setval`` can take any of it back.
+            low, high = sorted((start_value, int(last)))
+            allocated = f"{quoted_column} BETWEEN {low:d} AND {high:d} AND {on_path}"
+            if self._holds(conn, quoted_target, allocated):
+                raise RowMoveRefusedError(
+                    target_name,
+                    f"{sequence_name} caches {cache} values, so values it has already handed out may still be "
+                    "sitting in a session's cache, where no setval reaches them -- and PostgreSQL does not say "
+                    "which; stop the writers and reset the sequence yourself, or take the identity off the "
+                    "column for the migration",
+                )
+
+        # The furthest value the sequence could still reach that a row already
+        # owns: inside the declared range, ahead of where it stands, and on the
+        # values it actually lands on.
+        aggregate = "MAX" if ascending else "MIN"
+        ahead = ">=" if ascending else "<="
         collision = (
             conn.execute(
                 _as_text(
                     f"SELECT {aggregate}({quoted_column}) FROM {quoted_target} "  # noqa: S608
-                    f"WHERE {quoted_column} BETWEEN {minimum:d} AND {maximum:d} "
-                    f"AND {quoted_column} {ahead} {upcoming:d} "
-                    f"AND ({quoted_column} - {upcoming:d}) % {increment:d} = 0"
+                    f"WHERE {in_range} AND {quoted_column} {ahead} {upcoming:d} AND {on_path}"
                 )
             )
         ).scalar()
-
-        # A cache hands whole blocks to sessions, and a session keeps its block
-        # in memory until it is used up. PostgreSQL publishes only the newest
-        # allocation (``last_value``); an older block, drawn before another
-        # session moved the catalog on, is invisible and still live. So every
-        # value the sequence has already allocated -- everything on its path up
-        # to ``last_value`` -- has to count as possibly held, and no ``setval``
-        # can take any of it back.
-        if last is not None and cache > 1:
-            low, high = (minimum, int(last)) if ascending else (int(last), maximum)
-            held = (
-                conn.execute(
-                    _as_text(
-                        f"SELECT EXISTS (SELECT 1 FROM {quoted_target} "  # noqa: S608
-                        f"WHERE {quoted_column} BETWEEN {low:d} AND {high:d} "
-                        f"AND ({quoted_column} - {upcoming:d}) % {increment:d} = 0)"
-                    )
-                )
-            ).scalar()
-            if held:
-                raise RowMoveRefusedError(
-                    target_name,
-                    f"the identity sequence of {target_name}.{column} caches {cache} values, so values it has "
-                    "already handed out may still be sitting in a session's cache, where no setval reaches them "
-                    "-- and PostgreSQL does not say which; stop the writers and reset the sequence yourself, or "
-                    "take the identity off the column for the migration",
-                )
-
         if collision is None:
             return
 
-        sequence_name = f"the identity sequence of {target_name}.{column}"
-        if parameters.cycles:
-            raise RowMoveRefusedError(
-                target_name,
-                f"{sequence_name} cycles, so it would come back around to the ids these rows carry and hand "
-                "one out again; move into a destination whose identity does not cycle, or take the identity "
-                "off the column for the migration",
-            )
         beyond = int(collision) + increment
         if beyond > maximum or beyond < minimum:
             raise RowMoveRefusedError(
@@ -650,6 +649,14 @@ class PartitionCreator:
             ),
             {"table_name": to_regclass_argument(target_name), "column": column, "value": int(collision)},
         )
+
+    @staticmethod
+    def _holds(conn: Connection, quoted_target: str, condition: str) -> bool:
+        """Whether any row of the target carries a value the condition describes."""
+        result = conn.execute(
+            _as_text(f"SELECT EXISTS (SELECT 1 FROM {quoted_target} WHERE {condition})")  # noqa: S608
+        )
+        return bool(result.scalar())
 
     def _refuse_referential_actions(self, conn: Connection, source_name: str) -> None:
         """Refuse a move that a foreign key's ``ON DELETE`` action would turn into data loss.
