@@ -547,10 +547,11 @@ class PartitionCreator:
 
         A configuration where that is not enough refuses the move instead of
         leaving a destination that cannot take its next ordinary insert: a
-        cycling sequence comes back around to the moved values, and a sequence
+        cycling sequence comes back around to the moved values, a sequence
         whose remaining path is entirely consumed by them has nothing left to
-        issue. Runs in the move's transaction, so a refusal rolls the move
-        back with it.
+        issue, and a sequence with a cache has already handed a block of
+        values to some session, where no ``setval`` can reach them. Runs in
+        the move's transaction, so a refusal rolls the move back with it.
         """
         result = conn.execute(text(RELATION_IDENTITY_COLUMNS_SQL), {"table_name": to_regclass_argument(target_name)})
         for row in result.fetchall():
@@ -570,6 +571,7 @@ class PartitionCreator:
 
         increment = int(parameters.increment)
         minimum, maximum = int(parameters.minimum), int(parameters.maximum)
+        cache = int(parameters.cache)
         last = parameters.last_value
         # The next value the sequence would issue: its start until it has been
         # read once, one increment past the last value afterwards.
@@ -595,6 +597,30 @@ class PartitionCreator:
                 )
             )
         ).scalar()
+
+        # A cache means some session drew a block and holds the values below
+        # ``last_value`` privately: they are not in the catalog and no
+        # ``setval`` can take them back.
+        if last is not None and cache > 1:
+            low, high = sorted((int(last), int(last) - (cache - 1) * increment))
+            held = (
+                conn.execute(
+                    _as_text(
+                        f"SELECT EXISTS (SELECT 1 FROM {quoted_target} "  # noqa: S608
+                        f"WHERE {quoted_column} BETWEEN {low:d} AND {high:d} "
+                        f"AND ({quoted_column} - {upcoming:d}) % {increment:d} = 0)"
+                    )
+                )
+            ).scalar()
+            if held:
+                raise RowMoveRefusedError(
+                    target_name,
+                    f"the identity sequence of {target_name}.{column} caches {cache} values, and a session may "
+                    "still be holding ones these rows carry -- cached values live in that session, where no "
+                    "setval reaches them; stop the writers and reset the sequence yourself, or take the identity "
+                    "off the column for the migration",
+                )
+
         if collision is None:
             return
 

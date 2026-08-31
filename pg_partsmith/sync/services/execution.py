@@ -30,6 +30,7 @@ from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, Mainte
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionAttachedError,
+    PartitionError,
     PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
@@ -229,7 +230,7 @@ class PlanExecutor:
             self._run_hooks(lambda h: h.before_create(config, info), "before_create", partition_name=op.target)
 
         try:
-            target_oid = self._require_identity(op.target, self._materialize(config, op))
+            target_oid = _created_identity(op.target, self._materialize(config, op))
         except PartitionAlreadyExistsError:
             # The relation exists but the plan did not see it attached: either
             # a previous run stopped between creating it and attaching it, or
@@ -244,12 +245,15 @@ class PlanExecutor:
                 "Relation already exists but is not attached; completing its subtree before attaching it",
                 extra={"partition_name": op.target},
             )
-            # The identity is acquired here, once, and held through the fill
-            # and the attach: whatever takes over the name later fails stale
-            # instead of receiving the rows or going live. A name that resolves
-            # to nothing is stale in itself -- never a licence to carry on
-            # addressing it by name.
-            target_oid = self._require_identity(op.target, self._metadata.get_relation_oid(op.target))
+            # The identity is read once and held through the fill and the
+            # attach: whatever takes over the name later fails stale instead
+            # of receiving the rows or going live. One read, and a name that
+            # resolves to nothing is stale -- looking again would only give a
+            # replacement the chance to answer.
+            resolved = self._metadata.get_relation_oid(op.target)
+            if resolved is None:
+                raise PlanStaleError(op.target, "the relation does not exist, so its identity cannot be held") from None
+            target_oid = resolved
             tally.repaired += self._converge_detached(
                 config, plan, op, depth=depth, issues=issues, parent_oid=target_oid
             )
@@ -287,20 +291,6 @@ class PlanExecutor:
             attached = info.model_copy(update={"is_attached": True})
             self._run_hooks(lambda h: h.after_create(config, attached), "after_create", partition_name=op.target)
         return True
-
-    def _require_identity(self, name: str, oid: int | None) -> int:
-        """The relation's OID, or a stale plan.
-
-        Every destructive or filling step addresses relations by name and
-        checks this identity underneath; a name that resolves to nothing has
-        already changed hands, so carrying on unprotected is never the answer.
-        """
-        if oid is not None:
-            return oid
-        resolved = self._metadata.get_relation_oid(name)
-        if resolved is None:
-            raise PlanStaleError(name, "the relation does not exist, so its identity cannot be held")
-        return resolved
 
     def _materialize(self, config: TablePartitionConfig, op: CreatePartition) -> int | None:
         """Create the relation ``op`` describes, detached, as the leaf backend says.
@@ -411,7 +401,9 @@ class PlanExecutor:
         """Bring a detached orphan back, completing its subtree first."""
         self._require_same_relation(op.target, op.oid)
         depth = _depth_of(config, op.parent_name)
-        tally.repaired += self._converge_detached(config, plan, op, depth=depth, issues=issues)
+        # The subtree goes into the relation the plan chose, not into whatever
+        # holds its name by the time each child is attached.
+        tally.repaired += self._converge_detached(config, plan, op, depth=depth, issues=issues, parent_oid=op.oid)
         if fill is not None:
             if not fill(op.target, op.oid):
                 return False
@@ -712,6 +704,25 @@ class PlanExecutor:
 
 
 # ── Module helpers ──────────────────────────────────────────────────────────────
+
+
+def _created_identity(name: str, oid: int | None) -> int:
+    """The OID a repository read in the transaction that created the relation.
+
+    The protocol asks for it (``create_table_like`` returns an ``int``) because
+    nothing else can be trusted afterwards: a second look-up by name would
+    happily answer with whatever took the name in between. A repository that
+    does not report it cannot be protected, and this refuses to pretend
+    otherwise.
+    """
+    if oid is None:
+        msg = (
+            f"The repository created {name!r} without reporting its OID. A repository must return the identity it "
+            "read in the creating transaction (PartitionRepository.create_table_like / create_foreign_table_like), "
+            "which is what every fill and the attach are checked against."
+        )
+        raise PartitionError(msg)
+    return oid
 
 
 def _step_of(op: Operation) -> MaintenanceIssueStep:

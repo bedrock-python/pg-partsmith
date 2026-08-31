@@ -830,3 +830,63 @@ async def _identity_destination(engine: AsyncEngine, table: str, suffix: str, id
         "amount NUMERIC NOT NULL DEFAULT 0, doubled NUMERIC GENERATED ALWAYS AS (amount * 2) STORED)",
     )
     return name
+
+
+async def test__unpartition__into_a_cached_identity_table__refused_while_a_session_may_hold_ids(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    # Arrange: the destination's identity draws blocks of five, and one block is out
+    await _identity_rows(db_engine, ledger, ids=(2,))
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = await _identity_destination(db_engine, ledger, "cached", "CACHE 5")
+    await scalar(db_engine, f"SELECT nextval(pg_get_serial_sequence('public.{dest}', 'id'))")
+
+    # Act
+    result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert: id 2 is in the drawn block, where no setval reaches it
+    assert not result.complete
+    assert any("caches 5 values" in issue.error for issue in result.issues)
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert await _count(db_engine, ledger) == 1
+
+
+# sync-mirror: skip
+async def test__ensure_partitions__reattached_branch_replaced_before_its_children__children_never_go_live_in_it(
+    db_engine: AsyncEngine, tenants: str
+) -> None:
+    """A detached branch coming back must not hand its subtree to a replacement."""
+    # Arrange: a managed orphan branch with one bucket missing
+    config = nested_config(tenants, modulus=2)
+    service = make_service(db_engine)
+    when = datetime(2026, 8, 25, 10, tzinfo=UTC)
+    await service.ensure_partitions(config, [when])
+    branch = f"{tenants}__2026_w35"
+    listed = await PostgresMetadataProvider(db_engine).list_partitions(tenants)
+    await service.detach_old_partitions(tenants, [p for p in listed if p.relname == branch])
+    await exec_sql(db_engine, f'DROP TABLE "{branch}__h1"')
+    original = PostgresPartitionRepository.create_table_like
+    hijacked: list[str] = []
+
+    async def swapping(
+        self: PostgresPartitionRepository, template: str, name: str, partition_by: object, **kwargs: object
+    ) -> int:
+        if not hijacked:
+            hijacked.append(branch)
+            async with db_engine.begin() as conn:
+                await conn.execute(text(f'ALTER TABLE "{branch}" RENAME TO "{branch}_hijacked"'))
+                await conn.execute(
+                    text(f'CREATE TABLE "{branch}" (LIKE "{tenants}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
+                )
+        return await original(self, template, name, partition_by, **kwargs)  # type: ignore[arg-type]
+
+    # Act / Assert: the bucket is attached by the branch's identity, not by its name
+    with (
+        patch.object(PostgresPartitionRepository, "create_table_like", swapping),
+        pytest.raises(PlanStaleError),
+    ):
+        await service.ensure_partitions(config, [when])
+    assert await child_count(db_engine, branch) == 0
+    assert await child_count(db_engine, f"{branch}_hijacked") == 1
+    await exec_sql(db_engine, f'DROP TABLE "{branch}"')

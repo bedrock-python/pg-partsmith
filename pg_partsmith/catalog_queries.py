@@ -237,13 +237,16 @@ RELATION_IDENTITY_COLUMNS_SQL = """
 # next value it would issue is ``seqstart`` then, and ``last_value +
 # seqincrement`` afterwards. The declared range and ``seqcycle`` decide
 # whether a moved value can ever be reissued -- and whether the sequence can
-# be synchronized at all.
+# be synchronized at all. ``seqcache`` matters too: a session that fetched a
+# block of values holds the ones below ``last_value`` privately, where no
+# ``setval`` can reach them.
 SEQUENCE_PARAMETERS_SQL = """
     SELECT
         s.seqincrement AS increment,
         s.seqmin AS minimum,
         s.seqmax AS maximum,
         s.seqcycle AS cycles,
+        s.seqcache AS cache,
         s.seqstart AS start_value,
         pg_sequence_last_value(s.seqrelid) AS last_value
     FROM pg_sequence s

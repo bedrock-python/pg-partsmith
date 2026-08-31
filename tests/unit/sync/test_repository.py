@@ -62,11 +62,14 @@ class _Catalog:
             "minimum": 1,
             "maximum": 2**63 - 1,
             "cycles": False,
+            "cache": 1,
             "start_value": 1,
             "last_value": None,
         }
     )
     extreme_value: object = None
+    # Whether a row carries a value the sequence's cached block still holds.
+    cached_hit: object = False
     destructive_fks: list[tuple[str, str, str]] = field(default_factory=list)
     failures: dict[str, object] = field(default_factory=dict)
 
@@ -113,6 +116,8 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
         return _scalar(_next(catalog.identity_always))
     if "seqincrement" in sql:
         return _first(SimpleNamespace(**catalog.sequence))
+    if sql.startswith("SELECT EXISTS (SELECT 1 FROM"):
+        return _scalar(catalog.cached_hit)
     if sql.startswith(("SELECT MAX(", "SELECT MIN(")):
         return _scalar(catalog.extreme_value)
     if "obj_description" in sql:
@@ -1993,6 +1998,7 @@ def test__move_rows__descending_identity_target__chases_the_low_water_mark() -> 
         "minimum": -(2**63),
         "maximum": 0,
         "cycles": False,
+        "cache": 1,
         "start_value": 0,
         "last_value": None,
     }
@@ -2034,7 +2040,15 @@ def test__move_rows__nothing_moved__leaves_identity_sequences_alone() -> None:
 
 def test__move_rows__cycling_identity_sequence__refuses_the_move() -> None:
     # Arrange -- a cycling sequence comes back around onto the moved ids
-    sequence = {"increment": 1, "minimum": 1, "maximum": 5, "cycles": True, "start_value": 1, "last_value": None}
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 5,
+        "cycles": True,
+        "cache": 1,
+        "start_value": 1,
+        "last_value": None,
+    }
     engine, _ = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5))
     repo = PostgresPartitionRepository(engine)
 
@@ -2045,10 +2059,60 @@ def test__move_rows__cycling_identity_sequence__refuses_the_move() -> None:
 
 def test__move_rows__identity_sequence_would_be_exhausted__refuses_the_move() -> None:
     # Arrange -- every value the sequence can still reach is already carried
-    sequence = {"increment": 1, "minimum": 1, "maximum": 5, "cycles": False, "start_value": 1, "last_value": None}
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 5,
+        "cycles": False,
+        "cache": 1,
+        "start_value": 1,
+        "last_value": None,
+    }
     engine, _ = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
     with pytest.raises(RowMoveRefusedError, match="nothing left to issue"):
         repo.move_rows("a", "b")
+
+
+def test__move_rows__identity_sequence_with_a_cache__refuses_what_a_session_may_hold() -> None:
+    # Arrange -- CACHE 5 was drawn: 1..5 live in that session, the catalog says 5
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 1,
+        "last_value": 5,
+    }
+    catalog = _Catalog(moved_rows=2, identity_columns=["id"], sequence=sequence, extreme_value=2, cached_hit=True)
+    engine, _ = _engine(catalog)
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- no setval can take a cached value back
+    with pytest.raises(RowMoveRefusedError, match="caches 5 values"):
+        repo.move_rows("a", "b")
+
+
+def test__move_rows__identity_sequence_with_a_cache_nobody_holds__moves() -> None:
+    # Arrange -- the same cache, but no row carries a value from the drawn block
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 1,
+        "last_value": 5,
+    }
+    engine, conn = _engine(_Catalog(moved_rows=2, identity_columns=["id"], sequence=sequence, extreme_value=None))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert
+    assert moved == 2
+    assert not any("setval(" in s for s in _statements(conn))

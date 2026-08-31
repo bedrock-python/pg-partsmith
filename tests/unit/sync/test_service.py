@@ -791,9 +791,10 @@ def test__ensure_partitions__window_that_could_not_be_created__is_absent_from_th
     service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange -- the January name is held by a relation with other bounds; a topology conflict never aborts
-    def _create(template: str, name: str, partition_by: object) -> None:
+    def _create(template: str, name: str, partition_by: object) -> int:
         if name == "events__2024_01":
             raise PartitionAlreadyExistsError(name)
+        return 909
 
     repo.create_table_like.side_effect = _create
     metadata.is_partition_attached.return_value = True

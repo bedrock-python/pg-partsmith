@@ -26,6 +26,7 @@ from pg_partsmith.entities import (
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionAttachedError,
+    PartitionError,
     PartitionReferencedError,
     PartitionTopologyError,
     PlanStaleError,
@@ -459,7 +460,7 @@ def test__apply__already_exists_and_attached_with_other_bounds__records_topology
 ) -> None:
     # Arrange -- the name is taken by a relation that is not the partition we planned
     other = RangeBounds(from_value="2024-04-01", to_value="2024-04-15")
-    repo.create_table_like.side_effect = [PartitionAlreadyExistsError("events__2024_04"), None]
+    repo.create_table_like.side_effect = [PartitionAlreadyExistsError("events__2024_04"), 909]
     metadata.is_partition_attached.return_value = True
     metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=other)
     second = _create_op("events__2024_05", bounds=RangeBounds(from_value="2024-05-01", to_value="2024-06-01"))
@@ -549,9 +550,10 @@ def test__apply__buckets_repaired_inside_a_detached_branch__fire_no_create_hooks
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock, hooks: _RecordingHooks
 ) -> None:
     # Arrange
-    def _create(template: str, name: str, partition_by: PartitionBy | None) -> None:
+    def _create(template: str, name: str, partition_by: PartitionBy | None) -> int:
         if name == "events__2024_04":
             raise PartitionAlreadyExistsError(name)
+        return 909
 
     repo.create_table_like.side_effect = _create
     metadata.get_partition_tree.return_value = PartitionNode(
@@ -575,10 +577,11 @@ def test__apply__already_exists_not_attached_branch_with_range_children__windows
     # Arrange -- a HASH root whose buckets hold monthly partitions; bucket 0 exists detached and empty
     order = _record_ddl(repo)
 
-    def _create(template: str, name: str, partition_by: PartitionBy | None) -> None:
+    def _create(template: str, name: str, partition_by: PartitionBy | None) -> int:
         if name == "events__h0":
             raise PartitionAlreadyExistsError(name)
         order.append(f"create {name}")
+        return 909
 
     repo.create_table_like.side_effect = _create
     metadata.get_partition_tree.return_value = PartitionNode(
@@ -1450,10 +1453,11 @@ def test__apply__detached_branch_with_numeric_windows__replans_from_the_planned_
     )
     order = _record_ddl(repo)
 
-    def _create(template: str, name: str, partition_by: PartitionBy | None) -> None:
+    def _create(template: str, name: str, partition_by: PartitionBy | None) -> int:
         if name == "queue__h0":
             raise PartitionAlreadyExistsError(name)
         order.append(f"create {name}")
+        return 909
 
     repo.create_table_like.side_effect = _create
     metadata.get_partition_tree.return_value = PartitionNode(
@@ -1845,3 +1849,52 @@ def test__create_partition__existing_relation_vanished_before_recovery__is_stale
     with pytest.raises(PlanStaleError, match="identity cannot be held"):
         executor.apply(_config(), _plan(_create_op()))
     repo.attach_partition.assert_not_called()
+
+
+def test__create_partition__repository_reports_no_identity__refuses_to_go_on_by_name(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- a repository that predates the contract returns nothing
+    repo.create_table_like.side_effect = None
+    repo.create_table_like.return_value = None
+
+    # Act / Assert -- there is no identity to hold, and no second look-up to invent one
+    with pytest.raises(PartitionError, match="without reporting its OID"):
+        executor.apply(_config(), _plan(_create_op()))
+    metadata.get_relation_oid.assert_not_called()
+    repo.attach_partition.assert_not_called()
+
+
+def test__create_partition__recovery_identity_is_read_once(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the relation was already there when the create ran
+    repo.create_table_like.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    metadata.get_relation_oid.return_value = None
+
+    # Act / Assert -- one read; a second could only let a replacement answer
+    with pytest.raises(PlanStaleError, match="identity cannot be held"):
+        executor.apply(_config(), _plan(_create_op()))
+    assert metadata.get_relation_oid.call_count == 1
+
+
+def test__attach_partition__branch_orphan__its_children_carry_the_planned_parent(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- a detached branch that is missing one of its buckets
+    metadata.get_relation_oid.return_value = 77
+    metadata.get_partition_tree.return_value = PartitionNode(
+        name="events__2024_04",
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        is_attached=False,
+        children=(PartitionNode(name="events__2024_04__h0", bounds=HashBounds(modulus=2, remainder=0)),),
+    )
+
+    # Act
+    executor.apply(_nested_config(), _plan(_attach_op(oid=77)))
+
+    # Assert -- the bucket goes into the branch the plan chose, by identity
+    bucket = repo.attach_partition.call_args_list[0]
+    assert bucket.args[0] == "events__2024_04"
+    assert bucket.kwargs["expected_parent_oid"] == 77

@@ -672,3 +672,23 @@ def _identity_destination(engine: Engine, table: str, suffix: str, identity: str
         "amount NUMERIC NOT NULL DEFAULT 0, doubled NUMERIC GENERATED ALWAYS AS (amount * 2) STORED)",
     )
     return name
+
+
+def test__unpartition__into_a_cached_identity_table__refused_while_a_session_may_hold_ids(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    # Arrange: the destination's identity draws blocks of five, and one block is out
+    _identity_rows(sync_db_engine, ledger, ids=(2,))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(sync_db_engine, ledger, "cached", "CACHE 5")
+    scalar(sync_db_engine, f"SELECT nextval(pg_get_serial_sequence('public.{dest}', 'id'))")
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert: id 2 is in the drawn block, where no setval reaches it
+    assert not result.complete
+    assert any("caches 5 values" in issue.error for issue in result.issues)
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert _count(sync_db_engine, ledger) == 1
