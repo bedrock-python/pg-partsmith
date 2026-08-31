@@ -58,8 +58,9 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   `UnsupportedCapabilityError` is removed with the capability protocols it served.
 - Repository protocol additions a custom implementation has to provide:
   `create_table_like(..., physical=)`, `create_foreign_table_like`, `move_rows`,
-  `reconcile_default_rows(..., limit=)`, `detach_partition(..., expected_oid=)`,
-  `drop_partition(..., drain_into=)`; metadata protocol: `get_leading_key_minimum`,
+  `reconcile_default_rows(..., limit=, expected_target_oid=)`,
+  `attach_partition(..., expected_oid=)`, `detach_partition(..., expected_oid=)`,
+  `drop_partition(..., drain_into=) -> int`; metadata protocol: `get_leading_key_minimum`,
   `get_relation_kind`. `partition_exists` now reports foreign tables too.
 
 ### Added
@@ -94,22 +95,32 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   wanted — or retires it under the drop policy (`detach_finalize`). The tree is read with a
   recursive walk over `pg_inherits` instead of `pg_partition_tree`, which omits such a
   partition and takes `ACCESS SHARE` on every member; inspection now takes no relation lock.
-- Row moves (DEFAULT reconciliation, `partition_data`, `unpartition`) fail closed when an
-  incoming foreign key declares `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`
-  (`RowMoveRefusedError`, recorded as a `move` issue): the action would fire on the rows as
-  they leave their old partition. Generated columns are recomputed rather than copied, and
-  identity values survive a move (`OVERRIDING SYSTEM VALUE`).
-- `unpartition` refuses a destination inside the tree (the root, a partition, an orphan),
-  empties this library's detached partitions too, and — under `drop_emptied` — detaches,
-  drains the tail, and lets the drop move whatever arrived late in the same transaction
-  under the drop's lock, so a row committed between the last batch and the drop is moved,
-  never dropped. `partition_data` fills and re-attaches a matching detached partition
-  instead of giving up on its window, and drains DEFAULT into foreign leaves.
-- A detach re-checks the relation's identity and attachment under its own lock, after the
-  `before_detach` hooks ran (`detach_partition(expected_oid=)`): a hook or concurrent
-  session that swaps another relation in under the planned name gets `PlanStaleError`.
-  Re-attaching removes the orphan marker in the attach's transaction, so a later detach
-  starts a fresh grace period instead of inheriting the old instant.
+- Row moves (DEFAULT reconciliation, `partition_data`, `unpartition`) fail closed under
+  incoming foreign keys (`RowMoveRefusedError`, recorded as a `move` issue): a destructive
+  `ON DELETE` action (`CASCADE`, `SET NULL`, `SET DEFAULT`) is refused up front, and a
+  *referenced* row is refused atomically by PostgreSQL itself — mid-move it is outside the
+  referenced tree, so even `NO ACTION` cannot pass. Generated columns are recomputed
+  rather than copied; identity values survive a move (`OVERRIDING SYSTEM VALUE`) and the
+  target's identity sequences are advanced past the moved ids in the move's transaction.
+- `unpartition` refuses a destination that is the root, a member or an orphan of its tree,
+  or a partition of any other table; empties this library's detached partitions too; and —
+  under `drop_emptied` — detaches, drains the tail, and lets the drop move whatever
+  arrived late in the same transaction under the drop's lock, counted in `rows_moved`, so
+  a row committed between the last batch and the drop is moved, never dropped.
+  `partition_data` fills and re-attaches a matching detached partition instead of giving
+  up on its window — pinning its identity on every batch — and drains DEFAULT into
+  foreign leaves.
+- An OID-guarded detach fails closed (`detach_partition(expected_oid=)`): the blocking
+  form checks identity and attachment in its own transaction and re-checks after the
+  statement, rolling a swap back marker and all; the concurrent form pins the relation
+  (`pg_partsmith.aio.repositories.pin`) while it is verified and marked, releasing only
+  once the statement is queued for the partition's lock (the sync mirror pins through a
+  worker thread); a foreign relation cannot be pinned and uses the transactional blocking
+  form. Attaches carry the same identity
+  (`attach_partition(expected_oid=)`, re-checked after `ATTACH` in its transaction), and
+  `reconcile_default_rows(expected_target_oid=)` verifies the fill target under the
+  move's lock. Re-attaching removes the orphan marker in the attach's transaction, so a
+  later detach starts a fresh grace period instead of inheriting the old instant.
 - Under `DropNever` a matching detached table is never re-attached; a wanted window whose
   name it holds is reported (`name_unusable`) instead of recreated over it.
 - User-authored models — `TablePartitionConfig`, schemes, boundaries, leaves, lifecycle

@@ -76,7 +76,7 @@ def repo() -> MagicMock:
     repo.create_table_like = MagicMock(return_value=None)
     repo.attach_partition = MagicMock(return_value=None)
     repo.detach_partition = MagicMock(return_value=None)
-    repo.drop_partition = MagicMock(return_value=None)
+    repo.drop_partition = MagicMock(return_value=0)
     repo.reconcile_default_rows = MagicMock(return_value=0)
     return repo
 
@@ -566,7 +566,7 @@ def test__maintain__end_to_end__returns_counters_and_the_plan_it_executed(
     assert result.maintenance_plan is result.plan
     assert [op.target for op in result.plan.creates] == ["events__2024_03"]
     repo.create_table_like.assert_called_once_with("events", "events__2024_03", None)
-    repo.attach_partition.assert_called_once_with("events", "events__2024_03", MARCH, key_arity=1)
+    repo.attach_partition.assert_called_once_with("events", "events__2024_03", MARCH, key_arity=1, expected_oid=None)
     repo.detach_partition.assert_called_once_with("events", "events__2024_01", mode=DetachMode.AUTO, expected_oid=1)
     assert [call.args[0] for call in repo.drop_partition.call_args_list] == ["events__2024_01", "events__2023_12"]
 
@@ -712,7 +712,11 @@ def test__ensure_partitions__windows__are_accepted_as_they_are(
     # Assert
     assert [p.name for p in created] == ["events__2024_01"]
     repo.attach_partition.assert_called_once_with(
-        "events", "events__2024_01", RangeBounds(from_value="2024-01-01", to_value="2024-02-01"), key_arity=1
+        "events",
+        "events__2024_01",
+        RangeBounds(from_value="2024-01-01", to_value="2024-02-01"),
+        key_arity=1,
+        expected_oid=None,
     )
 
 
@@ -937,7 +941,7 @@ def test__create_future_partitions__orphan_for_a_wanted_window__is_reattached_no
     # Assert
     assert created == []
     repo.create_table_like.assert_not_called()
-    repo.attach_partition.assert_called_once_with("events", "events__2024_03", MARCH, key_arity=1)
+    repo.attach_partition.assert_called_once_with("events", "events__2024_03", MARCH, key_arity=1, expected_oid=66)
 
 
 def test__create_future_partitions__everything_exists__returns_nothing(
@@ -1161,7 +1165,7 @@ def test__drop_detached_partitions__still_attached__is_skipped(
     service: PartitionLifecycleService, repo: MagicMock
 ) -> None:
     # Arrange
-    repo.drop_partition.side_effect = [PartitionAttachedError("events__2024_04", "events"), None]
+    repo.drop_partition.side_effect = [PartitionAttachedError("events__2024_04", "events"), 0]
 
     # Act
     count = service.drop_detached_partitions("events", ["events__2024_04", "events__2023_12"])

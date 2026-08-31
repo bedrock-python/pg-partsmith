@@ -144,8 +144,11 @@ issue and goes on; `Unreferenced()` keeps such partitions out of the plan.
 
 Moving a row with `WITH moved AS (DELETE … RETURNING …) INSERT …` in one statement:
 
-- `NO ACTION`'s trigger runs at the end of the statement, finds the key re-inserted (in
-  another partition of the same referenced table), and passes.
+- `NO ACTION`'s trigger runs at the end of the statement and passes only when the key is
+  still reachable *through the referenced tree*. A move into a detached table (a
+  `partition_data` fill, DEFAULT reconciliation before an attach) or out of the tree
+  (`unpartition`) leaves it unreachable: `23503`, atomic — so a *referenced* row cannot
+  be moved at all, whatever the action.
 - `RESTRICT` fires immediately and fails the statement — safe, everything rolls back.
 - `CASCADE`, `SET NULL` and `SET DEFAULT` act on the DELETE alone: the referencing rows
   are deleted or rewritten even though the parent row is re-inserted in the same
@@ -154,7 +157,16 @@ Moving a row with `WITH moved AS (DELETE … RETURNING …) INSERT …` in one s
 `GENERATED ALWAYS AS … STORED` columns refuse explicit values (`428C9`), so the movers
 list only writable columns (`attgenerated = ''`) and let the target recompute; a
 `GENERATED ALWAYS AS IDENTITY` column on the target needs `OVERRIDING SYSTEM VALUE` for
-the moved values to survive, which the movers add when one is present.
+the moved values to survive, which the movers add when one is present. `OVERRIDING`
+leaves the backing sequence where it was, so after a move the movers advance every
+identity sequence on the target past the moved ids (`setval`, in the move's transaction,
+keeping a higher pre-existing position) — otherwise the target's next ordinary INSERT
+would draw an id a moved row already owns (`23505`).
+
+The first transaction of `DETACH PARTITION … CONCURRENTLY` requests `ACCESS EXCLUSIVE`
+on the partition being detached (measured on 17: `pg_locks` shows the waiting AEL), so
+*any* lock held on the partition blocks it — which is what the detach pin exploits, and
+why the pin must be released while the statement is already queued behind it.
 
 ## Overlaps and gaps
 

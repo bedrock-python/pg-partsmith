@@ -74,7 +74,7 @@ def executor() -> MagicMock:
     executor.create_partition = AsyncMock(side_effect=create_partition)
     executor.attach_partition = AsyncMock(side_effect=create_partition)
     executor.detach_single_partition = AsyncMock(return_value=None)
-    executor.drop_single_partition = AsyncMock(return_value=True)
+    executor.drop_single_partition = AsyncMock(return_value=0)
     return executor
 
 
@@ -191,6 +191,7 @@ async def test__partition_data__one_window__filled_in_batches_then_attached(
         "from_value": "2026-05-01",
         "to_value": "2026-06-01",
         "limit": 10,
+        "expected_target_oid": None,
     }
 
 
@@ -541,6 +542,8 @@ async def test__partition_data__window_owned_by_a_matching_orphan__is_filled_and
     assert result.rows_moved == 2
     executor.attach_partition.assert_awaited_once()
     executor.create_partition.assert_not_awaited()
+    # Every fill batch pins the orphan's identity under the target's lock.
+    assert repo.reconcile_default_rows.await_args.kwargs["expected_target_oid"] == 33
 
 
 async def test__partition_data__move_refused_by_a_foreign_key_action__issue_and_incomplete(
@@ -558,3 +561,33 @@ async def test__partition_data__move_refused_by_a_foreign_key_action__issue_and_
     assert not result.complete
     assert [issue.partition_name for issue in result.issues] == [DEFAULT]
     assert "ON DELETE CASCADE" in result.issues[0].error
+
+
+async def test__unpartition__into_a_leaf_of_another_tree__refused(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange -- a partition of some other root reads as a plain table in pg_class
+    metadata.get_actual_tree.return_value = _tree(_month(6))
+    metadata.get_relation_oid.return_value = 555
+    metadata.get_partition_tree = AsyncMock(return_value=_month(1))
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="attached as a partition"):
+        await mover.unpartition(_config(), "public.other_leaf")
+    repo.move_rows.assert_not_awaited()
+
+
+async def test__unpartition__rows_the_drop_moved__counted_in_rows_moved(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock, executor: MagicMock
+) -> None:
+    # Arrange -- the drop's own transactional drain moves two late rows
+    metadata.get_actual_tree.return_value = _tree(_month(6, oid=66))
+    repo.move_rows.return_value = 0
+    executor.drop_single_partition.return_value = 2
+
+    # Act
+    result = await mover.unpartition(_config(), "public.events_flat", drop_emptied=True)
+
+    # Assert
+    assert result.complete
+    assert result.rows_moved == 2

@@ -129,6 +129,7 @@ class PartitionRepository(Protocol):
         bounds: PartitionBounds,
         *,
         key_arity: int = 1,
+        expected_oid: int | None = None,
     ) -> None:
         """Attach a table to a partitioned parent.
 
@@ -170,7 +171,7 @@ class PartitionRepository(Protocol):
 
     def drop_partition(
         self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None
-    ) -> None:
+    ) -> int:
         """Drop a detached, marker-tagged partition table.
 
         Args:
@@ -210,6 +211,7 @@ class PartitionRepository(Protocol):
         from_value: str,
         to_value: str,
         limit: int | None = None,
+        expected_target_oid: int | None = None,
     ) -> int:
         """Move rows from a DEFAULT partition to the partition for a window.
 

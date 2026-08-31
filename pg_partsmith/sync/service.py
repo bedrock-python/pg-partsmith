@@ -472,7 +472,7 @@ class PartitionLifecycleService:
         dropped = 0
         for name in partition_names:
             op = DropPartition(target=name, reason=Reason.GRACE_ELAPSED, detail="requested explicitly")
-            if self._executor.drop_single_partition(table_name, op):
+            if self._executor.drop_single_partition(table_name, op) is not None:
                 dropped += 1
         return dropped
 

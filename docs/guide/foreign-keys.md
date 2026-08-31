@@ -97,17 +97,23 @@ A partition that could not be measured reads as referenced, so it is kept.
 ## Row moves and ON DELETE actions
 
 The movers — DEFAULT reconciliation at attach, `partition_data`, `unpartition` — move a
-row with one statement: `DELETE … RETURNING` piped into `INSERT`. PostgreSQL's
-`NO ACTION` check runs at the end of that statement, finds the row again in its new
-partition, and passes: an ordinary foreign key never notices a move. `RESTRICT` fires
-immediately and fails the whole statement, which is safe — everything stays where it was.
+row with one statement: `DELETE … RETURNING` piped into `INSERT`. What an incoming
+foreign key does to that statement depends on its action, and on where the row lands:
 
-`ON DELETE CASCADE`, `SET NULL` and `SET DEFAULT` are different: they act on the DELETE
-alone, deleting or rewriting the referencing rows while the moved row lives on in its new
-partition. The movers refuse to run under one — `RowMoveRefusedError`, surfaced as a
-`move` issue naming the constraint — rather than let a migration silently eat the
-referencing tables. Re-create such a key `ON DELETE NO ACTION` for the duration of the
-move, or move first and add the action after. Verified on PostgreSQL 15, 16 and 17.
+- **Unreferenced rows** move freely under `NO ACTION` — nothing fires.
+- **Referenced rows cannot be moved at all.** `NO ACTION`'s end-of-statement check looks
+  for the key *through the referenced tree*, and a row being moved sits in a table that
+  is not attached yet (`partition_data` fills before it attaches) or not part of the tree
+  at all (`unpartition`). The statement fails whole — atomic, nothing lost — and the
+  movers surface it as `RowMoveRefusedError` (a `move` issue): delete or repoint the
+  referencing rows first, or drop the foreign key for the migration and re-create it
+  after. `RESTRICT` fires even earlier, with the same safe outcome.
+- **`ON DELETE CASCADE`, `SET NULL` and `SET DEFAULT` are refused up front**, before any
+  row moves: they act on the DELETE alone and would delete or rewrite the referencing
+  rows even for a key that is re-inserted. Re-creating such a key `ON DELETE NO ACTION`
+  gets unreferenced rows moving again; referenced rows still refuse, row-safe.
+
+Verified on PostgreSQL 15, 16 and 17.
 
 ## Locks
 

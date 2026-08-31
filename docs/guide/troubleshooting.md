@@ -142,12 +142,14 @@ partitions out of the plan — see [Handle foreign keys](foreign-keys.md).
 
 ## `RowMoveRefusedError` — a move was refused by an ON DELETE action
 
-A foreign key referencing the table declares `ON DELETE CASCADE`, `SET NULL` or
-`SET DEFAULT`. A move is a DELETE and an INSERT in one statement, and such an action
-fires on the DELETE alone — the referencing rows would be deleted or rewritten while the
-moved row lives on in its new partition. The movers fail closed and record a `move` issue
-naming the constraint. Re-create the key `ON DELETE NO ACTION` for the duration of the
-move, or move first and add the action after. See
+Two causes, both fail-closed. A foreign key referencing the table declares
+`ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`: such an action fires on the DELETE half
+of a move and would delete or rewrite the referencing rows, so the move is refused before
+a single row leaves. Or the rows being moved are *referenced* through any foreign key: a
+row mid-move is outside the referenced tree, so even `NO ACTION` refuses at the end of
+the statement — atomically, with every row in place. Either way a `move` issue names the
+constraint. Delete or repoint the referencing rows first, or drop the foreign key for the
+migration and re-create it after the move. See
 [Row moves and ON DELETE actions](foreign-keys.md#row-moves-and-on-delete-actions).
 
 ## `InvalidPartitionConfigError`

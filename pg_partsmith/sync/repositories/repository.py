@@ -127,12 +127,13 @@ class PostgresPartitionRepository:
         bounds: PartitionBounds,
         *,
         key_arity: int = 1,
+        expected_oid: int | None = None,
     ) -> None:
         """Attach a table to a partitioned parent.
 
         See :meth:`PartitionCreator.attach`.
         """
-        self._creator.attach(parent_name, partition_name, bounds, key_arity=key_arity)
+        self._creator.attach(parent_name, partition_name, bounds, key_arity=key_arity, expected_oid=expected_oid)
 
     def detach_partition(
         self,
@@ -150,12 +151,12 @@ class PostgresPartitionRepository:
 
     def drop_partition(
         self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None
-    ) -> None:
-        """Drop a detached, marker-tagged partition.
+    ) -> int:
+        """Drop a detached, marker-tagged partition; returns the rows moved into ``drain_into``.
 
         See :meth:`PartitionRemover.drop`.
         """
-        self._remover.drop(partition_name, expected_oid=expected_oid, drain_into=drain_into)
+        return self._remover.drop(partition_name, expected_oid=expected_oid, drain_into=drain_into)
 
     def adopt_partition(self, table_name: str, partition_name: str) -> bool:
         """Mark a detached legacy table as owned by this library (orphan marker).
@@ -174,6 +175,7 @@ class PostgresPartitionRepository:
         from_value: str,
         to_value: str,
         limit: int | None = None,
+        expected_target_oid: int | None = None,
     ) -> int:
         """Move rows from a DEFAULT partition to the partition for a window.
 
@@ -186,6 +188,7 @@ class PostgresPartitionRepository:
             from_value=from_value,
             to_value=to_value,
             limit=limit,
+            expected_target_oid=expected_target_oid,
         )
 
     def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:

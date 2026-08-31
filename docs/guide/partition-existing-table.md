@@ -24,11 +24,10 @@ DEFAULT partition until monthly partitions exist.
     created_at)`. If the old table's key was `(id)` alone, change it on `events_legacy`
     before the swap, or `ATTACH` fails with `unique constraint … must include all
     partitioning columns`. Sequences, indexes and constraints come across with `LIKE …
-    INCLUDING ALL`; foreign keys *to* the old table need to be recreated against the new
-    parent — **`ON DELETE NO ACTION` for the duration of the migration**. A `CASCADE`,
-    `SET NULL` or `SET DEFAULT` action would fire on every batch as rows are deleted from
-    their old partition, so the movers refuse to run under one; add the action back once
-    the drain is done. See
+    INCLUDING ALL`; foreign keys *to* the old table are best recreated against the new
+    parent **after the drain**: rows that are already referenced cannot be moved at all
+    (the movers refuse them row-safe), and a `CASCADE`, `SET NULL` or `SET DEFAULT`
+    action is refused up front because it would fire on every batch. See
     [Row moves and ON DELETE actions](foreign-keys.md#row-moves-and-on-delete-actions).
 
 ## 2. Configure, plan, run the tick
@@ -115,9 +114,11 @@ result = await service.unpartition(config, "public.events_flat", batch_rows=50_0
 ```
 
 `events_flat` is created `LIKE` the root when it does not exist; it must be a plain
-table outside the tree — the root itself, one of its partitions or one of its detached
-partitions is refused (rows moved "into" the root would route straight back to where they
-came from). With `drop_emptied` a partition is detached once its last batch comes up
+table that is not a partition of *anything* — the root itself, one of its partitions or
+detached partitions, and a partition of any other table are all refused (rows moved
+"into" the root would route straight back to where they came from). Rows the drop's own
+drain moves are counted in `rows_moved`, and a destination with identity columns has its
+sequences advanced past the moved ids, so its next ordinary insert just works. With `drop_emptied` a partition is detached once its last batch comes up
 short, the rows that arrived in the meantime are moved, and the drop moves whatever is
 left **in the same transaction, under the drop's own lock** — a row committed between the
 last batch and the drop ends in `events_flat`, never in the dropped table. Detached

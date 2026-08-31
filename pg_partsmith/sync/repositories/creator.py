@@ -13,9 +13,15 @@ from pg_partsmith.catalog_queries import (
     RELATION_COLUMN_DEFINITIONS_SQL,
     RELATION_COLUMNS_SQL,
     RELATION_HAS_IDENTITY_ALWAYS_SQL,
+    RELATION_IDENTITY_COLUMNS_SQL,
     RELATION_PRIVILEGES_SQL,
 )
-from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionNotFoundError, RowMoveRefusedError
+from pg_partsmith.exceptions import (
+    PartitionAlreadyExistsError,
+    PartitionNotFoundError,
+    PlanStaleError,
+    RowMoveRefusedError,
+)
 from pg_partsmith.topology import HashBounds, ListBounds, RangeBounds
 from pg_partsmith.utils import (
     _as_text,
@@ -209,7 +215,15 @@ class PartitionCreator:
                 statement = f"{statement} WITH GRANT OPTION"
             conn.execute(_as_text(statement))
 
-    def attach(self, parent_name: str, partition_name: str, bounds: PartitionBounds, *, key_arity: int = 1) -> None:
+    def attach(
+        self,
+        parent_name: str,
+        partition_name: str,
+        bounds: PartitionBounds,
+        *,
+        key_arity: int = 1,
+        expected_oid: int | None = None,
+    ) -> None:
         """Attach a table to a partitioned parent.
 
         ATTACH rather than ``CREATE … PARTITION OF`` on purpose: attaching takes
@@ -238,6 +252,15 @@ class PartitionCreator:
             partition_name: Table to attach.
             bounds: What the partition owns.
             key_arity: Number of columns in the parent's partition key.
+            expected_oid: The identity the decision to attach was made about.
+                Checked after the ATTACH, under the ACCESS EXCLUSIVE lock it
+                took, in the same transaction -- a relation swapped in under
+                the name rolls the whole attach back (``PlanStaleError``)
+                instead of going live in the planned one's stead.
+
+        Raises:
+            PlanStaleError: If the relation holding the name is not the one
+                ``expected_oid`` identifies; nothing stays attached.
         """
         clause, values = _values_clause(bounds, key_arity)
         stmt = build_ddl_statement(
@@ -251,7 +274,23 @@ class PartitionCreator:
             if isinstance(bounds, RangeBounds) and self._ddl_timezone is not None:
                 conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             conn.execute(stmt)
+            self._require_oid(conn, partition_name, expected_oid)
             self._clear_orphan_marker(conn, partition_name)
+
+    def _require_oid(self, conn: Connection, partition_name: str, expected_oid: int | None) -> None:
+        """The relation holding the name is the one the caller decided about."""
+        if expected_oid is None:
+            return
+        result = conn.execute(
+            text("SELECT c.oid FROM pg_class c WHERE c.oid = to_regclass(:name)"),
+            {"name": to_regclass_argument(partition_name)},
+        )
+        actual = result.scalar()
+        if actual is None or int(actual) != expected_oid:
+            held = "nothing" if actual is None else f"OID {int(actual)}"
+            raise PlanStaleError(
+                partition_name, f"the name now resolves to {held}, the plan decided about OID {expected_oid}"
+            )
 
     def _clear_orphan_marker(self, conn: Connection, partition_name: str) -> None:
         """Take this library's marker lines off a relation that is attached again."""
@@ -298,6 +337,7 @@ class PartitionCreator:
         from_value: str,
         to_value: str,
         limit: int | None = None,
+        expected_target_oid: int | None = None,
     ) -> int:
         """Move conflicting rows from DEFAULT partition to target partition.
 
@@ -309,6 +349,10 @@ class PartitionCreator:
             to_value: Range end boundary (exclusive).
             limit: Move at most this many rows; None moves every row of the
                 window in one statement.
+            expected_target_oid: The identity of the relation the rows should
+                land in, checked under the target's lock in the move's own
+                transaction -- a target swapped at its name refuses the batch
+                (``PlanStaleError``) before a single row leaves DEFAULT.
 
         Returns:
             Number of rows moved.
@@ -335,6 +379,7 @@ class PartitionCreator:
             if self._ddl_timezone is not None:
                 conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             self._lock_for_move(conn, default_partition_name, target_partition_name)
+            self._require_oid(conn, target_partition_name, expected_target_oid)
             # All identifiers and literals are properly quoted, S608 is a false positive
             condition = f"{column_quoted} >= {from_quoted} AND {column_quoted} < {to_quoted}{not_null}"
             return self._move(conn, default_partition_name, target_partition_name, condition=condition, limit=limit)
@@ -401,8 +446,60 @@ class PartitionCreator:
             limit,
             overriding=overriding,
         )
-        result = conn.execute(_as_text(statement))
-        return result.rowcount or 0
+        try:
+            result = conn.execute(_as_text(statement))
+        except (SQLAlchemyError, OSError, TimeoutError) as exc:
+            if pg_sqlstate(exc) != "23503":
+                raise
+            # Even ON DELETE NO ACTION refuses here: its end-of-statement check
+            # looks for the key through the referenced tree, and a row being
+            # moved sits in a table that is not attached (or not attached any
+            # more), so a *referenced* row cannot be moved at all. The failure
+            # is atomic -- the statement rolls back with every row in place.
+            first_line = str(exc).strip().splitlines()[0]
+            raise RowMoveRefusedError(
+                source_name,
+                f"rows are still referenced through a foreign key and a referenced row cannot leave the "
+                f"partition tree it is referenced in ({first_line}); delete or repoint the referencing rows "
+                "first, or drop the foreign key for the migration and re-create it afterwards",
+            ) from exc
+        moved = result.rowcount or 0
+        if moved:
+            self._advance_identity_sequences(conn, target_name)
+        return moved
+
+    def _advance_identity_sequences(self, conn: Connection, target_name: str) -> None:
+        """Advance the target's identity sequences past the values a move brought in.
+
+        ``OVERRIDING SYSTEM VALUE`` preserves the moved ids but leaves the
+        backing sequence where it was, so the target's next ordinary INSERT
+        would draw an id a moved row already owns. Runs in the move's
+        transaction, under the target's lock; a pre-existing higher sequence
+        position is kept (``GREATEST``).
+        """
+        result = conn.execute(text(RELATION_IDENTITY_COLUMNS_SQL), {"table_name": to_regclass_argument(target_name)})
+        columns = [coerce_str(row[0]) or "" for row in result.fetchall()]
+        for column in columns:
+            maximum = (
+                conn.execute(
+                    _as_text(f"SELECT MAX({quote_identifier(column)}) FROM {quote_identifier(target_name)}")  # noqa: S608
+                )
+            ).scalar()
+            if maximum is None:
+                continue
+            conn.execute(
+                text(
+                    "SELECT setval(seq.oid, GREATEST(CAST(:maximum AS bigint), "
+                    "COALESCE(pg_sequence_last_value(seq.oid), CAST(:maximum AS bigint)))) "
+                    "FROM CAST(CAST(pg_get_serial_sequence(:table_name, :column) AS regclass) AS oid) AS seq(oid) "
+                    "WHERE pg_get_serial_sequence(:table_name, :column) IS NOT NULL"
+                ),
+                {
+                    "maximum": int(maximum),
+                    "table_name": to_regclass_argument(target_name),
+                    "column": column,
+                },
+            )
 
     def _refuse_referential_actions(self, conn: Connection, source_name: str) -> None:
         """Refuse a move that a foreign key's ``ON DELETE`` action would turn into data loss.
@@ -429,7 +526,8 @@ class PartitionCreator:
             source_name,
             f"foreign key {described} would act on the rows as they are deleted from their old partition, "
             "deleting or rewriting the rows that reference them; re-create it ON DELETE NO ACTION "
-            "(or after the move) and retry",
+            "(referenced rows are then refused row-safe instead) or drop it for the migration and "
+            "re-create it afterwards",
         )
 
     def _has_identity_always(self, conn: Connection, table_name: str) -> bool:

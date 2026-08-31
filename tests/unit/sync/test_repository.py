@@ -52,6 +52,8 @@ class _Catalog:
     relkind: str = "r"
     moved_rows: int | None = 0
     identity_always: object = False
+    identity_columns: list[str] = field(default_factory=list)
+    max_value: object = None
     destructive_fks: list[tuple[str, str, str]] = field(default_factory=list)
     failures: dict[str, object] = field(default_factory=dict)
 
@@ -86,8 +88,12 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
         return _scalar(catalog.detach_pending)
     if "confdeltype IN" in sql:
         return _rows(list(catalog.destructive_fks))
+    if "attidentity IN" in sql:
+        return _rows([(column,) for column in catalog.identity_columns])
     if "attidentity" in sql:
         return _scalar(_next(catalog.identity_always))
+    if sql.startswith("SELECT MAX("):
+        return _scalar(catalog.max_value)
     if "obj_description" in sql:
         return _scalar(_next(catalog.comment))
     if "relispartition = true" in sql:
@@ -150,6 +156,11 @@ def _locks(conn: MagicMock) -> list[str]:
 
 def _attach_statement(conn: MagicMock) -> str:
     return next(s for s in _statements(conn) if "ATTACH PARTITION" in s)
+
+
+def _move_statement_of(conn: MagicMock) -> str:
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    return statement
 
 
 # The comment read every attach ends with: a re-attached relation must not keep the marker.
@@ -465,7 +476,7 @@ def test__reconcile_default_rows__names_the_columns_on_both_sides_and_returns_th
         'LOCK TABLE "events_default" IN SHARE ROW EXCLUSIVE MODE',
         'LOCK TABLE "events__2024_04" IN SHARE ROW EXCLUSIVE MODE',
     ]
-    assert statements[-1] == (
+    assert _move_statement_of(conn) == (
         'WITH moved AS (DELETE FROM "events_default" '
         "WHERE \"created_at\" >= '2024-04-01' AND \"created_at\" < '2024-05-01' "
         'RETURNING "created_at", "tenant_id", "data") '
@@ -491,7 +502,7 @@ def test__reconcile_default_rows__composite_key__leaves_rows_with_a_null_trailin
     )
 
     # Assert
-    move = _statements(conn)[-1]
+    move = _move_statement_of(conn)
     assert 'AND "created_at" < \'2024-05-01\' AND "tenant_id" IS NOT NULL AND "shard_id" IS NOT NULL RETURNING' in move
 
 
@@ -1617,12 +1628,11 @@ def test__move_rows__locks_both_sides_and_moves_a_batch_of_any_rows() -> None:
 
     # Assert
     assert moved == 4
-    statements = _statements(conn)
     assert _locks(conn) == [
         'LOCK TABLE "public"."events__2024_01" IN SHARE ROW EXCLUSIVE MODE',
         'LOCK TABLE "public"."events_flat" IN SHARE ROW EXCLUSIVE MODE',
     ]
-    assert statements[-1] == (
+    assert _move_statement_of(conn) == (
         'WITH moved AS (DELETE FROM "public"."events__2024_01" WHERE (tableoid, ctid) IN ('
         'SELECT tableoid, ctid FROM "public"."events__2024_01" LIMIT 4) '
         'RETURNING "created_at", "tenant_id", "data") '
@@ -1642,7 +1652,7 @@ def test__move_rows__no_limit__moves_everything() -> None:
 
     # Assert
     assert moved == 99
-    assert _statements(conn)[-1].startswith('WITH moved AS (DELETE FROM "a" RETURNING')
+    assert _move_statement_of(conn).startswith('WITH moved AS (DELETE FROM "a" RETURNING')
 
 
 def test__move_rows__source_without_columns__raises_not_found() -> None:
@@ -1776,25 +1786,45 @@ def test__detach_partition__expected_oid_matches__locks_checks_marks_and_detache
     # Act
     repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING, expected_oid=4242)
 
-    # Assert -- lock first, then identity, marker, statement, all on one transaction
+    # Assert -- lock, identity, marker, statement, identity again: one transaction
     statements = _statements(conn)
     lock_at = statements.index('LOCK TABLE "events__2024_01" IN ACCESS EXCLUSIVE MODE')
     oid_at = next(i for i, s in enumerate(statements) if "SELECT c.oid" in s)
     comment_at = next(i for i, s in enumerate(statements) if s.startswith("COMMENT ON TABLE"))
-    assert lock_at < oid_at < comment_at
-    assert statements[-1] == 'ALTER TABLE "events" DETACH PARTITION "events__2024_01"'
+    detach_at = statements.index('ALTER TABLE "events" DETACH PARTITION "events__2024_01"')
+    recheck_at = max(i for i, s in enumerate(statements) if "SELECT c.oid" in s)
+    assert lock_at < oid_at < comment_at < detach_at < recheck_at
     engine.begin.assert_called_once()
 
 
-def test__detach_partition__concurrent_form__rechecks_the_oid_after_the_statement() -> None:
-    # Arrange -- the pre-check passes, the post-check sees another relation under the name
-    engine, conn = _engine(_Catalog(oid=[4242, 9999], attached_to=True))
+def test__detach_partition__concurrent_form_with_an_oid__pins_verifies_and_detaches() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=4242, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.CONCURRENT, expected_oid=4242)
+
+    # Assert -- the pin comes first; the statement runs while the relation was verified under it
+    statements = _statements(conn)
+    pin_at = statements.index('LOCK TABLE ONLY "events__2024_01" IN ACCESS SHARE MODE')
+    oid_at = next(i for i, s in enumerate(statements) if "SELECT c.oid" in s)
+    comment_at = next(i for i, s in enumerate(statements) if s.startswith("COMMENT ON TABLE"))
+    detach_at = next(i for i, s in enumerate(statements) if "DETACH PARTITION" in s and "CONCURRENTLY" in s)
+    assert pin_at < oid_at < comment_at < detach_at
+
+
+def test__detach_partition__concurrent_form__swapped_before_the_pin__is_stale_and_nothing_is_marked() -> None:
+    # Arrange -- the name resolves to another relation by the time the pin verifies it
+    engine, conn = _engine(_Catalog(oid=9999, attached_to=True))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
     with pytest.raises(PlanStaleError, match="OID 9999"):
         repo.detach_partition("events", "events__2024_01", mode=DetachMode.CONCURRENT, expected_oid=4242)
-    assert any("DETACH PARTITION" in s and "CONCURRENTLY" in s for s in _statements(conn))
+    statements = _statements(conn)
+    assert not any("COMMENT ON" in s for s in statements)
+    assert not any("DETACH PARTITION" in s for s in statements)
 
 
 def test__detach_partition__no_expected_oid__skips_the_identity_checks() -> None:
@@ -1825,3 +1855,115 @@ def test__drop_partition__drain_into__moves_the_tail_in_the_drop_transaction() -
     lock_at = next(i for i, s in enumerate(statements) if "ACCESS EXCLUSIVE" in s)
     assert lock_at < move_at < drop_at
     assert '"public"."events_flat"' in statements[move_at]
+
+
+# ── verification round: referenced rows, identity sequences, pinned identities ──
+
+
+def test__move_rows__referenced_rows__refused_atomically_with_guidance() -> None:
+    # Arrange -- even ON DELETE NO ACTION refuses: the moved row is outside the tree
+    error = _sqlstate_error("23503", 'update or delete on table "events__2024_01" violates foreign key constraint')
+    engine, _ = _engine(_Catalog(failures={"WITH moved AS": error}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="still referenced"):
+        repo.move_rows("public.events__2024_01", "public.events_flat")
+
+
+def test__move_rows__identity_target__advances_its_sequence_in_the_same_transaction() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], max_value=11))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert -- the sequence catches up past the moved ids, before the commit
+    assert moved == 4
+    statements = _statements(conn)
+    move_at = statements.index(_move_statement_of(conn))
+    max_at = next(i for i, s in enumerate(statements) if s.startswith('SELECT MAX("id") FROM "b"'))
+    setval_at = next(i for i, s in enumerate(statements) if "setval(seq.oid" in s)
+    assert move_at < max_at < setval_at
+    engine.begin.assert_called_once()
+
+
+def test__move_rows__nothing_moved__leaves_identity_sequences_alone() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=0, identity_columns=["id"], max_value=11))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert
+    assert not any("setval" in s for s in _statements(conn))
+
+
+def test__reconcile_default_rows__target_swapped_under_the_lock__is_stale_before_any_row_moves() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=9999))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.reconcile_default_rows(
+            default_partition_name="d",
+            target_partition_name="t",
+            key_columns=("k",),
+            from_value="1",
+            to_value="2",
+            expected_target_oid=4242,
+        )
+    assert not any(s.startswith("WITH moved AS") for s in _statements(conn))
+
+
+def test__attach_partition__expected_oid_mismatch__fails_inside_the_attach_transaction() -> None:
+    # Arrange -- the check runs after the ATTACH, under its lock; the raise rolls it all back
+    engine, conn = _engine(_Catalog(oid=9999))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.attach_partition("events", "events__x", HashBounds(modulus=2, remainder=0), expected_oid=4242)
+    statements = _statements(conn)
+    assert any("ATTACH PARTITION" in s for s in statements)
+    assert not any("obj_description" in s for s in statements)
+    engine.begin.assert_called_once()
+
+
+def test__drop_partition__drain_into__returns_the_rows_it_moved() -> None:
+    # Arrange
+    marked = orphan_table_comment("public.events")
+    engine, _ = _engine(_Catalog(comment=[marked, marked], moved_rows=3))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    assert repo.drop_partition("events__2024_01", drain_into="public.events_flat") == 3
+
+
+def test__detach_partition__blocking_foreign_with_a_swap__rolls_back_on_the_recheck() -> None:
+    # Arrange -- a foreign relation cannot be locked; the transactional re-check covers it
+    engine, conn = _engine(_Catalog(relkind="f", oid=[4242, 9999], attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.detach_partition("metrics", "metrics__2026_01", mode=DetachMode.BLOCKING, expected_oid=4242)
+    assert any("DETACH PARTITION" in s for s in _statements(conn))
+    engine.begin.assert_called_once()
+
+
+def test__detach_partition__foreign_with_an_oid__uses_the_transactional_blocking_form() -> None:
+    # Arrange -- the pin cannot hold a foreign relation, so AUTO goes blocking
+    engine, conn = _engine(_Catalog(relkind="f", oid=4242, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("metrics", "metrics__2026_01", mode=DetachMode.AUTO, expected_oid=4242)
+
+    # Assert
+    detaches = [s for s in _statements(conn) if "DETACH PARTITION" in s]
+    assert detaches
+    assert all("CONCURRENTLY" not in s for s in detaches)

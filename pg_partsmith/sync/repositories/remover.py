@@ -29,6 +29,7 @@ from pg_partsmith.utils import (
     to_regclass_argument,
 )
 
+from . import pin
 from .resolver import relation_kind
 from .timeouts import apply_local_statement_timeout, session_statement_timeout
 
@@ -104,11 +105,14 @@ class PartitionRemover:
         DDL addresses relations by name, and a name can change hands between
         the decision and the statement -- a hook or another session dropping
         the partition and creating another under the same name. With
-        ``expected_oid`` the relation's identity and its attachment are
-        checked again right before the marker and the statement: in the
-        blocking form under the lock the detach itself takes, so nothing can
-        change in between; in the concurrent form, which cannot run inside a
-        transaction, immediately before and once more after the statement.
+        ``expected_oid`` the detach fails closed: the blocking form checks
+        identity and attachment inside its own transaction and re-checks the
+        OID after the statement, so a swap rolls everything back -- marker
+        included; the concurrent form pins the relation with a holder lock
+        while it is checked and marked, and releases the pin only once the
+        statement holds the partition by OID itself (see
+        :mod:`pg_partsmith.sync.repositories.pin`). A foreign relation cannot
+        be pinned and uses the blocking form instead.
 
         Args:
             table_name: Parent table name.
@@ -144,6 +148,9 @@ class PartitionRemover:
                 self._ensure_still_the_partition(conn, table_name, partition_name, expected_oid)
                 self._mark_orphaned(conn, table_name, partition_name)
                 conn.execute(stmt)
+                # A foreign relation cannot be locked above; the re-check after
+                # the statement rolls the whole transaction back on a swap.
+                self._ensure_expected_oid(conn, partition_name, expected_oid)
             except (SQLAlchemyError, OSError, TimeoutError) as exc:
                 domain_exc = self._translate_detach_error(exc, partition_name)
                 if domain_exc is not None:
@@ -242,11 +249,55 @@ class PartitionRemover:
         """Run ``DETACH … CONCURRENTLY``; False when the blocking form should run instead.
 
         The statement cannot run inside a transaction block, so it goes out on
-        an AUTOCOMMIT connection. Identity is checked right before the marker
-        and again after the statement: the name cannot be pinned across an
-        autocommit statement, so a relation swapped in between is reported
-        rather than silently detached in place of the planned one.
+        an AUTOCOMMIT connection. With ``expected_oid`` the relation is pinned
+        while it is checked and marked (see
+        :mod:`pg_partsmith.sync.repositories.pin`); a foreign relation cannot
+        be pinned and uses the transactional blocking form instead, so an
+        OID-guarded detach never acts on a swapped-in relation.
         """
+        if expected_oid is not None:
+            if self._relkind_of(partition_name) == "f":
+                logger.info(
+                    "A foreign relation cannot be pinned; using the transactional blocking form",
+                    extra={"table_name": table_name, "partition_name": partition_name},
+                )
+                return False
+            return self._detach_concurrently_pinned(table_name, partition_name, expected_oid, fallback=fallback)
+
+        try:
+            return self._run_concurrent_detach(table_name, partition_name)
+        except (SQLAlchemyError, OSError, TimeoutError) as exc:
+            return self._classify_concurrent_failure(exc, table_name, partition_name, fallback=fallback)
+
+    def _detach_concurrently_pinned(
+        self, table_name: str, partition_name: str, expected_oid: int, *, fallback: bool
+    ) -> bool:
+        def verify(holder: Connection) -> None:
+            self._ensure_still_the_partition(holder, table_name, partition_name, expected_oid)
+
+        def mark() -> None:
+            with self._engine.begin() as conn:
+                apply_local_statement_timeout(conn, self._ddl_timeout)
+                self._mark_orphaned(conn, table_name, partition_name)
+
+        def statement() -> bool:
+            return self._run_concurrent_detach(table_name, partition_name)
+
+        try:
+            return pin.detach_concurrently_pinned(
+                self._engine,
+                partition_name,
+                expected_oid,
+                timeout_seconds=self._ddl_timeout,
+                verify=verify,
+                mark=mark,
+                statement=statement,
+            )
+        except (SQLAlchemyError, OSError, TimeoutError) as exc:
+            return self._classify_concurrent_failure(exc, table_name, partition_name, fallback=fallback)
+
+    def _run_concurrent_detach(self, table_name: str, partition_name: str) -> bool:
+        """The statement itself, on its own AUTOCOMMIT connection; marks first when unpinned."""
         stmt = build_ddl_statement(
             "ALTER TABLE {parent} DETACH PARTITION {partition} CONCURRENTLY",
             parent=table_name,
@@ -255,31 +306,43 @@ class PartitionRemover:
         with self._engine.connect() as base_conn:
             conn = base_conn.execution_options(isolation_level="AUTOCOMMIT")
             with session_statement_timeout(conn, self._ddl_timeout):
-                try:
-                    self._ensure_still_the_partition(conn, table_name, partition_name, expected_oid)
-                    self._mark_orphaned(conn, table_name, partition_name)
-                    conn.execute(stmt)
-                    self._ensure_expected_oid(conn, partition_name, expected_oid)
-                except (SQLAlchemyError, OSError, TimeoutError) as exc:
-                    sqlstate = pg_sqlstate(exc)
-                    if sqlstate in {"42P01", "55006", "23503"}:
-                        domain_exc = self._translate_detach_error(exc, partition_name)
-                        assert domain_exc is not None  # guaranteed by sqlstate match above
-                        raise domain_exc from exc
-                    if sqlstate not in _CONCURRENT_DETACH_UNAVAILABLE or not fallback:
-                        raise
-                    logger.warning(
-                        "DETACH PARTITION CONCURRENTLY failed; falling back to non-concurrent DETACH",
-                        extra={
-                            "table_name": table_name,
-                            "partition_name": partition_name,
-                            "sqlstate": sqlstate,
-                            "reason": str(exc),
-                        },
+                already_marked = (
+                    conn.execute(
+                        text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
+                        {"partition_name": to_regclass_argument(partition_name)},
                     )
-                    return False
-                else:
-                    return True
+                ).scalar()
+                if parse_orphan_comment(coerce_str(already_marked), marker_prefix=self._marker_prefix) is None:
+                    self._mark_orphaned(conn, table_name, partition_name)
+                conn.execute(stmt)
+                return True
+
+    def _classify_concurrent_failure(
+        self, exc: Exception, table_name: str, partition_name: str, *, fallback: bool
+    ) -> bool:
+        """Translate, fall back, or re-raise -- never swallow."""
+        sqlstate = pg_sqlstate(exc)
+        if sqlstate in {"42P01", "55006", "23503"}:
+            domain_exc = self._translate_detach_error(exc, partition_name)
+            assert domain_exc is not None  # guaranteed by sqlstate match above
+            raise domain_exc from exc
+        if sqlstate not in _CONCURRENT_DETACH_UNAVAILABLE or not fallback:
+            raise exc
+        logger.warning(
+            "DETACH PARTITION CONCURRENTLY failed; falling back to non-concurrent DETACH",
+            extra={
+                "table_name": table_name,
+                "partition_name": partition_name,
+                "sqlstate": sqlstate,
+                "reason": str(exc),
+            },
+        )
+        return False
+
+    def _relkind_of(self, name: str) -> str | None:
+        with self._engine.connect() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            return relation_kind(conn, name)
 
     def _mark_orphaned(
         self,
@@ -345,7 +408,7 @@ class PartitionRemover:
             return PartitionReferencedError(partition_name, str(exc).strip().splitlines()[0])
         return None
 
-    def drop(self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None) -> None:
+    def drop(self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None) -> int:
         """Drop a detached partition.
 
         Args:
@@ -359,21 +422,24 @@ class PartitionRemover:
                 drop -- what ``unpartition`` needs to promise that no row is
                 lost.
 
+        Returns:
+            Rows moved into ``drain_into`` in the drop's transaction; 0
+            without a drain, or when there was nothing left to move.
+
         Raises:
             PlanStaleError: If the relation holding the name is not the one
                 ``expected_oid`` identifies.
-            RowMoveRefusedError: If ``drain_into`` is given and a foreign key's
-                ``ON DELETE`` action would fire on the remaining rows; the
-                table is left as it is.
+            RowMoveRefusedError: If ``drain_into`` is given and the remaining
+                rows cannot be moved safely; the table is left as it is.
         """
         with self._engine.connect() as conn:
             apply_local_statement_timeout(conn, self._ddl_timeout)
             if not self._resolver.exists_conn(conn, partition_name):
-                return
+                return 0
             self._ensure_expected_oid(conn, partition_name, expected_oid)
             self._ensure_not_attached(conn, partition_name)
             if not self._ensure_managed(conn, partition_name):
-                return
+                return 0
 
         last_exc: BaseException | None = None
 
@@ -382,18 +448,18 @@ class PartitionRemover:
                 self._handle_retry_delay(attempt, last_exc, partition_name)
 
             try:
-                self._execute_drop(partition_name, expected_oid, drain_into)
+                drained = self._execute_drop(partition_name, expected_oid, drain_into)
             except (SQLAlchemyError, OSError, TimeoutError) as exc:
                 if isinstance(exc, SQLAlchemyError) and pg_sqlstate(exc) not in _RETRYABLE_PG_STATES:
                     raise
                 last_exc = exc
             else:
-                return
+                return drained
 
         raise DropRetryExhaustedError(partition_name, self._drop_max_retries, last_exc) from last_exc
 
-    def _execute_drop(self, partition_name: str, expected_oid: int | None, drain_into: str | None) -> None:
-        """Lock, revalidate, and drop in one transaction.
+    def _execute_drop(self, partition_name: str, expected_oid: int | None, drain_into: str | None) -> int:
+        """Lock, revalidate, drain, and drop in one transaction; returns the drained rows.
 
         The pre-checks in :meth:`drop` run on a different connection, so the
         relation could have been reattached or replaced since. Taking ACCESS
@@ -417,17 +483,18 @@ class PartitionRemover:
                     )
                 except (SQLAlchemyError, OSError, TimeoutError) as exc:
                     if pg_sqlstate(exc) == "42P01":  # dropped concurrently — nothing left to do
-                        return
+                        return 0
                     raise
             self._ensure_expected_oid(conn, partition_name, expected_oid)
             self._ensure_not_attached(conn, partition_name)
             if not self._ensure_managed(conn, partition_name):
-                return
+                return 0
             if foreign:
                 # A foreign table carries no constraints of its own, and
                 # ``DROP TABLE`` refuses it ("is not a table").
                 conn.execute(build_ddl_statement("DROP FOREIGN TABLE IF EXISTS {partition}", partition=partition_name))
-                return
+                return 0
+            drained = 0
             if drain_into is not None:
                 drained = self._creator.move_rows_conn(conn, partition_name, drain_into)
                 if drained:
@@ -438,6 +505,7 @@ class PartitionRemover:
             fk_constraints = self._fk_manager.list_constraints_conn(conn, partition_name)
             self._fk_manager.drop_constraints(conn, partition_name, fk_constraints)
             conn.execute(build_ddl_statement("DROP TABLE IF EXISTS {partition}", partition=partition_name))
+            return drained
 
     def _ensure_expected_oid(self, conn: Connection, partition_name: str, expected_oid: int | None) -> None:
         if expected_oid is None:

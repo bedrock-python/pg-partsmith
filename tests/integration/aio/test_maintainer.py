@@ -17,6 +17,7 @@ from pg_partsmith.aio.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.aio.maintainer import PartitionMaintainer
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
+from pg_partsmith.aio.repositories.remover import PartitionRemover
 from pg_partsmith.aio.service import PartitionLifecycleService
 from pg_partsmith.entities import (
     MaintenanceResult,
@@ -468,3 +469,44 @@ async def test__maintainer__relation_swapped_by_a_hook__detach_refused_as_stale(
     april = f"{partitioned_table}__2026_04"
     assert await is_attached(db_engine, april)
     assert await table_comment(db_engine, april) is None
+
+
+# sync-mirror: skip
+async def test__maintainer__pinned_concurrent_detach__a_swap_cannot_slip_in_while_it_is_marked(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    # Arrange: April expired; a saboteur tries to detach it out from under us mid-flight
+    config = monthly_config(partitioned_table, create_ahead=1, retention=1)
+    maintainer = PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine)))
+    with freezegun.freeze_time("2026-04-15"):
+        await maintainer.run_maintenance(config)
+    april = f"{partitioned_table}__2026_04"
+    swap_refused: list[str] = []
+    original = PartitionRemover._mark_orphaned
+
+    async def marking_swap(
+        self: PartitionRemover, conn: object, table_name: str, partition_name: str, *, stamp_now: bool = True
+    ) -> None:
+        # The pin (ACCESS SHARE, identity verified under it) is held right now:
+        # a swap needs ACCESS EXCLUSIVE and must time out instead of slipping in.
+        try:
+            async with db_engine.begin() as other:
+                await other.execute(text("SET LOCAL lock_timeout = '300ms'"))
+                await other.execute(text(f'ALTER TABLE "{partitioned_table}" DETACH PARTITION "{april}"'))
+        except DBAPIError as exc:
+            swap_refused.append(str(exc.orig))
+        return await original(self, conn, table_name, partition_name, stamp_now=stamp_now)  # type: ignore[arg-type]
+
+    # Act
+    with (
+        freezegun.freeze_time("2026-08-26"),
+        patch.object(PartitionRemover, "_mark_orphaned", marking_swap),
+    ):
+        result = await maintainer.run_maintenance(config)
+
+    # Assert: the swap timed out on the pin; the right relation was detached, then
+    # retired by the same call's drop policy -- exactly what the plan decided.
+    assert swap_refused, "the pin must hold the name while the relation is checked and marked"
+    assert result.detached_count == 1
+    assert result.dropped_count == 1
+    assert await scalar(db_engine, "SELECT CAST(to_regclass(:n) AS oid)", n=april) is None

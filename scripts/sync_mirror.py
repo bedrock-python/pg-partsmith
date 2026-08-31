@@ -9,7 +9,7 @@ aio modules, then format and review the diff::
     uv run ruff check --fix pg_partsmith/sync && uv run ruff format pg_partsmith/sync
 
 Hand-maintained (not mirrored): ``lock/``, ``maintainer.py`` and
-``repositories/{resolver,fk_manager,timeouts}.py``.
+``repositories/{resolver,fk_manager,timeouts,pin}.py``.
 """
 
 from __future__ import annotations

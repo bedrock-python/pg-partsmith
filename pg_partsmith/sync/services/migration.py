@@ -109,7 +109,10 @@ class DataMover:
             moved_before = tally.rows_moved
             bounds = op.bounds
             assert isinstance(bounds, RangeBounds)
-            fill = partial(self._drain_window, default.name, root.key, bounds, batch_rows, tally)
+            target_oid = op.oid if isinstance(op, AttachPartition) else None
+            fill = partial(
+                self._drain_window, default.name, root.key, bounds, batch_rows, tally, expected_target_oid=target_oid
+            )
             try:
                 if isinstance(op, CreatePartition):
                     attached = self._executor.create_partition(config, plan, op, issues=tally.issues, fill=fill)
@@ -155,8 +158,16 @@ class DataMover:
         batch_rows: int,
         tally: _Tally,
         target: str,
+        *,
+        expected_target_oid: int | None = None,
     ) -> bool:
-        """Move a window's rows from DEFAULT into ``target``; False when the batch budget ran out first."""
+        """Move a window's rows from DEFAULT into ``target``; False when the batch budget ran out first.
+
+        ``expected_target_oid`` pins a re-attached orphan's identity: every
+        batch verifies, under the target's lock and in the move's own
+        transaction, that the name still resolves to the relation the plan
+        chose before a row leaves DEFAULT.
+        """
         while not tally.exhausted:
             moved = self._repo.reconcile_default_rows(
                 default_partition_name=default_name,
@@ -165,6 +176,7 @@ class DataMover:
                 from_value=bounds.from_value,
                 to_value=bounds.to_value,
                 limit=batch_rows,
+                expected_target_oid=expected_target_oid,
             )
             tally.batch(moved)
             if moved < batch_rows:
@@ -261,6 +273,15 @@ class DataMover:
             described = "no relation at all" if kind is None else f"a {kind.value} relation"
             msg = f"unpartition moves rows into a plain table; {into!r} is {described}"
             raise InvalidPartitionConfigError(msg)
+        if self._metadata.get_partition_tree(into) is not None:
+            # A leaf of *any* partition tree reads as a plain table in
+            # pg_class; rows moved into one would become routed property of
+            # another root.
+            msg = (
+                f"unpartition moves rows into a plain table outside any partition tree; {into!r} is attached "
+                "as a partition"
+            )
+            raise InvalidPartitionConfigError(msg)
 
     def _drain(self, source: str, into: str, batch_rows: int, tally: _Tally) -> bool:
         """Empty ``source`` into ``into`` in batches; False when the budget ran out first."""
@@ -293,7 +314,11 @@ class DataMover:
         if tail:
             tally.batch(tail)
         drop = DropPartition(target=child.name, oid=child.oid, reason=Reason.EXPLICIT, detail=detail)
-        self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
+        drained = self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
+        if drained:
+            # Rows that slipped in after the tail, moved inside the drop's own
+            # transaction: theirs is a row count, not another budgeted batch.
+            tally.rows_moved += drained
 
     def _move_orphans(
         self,
@@ -328,14 +353,16 @@ class DataMover:
                 return False
             tally.partitions.append(orphan.name)
             if drop_emptied:
-                self._drop_orphan(config, orphan, into)
+                self._drop_orphan(config, orphan, into, tally)
         return complete
 
-    def _drop_orphan(self, config: TablePartitionConfig, orphan: DetachedPartition, into: str) -> None:
+    def _drop_orphan(self, config: TablePartitionConfig, orphan: DetachedPartition, into: str, tally: _Tally) -> None:
         drop = DropPartition(
             target=orphan.name, oid=orphan.oid, reason=Reason.EXPLICIT, detail="emptied by unpartition"
         )
-        self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
+        drained = self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
+        if drained:
+            tally.rows_moved += drained
 
 
 class _Tally:

@@ -418,3 +418,108 @@ def test__partition_data__window_of_a_detached_owned_partition__filled_and_reatt
     assert is_attached(sync_db_engine, march)
     assert _count(sync_db_engine, march) == 4
     assert table_comment(sync_db_engine, march) is None
+
+
+def test__partition_data__no_action_foreign_key_with_referenced_rows__refused_row_safe(
+    sync_db_engine: Engine, events: str
+) -> None:
+    # Arrange: rows in DEFAULT are referenced through an ordinary (NO ACTION) key
+    _default_with_rows(sync_db_engine, events, months=(3,), per_month=4)
+    ref = f"{events}_noact"
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{ref}" (event_id BIGINT, created_at TIMESTAMPTZ, '
+        f'FOREIGN KEY (event_id, created_at) REFERENCES "{events}" (id, created_at))',
+    )
+    exec_sql(sync_db_engine, f'INSERT INTO "{ref}" SELECT id, created_at FROM "{events}" LIMIT 1')  # noqa: S608
+
+    # Act
+    result = make_service(sync_db_engine).partition_data(monthly_config(events, create_ahead=1))
+
+    # Assert: a referenced row cannot leave the tree during a move; the batch fails whole
+    assert not result.complete
+    assert any("still referenced" in issue.error for issue in result.issues)
+    assert _count(sync_db_engine, events) == 4
+    assert _count(sync_db_engine, ref) == 1
+
+
+class _DetachedWriter(BasePartitionLifecycleHooks):
+    """Commits one more row straight into the detached table right before its drop."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def before_drop(self, table_name: str, partition_name: str) -> None:
+        quoted = ".".join(f'"{part}"' for part in partition_name.split("."))
+        exec_sql(
+            self._engine,
+            f"INSERT INTO {quoted} (created_at, payload) VALUES ('2026-03-20T12:00:00+00:00', 'dropwrite')",  # noqa: S608
+        )
+
+
+def test__unpartition__row_committed_inside_before_drop__moved_in_the_drop_transaction(
+    sync_db_engine: Engine, events: str
+) -> None:
+    # Arrange
+    _default_with_rows(sync_db_engine, events, months=(3,), per_month=5)
+    config = monthly_config(events, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    flat = f"{events}_flat"
+
+    # Act
+    result = make_service(sync_db_engine, hooks=[_DetachedWriter(sync_db_engine)]).unpartition(
+        config, flat, batch_rows=4, drop_emptied=True
+    )
+
+    # Assert: both drop-time rows are moved inside the drop's transaction and counted
+    assert result.complete
+    assert result.rows_moved == 7
+    assert _count(sync_db_engine, flat) == 7
+    assert _count(sync_db_engine, events) == 0
+
+
+def test__unpartition__into_an_identity_table__the_next_ordinary_insert_succeeds(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    # Arrange: five rows with explicit ids come through the tree
+    legacy = f"{ledger}_legacy"
+    exec_sql(sync_db_engine, f'CREATE TABLE "{legacy}" (LIKE "{ledger}" INCLUDING ALL EXCLUDING IDENTITY)')
+    exec_sql(
+        sync_db_engine,
+        f'INSERT INTO "{legacy}" (id, tenant_id, created_at, amount) '  # noqa: S608
+        f"SELECT g, 1, make_timestamptz(2026, 4, 1 + (g % 27), 12, 0, 0, 'UTC'), g FROM generate_series(1, 5) g",
+    )
+    exec_sql(sync_db_engine, f'ALTER TABLE "{ledger}" ATTACH PARTITION "{legacy}" DEFAULT')
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = f"{ledger}_dest"
+    exec_sql(sync_db_engine, f'CREATE TABLE "{dest}" (LIKE "{ledger}" INCLUDING ALL)')
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+    exec_sql(
+        sync_db_engine,
+        f"INSERT INTO \"{dest}\" (tenant_id, created_at, amount) VALUES (1, '2026-05-01T00:00:00+00:00', 9)",  # noqa: S608
+    )
+
+    # Assert: the identity sequence was advanced past the moved ids
+    assert result.complete
+    assert result.rows_moved == 5
+    assert int(scalar(sync_db_engine, f'SELECT max(id) FROM "{dest}"')) == 6  # noqa: S608
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 6  # noqa: S608
+
+
+def test__unpartition__into_a_leaf_of_another_tree__refused(sync_db_engine: Engine, events: str) -> None:
+    # Arrange: a partition of an unrelated root -- relkind 'r', but routed property of another tree
+    other = f"{events}_other"
+    exec_sql(sync_db_engine, f'CREATE TABLE "{other}" (ts TIMESTAMPTZ NOT NULL) PARTITION BY RANGE (ts)')
+    exec_sql(
+        sync_db_engine,
+        f"CREATE TABLE \"{other}_p1\" PARTITION OF \"{other}\" FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+    )
+    try:
+        # Act / Assert
+        with pytest.raises(InvalidPartitionConfigError, match="attached as a partition"):
+            make_service(sync_db_engine).unpartition(monthly_config(events, create_ahead=1), f"public.{other}_p1")
+    finally:
+        exec_sql(sync_db_engine, f'DROP TABLE "{other}"')

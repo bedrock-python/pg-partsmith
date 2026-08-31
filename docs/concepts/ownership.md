@@ -96,12 +96,14 @@ the executor checks that the relation is still the one the plan decided about:
 - for a drop, it is **not attached** to anything and **still carries the marker**.
 
 The drop's checks run under `ACCESS EXCLUSIVE` in the same transaction as `DROP TABLE`,
-and the detach's under the lock the detach itself takes, in the same transaction as its
-marker and its statement — closing the window in which a concurrently replaced relation
-(a `before_detach` hook swapping the table at its name, say) could be acted on in the
-plan's stead. The concurrent detach form, which cannot run inside a transaction, checks
-the identity immediately before the statement and once more after it. `DROP` is never
-issued with `CASCADE`, so a drop that would take something else with it fails instead.
+and the blocking detach's under the lock the detach itself takes, in the same transaction
+as its marker and its statement — a concurrently replaced relation (a `before_detach`
+hook swapping the table at its name, say) rolls the whole detach back. The concurrent
+form, which cannot run inside a transaction, holds the relation with a **pin** — a lock
+under which the identity is verified and the marker written — released only once the
+statement itself is queued for the partition, from where a swap can only make it fail.
+`DROP` is never issued with `CASCADE`, so a drop that would take something else with it
+fails instead.
 
 ## What the library will never do
 

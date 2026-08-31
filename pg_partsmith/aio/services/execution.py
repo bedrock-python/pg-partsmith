@@ -131,7 +131,7 @@ class PlanExecutor:
                             extra={"partition_name": op.target},
                         )
                         continue
-                    if await self.drop_single_partition(config.qualified_name, op):
+                    if await self.drop_single_partition(config.qualified_name, op) is not None:
                         tally.dropped += 1
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
@@ -363,9 +363,16 @@ class PlanExecutor:
         await self._require_same_relation(op.target, op.oid)
         depth = _depth_of(config, op.parent_name)
         tally.repaired += await self._converge_detached(config, plan, op, depth=depth, issues=issues)
-        if fill is not None and not await fill(op.target):
-            return False
-        await self._attach_with_reconcile(config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns)
+        if fill is not None:
+            if not await fill(op.target):
+                return False
+            # A fill can run for a while; make sure the name still means the
+            # same relation before it goes live (the attach re-checks under
+            # its own lock either way).
+            await self._require_same_relation(op.target, op.oid)
+        await self._attach_with_reconcile(
+            config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns, expected_oid=op.oid
+        )
         tally.attached += 1
         return True
 
@@ -377,6 +384,7 @@ class PlanExecutor:
         bounds: PartitionBounds,
         *,
         key_columns: tuple[str, ...],
+        expected_oid: int | None = None,
     ) -> None:
         """Attach a partition, moving DEFAULT rows out of the way for a RANGE window.
 
@@ -393,7 +401,9 @@ class PlanExecutor:
 
         for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
-                await self._repo.attach_partition(parent_name, partition_name, bounds, key_arity=key_arity)
+                await self._repo.attach_partition(
+                    parent_name, partition_name, bounds, key_arity=key_arity, expected_oid=expected_oid
+                )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 # Shielded so the compensating move-back completes even mid-cancellation.
                 await asyncio.shield(
@@ -561,7 +571,9 @@ class PlanExecutor:
         await self._repo.detach_partition(op.parent_name, op.target, mode=op.mode, expected_oid=op.oid)
         await self._run_hooks(lambda h: h.after_detach(table_name, op.target), "after_detach", partition_name=op.target)
 
-    async def drop_single_partition(self, table_name: str, op: DropPartition, *, drain_into: str | None = None) -> bool:
+    async def drop_single_partition(
+        self, table_name: str, op: DropPartition, *, drain_into: str | None = None
+    ) -> int | None:
         """Drop one detached partition, running the drop hooks around it.
 
         Extension point for callers that manage partitions one at a time.
@@ -571,17 +583,18 @@ class PlanExecutor:
         moved rather than dropped.
 
         Returns:
-            True when the partition was dropped; False when it is still
-            attached (logged and skipped).
+            The rows moved into ``drain_into`` in the drop's transaction (0
+            without a drain) when the partition was dropped; None when it is
+            still attached (logged and skipped).
         """
         await self._run_hooks(lambda h: h.before_drop(table_name, op.target), "before_drop", partition_name=op.target)
         try:
-            await self._repo.drop_partition(op.target, expected_oid=op.oid, drain_into=drain_into)
+            drained = await self._repo.drop_partition(op.target, expected_oid=op.oid, drain_into=drain_into)
         except PartitionAttachedError:
             logger.warning("Refusing to drop attached partition", extra={"partition_name": op.target})
-            return False
+            return None
         await self._run_hooks(lambda h: h.after_drop(table_name, op.target), "after_drop", partition_name=op.target)
-        return True
+        return drained
 
     async def _require_same_relation(self, name: str, expected_oid: int | None) -> None:
         """Refuse to act on a relation the plan did not see."""

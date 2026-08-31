@@ -216,6 +216,21 @@ RELATION_HAS_IDENTITY_ALWAYS_SQL = """
     )
 """
 
+# Identity columns of a relation, for advancing their sequences after a move.
+#
+# Both flavours: a moved row carries an explicit value either way, and a
+# sequence left behind would hand the next ordinary INSERT an id a moved row
+# already owns.
+RELATION_IDENTITY_COLUMNS_SQL = """
+    SELECT a.attname
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass(:table_name)
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attidentity IN ('a', 'd')
+    ORDER BY a.attnum
+"""
+
 # Foreign keys referencing a relation whose ON DELETE action would fire on
 # a row move.
 #

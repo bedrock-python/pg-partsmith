@@ -9,14 +9,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
+from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import MaintenanceIssueStep, Period
-from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
 from tests.integration.aio.support import (
     exec_sql,
     hash_children_of,
@@ -429,3 +432,139 @@ async def test__partition_data__window_of_a_detached_owned_partition__filled_and
     assert await is_attached(db_engine, march)
     assert await _count(db_engine, march) == 4
     assert await table_comment(db_engine, march) is None
+
+
+async def test__partition_data__no_action_foreign_key_with_referenced_rows__refused_row_safe(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange: rows in DEFAULT are referenced through an ordinary (NO ACTION) key
+    await _default_with_rows(db_engine, events, months=(3,), per_month=4)
+    ref = f"{events}_noact"
+    await exec_sql(
+        db_engine,
+        f'CREATE TABLE "{ref}" (event_id BIGINT, created_at TIMESTAMPTZ, '
+        f'FOREIGN KEY (event_id, created_at) REFERENCES "{events}" (id, created_at))',
+    )
+    await exec_sql(db_engine, f'INSERT INTO "{ref}" SELECT id, created_at FROM "{events}" LIMIT 1')  # noqa: S608
+
+    # Act
+    result = await make_service(db_engine).partition_data(monthly_config(events, create_ahead=1))
+
+    # Assert: a referenced row cannot leave the tree during a move; the batch fails whole
+    assert not result.complete
+    assert any("still referenced" in issue.error for issue in result.issues)
+    assert await _count(db_engine, events) == 4
+    assert await _count(db_engine, ref) == 1
+
+
+class _DetachedWriter(BasePartitionLifecycleHooks):
+    """Commits one more row straight into the detached table right before its drop."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    async def before_drop(self, table_name: str, partition_name: str) -> None:
+        quoted = ".".join(f'"{part}"' for part in partition_name.split("."))
+        await exec_sql(
+            self._engine,
+            f"INSERT INTO {quoted} (created_at, payload) VALUES ('2026-03-20T12:00:00+00:00', 'dropwrite')",  # noqa: S608
+        )
+
+
+async def test__unpartition__row_committed_inside_before_drop__moved_in_the_drop_transaction(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange
+    await _default_with_rows(db_engine, events, months=(3,), per_month=5)
+    config = monthly_config(events, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    flat = f"{events}_flat"
+
+    # Act
+    result = await make_service(db_engine, hooks=[_DetachedWriter(db_engine)]).unpartition(
+        config, flat, batch_rows=4, drop_emptied=True
+    )
+
+    # Assert: both drop-time rows are moved inside the drop's transaction and counted
+    assert result.complete
+    assert result.rows_moved == 7
+    assert await _count(db_engine, flat) == 7
+    assert await _count(db_engine, events) == 0
+
+
+async def test__unpartition__into_an_identity_table__the_next_ordinary_insert_succeeds(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    # Arrange: five rows with explicit ids come through the tree
+    legacy = f"{ledger}_legacy"
+    await exec_sql(db_engine, f'CREATE TABLE "{legacy}" (LIKE "{ledger}" INCLUDING ALL EXCLUDING IDENTITY)')
+    await exec_sql(
+        db_engine,
+        f'INSERT INTO "{legacy}" (id, tenant_id, created_at, amount) '  # noqa: S608
+        f"SELECT g, 1, make_timestamptz(2026, 4, 1 + (g % 27), 12, 0, 0, 'UTC'), g FROM generate_series(1, 5) g",
+    )
+    await exec_sql(db_engine, f'ALTER TABLE "{ledger}" ATTACH PARTITION "{legacy}" DEFAULT')
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = f"{ledger}_dest"
+    await exec_sql(db_engine, f'CREATE TABLE "{dest}" (LIKE "{ledger}" INCLUDING ALL)')
+
+    # Act
+    result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+    await exec_sql(
+        db_engine,
+        f"INSERT INTO \"{dest}\" (tenant_id, created_at, amount) VALUES (1, '2026-05-01T00:00:00+00:00', 9)",  # noqa: S608
+    )
+
+    # Assert: the identity sequence was advanced past the moved ids
+    assert result.complete
+    assert result.rows_moved == 5
+    assert int(await scalar(db_engine, f'SELECT max(id) FROM "{dest}"')) == 6  # noqa: S608
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 6  # noqa: S608
+
+
+async def test__unpartition__into_a_leaf_of_another_tree__refused(db_engine: AsyncEngine, events: str) -> None:
+    # Arrange: a partition of an unrelated root -- relkind 'r', but routed property of another tree
+    other = f"{events}_other"
+    await exec_sql(db_engine, f'CREATE TABLE "{other}" (ts TIMESTAMPTZ NOT NULL) PARTITION BY RANGE (ts)')
+    await exec_sql(
+        db_engine,
+        f"CREATE TABLE \"{other}_p1\" PARTITION OF \"{other}\" FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+    )
+    try:
+        # Act / Assert
+        with pytest.raises(InvalidPartitionConfigError, match="attached as a partition"):
+            await make_service(db_engine).unpartition(monthly_config(events, create_ahead=1), f"public.{other}_p1")
+    finally:
+        await exec_sql(db_engine, f'DROP TABLE "{other}"')
+
+
+# sync-mirror: skip
+async def test__partition_data__orphan_swapped_during_the_fill__stale_not_misfilled(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange: a matching detached orphan for March, and rows for it in DEFAULT
+    config = monthly_config(events, create_ahead=1)
+    service = make_service(db_engine)
+    await service.ensure_partitions(config, [Period(year=2026, month=3)])
+    march = f"{events}__2026_03"
+    listed = await PostgresMetadataProvider(db_engine).list_partitions(events)
+    await service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    await _default_with_rows(db_engine, events, months=(3,), per_month=4)
+
+    original = PostgresPartitionRepository.reconcile_default_rows
+
+    async def swapping(self: PostgresPartitionRepository, **kwargs: object) -> int:
+        target = str(kwargs["target_partition_name"]).split(".")[-1]
+        async with db_engine.begin() as conn:
+            await conn.execute(text(f'DROP TABLE "{target}"'))
+            await conn.execute(text(f'CREATE TABLE "{target}" (LIKE "{events}" INCLUDING ALL)'))
+        return await original(self, **kwargs)  # type: ignore[arg-type]
+
+    # Act / Assert: the batch verifies the target under its lock and fails closed
+    with (
+        patch.object(PostgresPartitionRepository, "reconcile_default_rows", swapping),
+        pytest.raises(PlanStaleError),
+    ):
+        await service.partition_data(config)
+    assert await _count(db_engine, events) == 4  # every row still in DEFAULT, visible through the root

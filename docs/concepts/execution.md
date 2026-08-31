@@ -63,10 +63,16 @@ A DEFAULT sibling holding rows for a hash or list member is reported
 `DetachMode.AUTO` runs `DETACH … CONCURRENTLY` on an autocommit connection —
 `SHARE UPDATE EXCLUSIVE` on the parent, readers and writers untouched — and falls back to
 the blocking form when PostgreSQL refuses the concurrent one, which it does when a DEFAULT
-partition exists. The marker is written *before* the detach, and the relation's identity
-(OID) and attachment are re-checked under the detach's own lock, after the
-`before_detach` hooks ran — a hook or a concurrent session that swaps another relation in
-under the planned name gets a `PlanStaleError`, not a detached replacement.
+partition exists. The marker is written *before* the detach, and with the plan's OID the
+detach fails closed, after the `before_detach` hooks ran: the blocking form checks
+identity and attachment inside its own transaction and re-checks after the statement, so
+a swapped-in relation rolls everything back — marker included; the concurrent form
+**pins** the relation (a holder connection takes `ACCESS SHARE` and verifies the OID
+under it) while it is checked and marked, and releases the pin only once the statement
+is queued for the partition's lock — from there a swap can only make the statement fail,
+never redirect it. A foreign relation cannot be pinned and uses the transactional
+blocking form instead. Either way a swap gets a `PlanStaleError`, not a detached
+replacement.
 
 A `DETACH CONCURRENTLY` interrupted mid-way (a statement timeout, a killed connection)
 leaves the partition in a **pending** state: still attached in the catalog, invisible
@@ -81,8 +87,9 @@ Detaching a branch keeps its subtree intact and readable through the branch.
 ## Drop
 
 A drop runs in one transaction: `SET lock_timeout`, `LOCK TABLE … IN ACCESS EXCLUSIVE
-MODE`, revalidate OID, attachment and marker, drop the partition's own foreign keys, then
-`DROP TABLE` — `DROP FOREIGN TABLE` for a foreign leaf, which cannot be locked and carries
+MODE`, revalidate OID, attachment and marker, drain the remaining rows when the caller
+asked for it (`drain_into` — `unpartition`'s guarantee, with the moved count reported),
+drop the partition's own foreign keys, then `DROP TABLE` — `DROP FOREIGN TABLE` for a foreign leaf, which cannot be locked and carries
 no constraints. Dropping a partitioned branch takes its children with it; `CASCADE` is
 never used. Lock contention is retried with exponential backoff
 (`drop_lock_timeout_ms`, `drop_max_retries`, `drop_retry_delay`, `drop_max_backoff` on the
