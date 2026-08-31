@@ -177,7 +177,7 @@ class PlanExecutor:
         op: CreatePartition,
         *,
         issues: list[MaintenanceIssue],
-        fill: Callable[[str], Awaitable[bool]] | None = None,
+        fill: Callable[[str, int | None], Awaitable[bool]] | None = None,
     ) -> bool:
         """Create one partition with its subtree and attach it, filling it in between.
 
@@ -210,7 +210,7 @@ class PlanExecutor:
         depth: int,
         tally: _Tally,
         issues: list[MaintenanceIssue],
-        fill: Callable[[str], Awaitable[bool]] | None = None,
+        fill: Callable[[str, int | None], Awaitable[bool]] | None = None,
     ) -> bool:
         """Create one partition with its subtree, then attach it.
 
@@ -224,7 +224,7 @@ class PlanExecutor:
             await self._run_hooks(lambda h: h.before_create(config, info), "before_create", partition_name=op.target)
 
         try:
-            await self._materialize(config, op)
+            target_oid: int | None = await self._materialize(config, op)
         except PartitionAlreadyExistsError:
             # The relation exists but the plan did not see it attached: either
             # a previous run stopped between creating it and attaching it, or
@@ -239,15 +239,21 @@ class PlanExecutor:
                 "Relation already exists but is not attached; completing its subtree before attaching it",
                 extra={"partition_name": op.target},
             )
+            # The identity is acquired here, once, and held through the fill
+            # and the attach: whatever takes over the name later fails stale
+            # instead of receiving the rows or going live.
+            target_oid = await self._metadata.get_relation_oid(op.target)
             tally.repaired += await self._converge_detached(config, plan, op, depth=depth, issues=issues)
         else:
             for child in op.children:
                 await self._create(config, plan, child, depth=depth + 1, tally=tally, issues=issues)
 
-        if fill is not None and not await fill(op.target):
+        if fill is not None and not await fill(op.target, target_oid):
             return False
 
-        await self._attach_with_reconcile(config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns)
+        await self._attach_with_reconcile(
+            config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns, expected_oid=target_oid
+        )
 
         if op.counts_as == "created":
             tally.created += 1
@@ -259,11 +265,14 @@ class PlanExecutor:
             await self._run_hooks(lambda h: h.after_create(config, attached), "after_create", partition_name=op.target)
         return True
 
-    async def _materialize(self, config: TablePartitionConfig, op: CreatePartition) -> None:
+    async def _materialize(self, config: TablePartitionConfig, op: CreatePartition) -> int | None:
         """Create the relation ``op`` describes, detached, as the leaf backend says.
 
         A branch is always a local partitioned table; a leaf is a local table
-        or a foreign table, depending on ``config.leaves``.
+        or a foreign table, depending on ``config.leaves``. Returns the OID
+        the repository read in the creating transaction (None from a
+        repository predating that contract), which the caller holds through
+        the fill and the attach.
         """
         leaves = config.leaves
         if op.partition_by is None and isinstance(leaves, ForeignLeaves):
@@ -272,14 +281,14 @@ class PlanExecutor:
             options = leaves.render_options(
                 relname=relname, schema=schema or "", parent=parent_relname, root=config.table_name
             )
-            await self._repo.create_foreign_table_like(op.parent_name, op.target, server=leaves.server, options=options)
-            return
+            return await self._repo.create_foreign_table_like(
+                op.parent_name, op.target, server=leaves.server, options=options
+            )
         if isinstance(leaves, LocalLeaves) and not leaves.is_plain:
-            await self._repo.create_table_like(op.parent_name, op.target, op.partition_by, physical=leaves)
-        else:
-            # The plain case is spelled the way it always was, so a repository
-            # written before leaf backends existed keeps working unchanged.
-            await self._repo.create_table_like(op.parent_name, op.target, op.partition_by)
+            return await self._repo.create_table_like(op.parent_name, op.target, op.partition_by, physical=leaves)
+        # The plain case is spelled the way it always was, so a repository
+        # written before leaf backends existed keeps working unchanged.
+        return await self._repo.create_table_like(op.parent_name, op.target, op.partition_by)
 
     async def _converge_detached(
         self,
@@ -334,7 +343,7 @@ class PlanExecutor:
         op: AttachPartition,
         *,
         issues: list[MaintenanceIssue],
-        fill: Callable[[str], Awaitable[bool]] | None = None,
+        fill: Callable[[str, int | None], Awaitable[bool]] | None = None,
     ) -> bool:
         """Bring one detached relation back, filling it in between.
 
@@ -357,14 +366,14 @@ class PlanExecutor:
         *,
         tally: _Tally,
         issues: list[MaintenanceIssue],
-        fill: Callable[[str], Awaitable[bool]] | None = None,
+        fill: Callable[[str, int | None], Awaitable[bool]] | None = None,
     ) -> bool:
         """Bring a detached orphan back, completing its subtree first."""
         await self._require_same_relation(op.target, op.oid)
         depth = _depth_of(config, op.parent_name)
         tally.repaired += await self._converge_detached(config, plan, op, depth=depth, issues=issues)
         if fill is not None:
-            if not await fill(op.target):
+            if not await fill(op.target, op.oid):
                 return False
             # A fill can run for a while; make sure the name still means the
             # same relation before it goes live (the attach re-checks under
@@ -473,7 +482,18 @@ class PlanExecutor:
                         key_columns=key_columns,
                         from_value=window.from_value,
                         to_value=window.to_value,
+                        expected_target_oid=expected_oid,
                     )
+                except PlanStaleError:
+                    # The relation at the name is no longer the one the rows
+                    # were reconciled into. Those rows sit safely in the
+                    # relation with the expected OID, under whatever name it
+                    # now has; nothing was handed to the replacement.
+                    logger.warning(
+                        "Attach target replaced mid-reconcile; earlier reconciled rows remain in the original relation",
+                        extra={"partition_name": partition_name, "expected_oid": expected_oid},
+                    )
+                    raise
                 except RowMoveRefusedError as refusal:
                     # Rows of DEFAULT belong to the new partition but cannot be
                     # moved safely; the partition stays out, the run goes on.

@@ -166,7 +166,18 @@ would draw an id a moved row already owns (`23505`).
 The first transaction of `DETACH PARTITION … CONCURRENTLY` requests `ACCESS EXCLUSIVE`
 on the partition being detached (measured on 17: `pg_locks` shows the waiting AEL), so
 *any* lock held on the partition blocks it — which is what the detach pin exploits, and
-why the pin must be released while the statement is already queued behind it.
+why the pin must be released while the statement is already queued behind it; the release
+is scoped to the statement backend's own pid, so a bystander's queued lock cannot lift the
+pin early. Unlike the `CONCURRENTLY` form, `DETACH … FINALIZE` may run inside a
+transaction block (verified on 15–17), which is what makes a fully transactional
+finalize — lock, identity checks, marker, statement — possible.
+
+`SET CONSTRAINTS ALL IMMEDIATE` inside the move's transaction forces `DEFERRABLE
+INITIALLY DEFERRED` foreign-key checks to fire at the statement, where the `23503`
+translation can catch them, instead of at commit. Identity sequences follow
+`pg_sequence.seqincrement`: an ascending sequence is advanced past `MAX(column)`
+(`GREATEST` keeps a higher pre-existing position), a descending one past `MIN(column)`
+(`LEAST`); cycling sequences keep their declared ranges.
 
 ## Overlaps and gaps
 

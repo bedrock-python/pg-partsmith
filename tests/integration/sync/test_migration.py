@@ -523,3 +523,64 @@ def test__unpartition__into_a_leaf_of_another_tree__refused(sync_db_engine: Engi
             make_service(sync_db_engine).unpartition(monthly_config(events, create_ahead=1), f"public.{other}_p1")
     finally:
         exec_sql(sync_db_engine, f'DROP TABLE "{other}"')
+
+
+def test__partition_data__deferred_foreign_key_with_referenced_rows__refused_row_safe(
+    sync_db_engine: Engine, events: str
+) -> None:
+    # Arrange: the check would otherwise wait for COMMIT, outside any statement handler
+    _default_with_rows(sync_db_engine, events, months=(3,), per_month=4)
+    ref = f"{events}_defer"
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{ref}" (event_id BIGINT, created_at TIMESTAMPTZ, '
+        f'FOREIGN KEY (event_id, created_at) REFERENCES "{events}" (id, created_at) '
+        f"DEFERRABLE INITIALLY DEFERRED)",
+    )
+    exec_sql(sync_db_engine, f'INSERT INTO "{ref}" SELECT id, created_at FROM "{events}" LIMIT 1')  # noqa: S608
+
+    # Act
+    result = make_service(sync_db_engine).partition_data(monthly_config(events, create_ahead=1))
+
+    # Assert: SET CONSTRAINTS ALL IMMEDIATE pulls the refusal into the statement, translated
+    assert not result.complete
+    assert any("still referenced" in issue.error for issue in result.issues)
+    assert _count(sync_db_engine, events) == 4
+    assert _count(sync_db_engine, ref) == 1
+
+
+def test__unpartition__into_a_descending_identity_table__the_next_ordinary_insert_succeeds(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    # Arrange: ids 0, -1, -2 come through the tree; the destination counts downwards
+    legacy = f"{ledger}_legacy"
+    exec_sql(sync_db_engine, f'CREATE TABLE "{legacy}" (LIKE "{ledger}" INCLUDING ALL EXCLUDING IDENTITY)')
+    exec_sql(
+        sync_db_engine,
+        f'INSERT INTO "{legacy}" (id, tenant_id, created_at, amount) '  # noqa: S608
+        f"SELECT 1 - g, 1, make_timestamptz(2026, 4, g, 12, 0, 0, 'UTC'), g FROM generate_series(1, 3) g",
+    )
+    exec_sql(sync_db_engine, f'ALTER TABLE "{ledger}" ATTACH PARTITION "{legacy}" DEFAULT')
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = f"{ledger}_ndest"
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{dest}" ('
+        "id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 0 INCREMENT BY -1 MAXVALUE 0), "
+        "tenant_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL, "
+        "amount NUMERIC NOT NULL DEFAULT 0, doubled NUMERIC GENERATED ALWAYS AS (amount * 2) STORED)",
+    )
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+    exec_sql(
+        sync_db_engine,
+        f"INSERT INTO \"{dest}\" (tenant_id, created_at, amount) VALUES (1, '2026-05-01T00:00:00+00:00', 9)",  # noqa: S608
+    )
+
+    # Assert: the sequence chased the LOW water mark, so the next id is -3
+    assert result.complete
+    assert result.rows_moved == 3
+    assert int(scalar(sync_db_engine, f'SELECT min(id) FROM "{dest}"')) == -3  # noqa: S608
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 4  # noqa: S608

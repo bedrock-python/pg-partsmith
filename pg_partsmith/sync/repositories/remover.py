@@ -205,43 +205,59 @@ class PartitionRemover:
     def _finalize_if_pending(self, table_name: str, partition_name: str, expected_oid: int | None) -> bool:
         """Complete a detach left pending by a cancelled DETACH CONCURRENTLY.
 
-        Returns True if the partition was in pending-detach state and has been
-        finalized (i.e. it is now fully detached).
+        Unlike the concurrent form, ``FINALIZE`` may run inside a transaction,
+        so the lock, the identity checks, the marker and the statement commit
+        or roll back together -- a relation swapped in at the name gets a
+        ``PlanStaleError`` and keeps no marker. Returns True if the partition
+        was in pending-detach state and has been finalized.
         """
-        with self._engine.connect() as base_conn:
-            conn = base_conn.execution_options(isolation_level="AUTOCOMMIT")
-            with session_statement_timeout(conn, self._ddl_timeout):
-                result = conn.execute(
-                    text(
-                        """
-                        SELECT inh.inhdetachpending
-                        FROM pg_inherits inh
-                        WHERE inh.inhrelid = to_regclass(:partition_name)
-                          AND inh.inhparent = to_regclass(:table_name)
-                        """
-                    ),
-                    {
-                        "partition_name": to_regclass_argument(partition_name),
-                        "table_name": to_regclass_argument(table_name),
-                    },
-                )
-                if not result.scalar():
-                    return False
+        if not self._is_pending(table_name, partition_name):
+            return False
 
-                logger.warning(
-                    "Completing pending detach left by a cancelled DETACH CONCURRENTLY",
-                    extra={"table_name": table_name, "partition_name": partition_name},
+        logger.warning(
+            "Completing pending detach left by a cancelled DETACH CONCURRENTLY",
+            extra={"table_name": table_name, "partition_name": partition_name},
+        )
+        with self._engine.begin() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            self._lock_partition(conn, partition_name)
+            if not self._is_pending_conn(conn, table_name, partition_name):
+                # Someone else finished it between the probe and the lock; let
+                # the ordinary detach flow decide what is left to do.
+                return False
+            self._ensure_expected_oid(conn, partition_name, expected_oid)
+            self._mark_orphaned(conn, table_name, partition_name)
+            conn.execute(
+                build_ddl_statement(
+                    "ALTER TABLE {parent} DETACH PARTITION {partition} FINALIZE",
+                    parent=table_name,
+                    partition=partition_name,
                 )
-                self._ensure_expected_oid(conn, partition_name, expected_oid)
-                self._mark_orphaned(conn, table_name, partition_name)
-                conn.execute(
-                    build_ddl_statement(
-                        "ALTER TABLE {parent} DETACH PARTITION {partition} FINALIZE",
-                        parent=table_name,
-                        partition=partition_name,
-                    )
-                )
-                return True
+            )
+            self._ensure_expected_oid(conn, partition_name, expected_oid)
+            return True
+
+    def _is_pending(self, table_name: str, partition_name: str) -> bool:
+        with self._engine.connect() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            return self._is_pending_conn(conn, table_name, partition_name)
+
+    def _is_pending_conn(self, conn: Connection, table_name: str, partition_name: str) -> bool:
+        result = conn.execute(
+            text(
+                """
+                SELECT inh.inhdetachpending
+                FROM pg_inherits inh
+                WHERE inh.inhrelid = to_regclass(:partition_name)
+                  AND inh.inhparent = to_regclass(:table_name)
+                """
+            ),
+            {
+                "partition_name": to_regclass_argument(partition_name),
+                "table_name": to_regclass_argument(table_name),
+            },
+        )
+        return bool(result.scalar())
 
     def _detach_concurrently(
         self, table_name: str, partition_name: str, expected_oid: int | None, *, fallback: bool
@@ -280,8 +296,10 @@ class PartitionRemover:
                 apply_local_statement_timeout(conn, self._ddl_timeout)
                 self._mark_orphaned(conn, table_name, partition_name)
 
+        pid_box: list[int | None] = [None]
+
         def statement() -> bool:
-            return self._run_concurrent_detach(table_name, partition_name)
+            return self._run_concurrent_detach(table_name, partition_name, pid_box=pid_box)
 
         try:
             return pin.detach_concurrently_pinned(
@@ -292,11 +310,14 @@ class PartitionRemover:
                 verify=verify,
                 mark=mark,
                 statement=statement,
+                statement_pid=lambda: pid_box[0],
             )
         except (SQLAlchemyError, OSError, TimeoutError) as exc:
             return self._classify_concurrent_failure(exc, table_name, partition_name, fallback=fallback)
 
-    def _run_concurrent_detach(self, table_name: str, partition_name: str) -> bool:
+    def _run_concurrent_detach(
+        self, table_name: str, partition_name: str, pid_box: list[int | None] | None = None
+    ) -> bool:
         """The statement itself, on its own AUTOCOMMIT connection; marks first when unpinned."""
         stmt = build_ddl_statement(
             "ALTER TABLE {parent} DETACH PARTITION {partition} CONCURRENTLY",
@@ -306,6 +327,9 @@ class PartitionRemover:
         with self._engine.connect() as base_conn:
             conn = base_conn.execution_options(isolation_level="AUTOCOMMIT")
             with session_statement_timeout(conn, self._ddl_timeout):
+                if pid_box is not None:
+                    backend = (conn.execute(text("SELECT pg_backend_pid()"))).scalar()
+                    pid_box[0] = None if backend is None else int(backend)
                 already_marked = (
                     conn.execute(
                         text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),

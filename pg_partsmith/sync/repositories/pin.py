@@ -25,12 +25,14 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Connection, Engine
 
-# See the aio module for the release-condition reasoning.
+# See the aio module for the release-condition reasoning: only the statement
+# backend's own queued lock (or the committed pending flag) releases the pin.
 _RELEASE_SQL = (
     "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'relation' AND relation = CAST(:oid AS oid) "
-    "AND mode = 'AccessExclusiveLock' AND NOT granted) "
+    "AND mode = 'AccessExclusiveLock' AND NOT granted AND pid = CAST(:pid AS int)) "
     "OR EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = CAST(:oid AS oid) AND inhdetachpending)"
 )
+_PENDING_ONLY_SQL = "SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = CAST(:oid AS oid) AND inhdetachpending)"
 
 
 def detach_concurrently_pinned(
@@ -42,6 +44,7 @@ def detach_concurrently_pinned(
     verify: Callable[[Connection], None],
     mark: Callable[[], None],
     statement: Callable[[], bool],
+    statement_pid: Callable[[], int | None],
 ) -> bool:
     """Run one pinned ``DETACH … CONCURRENTLY``; the return value is ``statement``'s."""
     deadline = time.monotonic() + timeout_seconds
@@ -55,7 +58,11 @@ def detach_concurrently_pinned(
             run = pool.submit(statement)
             try:
                 while not run.done():
-                    release = holder.execute(text(_RELEASE_SQL), {"oid": expected_oid}).scalar()
+                    pid = statement_pid()
+                    if pid is None:
+                        release = holder.execute(text(_PENDING_ONLY_SQL), {"oid": expected_oid}).scalar()
+                    else:
+                        release = holder.execute(text(_RELEASE_SQL), {"oid": expected_oid, "pid": pid}).scalar()
                     if release or time.monotonic() > deadline:
                         break
             finally:

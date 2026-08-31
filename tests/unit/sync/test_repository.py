@@ -52,6 +52,7 @@ class _Catalog:
     relkind: str = "r"
     moved_rows: int | None = 0
     identity_always: object = False
+    seq_increment: object = 1
     identity_columns: list[str] = field(default_factory=list)
     max_value: object = None
     destructive_fks: list[tuple[str, str, str]] = field(default_factory=list)
@@ -92,7 +93,9 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
         return _rows([(column,) for column in catalog.identity_columns])
     if "attidentity" in sql:
         return _scalar(_next(catalog.identity_always))
-    if sql.startswith("SELECT MAX("):
+    if "seqincrement" in sql:
+        return _scalar(_next(catalog.seq_increment))
+    if sql.startswith(("SELECT MAX(", "SELECT MIN(")):
         return _scalar(catalog.max_value)
     if "obj_description" in sql:
         return _scalar(_next(catalog.comment))
@@ -167,6 +170,11 @@ def _move_statement_of(conn: MagicMock) -> str:
 _MARKER_LOOKUP = "SELECT obj_description(to_regclass(:partition_name), 'pg_class')"
 
 
+def _creates(conn: object) -> list[str]:
+    """The create path's statements, without the created-OID lookup it now ends with."""
+    return [s for s in _statements(conn) if "SELECT c.oid" not in s]
+
+
 def _sqlstate_error(sqlstate: str, message: str = "pg error") -> SQLAlchemyError:
     exc = SQLAlchemyError(message)
     orig = MagicMock()
@@ -237,7 +245,7 @@ def test__create_table_like__leaf__copies_the_template_without_its_identity() ->
     repo.create_table_like("public.events", "public.events__2024_01", None)
 
     # Assert
-    assert _statements(conn) == [
+    assert _creates(conn) == [
         'CREATE TABLE "public"."events__2024_01" (LIKE "public"."events" INCLUDING ALL EXCLUDING IDENTITY)'
     ]
     engine.begin.assert_called_once()
@@ -253,7 +261,7 @@ def test__create_table_like__branch__partitions_by_every_quoted_column() -> None
     repo.create_table_like("events__2026_w35", "events__2026_w35__h0", partition_by)
 
     # Assert
-    assert _statements(conn) == [
+    assert _creates(conn) == [
         'CREATE TABLE "events__2026_w35__h0" (LIKE "events__2026_w35" INCLUDING ALL EXCLUDING IDENTITY) '
         'PARTITION BY HASH ("tenant_id", "shard_id")'
     ]
@@ -268,7 +276,7 @@ def test__create_table_like__range_branch__spells_the_method_in_upper_case() -> 
     repo.create_table_like("events", "events__h0", PartitionBy(method=PartitionType.RANGE, columns=("created_at",)))
 
     # Assert
-    assert _statements(conn)[0].endswith('PARTITION BY RANGE ("created_at")')
+    assert _creates(conn)[0].endswith('PARTITION BY RANGE ("created_at")')
 
 
 def test__create_table_like__name_taken__raises_already_exists() -> None:
@@ -615,7 +623,7 @@ def test__detach_partition__auto__marks_the_orphan_then_detaches_concurrently() 
     assert statements.index(_comment_statement(conn)) < len(statements) - 1
     assert engine.connect.call_count == 2
     engine.begin.assert_not_called()
-    assert conn.execution_options.call_count == 2
+    assert conn.execution_options.call_count == 1
     assert conn.execution_options.call_args.kwargs == {"isolation_level": "AUTOCOMMIT"}
 
 
@@ -823,7 +831,9 @@ def test__detach_partition__pending_detach__is_finalized_instead() -> None:
     assert any(s.startswith("COMMENT ON TABLE") for s in statements)
     assert not any("CONCURRENTLY" in s for s in statements)
     assert engine.connect.call_count == 1
-    engine.begin.assert_not_called()
+    # The finalize itself runs in a transaction: lock, checks, marker and
+    # statement commit or roll back together.
+    engine.begin.assert_called_once()
     logger.warning.assert_called_once()
 
 
@@ -1285,16 +1295,17 @@ def test__detach_partition__autocommit_connections__set_and_reset_a_session_time
     # Act
     repo.detach_partition("events", "events__2024_01", mode=mode)
 
-    # Assert -- both the pending pre-check and the concurrent detach reset what they set
+    # Assert -- the pending probe now runs a plain transaction; only the
+    # concurrent statement's autocommit connection sets and resets the session timeout
     statements = _all_statements(conn)
     session_sets = [
         call
         for call in conn.execute.call_args_list
         if str(call.args[0]) == "SELECT set_config('statement_timeout', :timeout, false)"
     ]
-    assert len(session_sets) == 2
+    assert len(session_sets) == 1
     assert all(call.args[1] == {"timeout": "30000"} for call in session_sets)
-    assert statements.count("RESET statement_timeout") == 2
+    assert statements.count("RESET statement_timeout") == 1
     assert statements[-1] == "RESET statement_timeout"
 
 
@@ -1385,7 +1396,7 @@ def test__create_table_like__storage_parameters_and_tablespace__spelled_as_liter
     repo.create_table_like("events", "events__2024_01", None, physical=physical)
 
     # Assert
-    assert _statements(conn) == [
+    assert _creates(conn) == [
         'CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY) '
         "WITH (fillfactor = '70', autovacuum_enabled = 'false') TABLESPACE \"fast_ssd\""
     ]
@@ -1403,7 +1414,7 @@ def test__create_table_like__branch__takes_the_tablespace_but_no_storage_paramet
     )
 
     # Assert
-    assert _statements(conn) == [
+    assert _creates(conn) == [
         'CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY) '
         'PARTITION BY HASH ("tenant_id") TABLESPACE "fast_ssd"'
     ]
@@ -1418,7 +1429,7 @@ def test__create_table_like__plain_physical__adds_nothing() -> None:
     repo.create_table_like("events", "events__2024_01", None, physical=LocalLeaves())
 
     # Assert
-    assert _statements(conn) == ['CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY)']
+    assert _creates(conn) == ['CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY)']
 
 
 def test__create_table_like__inherit_privileges__replays_owner_and_grants_in_the_same_transaction() -> None:
@@ -1492,7 +1503,7 @@ def test__create_foreign_table_like__spells_columns_server_and_options() -> None
     )
 
     # Assert
-    assert _statements(conn)[-1] == (
+    assert _creates(conn)[-1] == (
         'CREATE FOREIGN TABLE "public"."metrics__2026_01" '
         '("ts" timestamp with time zone NOT NULL, "v" double precision) '
         "SERVER \"archive\" OPTIONS (table_name 'metrics__2026_01', schema_name 'cold')"
@@ -1509,7 +1520,7 @@ def test__create_foreign_table_like__no_options__omits_the_clause() -> None:
     repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={})
 
     # Assert
-    assert _statements(conn)[-1].endswith('SERVER "archive"')
+    assert _creates(conn)[-1].endswith('SERVER "archive"')
 
 
 def test__create_foreign_table_like__option_value_is_a_literal__quotes_are_escaped() -> None:
@@ -1521,7 +1532,7 @@ def test__create_foreign_table_like__option_value_is_a_literal__quotes_are_escap
     repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={"table_name": "it's"})
 
     # Assert
-    assert "OPTIONS (table_name 'it''s')" in _statements(conn)[-1]
+    assert "OPTIONS (table_name 'it''s')" in _creates(conn)[-1]
 
 
 def test__create_foreign_table_like__template_without_columns__raises_not_found() -> None:
@@ -1967,3 +1978,18 @@ def test__detach_partition__foreign_with_an_oid__uses_the_transactional_blocking
     detaches = [s for s in _statements(conn) if "DETACH PARTITION" in s]
     assert detaches
     assert all("CONCURRENTLY" not in s for s in detaches)
+
+
+def test__move_rows__descending_identity_target__chases_the_low_water_mark() -> None:
+    # Arrange -- a sequence with INCREMENT -1 must be set to the minimum, not the maximum
+    engine, conn = _engine(_Catalog(moved_rows=3, identity_columns=["id"], seq_increment=-1, max_value=-2))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert
+    statements = _statements(conn)
+    assert any(s.startswith('SELECT MIN("id") FROM "b"') for s in statements)
+    (setval,) = [s for s in statements if "setval(seq.oid" in s]
+    assert "LEAST(" in setval

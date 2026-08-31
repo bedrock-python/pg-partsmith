@@ -204,32 +204,25 @@ class PartitionRemover:
     async def _finalize_if_pending(self, table_name: str, partition_name: str, expected_oid: int | None) -> bool:
         """Complete a detach left pending by a cancelled DETACH CONCURRENTLY.
 
-        Returns True if the partition was in pending-detach state and has been
-        finalized (i.e. it is now fully detached).
+        Unlike the concurrent form, ``FINALIZE`` may run inside a transaction,
+        so the lock, the identity checks, the marker and the statement commit
+        or roll back together -- a relation swapped in at the name gets a
+        ``PlanStaleError`` and keeps no marker. Returns True if the partition
+        was in pending-detach state and has been finalized.
         """
-        async with asyncio.timeout(self._ddl_timeout), self._engine.connect() as base_conn:
-            conn = await base_conn.execution_options(isolation_level="AUTOCOMMIT")
-            result = await conn.execute(
-                text(
-                    """
-                    SELECT inh.inhdetachpending
-                    FROM pg_inherits inh
-                    WHERE inh.inhrelid = to_regclass(:partition_name)
-                      AND inh.inhparent = to_regclass(:table_name)
-                    """
-                ),
-                {
-                    "partition_name": to_regclass_argument(partition_name),
-                    "table_name": to_regclass_argument(table_name),
-                },
-            )
-            if not result.scalar():
-                return False
+        if not await self._is_pending(table_name, partition_name):
+            return False
 
-            logger.warning(
-                "Completing pending detach left by a cancelled DETACH CONCURRENTLY",
-                extra={"table_name": table_name, "partition_name": partition_name},
-            )
+        logger.warning(
+            "Completing pending detach left by a cancelled DETACH CONCURRENTLY",
+            extra={"table_name": table_name, "partition_name": partition_name},
+        )
+        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            await self._lock_partition(conn, partition_name)
+            if not await self._is_pending_conn(conn, table_name, partition_name):
+                # Someone else finished it between the probe and the lock; let
+                # the ordinary detach flow decide what is left to do.
+                return False
             await self._ensure_expected_oid(conn, partition_name, expected_oid)
             await self._mark_orphaned(conn, table_name, partition_name)
             await conn.execute(
@@ -239,7 +232,29 @@ class PartitionRemover:
                     partition=partition_name,
                 )
             )
+            await self._ensure_expected_oid(conn, partition_name, expected_oid)
             return True
+
+    async def _is_pending(self, table_name: str, partition_name: str) -> bool:
+        async with asyncio.timeout(self._ddl_timeout), self._engine.connect() as conn:
+            return await self._is_pending_conn(conn, table_name, partition_name)
+
+    async def _is_pending_conn(self, conn: AsyncConnection, table_name: str, partition_name: str) -> bool:
+        result = await conn.execute(
+            text(
+                """
+                SELECT inh.inhdetachpending
+                FROM pg_inherits inh
+                WHERE inh.inhrelid = to_regclass(:partition_name)
+                  AND inh.inhparent = to_regclass(:table_name)
+                """
+            ),
+            {
+                "partition_name": to_regclass_argument(partition_name),
+                "table_name": to_regclass_argument(table_name),
+            },
+        )
+        return bool(result.scalar())
 
     async def _detach_concurrently(
         self, table_name: str, partition_name: str, expected_oid: int | None, *, fallback: bool
@@ -277,8 +292,10 @@ class PartitionRemover:
             async with self._engine.begin() as conn:
                 await self._mark_orphaned(conn, table_name, partition_name)
 
+        pid_box: list[int | None] = [None]
+
         async def statement() -> bool:
-            return await self._run_concurrent_detach(table_name, partition_name)
+            return await self._run_concurrent_detach(table_name, partition_name, pid_box=pid_box)
 
         try:
             return await pin.detach_concurrently_pinned(
@@ -289,11 +306,14 @@ class PartitionRemover:
                 verify=verify,
                 mark=mark,
                 statement=statement,
+                statement_pid=lambda: pid_box[0],
             )
         except (SQLAlchemyError, OSError, TimeoutError) as exc:
             return self._classify_concurrent_failure(exc, table_name, partition_name, fallback=fallback)
 
-    async def _run_concurrent_detach(self, table_name: str, partition_name: str) -> bool:
+    async def _run_concurrent_detach(
+        self, table_name: str, partition_name: str, pid_box: list[int | None] | None = None
+    ) -> bool:
         """The statement itself, on its own AUTOCOMMIT connection; marks first when unpinned."""
         stmt = build_ddl_statement(
             "ALTER TABLE {parent} DETACH PARTITION {partition} CONCURRENTLY",
@@ -302,6 +322,9 @@ class PartitionRemover:
         )
         async with asyncio.timeout(self._ddl_timeout), self._engine.connect() as base_conn:
             conn = await base_conn.execution_options(isolation_level="AUTOCOMMIT")
+            if pid_box is not None:
+                backend = (await conn.execute(text("SELECT pg_backend_pid()"))).scalar()
+                pid_box[0] = None if backend is None else int(backend)
             already_marked = (
                 await conn.execute(
                     text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),

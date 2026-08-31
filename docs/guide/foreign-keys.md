@@ -107,7 +107,9 @@ foreign key does to that statement depends on its action, and on where the row l
   at all (`unpartition`). The statement fails whole — atomic, nothing lost — and the
   movers surface it as `RowMoveRefusedError` (a `move` issue): delete or repoint the
   referencing rows first, or drop the foreign key for the migration and re-create it
-  after. `RESTRICT` fires even earlier, with the same safe outcome.
+  after. `RESTRICT` fires even earlier, with the same safe outcome. `DEFERRABLE` keys
+  included: the movers run `SET CONSTRAINTS ALL IMMEDIATE` in the move's transaction, so
+  a deferred check cannot slip past the statement to fail at commit unhandled.
 - **`ON DELETE CASCADE`, `SET NULL` and `SET DEFAULT` are refused up front**, before any
   row moves: they act on the DELETE alone and would delete or rewrite the referencing
   rows even for a key that is re-inserted. Re-creating such a key `ON DELETE NO ACTION`

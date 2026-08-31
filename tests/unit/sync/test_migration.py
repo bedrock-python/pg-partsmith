@@ -69,7 +69,7 @@ def executor() -> MagicMock:
     executor = MagicMock()
 
     def create_partition(config: Any, plan: Any, op: Any, *, issues: Any, fill: Any = None) -> bool:
-        return True if fill is None else fill(op.target)
+        return True if fill is None else fill(op.target, getattr(op, "oid", None))
 
     executor.create_partition = MagicMock(side_effect=create_partition)
     executor.attach_partition = MagicMock(side_effect=create_partition)

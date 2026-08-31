@@ -85,7 +85,7 @@ class PartitionRepository(Protocol):
         partition_by: PartitionBy | None,
         *,
         physical: LocalLeaves | None = None,
-    ) -> None:
+    ) -> int:
         """Create a detached table shaped like ``template_name``.
 
         Args:
@@ -108,7 +108,7 @@ class PartitionRepository(Protocol):
         *,
         server: str,
         options: dict[str, str],
-    ) -> None:
+    ) -> int:
         """Create a detached foreign table with ``template_name``'s columns.
 
         Args:

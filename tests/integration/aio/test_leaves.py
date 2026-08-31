@@ -9,13 +9,16 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 
+from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import Period
-from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
 from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
 from pg_partsmith.lifecycle import CreateAhead, DropAfter, KeepNewest, LifecyclePolicy
 from pg_partsmith.plan import FindingReason
@@ -363,3 +366,44 @@ async def test__partition_data__foreign_leaves__drains_default_through_the_wrapp
     assert await is_attached(db_engine, leaf)
     assert int(await scalar(db_engine, f'SELECT count(*) FROM "{leaf}_remote"')) == 6  # noqa: S608
     assert int(await scalar(db_engine, f'SELECT count(*) FROM "{hist}"')) == 0  # noqa: S608
+
+
+# sync-mirror: skip
+async def test__partition_data__foreign_target_swapped_mid_fill__stale_and_nothing_moved(
+    db_engine: AsyncEngine, metrics: str, loopback: str
+) -> None:
+    # Arrange: history in DEFAULT; the planned foreign leaf is swapped for another mapping
+    hist = f"{metrics}_hist"
+    await exec_sql(db_engine, f'CREATE TABLE "{hist}" (LIKE "{metrics}" INCLUDING ALL)')
+    await exec_sql(
+        db_engine,
+        f"INSERT INTO \"{hist}\" SELECT make_timestamptz(2026, 8, 15, 12, 0, 0, 'UTC'), g "  # noqa: S608
+        f"FROM generate_series(1, 6) g",
+    )
+    await exec_sql(db_engine, f'ALTER TABLE "{metrics}" ATTACH PARTITION "{hist}" DEFAULT')
+    leaf = f"{metrics}__2026_08"
+    await _remote(db_engine, leaf)
+    original = PostgresPartitionRepository.reconcile_default_rows
+    swapped: list[str] = []
+
+    async def swapping(self: PostgresPartitionRepository, **kwargs: object) -> int:
+        if not swapped:
+            swapped.append(leaf)
+            async with db_engine.begin() as conn:
+                await conn.execute(text(f'ALTER FOREIGN TABLE "{leaf}" RENAME TO "{leaf}_hijacked"'))
+                await conn.execute(
+                    text(
+                        f'CREATE FOREIGN TABLE "{leaf}" (ts TIMESTAMPTZ NOT NULL, v DOUBLE PRECISION) '
+                        f"SERVER {loopback} OPTIONS (table_name '{leaf}_decoy')"
+                    )
+                )
+        return await original(self, **kwargs)  # type: ignore[arg-type]
+
+    # Act / Assert: a foreign target cannot be locked, so the move's own OID checks carry it
+    with (
+        patch.object(PostgresPartitionRepository, "reconcile_default_rows", swapping),
+        pytest.raises(PlanStaleError),
+    ):
+        await make_service(db_engine).partition_data(_foreign_config(metrics, loopback))
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{hist}"')) == 6  # noqa: S608
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{leaf}_remote"')) == 0  # noqa: S608

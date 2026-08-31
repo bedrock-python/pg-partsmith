@@ -109,10 +109,7 @@ class DataMover:
             moved_before = tally.rows_moved
             bounds = op.bounds
             assert isinstance(bounds, RangeBounds)
-            target_oid = op.oid if isinstance(op, AttachPartition) else None
-            fill = partial(
-                self._drain_window, default.name, root.key, bounds, batch_rows, tally, expected_target_oid=target_oid
-            )
+            fill = partial(self._drain_window, default.name, root.key, bounds, batch_rows, tally)
             try:
                 if isinstance(op, CreatePartition):
                     attached = self._executor.create_partition(config, plan, op, issues=tally.issues, fill=fill)
@@ -158,15 +155,15 @@ class DataMover:
         batch_rows: int,
         tally: _Tally,
         target: str,
-        *,
         expected_target_oid: int | None = None,
     ) -> bool:
         """Move a window's rows from DEFAULT into ``target``; False when the batch budget ran out first.
 
-        ``expected_target_oid`` pins a re-attached orphan's identity: every
-        batch verifies, under the target's lock and in the move's own
-        transaction, that the name still resolves to the relation the plan
-        chose before a row leaves DEFAULT.
+        ``expected_target_oid`` comes from the executor -- the OID it read in
+        the creating transaction, or the planned orphan's -- and every batch
+        verifies it in the move's own transaction before a row leaves
+        DEFAULT, and again after the statement for a target that cannot be
+        locked.
         """
         while not tally.exhausted:
             moved = self._repo.reconcile_default_rows(

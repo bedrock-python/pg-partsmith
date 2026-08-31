@@ -99,12 +99,12 @@ class PostgresPartitionRepository:
         partition_by: PartitionBy | None,
         *,
         physical: LocalLeaves | None = None,
-    ) -> None:
-        """Create a detached table shaped like ``template_name``.
+    ) -> int:
+        """Create a detached table shaped like ``template_name``; returns its OID.
 
         See :meth:`PartitionCreator.create_table_like`.
         """
-        self._creator.create_table_like(template_name, table_name, partition_by, physical=physical)
+        return self._creator.create_table_like(template_name, table_name, partition_by, physical=physical)
 
     def create_foreign_table_like(
         self,
@@ -113,12 +113,12 @@ class PostgresPartitionRepository:
         *,
         server: str,
         options: dict[str, str],
-    ) -> None:
-        """Create a detached foreign table with ``template_name``'s columns.
+    ) -> int:
+        """Create a detached foreign table with ``template_name``'s columns; returns its OID.
 
         See :meth:`PartitionCreator.create_foreign_table_like`.
         """
-        self._creator.create_foreign_table_like(template_name, table_name, server=server, options=options)
+        return self._creator.create_foreign_table_like(template_name, table_name, server=server, options=options)
 
     def attach_partition(
         self,

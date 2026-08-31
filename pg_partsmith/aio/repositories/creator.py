@@ -70,7 +70,7 @@ class PartitionCreator:
         partition_by: PartitionBy | None,
         *,
         physical: LocalLeaves | None = None,
-    ) -> None:
+    ) -> int:
         """Create a detached table shaped like ``template_name``.
 
         Standalone — ``LIKE`` the template, not ``PARTITION OF`` it — so this
@@ -119,6 +119,7 @@ class PartitionCreator:
                 raise
             if physical is not None and physical.inherit_privileges:
                 await self._inherit_privileges(conn, template_name, table_name)
+            return await self._created_oid(conn, table_name)
 
     async def create_foreign_table_like(
         self,
@@ -127,7 +128,7 @@ class PartitionCreator:
         *,
         server: str,
         options: dict[str, str],
-    ) -> None:
+    ) -> int:
         """Create a detached foreign table with ``template_name``'s columns.
 
         ``CREATE FOREIGN TABLE`` has no ``LIKE``, so the columns are read from
@@ -165,6 +166,7 @@ class PartitionCreator:
                 if pg_sqlstate(exc) == "42P07":  # duplicate_table
                     raise PartitionAlreadyExistsError(table_name) from exc
                 raise
+            return await self._created_oid(conn, table_name)
 
     async def _column_definitions(self, conn: AsyncConnection, table_name: str) -> list[tuple[str, str, bool]]:
         """Read ``(name, type, not_null)`` for every live column of a relation."""
@@ -274,6 +276,22 @@ class PartitionCreator:
             await self._require_oid(conn, partition_name, expected_oid)
             await self._clear_orphan_marker(conn, partition_name)
 
+    async def _created_oid(self, conn: AsyncConnection, table_name: str) -> int:
+        """The OID of the relation just created, read in the creating transaction.
+
+        Callers hold it through fills and the final ATTACH, so nothing that
+        takes over the name later can receive the rows or go live in the
+        created relation's stead.
+        """
+        result = await conn.execute(
+            text("SELECT c.oid FROM pg_class c WHERE c.oid = to_regclass(:name)"),
+            {"name": to_regclass_argument(table_name)},
+        )
+        value = result.scalar()
+        if value is None:  # pragma: no cover - the relation was created one statement ago
+            raise PartitionNotFoundError(table_name)
+        return int(value)
+
     async def _require_oid(self, conn: AsyncConnection, partition_name: str, expected_oid: int | None) -> None:
         """The relation holding the name is the one the caller decided about."""
         if expected_oid is None:
@@ -375,11 +393,18 @@ class PartitionCreator:
             if self._ddl_timezone is not None:
                 await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             await self._lock_for_move(conn, default_partition_name, target_partition_name)
-            await self._require_oid(conn, target_partition_name, expected_target_oid)
+            # Deferred foreign-key checks would otherwise escape to COMMIT,
+            # outside the per-statement translation below.
+            await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
             # All identifiers and literals are properly quoted, S608 is a false positive
             condition = f"{column_quoted} >= {from_quoted} AND {column_quoted} < {to_quoted}{not_null}"
             return await self._move(
-                conn, default_partition_name, target_partition_name, condition=condition, limit=limit
+                conn,
+                default_partition_name,
+                target_partition_name,
+                condition=condition,
+                limit=limit,
+                expected_target_oid=expected_target_oid,
             )
 
     async def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:
@@ -400,14 +425,18 @@ class PartitionCreator:
         """
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             await self._lock_for_move(conn, source_name, target_name)
+            await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
             return await self._move(conn, source_name, target_name, condition=None, limit=limit)
 
     async def move_rows_conn(self, conn: AsyncConnection, source_name: str, target_name: str) -> int:
         """Move every row of ``source_name`` into ``target_name`` on an open transaction.
 
         For callers that need the move and what follows it -- a drop, say --
-        to commit together. Locks are the caller's.
+        to commit together. Locks are the caller's; deferred foreign-key
+        checks are forced to statement time so a refusal surfaces here, not
+        at the caller's commit.
         """
+        await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
         return await self._move(conn, source_name, target_name, condition=None, limit=None)
 
     async def _lock_for_move(self, conn: AsyncConnection, *names: str) -> None:
@@ -422,9 +451,24 @@ class PartitionCreator:
                 await conn.execute(text(f"LOCK TABLE {quote_identifier(name)} IN SHARE ROW EXCLUSIVE MODE"))
 
     async def _move(
-        self, conn: AsyncConnection, source_name: str, target_name: str, *, condition: str | None, limit: int | None
+        self,
+        conn: AsyncConnection,
+        source_name: str,
+        target_name: str,
+        *,
+        condition: str | None,
+        limit: int | None,
+        expected_target_oid: int | None = None,
     ) -> int:
-        """Run one move statement once it is known to be safe."""
+        """Run one move statement once it is known to be safe.
+
+        ``expected_target_oid`` is checked before *and after* the statement:
+        the pre-check runs under whatever lock the caller took, and the
+        post-check covers a target that cannot be locked -- a foreign table --
+        by rolling the whole transaction back when the name changed hands, so
+        the rows never stay with a replacement.
+        """
+        await self._require_oid(conn, target_name, expected_target_oid)
         await self._refuse_referential_actions(conn, source_name)
         columns = await self._relation_columns(conn, source_name)
         # Both sides name their columns. ``RETURNING *`` emits the source's
@@ -461,6 +505,7 @@ class PartitionCreator:
                 "first, or drop the foreign key for the migration and re-create it afterwards",
             ) from exc
         moved = result.rowcount or 0
+        await self._require_oid(conn, target_name, expected_target_oid)
         if moved:
             await self._advance_identity_sequences(conn, target_name)
         return moved
@@ -479,22 +524,39 @@ class PartitionCreator:
         )
         columns = [coerce_str(row[0]) or "" for row in result.fetchall()]
         for column in columns:
-            maximum = (
+            increment = (
                 await conn.execute(
-                    _as_text(f"SELECT MAX({quote_identifier(column)}) FROM {quote_identifier(target_name)}")  # noqa: S608
+                    text(
+                        "SELECT s.seqincrement FROM pg_sequence s "
+                        "WHERE s.seqrelid = CAST(pg_get_serial_sequence(:table_name, :column) AS regclass)"
+                    ),
+                    {"table_name": to_regclass_argument(target_name), "column": column},
                 )
             ).scalar()
-            if maximum is None:
+            if increment is None:
+                continue
+            # A descending sequence must chase the *low* water mark; cycling
+            # sequences are left to their owner (setval keeps their declared
+            # range either way).
+            aggregate, combine = ("MAX", "GREATEST") if int(increment) >= 0 else ("MIN", "LEAST")
+            extreme = (
+                await conn.execute(
+                    _as_text(
+                        f"SELECT {aggregate}({quote_identifier(column)}) FROM {quote_identifier(target_name)}"  # noqa: S608
+                    )
+                )
+            ).scalar()
+            if extreme is None:
                 continue
             await conn.execute(
                 text(
-                    "SELECT setval(seq.oid, GREATEST(CAST(:maximum AS bigint), "
-                    "COALESCE(pg_sequence_last_value(seq.oid), CAST(:maximum AS bigint)))) "
+                    f"SELECT setval(seq.oid, {combine}(CAST(:extreme AS bigint), "  # noqa: S608
+                    "COALESCE(pg_sequence_last_value(seq.oid), CAST(:extreme AS bigint)))) "
                     "FROM CAST(CAST(pg_get_serial_sequence(:table_name, :column) AS regclass) AS oid) AS seq(oid) "
                     "WHERE pg_get_serial_sequence(:table_name, :column) IS NOT NULL"
                 ),
                 {
-                    "maximum": int(maximum),
+                    "extreme": int(extreme),
                     "table_name": to_regclass_argument(target_name),
                     "column": column,
                 },
@@ -504,11 +566,13 @@ class PartitionCreator:
         """Refuse a move that a foreign key's ``ON DELETE`` action would turn into data loss.
 
         The move is one statement: ``DELETE ... RETURNING`` into ``INSERT``.
-        PostgreSQL's NO ACTION check runs at the end of it, finds the row in
-        its new partition and passes; RESTRICT refuses the statement, which is
-        safe. CASCADE, SET NULL and SET DEFAULT act on the DELETE alone and
-        would delete or rewrite the referencing rows while the moved row lives
-        on -- verified on PostgreSQL 15, 16 and 17.
+        CASCADE, SET NULL and SET DEFAULT act on the DELETE alone and would
+        delete or rewrite the referencing rows while the moved row lives on,
+        so they are refused up front. NO ACTION and RESTRICT stay allowed:
+        unreferenced rows move freely, and a *referenced* row fails the
+        statement atomically (the moved row is outside the referenced tree
+        when the check runs -- see ``_move``), which the caller receives as
+        :class:`RowMoveRefusedError`. Verified on PostgreSQL 15, 16 and 17.
         """
         result = await conn.execute(
             text(DESTRUCTIVE_INCOMING_FOREIGN_KEYS_SQL), {"table_name": to_regclass_argument(source_name)}

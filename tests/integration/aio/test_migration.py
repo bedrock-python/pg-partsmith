@@ -568,3 +568,94 @@ async def test__partition_data__orphan_swapped_during_the_fill__stale_not_misfil
     ):
         await service.partition_data(config)
     assert await _count(db_engine, events) == 4  # every row still in DEFAULT, visible through the root
+
+
+async def test__partition_data__deferred_foreign_key_with_referenced_rows__refused_row_safe(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange: the check would otherwise wait for COMMIT, outside any statement handler
+    await _default_with_rows(db_engine, events, months=(3,), per_month=4)
+    ref = f"{events}_defer"
+    await exec_sql(
+        db_engine,
+        f'CREATE TABLE "{ref}" (event_id BIGINT, created_at TIMESTAMPTZ, '
+        f'FOREIGN KEY (event_id, created_at) REFERENCES "{events}" (id, created_at) '
+        f"DEFERRABLE INITIALLY DEFERRED)",
+    )
+    await exec_sql(db_engine, f'INSERT INTO "{ref}" SELECT id, created_at FROM "{events}" LIMIT 1')  # noqa: S608
+
+    # Act
+    result = await make_service(db_engine).partition_data(monthly_config(events, create_ahead=1))
+
+    # Assert: SET CONSTRAINTS ALL IMMEDIATE pulls the refusal into the statement, translated
+    assert not result.complete
+    assert any("still referenced" in issue.error for issue in result.issues)
+    assert await _count(db_engine, events) == 4
+    assert await _count(db_engine, ref) == 1
+
+
+async def test__unpartition__into_a_descending_identity_table__the_next_ordinary_insert_succeeds(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    # Arrange: ids 0, -1, -2 come through the tree; the destination counts downwards
+    legacy = f"{ledger}_legacy"
+    await exec_sql(db_engine, f'CREATE TABLE "{legacy}" (LIKE "{ledger}" INCLUDING ALL EXCLUDING IDENTITY)')
+    await exec_sql(
+        db_engine,
+        f'INSERT INTO "{legacy}" (id, tenant_id, created_at, amount) '  # noqa: S608
+        f"SELECT 1 - g, 1, make_timestamptz(2026, 4, g, 12, 0, 0, 'UTC'), g FROM generate_series(1, 3) g",
+    )
+    await exec_sql(db_engine, f'ALTER TABLE "{ledger}" ATTACH PARTITION "{legacy}" DEFAULT')
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = f"{ledger}_ndest"
+    await exec_sql(
+        db_engine,
+        f'CREATE TABLE "{dest}" ('
+        "id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 0 INCREMENT BY -1 MAXVALUE 0), "
+        "tenant_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL, "
+        "amount NUMERIC NOT NULL DEFAULT 0, doubled NUMERIC GENERATED ALWAYS AS (amount * 2) STORED)",
+    )
+
+    # Act
+    result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+    await exec_sql(
+        db_engine,
+        f"INSERT INTO \"{dest}\" (tenant_id, created_at, amount) VALUES (1, '2026-05-01T00:00:00+00:00', 9)",  # noqa: S608
+    )
+
+    # Assert: the sequence chased the LOW water mark, so the next id is -3
+    assert result.complete
+    assert result.rows_moved == 3
+    assert int(await scalar(db_engine, f'SELECT min(id) FROM "{dest}"')) == -3  # noqa: S608
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 4  # noqa: S608
+
+
+# sync-mirror: skip
+async def test__partition_data__created_target_swapped_during_the_fill__stale_not_misfilled(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange: the very relation partition_data just created is renamed away mid-fill
+    await _default_with_rows(db_engine, events, months=(3,), per_month=4)
+    config = monthly_config(events, create_ahead=1)
+    service = make_service(db_engine)
+    original = PostgresPartitionRepository.reconcile_default_rows
+    swapped: list[str] = []
+
+    async def swapping(self: PostgresPartitionRepository, **kwargs: object) -> int:
+        target = str(kwargs["target_partition_name"]).split(".")[-1]
+        if not swapped:
+            swapped.append(target)
+            async with db_engine.begin() as conn:
+                await conn.execute(text(f'ALTER TABLE "{target}" RENAME TO "{target}_hijacked"'))
+                await conn.execute(text(f'CREATE TABLE "{target}" (LIKE "{events}" INCLUDING ALL)'))
+        return await original(self, **kwargs)  # type: ignore[arg-type]
+
+    # Act / Assert: the fill batch verifies the OID captured at creation and fails closed
+    with (
+        patch.object(PostgresPartitionRepository, "reconcile_default_rows", swapping),
+        pytest.raises(PlanStaleError),
+    ):
+        await service.partition_data(config)
+    assert await _count(db_engine, events) == 4
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{swapped[0]}"')) == 0  # noqa: S608

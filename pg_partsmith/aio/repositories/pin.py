@@ -30,16 +30,18 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-# The pin may be released once the statement holds the relation by OID: its
-# ACCESS EXCLUSIVE request is queued on the partition (behind the pin), or the
-# pending flag is already committed. Lock queues are ordered, so from that
-# moment a swap can only make the statement fail on a vanished OID -- it can
-# never redirect it to a replacement.
+# The pin may be released once the statement holds the relation by OID: *its
+# own backend's* ACCESS EXCLUSIVE request is queued on the partition (behind
+# the pin), or the pending flag is already committed. Lock queues are ordered,
+# so from that moment a swap can only make the statement fail on a vanished
+# OID -- it can never redirect it. Scoping to the statement's pid keeps a
+# bystander's queued lock from releasing the pin early.
 _RELEASE_SQL = (
     "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'relation' AND relation = CAST(:oid AS oid) "
-    "AND mode = 'AccessExclusiveLock' AND NOT granted) "
+    "AND mode = 'AccessExclusiveLock' AND NOT granted AND pid = CAST(:pid AS int)) "
     "OR EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = CAST(:oid AS oid) AND inhdetachpending)"
 )
+_PENDING_ONLY_SQL = "SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = CAST(:oid AS oid) AND inhdetachpending)"
 
 
 async def detach_concurrently_pinned(
@@ -51,6 +53,7 @@ async def detach_concurrently_pinned(
     verify: Callable[[AsyncConnection], Awaitable[None]],
     mark: Callable[[], Awaitable[None]],
     statement: Callable[[], Awaitable[bool]],
+    statement_pid: Callable[[], int | None],
 ) -> bool:
     """Run one pinned ``DETACH … CONCURRENTLY``; the return value is ``statement``'s.
 
@@ -68,7 +71,11 @@ async def detach_concurrently_pinned(
         run = asyncio.ensure_future(statement())
         try:
             while not run.done():
-                release = (await holder.execute(text(_RELEASE_SQL), {"oid": expected_oid})).scalar()
+                pid = statement_pid()
+                if pid is None:
+                    release = (await holder.execute(text(_PENDING_ONLY_SQL), {"oid": expected_oid})).scalar()
+                else:
+                    release = (await holder.execute(text(_RELEASE_SQL), {"oid": expected_oid, "pid": pid})).scalar()
                 if release:
                     break
                 # Each poll is a real round trip, which is both the pacing and

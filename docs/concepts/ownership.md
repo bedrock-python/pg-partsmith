@@ -103,7 +103,11 @@ form, which cannot run inside a transaction, holds the relation with a **pin** �
 under which the identity is verified and the marker written — released only once the
 statement itself is queued for the partition, from where a swap can only make it fail.
 `DROP` is never issued with `CASCADE`, so a drop that would take something else with it
-fails instead.
+fails instead. The same identity discipline covers creation: the OID of a relation the
+library just created is read in the creating transaction and held through its fill and
+its attach, and a finalize of an interrupted detach runs its lock, checks, marker and
+statement in one transaction — a relation swapped in at any of those names fails stale
+instead of receiving rows, a marker, or a place in the tree.
 
 ## What the library will never do
 

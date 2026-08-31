@@ -650,6 +650,7 @@ def test__apply__default_conflict_on_range_attach__moves_rows_and_retries(
         key_columns=("created_at",),
         from_value="2024-04-01",
         to_value="2024-05-01",
+        expected_target_oid=None,
     )
     assert repo.attach_partition.call_count == 2
     assert result.created_count == 1
@@ -1629,7 +1630,7 @@ def test__create_partition__fill_runs_between_the_build_and_the_attach(
     # Arrange
     order = _record_ddl(repo)
 
-    def fill(target: str) -> bool:
+    def fill(target: str, oid: int | None) -> bool:
         order.append(f"fill {target}")
         return True
 
@@ -1646,7 +1647,7 @@ def test__create_partition__fill_declines__relation_stays_detached_and_no_after_
     executor: PlanExecutor, repo: MagicMock, hooks: _RecordingHooks
 ) -> None:
     # Arrange
-    def fill(target: str) -> bool:
+    def fill(target: str, oid: int | None) -> bool:
         return False
 
     # Act
@@ -1667,7 +1668,7 @@ def test__create_partition__relation_already_attached__fill_is_skipped(
     metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
     filled: list[str] = []
 
-    def fill(target: str) -> bool:
+    def fill(target: str, oid: int | None) -> bool:
         filled.append(target)
         return True
 
@@ -1689,7 +1690,7 @@ def test__create_partition__relation_exists_detached__fill_runs_before_it_is_att
     metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", is_attached=False)
     filled: list[str] = []
 
-    def fill(target: str) -> bool:
+    def fill(target: str, oid: int | None) -> bool:
         filled.append(target)
         return True
 
@@ -1756,7 +1757,7 @@ def test__attach_partition__fill_returns_false__stays_detached(
     op = _attach_op(oid=9)
     seen: list[str] = []
 
-    def fill(name: str) -> bool:
+    def fill(name: str, oid: int | None) -> bool:
         seen.append(name)
         return False
 
@@ -1777,7 +1778,7 @@ def test__attach_partition__fill_returns_true__is_attached(
     metadata.get_partition_tree.return_value = None
     op = _attach_op(oid=9)
 
-    def fill(name: str) -> bool:
+    def fill(name: str, oid: int | None) -> bool:
         return True
 
     # Act
