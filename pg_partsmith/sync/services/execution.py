@@ -210,11 +210,17 @@ class PlanExecutor:
         tally: _Tally,
         issues: list[MaintenanceIssue],
         fill: Callable[[str, int | None], bool] | None = None,
+        expected_parent_oid: int | None = None,
     ) -> bool:
         """Create one partition with its subtree, then attach it.
 
         ``depth`` is the index into ``config.levels`` of the level the new
         partition belongs to: the root's own partitions are at depth 0.
+        ``expected_parent_oid`` is the identity of the relation this one goes
+        into, when the caller created it and is holding it: the attach
+        verifies it under its own locks, so a branch replaced while its
+        subtree is being built never gains the children.
+
         Returns whether the partition ended up attached.
         """
         fires_hooks = op.counts_as == "created"
@@ -223,7 +229,7 @@ class PlanExecutor:
             self._run_hooks(lambda h: h.before_create(config, info), "before_create", partition_name=op.target)
 
         try:
-            target_oid: int | None = self._materialize(config, op)
+            target_oid = self._require_identity(op.target, self._materialize(config, op))
         except PartitionAlreadyExistsError:
             # The relation exists but the plan did not see it attached: either
             # a previous run stopped between creating it and attaching it, or
@@ -240,18 +246,36 @@ class PlanExecutor:
             )
             # The identity is acquired here, once, and held through the fill
             # and the attach: whatever takes over the name later fails stale
-            # instead of receiving the rows or going live.
-            target_oid = self._metadata.get_relation_oid(op.target)
-            tally.repaired += self._converge_detached(config, plan, op, depth=depth, issues=issues)
+            # instead of receiving the rows or going live. A name that resolves
+            # to nothing is stale in itself -- never a licence to carry on
+            # addressing it by name.
+            target_oid = self._require_identity(op.target, self._metadata.get_relation_oid(op.target))
+            tally.repaired += self._converge_detached(
+                config, plan, op, depth=depth, issues=issues, parent_oid=target_oid
+            )
         else:
             for child in op.children:
-                self._create(config, plan, child, depth=depth + 1, tally=tally, issues=issues)
+                self._create(
+                    config,
+                    plan,
+                    child,
+                    depth=depth + 1,
+                    tally=tally,
+                    issues=issues,
+                    expected_parent_oid=target_oid,
+                )
 
         if fill is not None and not fill(op.target, target_oid):
             return False
 
         self._attach_with_reconcile(
-            config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns, expected_oid=target_oid
+            config,
+            op.parent_name,
+            op.target,
+            op.bounds,
+            key_columns=op.key_columns,
+            expected_oid=target_oid,
+            expected_parent_oid=expected_parent_oid,
         )
 
         if op.counts_as == "created":
@@ -263,6 +287,20 @@ class PlanExecutor:
             attached = info.model_copy(update={"is_attached": True})
             self._run_hooks(lambda h: h.after_create(config, attached), "after_create", partition_name=op.target)
         return True
+
+    def _require_identity(self, name: str, oid: int | None) -> int:
+        """The relation's OID, or a stale plan.
+
+        Every destructive or filling step addresses relations by name and
+        checks this identity underneath; a name that resolves to nothing has
+        already changed hands, so carrying on unprotected is never the answer.
+        """
+        if oid is not None:
+            return oid
+        resolved = self._metadata.get_relation_oid(name)
+        if resolved is None:
+            raise PlanStaleError(name, "the relation does not exist, so its identity cannot be held")
+        return resolved
 
     def _materialize(self, config: TablePartitionConfig, op: CreatePartition) -> int | None:
         """Create the relation ``op`` describes, detached, as the leaf backend says.
@@ -297,6 +335,7 @@ class PlanExecutor:
         *,
         depth: int,
         issues: list[MaintenanceIssue],
+        parent_oid: int | None = None,
     ) -> int:
         """Complete the subtree of a detached relation before it goes live.
 
@@ -331,7 +370,9 @@ class PlanExecutor:
             # they count as such and, like every other repair, fire no hooks.
             repair = child.model_copy(update={"counts_as": "repaired"})
             nested = _Tally()
-            self._create(config, plan, repair, depth=depth + 1, tally=nested, issues=issues)
+            self._create(
+                config, plan, repair, depth=depth + 1, tally=nested, issues=issues, expected_parent_oid=parent_oid
+            )
             created += child.count()
         return created
 
@@ -393,35 +434,44 @@ class PlanExecutor:
         *,
         key_columns: tuple[str, ...],
         expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
     ) -> None:
         """Attach a partition, moving DEFAULT rows out of the way for a RANGE window.
 
         If the attach ultimately fails after rows were reconciled out of the
         DEFAULT partition, the moved rows are returned to DEFAULT (best effort)
         so they do not end up stranded in a table that is invisible through the
-        parent. A lost race with another worker that attached the same
+        parent -- and both ends of that compensating move are pinned to the
+        identities the reconciliation used, so a relation swapped in at either
+        name leaves the rows in the verified partition instead of handing them
+        to a stranger. A lost race with another worker that attached the same
         partition first is benign; the same name attached with other bounds is
         a conflict.
         """
         key_arity = max(1, len(key_columns))
-        reconciled_from: str | None = None
+        reconciled_from: tuple[str, int | None] | None = None
         window = bounds if isinstance(bounds, RangeBounds) else None
 
         for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
                 self._repo.attach_partition(
-                    parent_name, partition_name, bounds, key_arity=key_arity, expected_oid=expected_oid
+                    parent_name,
+                    partition_name,
+                    bounds,
+                    key_arity=key_arity,
+                    expected_oid=expected_oid,
+                    expected_parent_oid=expected_parent_oid,
                 )
             except (KeyboardInterrupt, SystemExit):
                 # Shielded so the compensating move-back completes even mid-cancellation.
-                (self._restore_reconciled_rows(reconciled_from, partition_name, window, key_columns))
+                (self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns))
                 raise
             except (OSError, TimeoutError):
-                self._restore_reconciled_rows(reconciled_from, partition_name, window, key_columns)
+                self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                 raise
             except SQLAlchemyError as exc:
                 if pg_sqlstate(exc) in ATTACH_CONFLICT_SQLSTATES:
-                    self._restore_reconciled_rows(reconciled_from, partition_name, window, key_columns)
+                    self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                     if self._metadata.is_partition_attached(parent_name, partition_name):
                         self._require_planned_bounds(parent_name, partition_name, bounds)
                         logger.debug(
@@ -432,7 +482,7 @@ class PlanExecutor:
                     raise
 
                 if not is_default_partition_conflict(exc):
-                    self._restore_reconciled_rows(reconciled_from, partition_name, window, key_columns)
+                    self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                     raise
 
                 if window is None:
@@ -452,7 +502,7 @@ class PlanExecutor:
                         "Failed to attach after reconciliation retries",
                         extra={"partition_name": partition_name, "attempts": attempt},
                     )
-                    self._restore_reconciled_rows(reconciled_from, partition_name, window, key_columns)
+                    self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                     raise
 
                 default_partition = self._metadata.get_default_partition(parent_name)
@@ -461,7 +511,7 @@ class PlanExecutor:
                         "DEFAULT conflict detected but no DEFAULT partition found",
                         extra={"partition_name": partition_name},
                     )
-                    self._restore_reconciled_rows(reconciled_from, partition_name, window, key_columns)
+                    self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                     raise
 
                 logger.info(
@@ -479,6 +529,7 @@ class PlanExecutor:
                         key_columns=key_columns,
                         from_value=window.from_value,
                         to_value=window.to_value,
+                        expected_source_oid=default_partition.oid,
                         expected_target_oid=expected_oid,
                     )
                 except PlanStaleError:
@@ -501,15 +552,16 @@ class PlanExecutor:
                         f"belong to it, and they cannot be moved: {refusal.detail}",
                     ) from refusal
                 if moved:
-                    reconciled_from = default_partition.name
+                    reconciled_from = (default_partition.name, default_partition.oid)
                 logger.info("Reconciliation completed", extra={"partition_name": partition_name, "moved_rows": moved})
             else:
                 return
 
     def _restore_reconciled_rows(
         self,
-        default_partition_name: str | None,
+        reconciled_from: tuple[str, int | None] | None,
         partition_name: str,
+        partition_oid: int | None,
         window: RangeBounds | None,
         key_columns: tuple[str, ...],
     ) -> None:
@@ -517,11 +569,16 @@ class PlanExecutor:
 
         Reconciliation commits independently of ATTACH, so a final attach
         failure would otherwise leave the moved rows in a standalone table
-        that no query against the parent can see. Failures here are logged,
-        never raised, so the original attach error stays the primary one.
+        that no query against the parent can see. Both ends are pinned to the
+        identities the reconciliation itself used: if either name has since
+        changed hands, the move is refused and the rows stay in the partition
+        whose OID is known, rather than being handed to a replacement.
+        Failures here are logged, never raised, so the original attach error
+        stays the primary one.
         """
-        if default_partition_name is None or window is None:
+        if reconciled_from is None or window is None:
             return
+        default_partition_name, default_partition_oid = reconciled_from
         try:
             restored = self._repo.reconcile_default_rows(
                 default_partition_name=partition_name,
@@ -529,6 +586,8 @@ class PlanExecutor:
                 key_columns=key_columns,
                 from_value=window.from_value,
                 to_value=window.to_value,
+                expected_source_oid=partition_oid,
+                expected_target_oid=default_partition_oid,
             )
         except (KeyboardInterrupt, SystemExit):
             raise

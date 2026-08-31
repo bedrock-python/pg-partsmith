@@ -6,8 +6,10 @@ the marker is written under the pin, the statement runs on its own connection
 in a worker thread, and the pin is released once the statement is queued for
 the partition's lock (or the pending flag is committed) -- from there a swap
 can only make the statement fail on a vanished OID, never redirect it. The
-poll paces itself on real round trips; the deadline is a belt, since the
-statement carries its own server-side timeout.
+poll paces itself on real round trips. A deadline bounds the wait, but it
+cancels the statement's backend and waits for the worker before the pin goes:
+releasing it under a statement that is still to run would leave a
+name-addressed ``DETACH`` free to fire at whatever holds the name by then.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ _RELEASE_SQL = (
     "OR EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = CAST(:oid AS oid) AND inhdetachpending)"
 )
 _PENDING_ONLY_SQL = "SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = CAST(:oid AS oid) AND inhdetachpending)"
+_CANCEL_SQL = "SELECT pg_cancel_backend(CAST(:pid AS int))"
 
 
 def detach_concurrently_pinned(
@@ -63,9 +66,19 @@ def detach_concurrently_pinned(
                         release = holder.execute(text(_PENDING_ONLY_SQL), {"oid": expected_oid}).scalar()
                     else:
                         release = holder.execute(text(_RELEASE_SQL), {"oid": expected_oid, "pid": pid}).scalar()
-                    if release or time.monotonic() > deadline:
+                    if release:
+                        break
+                    if time.monotonic() > deadline:
+                        # Cancel the statement and wait for the worker rather
+                        # than releasing the pin under it; the statement's own
+                        # server-side timeout bounds the wait when its backend
+                        # is not known yet.
+                        if pid is not None:
+                            holder.execute(text(_CANCEL_SQL), {"pid": pid})
+                        run.result()
                         break
             finally:
-                # Release the pin so the statement can take its lock and finish.
+                # Release the pin: from here the statement either holds the
+                # relation by OID or is finished.
                 holder.rollback()
             return run.result()

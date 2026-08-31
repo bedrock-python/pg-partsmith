@@ -128,12 +128,20 @@ class PostgresPartitionRepository:
         *,
         key_arity: int = 1,
         expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
     ) -> None:
         """Attach a table to a partitioned parent.
 
         See :meth:`PartitionCreator.attach`.
         """
-        self._creator.attach(parent_name, partition_name, bounds, key_arity=key_arity, expected_oid=expected_oid)
+        self._creator.attach(
+            parent_name,
+            partition_name,
+            bounds,
+            key_arity=key_arity,
+            expected_oid=expected_oid,
+            expected_parent_oid=expected_parent_oid,
+        )
 
     def detach_partition(
         self,
@@ -175,6 +183,7 @@ class PostgresPartitionRepository:
         from_value: str,
         to_value: str,
         limit: int | None = None,
+        expected_source_oid: int | None = None,
         expected_target_oid: int | None = None,
     ) -> int:
         """Move rows from a DEFAULT partition to the partition for a window.
@@ -188,6 +197,7 @@ class PostgresPartitionRepository:
             from_value=from_value,
             to_value=to_value,
             limit=limit,
+            expected_source_oid=expected_source_oid,
             expected_target_oid=expected_target_oid,
         )
 

@@ -15,6 +15,7 @@ from pg_partsmith.catalog_queries import (
     RELATION_HAS_IDENTITY_ALWAYS_SQL,
     RELATION_IDENTITY_COLUMNS_SQL,
     RELATION_PRIVILEGES_SQL,
+    SEQUENCE_PARAMETERS_SQL,
 )
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
@@ -225,6 +226,7 @@ class PartitionCreator:
         *,
         key_arity: int = 1,
         expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
     ) -> None:
         """Attach a table to a partitioned parent.
 
@@ -259,10 +261,15 @@ class PartitionCreator:
                 took, in the same transaction -- a relation swapped in under
                 the name rolls the whole attach back (``PlanStaleError``)
                 instead of going live in the planned one's stead.
+            expected_parent_oid: The identity of the relation this partition
+                should go into, checked the same way under the SHARE UPDATE
+                EXCLUSIVE lock ATTACH takes on it -- so a branch this library
+                created and then had replaced never gains children in the
+                planned one's stead.
 
         Raises:
-            PlanStaleError: If the relation holding the name is not the one
-                ``expected_oid`` identifies; nothing stays attached.
+            PlanStaleError: If either name is not held by the relation the
+                caller decided about; nothing stays attached.
         """
         clause, values = _values_clause(bounds, key_arity)
         stmt = build_ddl_statement(
@@ -275,8 +282,11 @@ class PartitionCreator:
             apply_local_statement_timeout(conn, self._ddl_timeout)
             if isinstance(bounds, RangeBounds) and self._ddl_timezone is not None:
                 conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
+            self._require_oid(conn, parent_name, expected_parent_oid)
             conn.execute(stmt)
+            # Under ATTACH's own locks now: what these see is what went live.
             self._require_oid(conn, partition_name, expected_oid)
+            self._require_oid(conn, parent_name, expected_parent_oid)
             self._clear_orphan_marker(conn, partition_name)
 
     def _created_oid(self, conn: Connection, table_name: str) -> int:
@@ -355,6 +365,7 @@ class PartitionCreator:
         from_value: str,
         to_value: str,
         limit: int | None = None,
+        expected_source_oid: int | None = None,
         expected_target_oid: int | None = None,
     ) -> int:
         """Move conflicting rows from DEFAULT partition to target partition.
@@ -367,6 +378,9 @@ class PartitionCreator:
             to_value: Range end boundary (exclusive).
             limit: Move at most this many rows; None moves every row of the
                 window in one statement.
+            expected_source_oid: The identity of the relation the rows should
+                come from, checked the same way -- what a compensating move
+                back into DEFAULT needs, where both names matter.
             expected_target_oid: The identity of the relation the rows should
                 land in, checked under the target's lock in the move's own
                 transaction -- a target swapped at its name refuses the batch
@@ -408,6 +422,7 @@ class PartitionCreator:
                 target_partition_name,
                 condition=condition,
                 limit=limit,
+                expected_source_oid=expected_source_oid,
                 expected_target_oid=expected_target_oid,
             )
 
@@ -463,16 +478,18 @@ class PartitionCreator:
         *,
         condition: str | None,
         limit: int | None,
+        expected_source_oid: int | None = None,
         expected_target_oid: int | None = None,
     ) -> int:
         """Run one move statement once it is known to be safe.
 
-        ``expected_target_oid`` is checked before *and after* the statement:
-        the pre-check runs under whatever lock the caller took, and the
-        post-check covers a target that cannot be locked -- a foreign table --
-        by rolling the whole transaction back when the name changed hands, so
-        the rows never stay with a replacement.
+        Both identities are checked before *and after* the statement: the
+        pre-checks run under whatever locks the caller took, and the
+        post-checks cover a relation that cannot be locked -- a foreign table
+        -- by rolling the whole transaction back when a name changed hands, so
+        rows are never taken from, or handed to, a replacement.
         """
+        self._require_oid(conn, source_name, expected_source_oid)
         self._require_oid(conn, target_name, expected_target_oid)
         self._refuse_referential_actions(conn, source_name)
         columns = self._relation_columns(conn, source_name)
@@ -510,60 +527,99 @@ class PartitionCreator:
                 "first, or drop the foreign key for the migration and re-create it afterwards",
             ) from exc
         moved = result.rowcount or 0
+        self._require_oid(conn, source_name, expected_source_oid)
         self._require_oid(conn, target_name, expected_target_oid)
         if moved:
             self._advance_identity_sequences(conn, target_name)
         return moved
 
     def _advance_identity_sequences(self, conn: Connection, target_name: str) -> None:
-        """Advance the target's identity sequences past the values a move brought in.
+        """Keep the target's identity sequences from reissuing the values a move brought in.
 
         ``OVERRIDING SYSTEM VALUE`` preserves the moved ids but leaves the
-        backing sequence where it was, so the target's next ordinary INSERT
-        would draw an id a moved row already owns. Runs in the move's
-        transaction, under the target's lock; a pre-existing higher sequence
-        position is kept (``GREATEST``).
+        backing sequence where it was, so the sequence may still be about to
+        issue an id a moved row already owns. Only values the sequence can
+        actually still reach matter: on its own path (``next + k *
+        increment``), on the side it advances towards, and inside its declared
+        range. When such a value exists the sequence is set past the furthest
+        one; when none does, the sequence is left alone -- an id off its path
+        or outside its range can never collide.
+
+        A configuration where that is not enough refuses the move instead of
+        leaving a destination that cannot take its next ordinary insert: a
+        cycling sequence comes back around to the moved values, and a sequence
+        whose remaining path is entirely consumed by them has nothing left to
+        issue. Runs in the move's transaction, so a refusal rolls the move
+        back with it.
         """
         result = conn.execute(text(RELATION_IDENTITY_COLUMNS_SQL), {"table_name": to_regclass_argument(target_name)})
-        columns = [coerce_str(row[0]) or "" for row in result.fetchall()]
-        for column in columns:
-            increment = (
-                conn.execute(
-                    text(
-                        "SELECT s.seqincrement FROM pg_sequence s "
-                        "WHERE s.seqrelid = CAST(pg_get_serial_sequence(:table_name, :column) AS regclass)"
-                    ),
-                    {"table_name": to_regclass_argument(target_name), "column": column},
-                )
-            ).scalar()
-            if increment is None:
-                continue
-            # A descending sequence must chase the *low* water mark; cycling
-            # sequences are left to their owner (setval keeps their declared
-            # range either way).
-            aggregate, combine = ("MAX", "GREATEST") if int(increment) >= 0 else ("MIN", "LEAST")
-            extreme = (
-                conn.execute(
-                    _as_text(
-                        f"SELECT {aggregate}({quote_identifier(column)}) FROM {quote_identifier(target_name)}"  # noqa: S608
-                    )
-                )
-            ).scalar()
-            if extreme is None:
-                continue
+        for row in result.fetchall():
+            column = coerce_str(row[0]) or ""
+            self._advance_identity_sequence(conn, target_name, column)
+
+    def _advance_identity_sequence(self, conn: Connection, target_name: str, column: str) -> None:
+        """Synchronise one identity column's sequence, or refuse the move."""
+        parameters = (
             conn.execute(
-                text(
-                    f"SELECT setval(seq.oid, {combine}(CAST(:extreme AS bigint), "  # noqa: S608
-                    "COALESCE(pg_sequence_last_value(seq.oid), CAST(:extreme AS bigint)))) "
-                    "FROM CAST(CAST(pg_get_serial_sequence(:table_name, :column) AS regclass) AS oid) AS seq(oid) "
-                    "WHERE pg_get_serial_sequence(:table_name, :column) IS NOT NULL"
-                ),
-                {
-                    "extreme": int(extreme),
-                    "table_name": to_regclass_argument(target_name),
-                    "column": column,
-                },
+                text(SEQUENCE_PARAMETERS_SQL),
+                {"table_name": to_regclass_argument(target_name), "column": column},
             )
+        ).first()
+        if parameters is None:  # pragma: no cover - an identity column always owns a sequence
+            return
+
+        increment = int(parameters.increment)
+        minimum, maximum = int(parameters.minimum), int(parameters.maximum)
+        last = parameters.last_value
+        # The next value the sequence would issue: its start until it has been
+        # read once, one increment past the last value afterwards.
+        upcoming = int(parameters.start_value) if last is None else int(last) + increment
+        ascending = increment > 0
+
+        # The furthest value the sequence could still reach that a row already
+        # owns. ``BETWEEN`` bounds it to the declared range; the modulus keeps
+        # to the values the sequence actually lands on.
+        aggregate = "MAX" if ascending else "MIN"
+        ahead = ">=" if ascending else "<="
+        # Every identifier is quoted and every number is a catalog integer
+        # rendered with ``:d``; ``_as_text`` escapes the colons an identifier
+        # may carry, which is why the numbers are formatted rather than bound.
+        quoted_column, quoted_target = quote_identifier(column), quote_identifier(target_name)
+        collision = (
+            conn.execute(
+                _as_text(
+                    f"SELECT {aggregate}({quoted_column}) FROM {quoted_target} "  # noqa: S608
+                    f"WHERE {quoted_column} BETWEEN {minimum:d} AND {maximum:d} "
+                    f"AND {quoted_column} {ahead} {upcoming:d} "
+                    f"AND ({quoted_column} - {upcoming:d}) % {increment:d} = 0"
+                )
+            )
+        ).scalar()
+        if collision is None:
+            return
+
+        sequence_name = f"the identity sequence of {target_name}.{column}"
+        if parameters.cycles:
+            raise RowMoveRefusedError(
+                target_name,
+                f"{sequence_name} cycles, so it would come back around to the ids these rows carry and hand "
+                "one out again; move into a destination whose identity does not cycle, or take the identity "
+                "off the column for the migration",
+            )
+        beyond = int(collision) + increment
+        if beyond > maximum or beyond < minimum:
+            raise RowMoveRefusedError(
+                target_name,
+                f"{sequence_name} would have nothing left to issue: every value it can still reach is already "
+                f"carried by a row (its range is {minimum}..{maximum}); give the destination a wider range, or "
+                "take the identity off the column for the migration",
+            )
+        conn.execute(
+            text(
+                "SELECT setval(CAST(pg_get_serial_sequence(:table_name, :column) AS regclass), CAST(:value AS bigint))"
+            ),
+            {"table_name": to_regclass_argument(target_name), "column": column, "value": int(collision)},
+        )
 
     def _refuse_referential_actions(self, conn: Connection, source_name: str) -> None:
         """Refuse a move that a foreign key's ``ON DELETE`` action would turn into data loss.

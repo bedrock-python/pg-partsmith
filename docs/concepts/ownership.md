@@ -104,10 +104,14 @@ under which the identity is verified and the marker written — released only on
 statement itself is queued for the partition, from where a swap can only make it fail.
 `DROP` is never issued with `CASCADE`, so a drop that would take something else with it
 fails instead. The same identity discipline covers creation: the OID of a relation the
-library just created is read in the creating transaction and held through its fill and
-its attach, and a finalize of an interrupted detach runs its lock, checks, marker and
-statement in one transaction — a relation swapped in at any of those names fails stale
-instead of receiving rows, a marker, or a place in the tree.
+library just created is read in the creating transaction and held through its fill, its
+subtree and its attach — children are attached only into the branch that OID names, and
+a relation whose name resolves to nothing at recovery time is stale, never a licence to
+carry on by name. A finalize of an interrupted detach runs its lock, checks, marker and
+statement in one transaction, and a compensating move back into a DEFAULT partition
+checks *both* ends against the identities the reconciliation used. Whatever is swapped in
+at any of those names fails stale instead of receiving rows, a marker, or a place in the
+tree.
 
 ## What the library will never do
 

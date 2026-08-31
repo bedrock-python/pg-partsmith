@@ -117,6 +117,17 @@ foreign key does to that statement depends on its action, and on where the row l
 
 Verified on PostgreSQL 15, 16 and 17.
 
+## Identity columns in a destination
+
+Moved rows carry their ids (`OVERRIDING SYSTEM VALUE`), which leaves the destination's
+identity sequence where it was. The movers set it past the ids it could still hand out —
+following the sequence's own direction, path and declared range, so an id off its path or
+outside its range is left alone as the collision it cannot be. A sequence that would
+still collide is refused rather than left broken: one that **cycles** comes back around
+onto the moved ids, and one whose remaining values are all taken has nothing left to
+issue. Both refusals are `RowMoveRefusedError` and roll the move back whole; widen the
+range, or take the identity off the column for the migration.
+
 ## Locks
 
 Either form of `DETACH` takes `ACCESS EXCLUSIVE` on every table that references the parent

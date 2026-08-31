@@ -231,13 +231,34 @@ RELATION_IDENTITY_COLUMNS_SQL = """
     ORDER BY a.attnum
 """
 
+# Everything needed to reason about an identity column's sequence.
+#
+# ``pg_sequence_last_value`` is NULL until the sequence has been read, so the
+# next value it would issue is ``seqstart`` then, and ``last_value +
+# seqincrement`` afterwards. The declared range and ``seqcycle`` decide
+# whether a moved value can ever be reissued -- and whether the sequence can
+# be synchronized at all.
+SEQUENCE_PARAMETERS_SQL = """
+    SELECT
+        s.seqincrement AS increment,
+        s.seqmin AS minimum,
+        s.seqmax AS maximum,
+        s.seqcycle AS cycles,
+        s.seqstart AS start_value,
+        pg_sequence_last_value(s.seqrelid) AS last_value
+    FROM pg_sequence s
+    WHERE s.seqrelid = CAST(pg_get_serial_sequence(:table_name, :column) AS regclass)
+"""
+
 # Foreign keys referencing a relation whose ON DELETE action would fire on
 # a row move.
 #
 # A move deletes the row from one partition and inserts it into another in
-# a single statement. The NO ACTION check sees the row again and passes,
-# RESTRICT refuses the statement outright; CASCADE, SET NULL and SET DEFAULT
-# act on the DELETE alone and would delete or rewrite the referencing rows.
+# a single statement. CASCADE, SET NULL and SET DEFAULT act on the DELETE
+# alone and would delete or rewrite the referencing rows, so they are refused
+# here, before anything moves. NO ACTION and RESTRICT are left to PostgreSQL:
+# an unreferenced row moves freely, and a referenced one fails the statement
+# atomically, because mid-move it sits outside the referenced tree.
 # A foreign key referencing a partitioned table is cloned onto each of its
 # partitions with ``confrelid`` pointing at the partition, so one lookup by
 # the source relation finds what would fire on it.

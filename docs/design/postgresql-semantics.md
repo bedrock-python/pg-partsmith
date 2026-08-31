@@ -174,10 +174,14 @@ finalize — lock, identity checks, marker, statement — possible.
 
 `SET CONSTRAINTS ALL IMMEDIATE` inside the move's transaction forces `DEFERRABLE
 INITIALLY DEFERRED` foreign-key checks to fire at the statement, where the `23503`
-translation can catch them, instead of at commit. Identity sequences follow
-`pg_sequence.seqincrement`: an ascending sequence is advanced past `MAX(column)`
-(`GREATEST` keeps a higher pre-existing position), a descending one past `MIN(column)`
-(`LEAST`); cycling sequences keep their declared ranges.
+translation can catch them, instead of at commit. Identity sequences are read whole (`pg_sequence` plus
+`pg_sequence_last_value`, which is NULL until the sequence has been called): the next
+value it would issue is `seqstart`, or `last_value + seqincrement`. Only ids on that
+arithmetic path, ahead of it, and inside `[seqmin, seqmax]` can ever be reissued, so only
+those are chased — with `MAX` for an ascending sequence and `MIN` for a descending one.
+`setval` past `seqmax` raises `22003`, and a bounded sequence whose remaining path is
+entirely taken raises `2200H` on its next insert, which is why both are refused up front
+instead.
 
 ## Overlaps and gaps
 

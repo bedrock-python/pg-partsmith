@@ -68,9 +68,11 @@ detach fails closed, after the `before_detach` hooks ran: the blocking form chec
 identity and attachment inside its own transaction and re-checks after the statement, so
 a swapped-in relation rolls everything back — marker included; the concurrent form
 **pins** the relation (a holder connection takes `ACCESS SHARE` and verifies the OID
-under it) while it is checked and marked, and releases the pin only once the statement
-is queued for the partition's lock — from there a swap can only make the statement fail,
-never redirect it. A foreign relation cannot be pinned and uses the transactional
+under it) while it is checked and marked, and releases the pin only once *that
+statement's own backend* is queued for the partition's lock — from there a swap can only
+make the statement fail, never redirect it. A statement that has still not got that far
+when the DDL timeout expires is cancelled and waited for **before** the pin goes, so a
+late `DETACH` can never fire at a name that changed hands in the meantime. A foreign relation cannot be pinned and uses the transactional
 blocking form instead. Either way a swap gets a `PlanStaleError`, not a detached
 replacement.
 

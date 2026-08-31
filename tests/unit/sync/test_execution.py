@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from itertools import count
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -92,8 +93,11 @@ class _BoomError(Exception):
 @pytest.fixture
 def repo() -> MagicMock:
     repo = MagicMock()
-    repo.create_table_like = MagicMock(return_value=None)
-    repo.create_foreign_table_like = MagicMock(return_value=None)
+    # Every created relation reports the OID its creating transaction read;
+    # the counter makes a parent branch and its children distinguishable.
+    oids = count(101)
+    repo.create_table_like = MagicMock(side_effect=lambda *_args, **_kwargs: next(oids))
+    repo.create_foreign_table_like = MagicMock(side_effect=lambda *_args, **_kwargs: next(oids))
     repo.attach_partition = MagicMock(return_value=None)
     repo.detach_partition = MagicMock(return_value=None)
     repo.drop_partition = MagicMock(return_value=0)
@@ -107,7 +111,7 @@ def metadata() -> MagicMock:
     metadata.is_partition_attached = MagicMock(return_value=False)
     metadata.get_partition_tree = MagicMock(return_value=None)
     metadata.get_default_partition = MagicMock(return_value=None)
-    metadata.get_relation_oid = MagicMock(return_value=None)
+    metadata.get_relation_oid = MagicMock(return_value=4242)
     return metadata
 
 
@@ -245,11 +249,20 @@ def _record_ddl(repo: MagicMock) -> list[str]:
     """Make the repository log creates and attaches in the order they happen."""
     order: list[str] = []
 
-    def _create(template: str, name: str, partition_by: PartitionBy | None) -> None:
+    oids = count(201)
+
+    def _create(template: str, name: str, partition_by: PartitionBy | None) -> int:
         order.append(f"create {name}")
+        return next(oids)
 
     def _attach(
-        parent: str, name: str, bounds: PartitionBounds, *, key_arity: int, expected_oid: int | None = None
+        parent: str,
+        name: str,
+        bounds: PartitionBounds,
+        *,
+        key_arity: int,
+        expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
     ) -> None:
         order.append(f"attach {name}")
 
@@ -270,7 +283,9 @@ def test__apply__create_op__creates_table_then_attaches_with_key_arity(executor:
 
     # Assert
     repo.create_table_like.assert_called_once_with("events", "events__2024_04", None)
-    repo.attach_partition.assert_called_once_with("events", "events__2024_04", APRIL, key_arity=2, expected_oid=None)
+    repo.attach_partition.assert_called_once_with(
+        "events", "events__2024_04", APRIL, key_arity=2, expected_oid=101, expected_parent_oid=None
+    )
     assert result.created_count == 1
     assert result.issues == ()
     assert result.plan is not None
@@ -489,7 +504,9 @@ def test__apply__already_exists_not_attached_single_level__attaches_without_insp
 
     # Assert
     metadata.get_partition_tree.assert_not_called()
-    repo.attach_partition.assert_called_once_with("events", "events__2024_04", APRIL, key_arity=1, expected_oid=None)
+    repo.attach_partition.assert_called_once_with(
+        "events", "events__2024_04", APRIL, key_arity=1, expected_oid=4242, expected_parent_oid=None
+    )
     assert result.created_count == 1
     assert result.repaired_count == 0
 
@@ -500,10 +517,11 @@ def test__apply__already_exists_not_attached_branch__missing_buckets_are_repaire
     # Arrange -- the branch exists detached with one of its two buckets
     order = _record_ddl(repo)
 
-    def _create(template: str, name: str, partition_by: PartitionBy | None) -> None:
+    def _create(template: str, name: str, partition_by: PartitionBy | None) -> int:
         if name == "events__2024_04":
             raise PartitionAlreadyExistsError(name)
         order.append(f"create {name}")
+        return 777
 
     repo.create_table_like.side_effect = _create
     metadata.get_partition_tree.return_value = PartitionNode(
@@ -522,7 +540,7 @@ def test__apply__already_exists_not_attached_branch__missing_buckets_are_repaire
     metadata.get_partition_tree.assert_called_once_with("events__2024_04")
     h1_attach = repo.attach_partition.call_args_list[0]
     assert h1_attach.args == ("events__2024_04", "events__2024_04__h1", HashBounds(modulus=2, remainder=1))
-    assert h1_attach.kwargs == {"key_arity": 1, "expected_oid": None}
+    assert h1_attach.kwargs == {"key_arity": 1, "expected_oid": 777, "expected_parent_oid": 4242}
     assert result.created_count == 1
     assert result.repaired_count == 1
 
@@ -650,7 +668,8 @@ def test__apply__default_conflict_on_range_attach__moves_rows_and_retries(
         key_columns=("created_at",),
         from_value="2024-04-01",
         to_value="2024-05-01",
-        expected_target_oid=None,
+        expected_source_oid=None,
+        expected_target_oid=101,
     )
     assert repo.attach_partition.call_count == 2
     assert result.created_count == 1
@@ -910,7 +929,9 @@ def test__apply__attach_op__revalidates_oid_then_attaches(
 
     # Assert
     metadata.get_relation_oid.assert_called_once_with("events__2024_04")
-    repo.attach_partition.assert_called_once_with("events", "events__2024_04", APRIL, key_arity=1, expected_oid=77)
+    repo.attach_partition.assert_called_once_with(
+        "events", "events__2024_04", APRIL, key_arity=1, expected_oid=77, expected_parent_oid=None
+    )
     repo.create_table_like.assert_not_called()
     assert result.attached_count == 1
     assert result.created_count == 0
@@ -991,7 +1012,7 @@ def test__apply__attach_op_under_a_bucket_of_a_hash_root__depth_comes_from_the_r
     # Assert -- a leaf level has nothing below it to converge
     metadata.get_partition_tree.assert_not_called()
     repo.attach_partition.assert_called_once_with(
-        "events__h0", "events__h0__2024_04", APRIL, key_arity=1, expected_oid=None
+        "events__h0", "events__h0__2024_04", APRIL, key_arity=1, expected_oid=None, expected_parent_oid=None
     )
     assert result.attached_count == 1
 
@@ -1595,7 +1616,7 @@ def test__apply__foreign_leaves__leaf_is_a_foreign_table_with_rendered_options(
     )
     repo.create_table_like.assert_not_called()
     repo.attach_partition.assert_called_once_with(
-        "public.events", "public.events__2024_04", APRIL, key_arity=1, expected_oid=None
+        "public.events", "public.events__2024_04", APRIL, key_arity=1, expected_oid=101, expected_parent_oid=None
     )
     assert result.created_count == 1
 
@@ -1786,7 +1807,9 @@ def test__attach_partition__fill_returns_true__is_attached(
 
     # Assert
     assert attached is True
-    repo.attach_partition.assert_called_once_with("events", "events__2024_04", APRIL, key_arity=1, expected_oid=9)
+    repo.attach_partition.assert_called_once_with(
+        "events", "events__2024_04", APRIL, key_arity=1, expected_oid=9, expected_parent_oid=None
+    )
 
 
 def test__apply__reconcile_refused_by_a_foreign_key_action__recorded_and_the_run_goes_on(
@@ -1809,3 +1832,16 @@ def test__apply__reconcile_refused_by_a_foreign_key_action__recorded_and_the_run
     assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
     assert "ON DELETE CASCADE" in result.issues[0].error
     assert result.created_count == 0
+
+
+def test__create_partition__existing_relation_vanished_before_recovery__is_stale(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the name was taken when the create ran and empty when its identity was read
+    repo.create_table_like.side_effect = PartitionAlreadyExistsError("events__2024_04")
+    metadata.get_relation_oid.return_value = None
+
+    # Act / Assert -- a missing identity is never a licence to carry on by name
+    with pytest.raises(PlanStaleError, match="identity cannot be held"):
+        executor.apply(_config(), _plan(_create_op()))
+    repo.attach_partition.assert_not_called()

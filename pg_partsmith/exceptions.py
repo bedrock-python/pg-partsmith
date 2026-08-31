@@ -58,12 +58,19 @@ class PartitionReferencedError(PartitionError):
 class RowMoveRefusedError(PartitionError):
     """Raised when rows are not moved because the move would not be safe.
 
-    A move is a ``DELETE`` and an ``INSERT`` in one statement. A foreign key
-    referencing the source with ``ON DELETE CASCADE``, ``SET NULL`` or
-    ``SET DEFAULT`` acts on the ``DELETE`` alone: the referencing rows would
-    be deleted or rewritten while the moved row lives on in its new
-    partition. Such a foreign key has to be re-created without the action
-    (or after the move) before rows can be moved.
+    Two kinds of refusal, both fail-closed -- the move's transaction rolls
+    back with every row where it was:
+
+    * A foreign key referencing the source with ``ON DELETE CASCADE``,
+      ``SET NULL`` or ``SET DEFAULT``. A move is a ``DELETE`` and an
+      ``INSERT`` in one statement, and such an action fires on the ``DELETE``
+      alone: the referencing rows would be deleted or rewritten while the
+      moved row lives on in its new partition. Re-create the key without the
+      action, or after the move.
+    * A destination whose identity sequence cannot be made consistent with
+      the ids the rows carry -- it cycles back onto them, or its declared
+      range leaves it nothing to issue afterwards. Widen the range, or take
+      the identity off the column for the migration.
     """
 
     def __init__(self, relation_name: str, detail: str) -> None:

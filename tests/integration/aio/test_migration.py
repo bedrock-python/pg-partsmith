@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
@@ -21,6 +22,7 @@ from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import MaintenanceIssueStep, Period
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
 from tests.integration.aio.support import (
+    child_count,
     exec_sql,
     hash_children_of,
     is_attached,
@@ -659,3 +661,172 @@ async def test__partition_data__created_target_swapped_during_the_fill__stale_no
         await service.partition_data(config)
     assert await _count(db_engine, events) == 4
     assert int(await scalar(db_engine, f'SELECT count(*) FROM "{swapped[0]}"')) == 0  # noqa: S608
+
+
+# sync-mirror: skip
+async def test__partition_data__branch_replaced_before_its_children__children_never_go_live_in_it(
+    db_engine: AsyncEngine, tenants: str
+) -> None:
+    """A nested branch swapped during construction must not gain the subtree."""
+    # Arrange: a RANGE -> HASH tree whose branch is renamed right after it is created
+    default = f"{tenants}_legacy"
+    await exec_sql(db_engine, f'CREATE TABLE "{default}" (LIKE "{tenants}" INCLUDING ALL)')
+    await exec_sql(
+        db_engine,
+        f'INSERT INTO "{default}" (tenant_id, created_at, payload) '  # noqa: S608
+        f"SELECT g % 5, '2026-08-25 10:00:00+00', 'p' FROM generate_series(1, 6) g",
+    )
+    await exec_sql(db_engine, f'ALTER TABLE "{tenants}" ATTACH PARTITION "{default}" DEFAULT')
+    config = nested_config(tenants, modulus=2)
+    original = PostgresPartitionRepository.create_table_like
+    hijacked: list[str] = []
+
+    async def swapping(
+        self: PostgresPartitionRepository, template: str, name: str, partition_by: object, **kwargs: object
+    ) -> int:
+        oid = await original(self, template, name, partition_by, **kwargs)  # type: ignore[arg-type]
+        relname = name.rsplit(".", maxsplit=1)[-1]
+        if partition_by is not None and not hijacked:
+            hijacked.append(relname)
+            async with db_engine.begin() as conn:
+                await conn.execute(text(f'ALTER TABLE "{relname}" RENAME TO "{relname}_hijacked"'))
+                await conn.execute(
+                    text(f'CREATE TABLE "{relname}" (LIKE "{tenants}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
+                )
+        return oid
+
+    # Act / Assert: the child attach checks the parent it was planned for
+    with (
+        patch.object(PostgresPartitionRepository, "create_table_like", swapping),
+        pytest.raises(PlanStaleError),
+    ):
+        await make_service(db_engine).partition_data(config)
+    replacement = hijacked[0]
+    assert await child_count(db_engine, replacement) == 0
+    await exec_sql(db_engine, f'DROP TABLE "{replacement}"')
+
+
+# sync-mirror: skip
+async def test__ensure_partitions__default_replaced_before_a_failing_attach__rows_stay_where_they_are(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    """A compensating restore never hands rows to a relation that took the DEFAULT's name."""
+    # Arrange: March's rows sit in DEFAULT, so the attach reconciles them out first
+    await _default_with_rows(db_engine, events, months=(3,), per_month=4)
+    default = f"{events}_legacy"
+    config = monthly_config(events, create_ahead=1)
+    original = PostgresPartitionRepository.attach_partition
+    attempts: list[str] = []
+
+    async def failing(
+        self: PostgresPartitionRepository, parent: str, name: str, bounds: object, **kwargs: object
+    ) -> None:
+        attempts.append(name)
+        if len(attempts) == 1:
+            # The real attach, which PostgreSQL refuses while DEFAULT holds the rows.
+            await original(self, parent, name, bounds, **kwargs)  # type: ignore[arg-type]
+            return
+        # The DEFAULT changes hands while its rows are out of it.
+        async with db_engine.begin() as conn:
+            await conn.execute(text(f'ALTER TABLE "{events}" DETACH PARTITION "{default}"'))
+            await conn.execute(text(f'ALTER TABLE "{default}" RENAME TO "{default}_hijacked"'))
+            await conn.execute(text(f'CREATE TABLE "{default}" (LIKE "{events}" INCLUDING ALL)'))
+        msg = "attach refused after the reconcile"
+        raise SQLAlchemyError(msg)
+
+    # Act / Assert
+    with patch.object(PostgresPartitionRepository, "attach_partition", failing), pytest.raises(SQLAlchemyError):
+        await make_service(db_engine).ensure_partitions(config, [Period(year=2026, month=3)])
+
+    # The rows are in the partition whose identity was verified, not in the stranger
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{events}__2026_03"')) == 4  # noqa: S608
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{default}"')) == 0  # noqa: S608
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{default}_hijacked"')) == 0  # noqa: S608
+
+
+async def test__unpartition__into_a_cycling_identity_table__refused_with_nothing_moved(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    # Arrange: the destination's identity cycles, so it would reissue the moved ids
+    await _identity_rows(db_engine, ledger, ids=(1, 2, 3))
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = await _identity_destination(db_engine, ledger, "cyc", "MINVALUE 1 MAXVALUE 5 CYCLE")
+
+    # Act
+    result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert: refused whole, nothing half-moved
+    assert not result.complete
+    assert any("cycles" in issue.error for issue in result.issues)
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert await _count(db_engine, ledger) == 3
+
+
+async def test__unpartition__identity_range_too_narrow__refused_before_the_destination_breaks(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    # Arrange: three ids into a sequence that has exactly three values to give
+    await _identity_rows(db_engine, ledger, ids=(1, 2, 3))
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = await _identity_destination(db_engine, ledger, "narrow", "MINVALUE 1 MAXVALUE 3")
+
+    # Act
+    result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert not result.complete
+    assert any("nothing left to issue" in issue.error for issue in result.issues)
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+
+
+async def test__unpartition__ids_off_the_sequences_path__moved_and_the_sequence_left_alone(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    # Arrange: id 6 is inside the range but not a value the sequence lands on
+    await _identity_rows(db_engine, ledger, ids=(6,))
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = await _identity_destination(db_engine, ledger, "offpath", "START WITH 1 INCREMENT BY 3 MAXVALUE 7")
+
+    # Act
+    result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+    await exec_sql(
+        db_engine,
+        f"INSERT INTO \"{dest}\" (tenant_id, created_at, amount) VALUES (1, '2026-05-01T00:00:00+00:00', 9)",  # noqa: S608
+    )
+
+    # Assert: nothing to synchronise, and the sequence still starts where it meant to
+    assert result.complete
+    assert result.rows_moved == 1
+    assert int(await scalar(db_engine, f'SELECT min(id) FROM "{dest}"')) == 1  # noqa: S608
+
+
+async def _identity_rows(engine: AsyncEngine, table: str, *, ids: tuple[int, ...]) -> None:
+    """Attach the legacy table as DEFAULT with rows carrying explicit ids."""
+    legacy = f"{table}_legacy"
+    await exec_sql(engine, f'CREATE TABLE "{legacy}" (LIKE "{table}" INCLUDING ALL EXCLUDING IDENTITY)')
+    for index, value in enumerate(ids, start=1):
+        await exec_sql(
+            engine,
+            f'INSERT INTO "{legacy}" (id, tenant_id, created_at, amount) '  # noqa: S608
+            f"VALUES (:id, 1, make_timestamptz(2026, 4, :day, 12, 0, 0, 'UTC'), :amount)",
+            id=value,
+            day=index,
+            amount=index,
+        )
+    await exec_sql(engine, f'ALTER TABLE "{table}" ATTACH PARTITION "{legacy}" DEFAULT')
+
+
+async def _identity_destination(engine: AsyncEngine, table: str, suffix: str, identity: str) -> str:
+    """A plain destination shaped like the ledger, with a deliberately awkward identity."""
+    name = f"{table}_{suffix}"
+    await exec_sql(
+        engine,
+        f'CREATE TABLE "{name}" ('
+        f"id BIGINT GENERATED ALWAYS AS IDENTITY ({identity}), "
+        "tenant_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL, "
+        "amount NUMERIC NOT NULL DEFAULT 0, doubled NUMERIC GENERATED ALWAYS AS (amount * 2) STORED)",
+    )
+    return name

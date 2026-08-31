@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from itertools import count
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -73,7 +74,9 @@ def events() -> list[str]:
 def repo() -> MagicMock:
     repo = MagicMock()
     repo.ddl_timezone = "UTC"
-    repo.create_table_like = AsyncMock(return_value=None)
+    # Every created relation reports the OID its creating transaction read.
+    oids = count(101)
+    repo.create_table_like = AsyncMock(side_effect=lambda *_args, **_kwargs: next(oids))
     repo.attach_partition = AsyncMock(return_value=None)
     repo.detach_partition = AsyncMock(return_value=None)
     repo.drop_partition = AsyncMock(return_value=0)
@@ -91,7 +94,7 @@ def metadata() -> MagicMock:
     metadata.get_partition_tree = AsyncMock(return_value=None)
     metadata.get_default_partition = AsyncMock(return_value=None)
     metadata.is_partition_attached = AsyncMock(return_value=False)
-    metadata.get_relation_oid = AsyncMock(return_value=None)
+    metadata.get_relation_oid = AsyncMock(return_value=4242)
     metadata.get_unique_constraint_columns = AsyncMock(return_value=())
     metadata.get_key_high_water_mark = AsyncMock(return_value=None)
     return metadata
@@ -570,7 +573,9 @@ async def test__maintain__end_to_end__returns_counters_and_the_plan_it_executed(
     assert result.maintenance_plan is result.plan
     assert [op.target for op in result.plan.creates] == ["events__2024_03"]
     repo.create_table_like.assert_awaited_once_with("events", "events__2024_03", None)
-    repo.attach_partition.assert_awaited_once_with("events", "events__2024_03", MARCH, key_arity=1, expected_oid=None)
+    repo.attach_partition.assert_awaited_once_with(
+        "events", "events__2024_03", MARCH, key_arity=1, expected_oid=101, expected_parent_oid=None
+    )
     repo.detach_partition.assert_awaited_once_with("events", "events__2024_01", mode=DetachMode.AUTO, expected_oid=1)
     assert [call.args[0] for call in repo.drop_partition.call_args_list] == ["events__2024_01", "events__2023_12"]
 
@@ -720,7 +725,8 @@ async def test__ensure_partitions__windows__are_accepted_as_they_are(
         "events__2024_01",
         RangeBounds(from_value="2024-01-01", to_value="2024-02-01"),
         key_arity=1,
-        expected_oid=None,
+        expected_oid=101,
+        expected_parent_oid=None,
     )
 
 
@@ -945,7 +951,9 @@ async def test__create_future_partitions__orphan_for_a_wanted_window__is_reattac
     # Assert
     assert created == []
     repo.create_table_like.assert_not_awaited()
-    repo.attach_partition.assert_awaited_once_with("events", "events__2024_03", MARCH, key_arity=1, expected_oid=66)
+    repo.attach_partition.assert_awaited_once_with(
+        "events", "events__2024_03", MARCH, key_arity=1, expected_oid=66, expected_parent_oid=None
+    )
 
 
 async def test__create_future_partitions__everything_exists__returns_nothing(

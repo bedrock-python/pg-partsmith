@@ -19,6 +19,7 @@ here, a worker thread in the sync mirror's hand-kept twin of this module.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -61,8 +62,14 @@ async def detach_concurrently_pinned(
     the pin; ``mark`` writes the orphan marker in its own short transaction;
     ``statement`` runs the DDL and returns False when the caller should fall
     back to the blocking form. Exceptions from any of them propagate.
+
+    The pin outlives every path out of this function. Waiting for the release
+    condition is bounded by ``timeout_seconds``, but a timeout cancels the
+    statement and waits for that cancellation to land *before* the pin goes:
+    releasing it under a statement that is still to run would leave a
+    name-addressed ``DETACH`` free to fire at whatever holds the name by then.
     """
-    async with asyncio.timeout(timeout_seconds), engine.connect() as holder:
+    async with engine.connect() as holder:
         await holder.execute(
             build_ddl_statement("LOCK TABLE ONLY {partition} IN ACCESS SHARE MODE", partition=partition_name)
         )
@@ -70,19 +77,26 @@ async def detach_concurrently_pinned(
         await mark()
         run = asyncio.ensure_future(statement())
         try:
-            while not run.done():
-                pid = statement_pid()
-                if pid is None:
-                    release = (await holder.execute(text(_PENDING_ONLY_SQL), {"oid": expected_oid})).scalar()
-                else:
-                    release = (await holder.execute(text(_RELEASE_SQL), {"oid": expected_oid, "pid": pid})).scalar()
-                if release:
-                    break
-                # Each poll is a real round trip, which is both the pacing and
-                # the yield the statement task needs; a clock-based sleep would
-                # not wake under a frozen test clock.
-                await asyncio.sleep(0)
+            async with asyncio.timeout(timeout_seconds):
+                while not run.done():
+                    pid = statement_pid()
+                    if pid is None:
+                        release = (await holder.execute(text(_PENDING_ONLY_SQL), {"oid": expected_oid})).scalar()
+                    else:
+                        release = (await holder.execute(text(_RELEASE_SQL), {"oid": expected_oid, "pid": pid})).scalar()
+                    if release:
+                        break
+                    # Each poll is a real round trip, which is both the pacing
+                    # and the yield the statement task needs; a clock-based
+                    # sleep would not wake under a frozen test clock.
+                    await asyncio.sleep(0)
+        except BaseException:
+            run.cancel()
+            with contextlib.suppress(BaseException):
+                await run
+            raise
         finally:
-            # Release the pin so the statement can take its lock and finish.
+            # Release the pin: from here the statement either holds the
+            # relation by OID or is finished.
             await holder.rollback()
         return await run

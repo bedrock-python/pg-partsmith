@@ -130,6 +130,7 @@ class PartitionRepository(Protocol):
         *,
         key_arity: int = 1,
         expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
     ) -> None:
         """Attach a table to a partitioned parent.
 
@@ -140,6 +141,12 @@ class PartitionRepository(Protocol):
                 set of LIST values, or DEFAULT. A RANGE bound under a composite
                 key has its trailing columns padded with ``MINVALUE``.
             key_arity: Number of columns in ``parent_name``'s partition key.
+            expected_oid: The catalog identity the caller decided on, checked
+                under ATTACH's own locks in its transaction; a relation
+                swapped in at the name rolls the attach back.
+            expected_parent_oid: The identity the partition should go into,
+                checked the same way -- a branch replaced during construction
+                never gains children in the planned one's stead.
         """
         ...
 
@@ -211,6 +218,7 @@ class PartitionRepository(Protocol):
         from_value: str,
         to_value: str,
         limit: int | None = None,
+        expected_source_oid: int | None = None,
         expected_target_oid: int | None = None,
     ) -> int:
         """Move rows from a DEFAULT partition to the partition for a window.

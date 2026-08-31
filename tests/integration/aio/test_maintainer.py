@@ -510,3 +510,36 @@ async def test__maintainer__pinned_concurrent_detach__a_swap_cannot_slip_in_whil
     assert result.detached_count == 1
     assert result.dropped_count == 1
     assert await scalar(db_engine, "SELECT CAST(to_regclass(:n) AS oid)", n=april) is None
+
+
+# sync-mirror: skip
+async def test__detach_partition__pinned_and_timing_out__the_statement_is_cancelled_not_left_running(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    """A timeout must not release the pin under a statement that has yet to run.
+
+    The clock is real here on purpose: freezegun freezes ``time.monotonic``,
+    which is what ``asyncio.timeout`` and ``asyncio.sleep`` run on.
+    """
+    # Arrange: one attached partition, and a DDL delayed past the repository's own timeout
+    config = monthly_config(partitioned_table, create_ahead=1, retention=12)
+    with freezegun.freeze_time("2026-04-15"):
+        await PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine))).run_maintenance(config)
+    april = f"{partitioned_table}__2026_04"
+    oid_before = await scalar(db_engine, "SELECT CAST(to_regclass(:n) AS oid)", n=april)
+    repo = PostgresPartitionRepository(db_engine, ddl_timeout_seconds=0.3)
+    original = PartitionRemover._run_concurrent_detach
+
+    async def delayed(self: PartitionRemover, *args: object, **kwargs: object) -> bool:
+        await asyncio.sleep(3)
+        return await original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    # Act / Assert: the wait ends in a timeout, with the statement cancelled under the pin
+    with patch.object(PartitionRemover, "_run_concurrent_detach", delayed), pytest.raises(TimeoutError):
+        await repo.detach_partition(
+            f"public.{partitioned_table}", f"public.{april}", mode=DetachMode.CONCURRENT, expected_oid=oid_before
+        )
+
+    # Nothing was detached behind the timeout, and the relation is untouched
+    assert await is_attached(db_engine, april)
+    assert await scalar(db_engine, "SELECT CAST(to_regclass(:n) AS oid)", n=april) == oid_before

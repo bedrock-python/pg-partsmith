@@ -584,3 +584,91 @@ def test__unpartition__into_a_descending_identity_table__the_next_ordinary_inser
     assert result.rows_moved == 3
     assert int(scalar(sync_db_engine, f'SELECT min(id) FROM "{dest}"')) == -3  # noqa: S608
     assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 4  # noqa: S608
+
+
+def test__unpartition__into_a_cycling_identity_table__refused_with_nothing_moved(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    # Arrange: the destination's identity cycles, so it would reissue the moved ids
+    _identity_rows(sync_db_engine, ledger, ids=(1, 2, 3))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(sync_db_engine, ledger, "cyc", "MINVALUE 1 MAXVALUE 5 CYCLE")
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert: refused whole, nothing half-moved
+    assert not result.complete
+    assert any("cycles" in issue.error for issue in result.issues)
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert _count(sync_db_engine, ledger) == 3
+
+
+def test__unpartition__identity_range_too_narrow__refused_before_the_destination_breaks(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    # Arrange: three ids into a sequence that has exactly three values to give
+    _identity_rows(sync_db_engine, ledger, ids=(1, 2, 3))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(sync_db_engine, ledger, "narrow", "MINVALUE 1 MAXVALUE 3")
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert not result.complete
+    assert any("nothing left to issue" in issue.error for issue in result.issues)
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+
+
+def test__unpartition__ids_off_the_sequences_path__moved_and_the_sequence_left_alone(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    # Arrange: id 6 is inside the range but not a value the sequence lands on
+    _identity_rows(sync_db_engine, ledger, ids=(6,))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(sync_db_engine, ledger, "offpath", "START WITH 1 INCREMENT BY 3 MAXVALUE 7")
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+    exec_sql(
+        sync_db_engine,
+        f"INSERT INTO \"{dest}\" (tenant_id, created_at, amount) VALUES (1, '2026-05-01T00:00:00+00:00', 9)",  # noqa: S608
+    )
+
+    # Assert: nothing to synchronise, and the sequence still starts where it meant to
+    assert result.complete
+    assert result.rows_moved == 1
+    assert int(scalar(sync_db_engine, f'SELECT min(id) FROM "{dest}"')) == 1  # noqa: S608
+
+
+def _identity_rows(engine: Engine, table: str, *, ids: tuple[int, ...]) -> None:
+    """Attach the legacy table as DEFAULT with rows carrying explicit ids."""
+    legacy = f"{table}_legacy"
+    exec_sql(engine, f'CREATE TABLE "{legacy}" (LIKE "{table}" INCLUDING ALL EXCLUDING IDENTITY)')
+    for index, value in enumerate(ids, start=1):
+        exec_sql(
+            engine,
+            f'INSERT INTO "{legacy}" (id, tenant_id, created_at, amount) '  # noqa: S608
+            f"VALUES (:id, 1, make_timestamptz(2026, 4, :day, 12, 0, 0, 'UTC'), :amount)",
+            id=value,
+            day=index,
+            amount=index,
+        )
+    exec_sql(engine, f'ALTER TABLE "{table}" ATTACH PARTITION "{legacy}" DEFAULT')
+
+
+def _identity_destination(engine: Engine, table: str, suffix: str, identity: str) -> str:
+    """A plain destination shaped like the ledger, with a deliberately awkward identity."""
+    name = f"{table}_{suffix}"
+    exec_sql(
+        engine,
+        f'CREATE TABLE "{name}" ('
+        f"id BIGINT GENERATED ALWAYS AS IDENTITY ({identity}), "
+        "tenant_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL, "
+        "amount NUMERIC NOT NULL DEFAULT 0, doubled NUMERIC GENERATED ALWAYS AS (amount * 2) STORED)",
+    )
+    return name

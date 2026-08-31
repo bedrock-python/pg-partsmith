@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -51,9 +52,20 @@ class _Catalog:
     relkind: str = "r"
     moved_rows: int | None = 0
     identity_always: object = False
-    seq_increment: object = 1
     identity_columns: list[str] = field(default_factory=list)
-    max_value: object = None
+    # What ``pg_sequence`` and ``pg_sequence_last_value`` say about the
+    # identity column's sequence, and the extreme id the target holds.
+    sequence: dict[str, object] = field(
+        default_factory=lambda: {
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 2**63 - 1,
+            "cycles": False,
+            "start_value": 1,
+            "last_value": None,
+        }
+    )
+    extreme_value: object = None
     destructive_fks: list[tuple[str, str, str]] = field(default_factory=list)
     failures: dict[str, object] = field(default_factory=dict)
 
@@ -68,6 +80,12 @@ def _scalar(value: object) -> MagicMock:
     result = MagicMock()
     result.scalar.return_value = value
     result.fetchall.return_value = []
+    return result
+
+
+def _first(row: object) -> MagicMock:
+    result = MagicMock()
+    result.first.return_value = row
     return result
 
 
@@ -93,9 +111,9 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
     if "attidentity" in sql:
         return _scalar(_next(catalog.identity_always))
     if "seqincrement" in sql:
-        return _scalar(_next(catalog.seq_increment))
+        return _first(SimpleNamespace(**catalog.sequence))
     if sql.startswith(("SELECT MAX(", "SELECT MIN(")):
-        return _scalar(catalog.max_value)
+        return _scalar(catalog.extreme_value)
     if "obj_description" in sql:
         return _scalar(_next(catalog.comment))
     if "relispartition = true" in sql:
@@ -1767,36 +1785,6 @@ async def test__move_rows__referenced_rows__refused_atomically_with_guidance() -
         await repo.move_rows("public.events__2024_01", "public.events_flat")
 
 
-async def test__move_rows__identity_target__advances_its_sequence_in_the_same_transaction() -> None:
-    # Arrange
-    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], max_value=11))
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    moved = await repo.move_rows("a", "b")
-
-    # Assert -- the sequence catches up past the moved ids, before the commit
-    assert moved == 4
-    statements = _statements(conn)
-    move_at = statements.index(_move_statement_of(conn))
-    max_at = next(i for i, s in enumerate(statements) if s.startswith('SELECT MAX("id") FROM "b"'))
-    setval_at = next(i for i, s in enumerate(statements) if "setval(seq.oid" in s)
-    assert move_at < max_at < setval_at
-    engine.begin.assert_called_once()
-
-
-async def test__move_rows__nothing_moved__leaves_identity_sequences_alone() -> None:
-    # Arrange
-    engine, conn = _engine(_Catalog(moved_rows=0, identity_columns=["id"], max_value=11))
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    await repo.move_rows("a", "b")
-
-    # Assert
-    assert not any("setval" in s for s in _statements(conn))
-
-
 async def test__reconcile_default_rows__target_swapped_under_the_lock__is_stale_before_any_row_moves() -> None:
     # Arrange
     engine, conn = _engine(_Catalog(oid=9999))
@@ -1865,9 +1853,35 @@ async def test__detach_partition__foreign_with_an_oid__uses_the_transactional_bl
     assert all("CONCURRENTLY" not in s for s in detaches)
 
 
+async def test__move_rows__identity_target__sets_the_sequence_past_the_ids_it_could_reissue() -> None:
+    # Arrange -- a fresh ascending sequence and rows carrying 1..11
+    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], extreme_value=11))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = await repo.move_rows("a", "b")
+
+    # Assert -- the reachable extreme is found, then the sequence is set to it
+    assert moved == 4
+    statements = _statements(conn)
+    move_at = statements.index(_move_statement_of(conn))
+    reach_at = next(i for i, s in enumerate(statements) if s.startswith('SELECT MAX("id") FROM "b"'))
+    setval_at = next(i for i, s in enumerate(statements) if "setval(" in s)
+    assert move_at < reach_at < setval_at
+    engine.begin.assert_called_once()
+
+
 async def test__move_rows__descending_identity_target__chases_the_low_water_mark() -> None:
-    # Arrange -- a sequence with INCREMENT -1 must be set to the minimum, not the maximum
-    engine, conn = _engine(_Catalog(moved_rows=3, identity_columns=["id"], seq_increment=-1, max_value=-2))
+    # Arrange -- INCREMENT -1 means the reachable extreme is the minimum
+    sequence = {
+        "increment": -1,
+        "minimum": -(2**63),
+        "maximum": 0,
+        "cycles": False,
+        "start_value": 0,
+        "last_value": None,
+    }
+    engine, conn = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=-2))
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -1876,5 +1890,50 @@ async def test__move_rows__descending_identity_target__chases_the_low_water_mark
     # Assert
     statements = _statements(conn)
     assert any(s.startswith('SELECT MIN("id") FROM "b"') for s in statements)
-    (setval,) = [s for s in statements if "setval(seq.oid" in s]
-    assert "LEAST(" in setval
+    assert any("setval(" in s for s in statements)
+
+
+async def test__move_rows__identity_sequence_out_of_reach__is_left_alone() -> None:
+    # Arrange -- no row carries a value the sequence can still issue
+    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], extreme_value=None))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.move_rows("a", "b")
+
+    # Assert -- an id off the sequence's path or outside its range cannot collide
+    assert not any("setval(" in s for s in _statements(conn))
+
+
+async def test__move_rows__nothing_moved__leaves_identity_sequences_alone() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=0, identity_columns=["id"], extreme_value=11))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.move_rows("a", "b")
+
+    # Assert
+    assert not any("setval(" in s for s in _statements(conn))
+
+
+async def test__move_rows__cycling_identity_sequence__refuses_the_move() -> None:
+    # Arrange -- a cycling sequence comes back around onto the moved ids
+    sequence = {"increment": 1, "minimum": 1, "maximum": 5, "cycles": True, "start_value": 1, "last_value": None}
+    engine, _ = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="cycles"):
+        await repo.move_rows("a", "b")
+
+
+async def test__move_rows__identity_sequence_would_be_exhausted__refuses_the_move() -> None:
+    # Arrange -- every value the sequence can still reach is already carried
+    sequence = {"increment": 1, "minimum": 1, "maximum": 5, "cycles": False, "start_value": 1, "last_value": None}
+    engine, _ = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="nothing left to issue"):
+        await repo.move_rows("a", "b")
