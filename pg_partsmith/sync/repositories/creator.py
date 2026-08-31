@@ -598,11 +598,15 @@ class PartitionCreator:
             )
         ).scalar()
 
-        # A cache means some session drew a block and holds the values below
-        # ``last_value`` privately: they are not in the catalog and no
-        # ``setval`` can take them back.
+        # A cache hands whole blocks to sessions, and a session keeps its block
+        # in memory until it is used up. PostgreSQL publishes only the newest
+        # allocation (``last_value``); an older block, drawn before another
+        # session moved the catalog on, is invisible and still live. So every
+        # value the sequence has already allocated -- everything on its path up
+        # to ``last_value`` -- has to count as possibly held, and no ``setval``
+        # can take any of it back.
         if last is not None and cache > 1:
-            low, high = sorted((int(last), int(last) - (cache - 1) * increment))
+            low, high = (minimum, int(last)) if ascending else (int(last), maximum)
             held = (
                 conn.execute(
                     _as_text(
@@ -615,10 +619,10 @@ class PartitionCreator:
             if held:
                 raise RowMoveRefusedError(
                     target_name,
-                    f"the identity sequence of {target_name}.{column} caches {cache} values, and a session may "
-                    "still be holding ones these rows carry -- cached values live in that session, where no "
-                    "setval reaches them; stop the writers and reset the sequence yourself, or take the identity "
-                    "off the column for the migration",
+                    f"the identity sequence of {target_name}.{column} caches {cache} values, so values it has "
+                    "already handed out may still be sitting in a session's cache, where no setval reaches them "
+                    "-- and PostgreSQL does not say which; stop the writers and reset the sequence yourself, or "
+                    "take the identity off the column for the migration",
                 )
 
         if collision is None:

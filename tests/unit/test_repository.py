@@ -2001,3 +2001,26 @@ async def test__move_rows__identity_sequence_with_a_cache_nobody_holds__moves() 
     # Assert
     assert moved == 2
     assert not any("setval(" in s for s in _statements(conn))
+
+
+async def test__move_rows__identity_cache_block_below_the_newest__still_refuses() -> None:
+    # Arrange -- one session drew 1..5 and another 6..10, so the catalog says 10
+    # while 2 is still sitting in the first session's cache.
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 1,
+        "last_value": 10,
+    }
+    catalog = _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, cached_hit=True)
+    engine, conn = _engine(catalog)
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- the whole allocated region counts, not just the newest block
+    with pytest.raises(RowMoveRefusedError, match="already handed out"):
+        await repo.move_rows("a", "b")
+    (probe,) = [s for s in _statements(conn) if s.startswith("SELECT EXISTS (SELECT 1 FROM")]
+    assert "BETWEEN 1 AND 10" in probe

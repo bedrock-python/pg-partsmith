@@ -890,3 +890,29 @@ async def test__ensure_partitions__reattached_branch_replaced_before_its_childre
     assert await child_count(db_engine, branch) == 0
     assert await child_count(db_engine, f"{branch}_hijacked") == 1
     await exec_sql(db_engine, f'DROP TABLE "{branch}"')
+
+
+async def test__unpartition__cached_identity_block_held_by_an_older_session__still_refused(
+    db_engine: AsyncEngine, ledger: str
+) -> None:
+    """The newest allocation is not the only one a session may still be holding."""
+    # Arrange: session A draws 1..5 and keeps it; session B draws 6..10, moving the catalog to 10
+    await _identity_rows(db_engine, ledger, ids=(2,))
+    config = monthly_config(ledger, create_ahead=1)
+    await make_service(db_engine).partition_data(config)
+    dest = await _identity_destination(db_engine, ledger, "twoback", "CACHE 5")
+    sequence_of = f"pg_get_serial_sequence('public.{dest}', 'id')"
+    async with db_engine.connect() as session_a, db_engine.connect() as session_b:
+        first = (await session_a.execute(text(f"SELECT nextval({sequence_of})"))).scalar()
+        second = (await session_b.execute(text(f"SELECT nextval({sequence_of})"))).scalar()
+        assert (first, second) == (1, 6)
+        assert int(await scalar(db_engine, f"SELECT pg_sequence_last_value({sequence_of})")) == 10
+
+        # Act: id 2 is below the newest block, still live in session A
+        result = await make_service(db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert not result.complete
+    assert any("already handed out" in issue.error for issue in result.issues)
+    assert int(await scalar(db_engine, f'SELECT count(*) FROM "{dest}"')) == 0  # noqa: S608
+    assert await _count(db_engine, ledger) == 1

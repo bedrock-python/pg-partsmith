@@ -183,6 +183,13 @@ those are chased — with `MAX` for an ascending sequence and `MIN` for a descen
 entirely taken raises `2200H` on its next insert, which is why both are refused up front
 instead.
 
+`seqcache > 1` is refused too, and for the whole allocated region rather than the newest
+block: `pg_sequence_last_value` publishes only the latest allocation, so a session that
+drew an earlier block — before another session moved the catalog on — holds values no
+query can see and no `setval` can take back. Measured on 17: session A's `nextval`
+returns `1` and keeps `2..5`; session B's returns `6` and moves `last_value` to `10`;
+`2` is still A's to issue.
+
 ## Overlaps and gaps
 
 - Overlapping RANGE siblings (`ATTACH` or `CREATE … PARTITION OF`), overlapping LIST values,

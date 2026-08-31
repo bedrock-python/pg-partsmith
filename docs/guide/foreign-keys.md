@@ -125,8 +125,9 @@ following the sequence's own direction, path and declared range, so an id off it
 outside its range is left alone as the collision it cannot be. A sequence that would
 still collide is refused rather than left broken: one that **cycles** comes back around
 onto the moved ids, one whose remaining values are all taken has nothing left to issue,
-and one with a **cache** has already handed a block of values to some session, where no
-`setval` reaches them. Every refusal is `RowMoveRefusedError` and rolls the move back
+and one with a **cache** has already handed blocks of values to sessions, which keep them
+in memory where no `setval` reaches them — and PostgreSQL publishes only the newest
+allocation, so every value already handed out has to count as possibly held. Every refusal is `RowMoveRefusedError` and rolls the move back
 whole; widen the range, quiesce the writers and reset the sequence yourself, or take the
 identity off the column for the migration.
 
