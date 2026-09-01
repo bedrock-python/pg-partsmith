@@ -265,3 +265,43 @@ a block another session still holds.
 - Dropping and recreating a table under the same name yields a **different OID**;
   `to_regclass('missing')` is `NULL`. The executor revalidates OIDs before detach and drop.
 - `max_identifier_length` is 63.
+
+## Query pruning (measured on 17, 2026-09-01)
+
+Twelve leaves: a monthly `RANGE (created_at)` with four `HASH (tenant_id)` buckets per
+month, three months created. `EXPLAIN (COSTS OFF)`, counting the nodes under `Append`:
+
+| Query shape | Leaves opened |
+|---|---|
+| no predicate | 12 |
+| `created_at >= TIMESTAMPTZ '…' AND created_at < TIMESTAMPTZ '…'` | 4 — one month |
+| the same plus `tenant_id = 3` | 1, and no `Append` node at all |
+| `tenant_id = 3` alone | 3 — one bucket per month |
+| `date_trunc('month', created_at) = TIMESTAMPTZ '…'` | 12 — an expression over the key prunes nothing |
+| `created_at::date = DATE '…'` | 12 |
+| `created_at < now() + interval '3 days'` | run-time pruning: `Subplans Removed: 8` |
+| a naive `TIMESTAMP '…'` literal against the `timestamptz` key | run-time pruning: `Subplans Removed: 8` |
+
+On a weekly `RANGE (id)` over UUIDv7 with the `UUIDv7BoundaryCodec`, a predicate built from
+`min_uuid_for(start)` / `min_uuid_for(end)` opens exactly one weekly partition and uses its
+primary-key index. Written up for users in
+[Query a partitioned table](../guide/querying.md).
+
+## Clock changes
+
+A daily grid in `Europe/Berlin` follows the local calendar, not a fixed 24 hours:
+
+| Local day | Bounds in UTC | Real length |
+|---|---|---|
+| 2026-03-29 (clocks go forward) | `2026-03-28 23:00+00` → `2026-03-29 22:00+00` | 23 h |
+| 2026-10-25 (clocks go back) | `2026-10-24 22:00+00` → `2026-10-25 23:00+00` | 25 h |
+
+Rows at `2026-03-29 21:30+00` and `22:30+00` — 23:30 and 00:30 in Berlin — route to the
+29th and the 30th respectively. The same shift applies to encoded keys: the UUIDv7 codec
+encodes those exact instants, and adjacent days stay contiguous across the transition.
+Verified by unit tests and by an integration test that maintains such a table and checks
+`pg_get_expr` and `tableoid`.
+
+Note for readers of the code: subtracting two aware datetimes that share one `tzinfo`
+compares wall clocks, not instants, so a 23-hour day still measures as `1 day` unless both
+ends are converted to UTC first.
