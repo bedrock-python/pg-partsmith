@@ -51,6 +51,9 @@ _PRIVILEGE_PATTERN = re.compile(r"^[A-Z]+$")
 
 # ``pg_constraint.confdeltype`` codes of the actions a row move must not trigger.
 _ON_DELETE_ACTIONS = {"c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
+# Where a move parks the identity values it brought in, for as long as the
+# transaction that brought them lasts.
+_MOVED_IDENTITY_TABLE = "pg_partsmith_moved_identity"
 
 
 class PartitionCreator:
@@ -496,6 +499,20 @@ class PartitionCreator:
         # not share the order of one created with LIKE.
         column_list = ", ".join(quote_identifier(column) for column in columns)
         overriding = await self._has_identity_always(conn, target_name)
+        # Which ids the destination's sequences must not reissue is a question
+        # about the rows this move brings in, not about the rows the destination
+        # already held -- those its own sequence handed out, and it does not hand
+        # a value out twice. The statement therefore keeps the identity values it
+        # inserts, and the decisions below read them back from there.
+        # An identity column the source does not carry is filled by the sequence
+        # itself, exactly as an ordinary insert would: the move brings it no
+        # values, so there is nothing to decide about it.
+        identity_columns = tuple(
+            column for column in await self._identity_columns(conn, target_name) if column in columns
+        )
+        capture = ", ".join(quote_identifier(column) for column in identity_columns)
+        if identity_columns:
+            await self._open_moved_identity(conn, target_name, capture)
         statement = _move_statement(
             quote_identifier(source_name),
             quote_identifier(target_name),
@@ -503,6 +520,7 @@ class PartitionCreator:
             condition,
             limit,
             overriding=overriding,
+            capture=capture or None,
         )
         try:
             result = await conn.execute(_as_text(statement))
@@ -524,11 +542,39 @@ class PartitionCreator:
         moved = result.rowcount or 0
         await self._require_oid(conn, source_name, expected_source_oid)
         await self._require_oid(conn, target_name, expected_target_oid)
-        if moved:
-            await self._advance_identity_sequences(conn, target_name)
+        if identity_columns:
+            if moved:
+                await self._advance_identity_sequences(conn, target_name, identity_columns)
+            # A refusal takes the whole transaction with it; a move that gets this
+            # far hands the name back, so the next move in the same transaction
+            # can take it.
+            await conn.execute(text(f"DROP TABLE {quote_identifier(_MOVED_IDENTITY_TABLE)}"))
         return moved
 
-    async def _advance_identity_sequences(self, conn: AsyncConnection, target_name: str) -> None:
+    async def _identity_columns(self, conn: AsyncConnection, table_name: str) -> tuple[str, ...]:
+        """The relation's identity columns, in its own attribute order."""
+        result = await conn.execute(
+            text(RELATION_IDENTITY_COLUMNS_SQL), {"table_name": to_regclass_argument(table_name)}
+        )
+        return tuple(coerce_str(row[0]) or "" for row in result.fetchall())
+
+    async def _open_moved_identity(self, conn: AsyncConnection, target_name: str, capture: str) -> None:
+        """Open the temporary relation a move parks its identity values in.
+
+        Shaped from the target's own columns, so every value keeps the type it
+        will be compared against, and dropped with the transaction whatever
+        becomes of the move.
+        """
+        await conn.execute(
+            _as_text(
+                f"CREATE TEMP TABLE {quote_identifier(_MOVED_IDENTITY_TABLE)} ON COMMIT DROP AS "  # noqa: S608
+                f"SELECT {capture} FROM {quote_identifier(target_name)} WITH NO DATA"
+            )
+        )
+
+    async def _advance_identity_sequences(
+        self, conn: AsyncConnection, target_name: str, columns: tuple[str, ...]
+    ) -> None:
         """Keep the target's identity sequences from reissuing the values a move brought in.
 
         ``OVERRIDING SYSTEM VALUE`` preserves the moved ids but leaves the
@@ -547,12 +593,14 @@ class PartitionCreator:
         issue, and a sequence with a cache has already handed a block of
         values to some session, where no ``setval`` can reach them. Runs in
         the move's transaction, so a refusal rolls the move back with it.
+
+        Every question is asked of the values this move carried in, which the
+        statement parked in a temporary relation. A row the destination already
+        held is none of the move's business: its id came from this very
+        sequence, and whatever the sequence does next it does the same with the
+        move or without it.
         """
-        result = await conn.execute(
-            text(RELATION_IDENTITY_COLUMNS_SQL), {"table_name": to_regclass_argument(target_name)}
-        )
-        for row in result.fetchall():
-            column = coerce_str(row[0]) or ""
+        for column in columns:
             await self._advance_identity_sequence(conn, target_name, column)
 
     async def _advance_identity_sequence(self, conn: AsyncConnection, target_name: str, column: str) -> None:
@@ -578,7 +626,8 @@ class PartitionCreator:
         # Every identifier is quoted and every number is a catalog integer
         # rendered with ``:d``; ``_as_text`` escapes the colons an identifier
         # may carry, which is why the numbers are formatted rather than bound.
-        quoted_column, quoted_target = quote_identifier(column), quote_identifier(target_name)
+        quoted_column = quote_identifier(column)
+        quoted_moved = quote_identifier(f"pg_temp.{_MOVED_IDENTITY_TABLE}")
         in_range = f"{quoted_column} BETWEEN {minimum:d} AND {maximum:d}"
         on_path = f"({quoted_column} - {upcoming:d}) % {increment:d} = 0"
 
@@ -587,7 +636,7 @@ class PartitionCreator:
             # the far end of its range -- which can land it on values its
             # pre-wrap increments never touched. Anything inside the range is
             # therefore something it may hand out again, whatever its residue.
-            if await self._holds(conn, quoted_target, in_range):
+            if await self._holds(conn, quoted_moved, in_range):
                 raise RowMoveRefusedError(
                     target_name,
                     f"{sequence_name} cycles, so it comes back around to the ids these rows carry and hands one "
@@ -607,7 +656,7 @@ class PartitionCreator:
             # as possibly held, and no ``setval`` can take any of it back.
             low, high = sorted((start_value, int(last)))
             allocated = f"{quoted_column} BETWEEN {low:d} AND {high:d} AND {on_path}"
-            if await self._holds(conn, quoted_target, allocated):
+            if await self._holds(conn, quoted_moved, allocated):
                 raise RowMoveRefusedError(
                     target_name,
                     f"{sequence_name} caches {cache} values, so values it has already handed out may still be "
@@ -616,7 +665,7 @@ class PartitionCreator:
                     "column for the migration",
                 )
 
-        # The furthest value the sequence could still reach that a row already
+        # The furthest value the sequence could still reach that a moved row
         # owns: inside the declared range, ahead of where it stands, and on the
         # values it actually lands on.
         aggregate = "MAX" if ascending else "MIN"
@@ -624,7 +673,7 @@ class PartitionCreator:
         collision = (
             await conn.execute(
                 _as_text(
-                    f"SELECT {aggregate}({quoted_column}) FROM {quoted_target} "  # noqa: S608
+                    f"SELECT {aggregate}({quoted_column}) FROM {quoted_moved} "  # noqa: S608
                     f"WHERE {in_range} AND {quoted_column} {ahead} {upcoming:d} AND {on_path}"
                 )
             )
@@ -637,8 +686,8 @@ class PartitionCreator:
             raise RowMoveRefusedError(
                 target_name,
                 f"{sequence_name} would have nothing left to issue: every value it can still reach is already "
-                f"carried by a row (its range is {minimum}..{maximum}); give the destination a wider range, or "
-                "take the identity off the column for the migration",
+                f"carried by a moved row (its range is {minimum}..{maximum}); give the destination a wider "
+                "range, or take the identity off the column for the migration",
             )
         await conn.execute(
             text(
@@ -648,10 +697,10 @@ class PartitionCreator:
         )
 
     @staticmethod
-    async def _holds(conn: AsyncConnection, quoted_target: str, condition: str) -> bool:
-        """Whether any row of the target carries a value the condition describes."""
+    async def _holds(conn: AsyncConnection, quoted_relation: str, condition: str) -> bool:
+        """Whether any row of the relation carries a value the condition describes."""
         result = await conn.execute(
-            _as_text(f"SELECT EXISTS (SELECT 1 FROM {quoted_target} WHERE {condition})")  # noqa: S608
+            _as_text(f"SELECT EXISTS (SELECT 1 FROM {quoted_relation} WHERE {condition})")  # noqa: S608
         )
         return bool(result.scalar())
 
@@ -694,7 +743,14 @@ class PartitionCreator:
 
 
 def _move_statement(
-    source: str, target: str, column_list: str, condition: str | None, limit: int | None, *, overriding: bool = False
+    source: str,
+    target: str,
+    column_list: str,
+    condition: str | None,
+    limit: int | None,
+    *,
+    overriding: bool = False,
+    capture: str | None = None,
 ) -> str:
     """One ``DELETE ... RETURNING`` / ``INSERT`` statement moving rows from ``source`` to ``target``.
 
@@ -704,20 +760,24 @@ def _move_statement(
     A batch is bounded through ``(tableoid, ctid)`` rather than ``ctid`` alone
     so a partitioned source, whose leaves each number their own tuples, is
     addressed unambiguously. ``overriding`` keeps the values of a
-    ``GENERATED ALWAYS AS IDENTITY`` column on the target. Every identifier
-    and literal is already quoted.
+    ``GENERATED ALWAYS AS IDENTITY`` column on the target. ``capture`` names the
+    identity columns whose inserted values are kept for the sequence decisions
+    that follow -- one statement, so what it hands over is exactly what it
+    placed. Every identifier and literal is already quoted.
     """
     where = f" WHERE {condition}" if condition else ""
     if limit is not None:
         picked = f"SELECT tableoid, ctid FROM {source}{where} LIMIT {int(limit):d}"  # noqa: S608
         where = f" WHERE (tableoid, ctid) IN ({picked})"
     override = " OVERRIDING SYSTEM VALUE" if overriding else ""
+    taking = f"DELETE FROM {source}{where} RETURNING {column_list}"  # noqa: S608
+    placing = f"INSERT INTO {target} ({column_list}){override} SELECT {column_list} FROM moved"  # noqa: S608
+    if capture is None:
+        return f"WITH moved AS ({taking}) {placing}"
+    kept = quote_identifier(f"pg_temp.{_MOVED_IDENTITY_TABLE}")
     return (
-        f"WITH moved AS ("  # noqa: S608
-        f"DELETE FROM {source}{where} RETURNING {column_list}"
-        f") "
-        f"INSERT INTO {target} ({column_list}){override} "
-        f"SELECT {column_list} FROM moved"
+        f"WITH moved AS ({taking}), placed AS ({placing} RETURNING {capture}) "  # noqa: S608
+        f"INSERT INTO {kept} ({capture}) SELECT {capture} FROM placed"
     )
 
 

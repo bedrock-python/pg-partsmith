@@ -130,6 +130,12 @@ One whose remaining values are all taken has nothing left to issue. One with a *
 has handed blocks of values to sessions, which keep them in memory where no `setval`
 reaches them; PostgreSQL publishes only the newest allocation, so everything the sequence
 has issued since its `START` counts as possibly held — ids from before it never were.
+Every question is asked of the ids **this move carries**, which the move statement hands
+over as it places them. Rows the destination already held are its own: their ids came from
+this very sequence, and whatever it does next it does with the move or without it. So a
+destination that already contains an ordinary row of its own never refuses a move on that
+row's account.
+
 Every refusal is `RowMoveRefusedError` and rolls the move back whole; widen the range,
 quiesce the writers and reset the sequence yourself, or take the identity off the column
 for the migration.

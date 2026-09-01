@@ -74,6 +74,18 @@ class _Catalog:
     failures: dict[str, object] = field(default_factory=dict)
 
 
+# A source that carries the destination's identity column: the move hands those
+# ids over, so the destination's sequence has something to decide about. One it
+# does not carry is filled by the sequence itself, like any ordinary insert.
+_IDENTITY_SOURCE_COLUMNS = ["id", "created_at", "tenant_id", "data"]
+# Where a move parks the identity values it brought in, and where every
+# sequence decision reads them back from.
+_MOVED_IDENTITY = '"pg_temp"."pg_partsmith_moved_identity"'
+_MOVED_MAX = 'SELECT MAX("id") FROM "pg_temp"."pg_partsmith_moved_identity"'
+_MOVED_MIN = 'SELECT MIN("id") FROM "pg_temp"."pg_partsmith_moved_identity"'
+_MOVED_CAPTURE = 'INSERT INTO "pg_temp"."pg_partsmith_moved_identity" ("id") SELECT "id" FROM placed'
+
+
 def _next(value: object) -> object:
     if isinstance(value, list):
         return value.pop(0) if value else None
@@ -1861,7 +1873,9 @@ async def test__detach_partition__foreign_with_an_oid__uses_the_transactional_bl
 
 async def test__move_rows__identity_target__sets_the_sequence_past_the_ids_it_could_reissue() -> None:
     # Arrange -- a fresh ascending sequence and rows carrying 1..11
-    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], extreme_value=11))
+    engine, conn = _engine(
+        _Catalog(moved_rows=4, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, extreme_value=11)
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -1871,7 +1885,7 @@ async def test__move_rows__identity_target__sets_the_sequence_past_the_ids_it_co
     assert moved == 4
     statements = _statements(conn)
     move_at = statements.index(_move_statement_of(conn))
-    reach_at = next(i for i, s in enumerate(statements) if s.startswith('SELECT MAX("id") FROM "b"'))
+    reach_at = next(i for i, s in enumerate(statements) if s.startswith(_MOVED_MAX))
     setval_at = next(i for i, s in enumerate(statements) if "setval(" in s)
     assert move_at < reach_at < setval_at
     engine.begin.assert_called_once()
@@ -1888,7 +1902,11 @@ async def test__move_rows__descending_identity_target__chases_the_low_water_mark
         "start_value": 0,
         "last_value": None,
     }
-    engine, conn = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=-2))
+    engine, conn = _engine(
+        _Catalog(
+            moved_rows=3, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, sequence=sequence, extreme_value=-2
+        )
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -1896,13 +1914,15 @@ async def test__move_rows__descending_identity_target__chases_the_low_water_mark
 
     # Assert
     statements = _statements(conn)
-    assert any(s.startswith('SELECT MIN("id") FROM "b"') for s in statements)
+    assert any(s.startswith(_MOVED_MIN) for s in statements)
     assert any("setval(" in s for s in statements)
 
 
 async def test__move_rows__identity_sequence_out_of_reach__is_left_alone() -> None:
     # Arrange -- no row carries a value the sequence can still issue
-    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], extreme_value=None))
+    engine, conn = _engine(
+        _Catalog(moved_rows=4, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, extreme_value=None)
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -1914,7 +1934,9 @@ async def test__move_rows__identity_sequence_out_of_reach__is_left_alone() -> No
 
 async def test__move_rows__nothing_moved__leaves_identity_sequences_alone() -> None:
     # Arrange
-    engine, conn = _engine(_Catalog(moved_rows=0, identity_columns=["id"], extreme_value=11))
+    engine, conn = _engine(
+        _Catalog(moved_rows=0, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, extreme_value=11)
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -1936,7 +1958,14 @@ async def test__move_rows__cycling_identity_sequence__refuses_the_move() -> None
         "last_value": None,
     }
     engine, _ = _engine(
-        _Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5, holds_value=True)
+        _Catalog(
+            moved_rows=3,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=5,
+            holds_value=True,
+        )
     )
     repo = PostgresPartitionRepository(engine)
 
@@ -1956,7 +1985,11 @@ async def test__move_rows__identity_sequence_would_be_exhausted__refuses_the_mov
         "start_value": 1,
         "last_value": None,
     }
-    engine, _ = _engine(_Catalog(moved_rows=3, identity_columns=["id"], sequence=sequence, extreme_value=5))
+    engine, _ = _engine(
+        _Catalog(
+            moved_rows=3, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, sequence=sequence, extreme_value=5
+        )
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
@@ -1975,7 +2008,14 @@ async def test__move_rows__identity_sequence_with_a_cache__refuses_what_a_sessio
         "start_value": 1,
         "last_value": 5,
     }
-    catalog = _Catalog(moved_rows=2, identity_columns=["id"], sequence=sequence, extreme_value=2, holds_value=True)
+    catalog = _Catalog(
+        moved_rows=2,
+        identity_columns=["id"],
+        columns=_IDENTITY_SOURCE_COLUMNS,
+        sequence=sequence,
+        extreme_value=2,
+        holds_value=True,
+    )
     engine, _ = _engine(catalog)
     repo = PostgresPartitionRepository(engine)
 
@@ -1995,7 +2035,15 @@ async def test__move_rows__identity_sequence_with_a_cache_nobody_holds__moves() 
         "start_value": 1,
         "last_value": 5,
     }
-    engine, conn = _engine(_Catalog(moved_rows=2, identity_columns=["id"], sequence=sequence, extreme_value=None))
+    engine, conn = _engine(
+        _Catalog(
+            moved_rows=2,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=None,
+        )
+    )
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -2018,7 +2066,14 @@ async def test__move_rows__identity_cache_block_below_the_newest__still_refuses(
         "start_value": 1,
         "last_value": 10,
     }
-    catalog = _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, holds_value=True)
+    catalog = _Catalog(
+        moved_rows=1,
+        identity_columns=["id"],
+        columns=_IDENTITY_SOURCE_COLUMNS,
+        sequence=sequence,
+        extreme_value=None,
+        holds_value=True,
+    )
     engine, conn = _engine(catalog)
     repo = PostgresPartitionRepository(engine)
 
@@ -2041,7 +2096,14 @@ async def test__move_rows__cached_identity__values_before_its_start_are_not_refu
         "last_value": 109,
     }
     engine, conn = _engine(
-        _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, holds_value=False)
+        _Catalog(
+            moved_rows=1,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=None,
+            holds_value=False,
+        )
     )
     repo = PostgresPartitionRepository(engine)
 
@@ -2067,10 +2129,55 @@ async def test__move_rows__cycling_identity__asks_about_the_whole_range_not_one_
         "last_value": 4,
     }
     engine, _ = _engine(
-        _Catalog(moved_rows=1, identity_columns=["id"], sequence=sequence, extreme_value=None, holds_value=True)
+        _Catalog(
+            moved_rows=1,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=None,
+            holds_value=True,
+        )
     )
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
     with pytest.raises(RowMoveRefusedError, match="skipped before"):
         await repo.move_rows("a", "b")
+
+
+async def test__move_rows__identity_target__keeps_the_ids_it_moved_and_asks_about_those() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.move_rows("a", "b")
+
+    # Assert -- one statement moves the rows and hands over what it placed,
+    # and the relation it parked them in is opened before and released after
+    statements = _statements(conn)
+    move = _move_statement_of(conn)
+    assert 'placed AS (INSERT INTO "b" ("id", "created_at", "tenant_id", "data") ' in move
+    assert 'RETURNING "id") ' in move
+    assert _MOVED_CAPTURE in move
+    opened = next(i for i, s in enumerate(statements) if s.startswith("CREATE TEMP TABLE"))
+    released = next(i for i, s in enumerate(statements) if s.startswith("DROP TABLE"))
+    assert opened < statements.index(move) < released
+    assert all(_MOVED_IDENTITY in s for s in statements if s.startswith(("SELECT MAX(", "SELECT MIN(")))
+
+
+async def test__move_rows__identity_column_the_source_does_not_carry__is_left_to_its_sequence() -> None:
+    # Arrange -- the move inserts no id, so the destination's sequence issues
+    # them itself and has nothing the move could have taken from it
+    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], extreme_value=11))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = await repo.move_rows("a", "b")
+
+    # Assert
+    assert moved == 4
+    statements = _statements(conn)
+    assert "placed AS" not in _move_statement_of(conn)
+    assert not any(s.startswith("CREATE TEMP TABLE") for s in statements)
+    assert not any("setval(" in s for s in statements)

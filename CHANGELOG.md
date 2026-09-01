@@ -111,7 +111,10 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   far end and can move it onto values its increments skipped), would have nothing left to
   issue, or has handed cached blocks out to sessions — which keep them where no `setval`
   reaches, while PostgreSQL publishes only the newest allocation, so everything issued
-  since `START` counts — is refused instead of quietly broken.
+  since `START` counts — is refused instead of quietly broken. Every one of those
+  questions is about the ids the move carries, which the move statement hands over as it
+  places them: a row the destination already held came from that sequence itself and
+  never refuses a move.
 - `unpartition` refuses a destination that is the root, a member or an orphan of its tree,
   or a partition of any other table; empties this library's detached partitions too; and —
   under `drop_emptied` — detaches, drains the tail, and lets the drop move whatever

@@ -764,3 +764,55 @@ def test__unpartition__cached_identity__ids_before_its_start_move(sync_db_engine
     assert result.complete
     assert result.rows_moved == 1
     assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{dest}"')) == 1  # noqa: S608
+
+
+def test__unpartition__cycling_identity__a_row_it_issued_itself_does_not_refuse_the_move(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    """A pre-existing destination row is the destination's own business."""
+    # Arrange: the destination cycles over 1..10 and already holds an id it
+    # issued itself; the only row moving carries 50, which it can never reach
+    _identity_rows(sync_db_engine, ledger, ids=(50,))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(
+        sync_db_engine, ledger, "ownrow", "START WITH 2 INCREMENT BY 3 MINVALUE 1 MAXVALUE 10 CYCLE CACHE 2"
+    )
+    exec_sql(
+        sync_db_engine,
+        f'INSERT INTO "{dest}" (tenant_id, created_at, amount) '  # noqa: S608
+        "VALUES (1, '2026-05-01T00:00:00+00:00', 9)",
+    )
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert result.complete
+    assert result.rows_moved == 1
+    assert scalar(sync_db_engine, f"SELECT string_agg(id::text, ',' ORDER BY id) FROM \"{dest}\"") == "2,50"  # noqa: S608
+    assert _count(sync_db_engine, ledger) == 0
+
+
+def test__unpartition__cached_identity__a_block_it_issued_itself_does_not_refuse_the_move(
+    sync_db_engine: Engine, ledger: str
+) -> None:
+    # Arrange: an ordinary insert draws the block 100..104; the moved row's 50
+    # was never the sequence's to give
+    _identity_rows(sync_db_engine, ledger, ids=(50,))
+    config = monthly_config(ledger, create_ahead=1)
+    make_service(sync_db_engine).partition_data(config)
+    dest = _identity_destination(sync_db_engine, ledger, "ownblock", "START WITH 100 MINVALUE 1 CACHE 5")
+    exec_sql(
+        sync_db_engine,
+        f'INSERT INTO "{dest}" (tenant_id, created_at, amount) '  # noqa: S608
+        "VALUES (1, '2026-05-01T00:00:00+00:00', 9)",
+    )
+
+    # Act
+    result = make_service(sync_db_engine).unpartition(config, f"public.{dest}")
+
+    # Assert
+    assert result.complete
+    assert result.rows_moved == 1
+    assert scalar(sync_db_engine, f"SELECT string_agg(id::text, ',' ORDER BY id) FROM \"{dest}\"") == "50,100"  # noqa: S608
