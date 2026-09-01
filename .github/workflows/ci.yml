@@ -63,11 +63,49 @@ jobs:
           files: coverage.xml
         continue-on-error: true
 
+  image:
+    name: Container image
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pg-partsmith:ci
+          build-args: VERSION=ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Size is the first thing a team evaluating this reads, so a regression in
+      # it is a build failure and not a note in a release.
+      - name: Size budget
+        run: |
+          BYTES=$(docker image inspect pg-partsmith:ci -f '{{.Size}}')
+          MB=$((BYTES / 1024 / 1024))
+          echo "image is ${MB} MB (budget ${IMAGE_SIZE_BUDGET_MB} MB)"
+          test "$MB" -le "$IMAGE_SIZE_BUDGET_MB"
+        env:
+          IMAGE_SIZE_BUDGET_MB: 280
+      - name: It runs, and it is not root
+        run: |
+          docker run --rm pg-partsmith:ci --version
+          test "$(docker run --rm --entrypoint id pg-partsmith:ci -u)" = "65532"
+      - name: Scan
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: pg-partsmith:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
   # Sentinel job — use this as the single required status check in branch protection.
   all-checks-passed:
     name: All checks passed
     if: always()
-    needs: [lint, test-unit, test-integration]
+    needs: [lint, test-unit, test-integration, image]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded

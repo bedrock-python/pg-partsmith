@@ -47,6 +47,8 @@ serialize, filter and apply. No extension, no superuser, no scheduler of its own
 - **A command line** — `pg-partsmith inspect / plan / validate / apply` over a YAML or
   JSON document, with a saved plan as the artifact between plan and apply, and exit codes
   a CronJob and a CI step can read
+- **A container image** — `ghcr.io/bedrock-python/pg-partsmith`, for stacks with no Python
+  in them
 - **Hooks, locks, schemas** — six lifecycle hooks; PostgreSQL advisory or Redis locks;
   schema-qualified everything
 - **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15, 16 and 17 via testcontainers

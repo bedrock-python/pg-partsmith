@@ -63,6 +63,9 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
   5 connection, 6 lock held, 1 unexpected. `--output json` is the model dump under a
   versioned envelope. See `guide/cli.md`.
+* The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command
+  as its entrypoint; tags are the exact version and a moving minor, never `latest`. See
+  `guide/container.md`.
 * `PartitionsDocument` is several tables and their wiring as one validated model — what a
   YAML or JSON file parses into. `document.configs()` gives every `TablePartitionConfig`,
   `document.config_for(name)` one of them, and

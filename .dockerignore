@@ -1,0 +1,9 @@
+# Everything the build does not need: the image is measured, and a build
+# context that carries the test suite and a virtualenv is how it stops being.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!CHANGELOG.md
+!pg_partsmith/**
+pg_partsmith/**/__pycache__/

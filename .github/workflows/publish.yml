@@ -13,6 +13,7 @@ on:
 permissions:
   contents: read
   id-token: write   # Trusted Publisher (PyPI OIDC)
+  packages: write   # ghcr.io
 
 jobs:
   check:
@@ -59,3 +60,67 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv build
       - run: uv publish
+
+  image:
+    name: Build and publish the image
+    needs: [check, publish]
+    if: needs.check.outputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+
+      # The library, the CLI and the image carry the same number, always. It
+      # comes off the tag here so the label, the tags and `--version` inside the
+      # container cannot disagree.
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="${TAG#pg-partsmith-v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "minor=${VERSION%.*}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pg-partsmith:release
+          build-args: VERSION=${{ steps.version.outputs.version }}
+
+      - name: The image reports the version it is tagged with
+        run: |
+          test "$(docker run --rm pg-partsmith:release --version)" = "pg-partsmith ${VERSION}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Scan
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: pg-partsmith:release
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # The exact version, and a minor tag that moves within it. Never `latest`:
+      # a CronJob following it would cross a major on its own.
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ghcr.io/bedrock-python/pg-partsmith:${{ steps.version.outputs.version }}
+            ghcr.io/bedrock-python/pg-partsmith:${{ steps.version.outputs.minor }}

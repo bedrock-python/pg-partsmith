@@ -145,6 +145,25 @@ reads it back. Both guards from earlier in this release apply to it: a plan made
 another table, or under a configuration that has since been edited, is refused with exit
 `4` unless `--allow-config-drift` is passed.
 
+### A container image
+
+`ghcr.io/bedrock-python/pg-partsmith:<version>`, published from the release workflow, so a
+Go, Ruby or Node stack runs partition maintenance as a CronJob, a Compose service or an
+init container with no Python of its own. The entrypoint is the command itself, it runs as
+UID 65532, and the build stage — pip, the build backend, every `__pycache__` — is thrown
+away rather than shipped.
+
+The library, the CLI and the image carry the same number, always; CI refuses to publish an
+image whose `--version` disagrees with its tag. Tags are the exact version and a moving
+minor, never `latest`: a scheduled job following `latest` would cross a major on its own,
+at 02:15, with `DROP` in its hands. The image size is checked against a budget on every
+pull request and a regression fails the build.
+
+The init-container case needs no flag of its own: `apply` without `--allow-destructive`
+creates and retires nothing, which is exactly what running maintenance at application
+startup should do. The documentation states the grants this thing needs and recommends a
+dedicated role, because it issues DDL and nobody should have to guess that.
+
 ## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
 
 

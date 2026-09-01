@@ -156,6 +156,11 @@ fingerprint asks whether the plan is still the same intent: a plan made under
 `retention_count: 12` names exactly the right partitions to expire, for a reason that
 stopped being true the moment someone wrote `120`.
 
+## In a container
+
+The same commands, with nothing installed:
+`ghcr.io/bedrock-python/pg-partsmith:1.1` — see [the container image](container.md).
+
 ## What is not here yet
 
 `partition_data` and `unpartition` — the batched row-movement verbs — are library-only for
