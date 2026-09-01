@@ -35,7 +35,7 @@ def target_for(source: pathlib.Path) -> pathlib.Path:
     belongs at ``reference.md``. The site's own index keeps its name.
     """
     relative = source.relative_to(DOCS)
-    if relative.name == "index.md" and relative.parent != pathlib.Path("."):
+    if relative.name == "index.md" and relative.parent != pathlib.Path():
         return SITE / relative.parent.with_suffix(".md")
     return SITE / relative
 
