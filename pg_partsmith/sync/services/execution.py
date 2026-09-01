@@ -22,8 +22,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy.exc import SQLAlchemyError
-
 from pg_partsmith.boundaries import Window
 from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, DEFAULT_CONFLICT_MAX_RETRIES
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult, PartitionInfo
@@ -461,7 +459,13 @@ class PlanExecutor:
             except (OSError, TimeoutError):
                 self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                 raise
-            except SQLAlchemyError as exc:
+            except Exception as exc:
+                # Recognised structurally, by the SQLSTATE the driver carries,
+                # rather than by a driver's exception type: a repository built
+                # on something other than SQLAlchemy must not lose the
+                # compensating move-back, the benign-race check or the retry.
+                # Anything unrecognised still leaves through the branches below,
+                # after the reconciled rows have been put back.
                 if pg_sqlstate(exc) in ATTACH_CONFLICT_SQLSTATES:
                     self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                     if self._metadata.is_partition_attached(parent_name, partition_name):

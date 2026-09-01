@@ -307,9 +307,12 @@ def comment_without_markers(comment: str | None, *, marker_prefix: str | None = 
 
 
 def pg_sqlstate(exc: BaseException) -> str | None:
-    """Extract PostgreSQL SQLSTATE code from SQLAlchemy/DBAPI exception.
+    """Extract the PostgreSQL SQLSTATE code an exception carries.
 
-    Works with asyncpg (exc.orig.sqlstate) and psycopg2 (exc.orig.pgcode).
+    Driver-neutral: it reads ``sqlstate`` or ``pgcode`` off the exception, or
+    off its ``orig`` if it wraps one, so a SQLAlchemy error, a bare
+    ``psycopg.Error`` and an ``asyncpg.PostgresError`` all answer alike. That
+    is what lets the executor recognise a conflict without naming a driver.
 
     Args:
         exc: Exception from database operation.
