@@ -16,13 +16,17 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .exceptions import PlanConfigMismatchError
 from .lifecycle import DetachMode
 from .topology import PartitionBounds, PartitionType
 from .types import NonNegativeInt, StrippedNonEmptyStr
+
+if TYPE_CHECKING:
+    from .entities import TablePartitionConfig
 
 __all__ = [
     "AttachPartition",
@@ -38,6 +42,7 @@ __all__ = [
     "PartitionBy",
     "Reason",
     "Severity",
+    "validate_plan_for_config",
 ]
 
 
@@ -496,7 +501,13 @@ class MaintenancePlan(BaseModel):
         generated_at: The instant the plan was made; every policy was
             evaluated against it.
         cursors: Cursor of every integer axis the plan was made against,
-            keyed by leading column.
+            keyed by leading column. Integers, because only an integer axis
+            records one -- a time axis is cursored by ``generated_at`` -- so
+            the plan survives a round trip through JSON unchanged.
+        config_fingerprint: :attr:`~pg_partsmith.TablePartitionConfig.fingerprint`
+            of the configuration the plan was made from, so a plan read back
+            from a file can say whether that configuration still holds. None
+            on a plan built by hand.
         operations: What to do, in order.
         findings: What was deliberately left alone, and why.
     """
@@ -505,7 +516,8 @@ class MaintenancePlan(BaseModel):
 
     table_name: StrippedNonEmptyStr
     generated_at: datetime
-    cursors: dict[str, Any] = Field(default_factory=dict)
+    cursors: dict[str, int] = Field(default_factory=dict)
+    config_fingerprint: str | None = None
     operations: tuple[Operation, ...] = ()
     findings: tuple[Finding, ...] = ()
 
@@ -576,6 +588,49 @@ class MaintenancePlan(BaseModel):
         if len(lines) == 1:
             lines.append("  nothing to do")
         return "\n".join(lines)
+
+
+def validate_plan_for_config(
+    config: TablePartitionConfig,
+    plan: MaintenancePlan,
+    *,
+    allow_config_drift: bool = False,
+) -> None:
+    """Refuse a plan that was not made from ``config``.
+
+    Two questions the identity revalidation on each destructive operation does
+    not answer: whether this is the plan for this table, and whether it was
+    planned under the policy in force now. Both become reachable the moment a
+    plan is written to a file and applied by a later process -- against the
+    wrong table of a document describing several, or after the retention it
+    was planned under was edited. The plan would still be applied to exactly
+    the relations it named, for reasons that had stopped being true.
+
+    A plan carrying no fingerprint -- built by hand, or by a version that did
+    not record one -- is checked for its table alone; there is nothing to
+    compare it against, and inventing a refusal from that would be guessing.
+
+    Args:
+        config: The configuration the plan is about to be applied with.
+        plan: The plan.
+        allow_config_drift: Apply a plan whose fingerprint no longer matches
+            the configuration.
+
+    Raises:
+        PlanConfigMismatchError: If the plan is for another table, or was made
+            under another configuration and ``allow_config_drift`` is not set.
+    """
+    if plan.table_name != config.qualified_name:
+        raise PlanConfigMismatchError(plan.table_name, f"the configuration describes {config.qualified_name!r}")
+    if allow_config_drift or plan.config_fingerprint is None:
+        return
+    current = config.fingerprint
+    if plan.config_fingerprint != current:
+        msg = (
+            f"the configuration changed after the plan was made ({plan.config_fingerprint} -> {current}); "
+            "plan again, or pass allow_config_drift=True to apply it as it stands"
+        )
+        raise PlanConfigMismatchError(plan.table_name, msg)
 
 
 def _describe_operation(op: Operation, indent: int) -> list[str]:

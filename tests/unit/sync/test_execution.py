@@ -30,6 +30,7 @@ from pg_partsmith.exceptions import (
     PartitionError,
     PartitionReferencedError,
     PartitionTopologyError,
+    PlanConfigMismatchError,
     PlanStaleError,
     RowMoveRefusedError,
 )
@@ -169,8 +170,8 @@ def _hash_root_config() -> TablePartitionConfig:
     )
 
 
-def _plan(*operations: Operation, findings: tuple[Finding, ...] = ()) -> MaintenancePlan:
-    return MaintenancePlan(table_name="events", generated_at=NOW, operations=tuple(operations), findings=findings)
+def _plan(*operations: Operation, findings: tuple[Finding, ...] = (), table_name: str = "events") -> MaintenancePlan:
+    return MaintenancePlan(table_name=table_name, generated_at=NOW, operations=tuple(operations), findings=findings)
 
 
 def _create_op(
@@ -1855,7 +1856,7 @@ def test__apply__plain_local_leaves__create_is_spelled_as_it_always_was(
 ) -> None:
     # Arrange / Act
     op = _create_op("public.events__2024_04", parent="public.events")
-    executor.apply(_leaves_config(LocalLeaves()), _plan(op))
+    executor.apply(_leaves_config(LocalLeaves()), _plan(op, table_name="public.events"))
 
     # Assert
     repo.create_table_like.assert_called_once_with("public.events", "public.events__2024_04", None)
@@ -1869,7 +1870,7 @@ def test__apply__customised_local_leaves__physical_spec_reaches_the_repository(
     leaves = LocalLeaves(tablespace="fast", storage_parameters={"fillfactor": 70})
 
     # Act
-    executor.apply(_leaves_config(leaves), _plan(_create_op()))
+    executor.apply(_leaves_config(leaves), _plan(_create_op(), table_name="public.events"))
 
     # Assert
     repo.create_table_like.assert_called_once_with("events", "events__2024_04", None, physical=leaves)
@@ -1883,7 +1884,7 @@ def test__apply__foreign_leaves__leaf_is_a_foreign_table_with_rendered_options(
     op = _create_op("public.events__2024_04", parent="public.events")
 
     # Act
-    result = executor.apply(_leaves_config(leaves), _plan(op))
+    result = executor.apply(_leaves_config(leaves), _plan(op, table_name="public.events"))
 
     # Assert
     repo.create_foreign_table_like.assert_called_once_with(
@@ -1906,7 +1907,7 @@ def test__apply__foreign_leaves__branch_stays_local_and_its_buckets_are_foreign(
     leaves = ForeignLeaves(server="archive", options={"table_name": "{parent}_{relname}"})
 
     # Act
-    executor.apply(_leaves_config(leaves, nested=True), _plan(_branch_op()))
+    executor.apply(_leaves_config(leaves, nested=True), _plan(_branch_op(), table_name="public.events"))
 
     # Assert
     repo.create_table_like.assert_called_once_with("events", "events__2024_04", _branch_op().partition_by)
@@ -2172,3 +2173,16 @@ def test__attach_partition__branch_orphan__its_children_carry_the_planned_parent
     bucket = repo.attach_partition.call_args_list[0]
     assert bucket.args[0] == "events__2024_04"
     assert bucket.kwargs["expected_parent_oid"] == 77
+
+
+def test__apply__a_plan_made_for_another_table__is_refused_before_any_ddl(
+    executor: PlanExecutor, repo: MagicMock
+) -> None:
+    # Arrange: the plan names relations that exist, under a configuration that
+    # describes a different table -- reachable once a plan is an artifact.
+    plan = _plan(_create_op(), table_name="public.audit")
+
+    # Act / Assert
+    with pytest.raises(PlanConfigMismatchError):
+        executor.apply(_config(), plan)
+    repo.create_table_like.assert_not_called()

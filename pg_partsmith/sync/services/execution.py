@@ -44,6 +44,7 @@ from pg_partsmith.plan import (
     FindingReason,
     MaintenancePlan,
     Operation,
+    validate_plan_for_config,
 )
 from pg_partsmith.planner import PlanMode, PlanningContext, plan_maintenance, to_maintenance_issue
 from pg_partsmith.scheme import ListPartitioning, RangePartitioning
@@ -88,6 +89,7 @@ class PlanExecutor:
         plan: MaintenancePlan,
         *,
         continue_on_error: bool = False,
+        allow_config_drift: bool = False,
     ) -> MaintenanceResult:
         """Execute every operation of ``plan`` in order.
 
@@ -104,10 +106,16 @@ class PlanExecutor:
             plan: The plan.
             continue_on_error: Isolate operation failures into
                 ``MaintenanceResult.issues`` instead of aborting.
+            allow_config_drift: Execute a plan whose fingerprint no longer
+                matches ``config``.
 
         Returns:
             The counters, the issues, and the plan itself.
+
+        Raises:
+            PlanConfigMismatchError: If the plan was not made from ``config``.
         """
+        validate_plan_for_config(config, plan, allow_config_drift=allow_config_drift)
         tally = _Tally()
         issues: list[MaintenanceIssue] = [to_maintenance_issue(f) for f in plan.actionable_findings]
         detached: set[str] = set()

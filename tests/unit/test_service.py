@@ -494,7 +494,7 @@ async def test__apply__holds_the_table_lock_while_the_executor_runs(
     assert result is expected
     locks.acquire_lock.assert_called_once_with("events")
     assert events == ["acquire", "apply", "release"]
-    service._executor.apply.assert_awaited_once_with(config, plan, continue_on_error=True)
+    service._executor.apply.assert_awaited_once_with(config, plan, continue_on_error=True, allow_config_drift=False)
 
 
 async def test__apply__executor_fails__lock_is_still_released(

@@ -51,7 +51,7 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   each with the reason it is there, plus **findings**: what the planner saw and
   deliberately did not touch.
 * `apply()` runs a plan under the table's lock, revalidating every destructive operation
-  against the catalog first.
+  against the catalog first, and refusing a plan this configuration did not produce.
 * `maintain()` is both under one lock, and is what a scheduled tick calls.
 
 Two kinds of level:
@@ -230,7 +230,7 @@ Every method takes the `TablePartitionConfig` as its first argument.
 |---|---|---|---|
 | `inspect(config)` | no | no | `ActualTree \| None` |
 | `plan(config, *, mode=PlanMode.MAINTAIN, now=None, windows=None)` | no | no | `MaintenancePlan` |
-| `apply(config, plan, *, continue_on_error=False)` | **yes** | yes | `MaintenanceResult` |
+| `apply(config, plan, *, continue_on_error=False, allow_config_drift=False)` | **yes** | yes | `MaintenanceResult` |
 | `maintain(config, *, skip_create=False, skip_detach=False, skip_drop=False, continue_on_error=False)` | **yes** | yes | `MaintenanceResult` |
 | `reconcile(config)` | no | yes | `MaintenanceResult` |
 | `ensure_partition(config, period_or_window_or_position)` | no | yes | `PartitionInfo \| None` |
@@ -250,9 +250,17 @@ raises and reports the failure on `result.error` instead, which is what a schedu
 `EXPLICIT` (only the windows named in `windows=`).
 
 On a `MaintenancePlan`: `.operations`, `.findings`, `.cursors`, `.generated_at`,
-`.creates` / `.attaches` / `.detaches` / `.drops`, `.is_noop`, `.only(*kinds)`,
-`.without(*kinds)`, `.describe()`. Filtering a plan and applying the rest is supported and
-is how you split creation from pruning across schedules.
+`.config_fingerprint`, `.creates` / `.attaches` / `.detaches` / `.drops`, `.is_noop`,
+`.only(*kinds)`, `.without(*kinds)`, `.describe()`. Filtering a plan and applying the rest
+is supported and is how you split creation from pruning across schedules.
+
+Serialize a plan with `model_dump_json(by_alias=True)` — the same vocabulary a
+configuration uses (`kind`, `method`, `schema`) — and read it back with
+`MaintenancePlan.model_validate_json`. `apply()` refuses a plan made for another table, or
+one whose `config_fingerprint` no longer matches `config.fingerprint`, with
+`PlanConfigMismatchError`; pass `allow_config_drift=True` to apply it anyway. OID
+revalidation asks whether this is still the same relation, the fingerprint whether it is
+still the same intent.
 
 Results:
 
@@ -373,6 +381,7 @@ for issue in result.issues:                 # non-fatal, but they are why nothin
 
 `InvalidPartitionConfigError` (the config does not match the table),
 `LockAcquisitionError` (another maintainer holds the lock), `PlanStaleError`,
+`PlanConfigMismatchError` (the plan was not made from this configuration),
 `PartitionTopologyError`, `PartitionReferencedError` (a detach PostgreSQL refused because
 rows still reference the partition), `RowMoveRefusedError` (a row move an incoming foreign
 key's `ON DELETE` action would corrupt), `PartitionAlreadyExistsError`,

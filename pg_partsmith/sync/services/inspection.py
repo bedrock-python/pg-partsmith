@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from pg_partsmith.boundaries import Axis, CursorSource, Window
 from pg_partsmith.planner import PlanMode, PlanningContext, fact_targets
@@ -67,7 +67,7 @@ class PartitionInspector:
         if instant.tzinfo is None:
             instant = instant.replace(tzinfo=UTC)
 
-        cursors: dict[str, Any] = {}
+        cursors: dict[str, int] = {}
         for level in config.levels:
             boundaries = level.progression
             if boundaries is None or boundaries.axis is not Axis.INTEGER:

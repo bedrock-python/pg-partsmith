@@ -63,6 +63,27 @@ now takes one `PartitionEvent`:
 - Hook signatures are read when the service is constructed; one still taking the 1.0
   arguments is refused there, naming the class, the method and the shape to move to.
 
+### The plan as an artifact
+
+`plan()` and `apply()` were always separable and the plan was always a pydantic model, but
+nothing checked that the plan handed to `apply()` was the one this configuration produced.
+In one process the pair cannot disagree; written to a file by one run and read by another
+— which is the whole point of the split — it can.
+
+- `MaintenancePlan.config_fingerprint` records `TablePartitionConfig.fingerprint`, a digest
+  of the configuration the plan was made from. `apply()` now refuses a plan made for
+  another table, and one made under a configuration that has since been edited, with
+  `PlanConfigMismatchError` and before any DDL runs; `allow_config_drift=True` applies it
+  as it stands. The identity revalidation each destructive operation already did answers
+  whether this is still the same *relation*, not whether it is still the same *intent* — a
+  plan made under `retention_count=12` names exactly the right partitions to expire for a
+  reason that stopped being true the moment someone wrote `120`.
+- `MaintenancePlan.cursors` is typed `dict[str, int]`. Only an integer axis records a
+  cursor — a time axis is cursored by `generated_at` — and leaving it `Any` meant a plan
+  written to JSON did not always read back as the plan that was written.
+- `validate_plan_for_config(config, plan, *, allow_config_drift=False)` is exported for
+  anything that pairs a plan with a configuration itself.
+
 ## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
 
 

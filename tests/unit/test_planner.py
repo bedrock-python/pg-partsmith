@@ -2421,3 +2421,14 @@ def test__plan_maintenance__detach_pending_child_in_a_wanted_window__finalized_w
     assert [op.reason for op in plan.detaches] == [Reason.DETACH_FINALIZE]
     assert plan.creates == ()
     assert _reasons(plan) == [FindingReason.DETACH_PENDING]
+
+
+def test__plan_maintenance__records_the_configuration_it_planned_under() -> None:
+    # Arrange
+    config = _config()
+
+    # Act
+    plan = _plan(config, _root())
+
+    # Assert: what makes a plan read back from a file answerable
+    assert plan.config_fingerprint == config.fingerprint

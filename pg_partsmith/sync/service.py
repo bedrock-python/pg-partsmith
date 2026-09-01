@@ -135,23 +135,32 @@ class PartitionLifecycleService:
         plan: MaintenancePlan,
         *,
         continue_on_error: bool = False,
+        allow_config_drift: bool = False,
     ) -> MaintenanceResult:
         """Execute a plan under the table's lock.
 
         Every destructive operation is revalidated against the catalog first:
-        a relation that no longer has the OID the plan saw is left alone.
+        a relation that no longer has the OID the plan saw is left alone, and
+        a plan made for another table, or under a configuration that has since
+        been edited, is refused before anything is executed.
 
         Args:
             config: The configuration the plan was made from.
             plan: The plan, possibly filtered.
             continue_on_error: Isolate operation failures into
                 ``MaintenanceResult.issues`` instead of aborting.
+            allow_config_drift: Apply a plan whose fingerprint no longer
+                matches ``config`` -- it was planned under a policy that has
+                since changed, and its operations still carry the old reasons.
 
         Raises:
             LockAcquisitionError: If the table-level maintenance lock is unavailable.
+            PlanConfigMismatchError: If the plan was not made from ``config``.
         """
         with self._locks.acquire_lock(config.qualified_name):
-            return self._executor.apply(config, plan, continue_on_error=continue_on_error)
+            return self._executor.apply(
+                config, plan, continue_on_error=continue_on_error, allow_config_drift=allow_config_drift
+            )
 
     def maintain(
         self,

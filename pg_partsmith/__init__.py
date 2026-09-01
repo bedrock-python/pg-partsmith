@@ -43,6 +43,7 @@ from .exceptions import (
     PartitionNotFoundError,
     PartitionReferencedError,
     PartitionTopologyError,
+    PlanConfigMismatchError,
     PlanStaleError,
     RowMoveRefusedError,
     UnmanagedPartitionDropError,
@@ -89,6 +90,7 @@ from .plan import (
     PartitionBy,
     Reason,
     Severity,
+    validate_plan_for_config,
 )
 from .planner import PlanMode, PlanningContext, plan_maintenance
 from .protocols import (
@@ -194,6 +196,7 @@ __all__ = [
     "PartitionType",
     "Period",
     "PeriodCalculator",
+    "PlanConfigMismatchError",
     "PlanMode",
     "PlanStaleError",
     "PlanningContext",
@@ -227,4 +230,5 @@ __all__ = [
     "plan_maintenance",
     "qualify",
     "split_qualified_name",
+    "validate_plan_for_config",
 ]

@@ -157,7 +157,10 @@ acquire_min_interval_seconds=0)`.
 ## Serialization
 
 `config.model_dump(mode="json", by_alias=True)` round-trips through
-`TablePartitionConfig.model_validate`. Boundaries dump with a `kind` (`time`, `integer`,
+`TablePartitionConfig.model_validate`. `config.fingerprint` is a digest of that form,
+which is what a plan records in `config_fingerprint` and what `apply()` compares against;
+anything excluded from serialization is invisible to it, so two configurations differing
+only in a `Callback`'s function share a fingerprint. Boundaries dump with a `kind` (`time`, `integer`,
 `sequence`), levels with `method` (`range`, `list`, `hash`), policies and predicates with
 `kind`, leaves with `kind` (`local`, `foreign`). Custom calculators, custom codecs and
 `Callback` functions are left out.
