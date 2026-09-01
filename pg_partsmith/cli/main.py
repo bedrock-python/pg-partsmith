@@ -22,7 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
-from pg_partsmith.aio import PartitionToolkit
+from pg_partsmith.aio import CommandHooks, PartitionToolkit
 from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError, PlanConfigMismatchError
 
 from .commands import CommandResult, run_apply, run_inspect, run_plan, run_validate
@@ -40,6 +40,9 @@ from .render import to_json
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from pg_partsmith.aio import PartitionLifecycleHooks
+    from pg_partsmith.document import PartitionsDocument
 
 logger = logging.getLogger("pg_partsmith.cli")
 
@@ -131,7 +134,7 @@ async def _run(args: argparse.Namespace) -> CommandResult:
 
     engine = create_async_engine(url)
     try:
-        kit = PartitionToolkit.from_options(engine, document.runtime)
+        kit = PartitionToolkit.from_options(engine, document.runtime, hooks=_hooks(document, args))
         if args.command == "inspect":
             return await run_inspect(kit, configs)
         if args.command == "plan":
@@ -151,6 +154,35 @@ async def _run(args: argparse.Namespace) -> CommandResult:
         return await run_validate(kit, configs)
     finally:
         await engine.dispose()
+
+
+def _hooks(document: PartitionsDocument, args: argparse.Namespace) -> list[PartitionLifecycleHooks] | None:
+    """The hooks this run honours, and a refusal when it was not told to honour any.
+
+    Hooks fire during ``apply`` alone, so nothing else has to decide. Ignoring a
+    configured ``before_drop`` silently would be the worst outcome available: an
+    operator would read the file, believe their archiver ran, and be wrong. So a
+    document declaring hooks is refused rather than quietly stripped.
+
+    Raises:
+        ConfigError: If the document names hooks and ``--allow-hooks`` was not given.
+    """
+    hooks = document.hooks
+    if hooks is None or hooks.is_empty:
+        return None
+    if args.command != "apply":
+        return None
+    if not getattr(args, "allow_hooks", False):
+        named = ", ".join(phase.value for phase in hooks.commands())
+        msg = (
+            f"This document runs commands ({named}). They execute in a process holding DDL credentials, "
+            "so they run only when asked for: pass --allow-hooks, or remove the hooks section."
+        )
+        raise ConfigError(msg)
+    # Annotated as the protocol, not the class: a list is invariant, and the
+    # toolkit takes any hook implementation.
+    configured: list[PartitionLifecycleHooks] = [CommandHooks(hooks.commands(), timeout_seconds=hooks.timeout_seconds)]
+    return configured
 
 
 def _add_apply_arguments(parser: argparse.ArgumentParser) -> None:
@@ -175,6 +207,11 @@ def _add_apply_arguments(parser: argparse.ArgumentParser) -> None:
         "--allow-config-drift",
         action="store_true",
         help="apply a saved plan whose configuration has changed since it was made",
+    )
+    parser.add_argument(
+        "--allow-hooks",
+        action="store_true",
+        help="run the commands the document's hooks section names; without it, a document declaring any is refused",
     )
 
 

@@ -13,7 +13,7 @@ from .boundaries import (
     UUIDv7BoundaryCodec,
     Window,
 )
-from .document import PartitionsDocument, PartitionTableSpec, ToolkitOptions
+from .document import HookOptions, PartitionsDocument, PartitionTableSpec, ToolkitOptions
 from .entities import (
     DefaultBounds,
     HashBounds,
@@ -151,6 +151,7 @@ __all__ = [
     "ForeignLeaves",
     "HashBounds",
     "HashPartitioning",
+    "HookOptions",
     "HookPhase",
     "HourPeriodCalculator",
     "IntegerSequence",

@@ -145,6 +145,26 @@ reads it back. Both guards from earlier in this release apply to it: a plan made
 another table, or under a configuration that has since been edited, is refused with exit
 `4` unless `--allow-config-drift` is passed.
 
+### Commands around the lifecycle
+
+`CommandHooks` runs a configured command at each lifecycle phase, handing it the
+`PartitionEvent` as JSON on stdin and treating a non-zero exit exactly as a raised
+exception. It needed no new context: the event has been one pydantic model for every phase
+since earlier in this release, so the payload is a dump of the object a Python hook already
+receives. In a document it is a `hooks` section, and it is what makes the destructive half
+usable by a team that does not write Python — they own the archiver already, they only
+need it invoked at the right moment.
+
+The commands run only when the run is told to run them (`apply --allow-hooks`), and a
+document declaring hooks is refused rather than quietly stripped when it is not: silently
+skipping a configured `before_drop` would let an operator read the file, believe their
+archiver ran, and be wrong. No sandbox is provided and none is claimed; the container
+boundary is the answer if isolation is wanted.
+
+Both mirrors run the command through one implementation, so it does not depend on the
+event loop being able to spawn processes — a hook that works in production works on a
+developer's machine too.
+
 ### A container image
 
 `ghcr.io/bedrock-python/pg-partsmith:<version>`, published from the release workflow, so a

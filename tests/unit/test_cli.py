@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pg_partsmith.__version__ import __version__
-from pg_partsmith.cli import ExitCode, main
+from pg_partsmith.cli import ExitCode, build_parser, main
 from pg_partsmith.cli.commands import run_apply, run_plan, run_validate
 from pg_partsmith.cli.loader import (
     DSN_ENV_VAR,
@@ -23,9 +23,11 @@ from pg_partsmith.cli.loader import (
     resolve_dsn,
     select_configs,
 )
+from pg_partsmith.cli.main import _hooks as _cli_hooks
 from pg_partsmith.cli.render import envelope, plan_entry
 from pg_partsmith.document import PartitionsDocument
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult
+from pg_partsmith.events import HookPhase
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.plan import (
     CreatePartition,
@@ -457,3 +459,45 @@ def test__load_plans__something_that_is_not_a_saved_plan__is_refused(tmp_path: P
     # Act / Assert
     with pytest.raises(ConfigError, match="no 'tables'"):
         load_plans(path)
+
+
+# ── Hooks are code, and run only when asked for ─────────────────────────────────
+
+
+def _hooks_document(tmp_path: Path) -> str:
+    payload = {**DOCUMENT, "dsn": "postgresql://app@localhost/app", "hooks": {"before_drop": ["/bin/archive"]}}
+    return str(_write(tmp_path, "partitions.json", json.dumps(payload)))
+
+
+def test__apply__a_document_that_runs_commands__is_refused_unless_asked_for(tmp_path: Path) -> None:
+    # Arrange: ignoring a configured before_drop silently would be the worst
+    # outcome available -- an operator reads the file and believes it ran.
+    config = _hooks_document(tmp_path)
+
+    # Act
+    code = main(["apply", "-c", config])
+
+    # Assert: refused as configuration, before any connection is made
+    assert code == ExitCode.CONFIG
+
+
+def test__plan__a_document_that_runs_commands__needs_no_permission(tmp_path: Path) -> None:
+    # Hooks fire during apply alone, so planning one is not running one. This
+    # gets as far as connecting, which is a different failure entirely.
+    config = _hooks_document(tmp_path)
+
+    # Act / Assert
+    assert main(["plan", "-c", config]) == ExitCode.CONNECTION
+
+
+def test__hooks__allowed__are_built_from_the_document(tmp_path: Path) -> None:
+    # Arrange
+    document = load_document(Path(_hooks_document(tmp_path)))
+    args = build_parser().parse_args(["apply", "-c", "x", "--allow-hooks"])
+
+    # Act
+    hooks = _cli_hooks(document, args)
+
+    # Assert
+    assert hooks is not None
+    assert hooks[0].phases == (HookPhase.BEFORE_DROP,)

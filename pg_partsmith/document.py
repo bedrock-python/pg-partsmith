@@ -36,13 +36,15 @@ from .constants import (
     DEFAULT_DROP_MAX_BACKOFF,
     DEFAULT_DROP_MAX_RETRIES,
     DEFAULT_DROP_RETRY_DELAY,
+    DEFAULT_HOOK_TIMEOUT_SECONDS,
     DEFAULT_LOCK_PREFIX,
     DEFAULT_RETENTION_COUNT,
 )
 from .entities import PartitionGranularity, PartitionStrategy, PartitionType, TablePartitionConfig
+from .events import HookPhase
 from .strategies import BasePeriodCalculator, get_period_calculator
 
-__all__ = ["PartitionTableSpec", "PartitionsDocument", "ToolkitOptions"]
+__all__ = ["HookOptions", "PartitionTableSpec", "PartitionsDocument", "ToolkitOptions"]
 
 
 class PartitionTableSpec(BaseModel):
@@ -206,6 +208,47 @@ class ToolkitOptions(BaseModel):
         return {**self.model_dump(), "boundary_codec": resolve_codec(self.boundary_codec)}
 
 
+class HookOptions(BaseModel):
+    """A command to run at each lifecycle moment, as a file writes them.
+
+    One field per phase, spelled out rather than a free mapping, so a
+    misspelled ``befor_drop`` is refused where it is written instead of
+    silently never running -- which, for the phase that exports data before a
+    ``DROP``, is the difference between an archive and no archive.
+
+    Each command is an argument vector. Nothing is passed through a shell, so a
+    partition name can never be read as syntax.
+
+    Hooks fire during ``apply`` only. ``plan`` issues no DDL and runs no hook,
+    which is what makes a plan safe to compute anywhere.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeout_seconds: float = Field(
+        default=DEFAULT_HOOK_TIMEOUT_SECONDS,
+        gt=0,
+        description="How long a command may run before it is killed; it holds the table's lock",
+    )
+    before_create: tuple[str, ...] | None = Field(default=None, description="Before a partition exists")
+    after_create: tuple[str, ...] | None = Field(default=None, description="After it is created and attached")
+    before_attach: tuple[str, ...] | None = Field(default=None, description="Before a detached partition returns")
+    after_attach: tuple[str, ...] | None = Field(default=None, description="After it is taking rows again")
+    before_detach: tuple[str, ...] | None = Field(default=None, description="While its rows are still reachable")
+    after_detach: tuple[str, ...] | None = Field(default=None, description="After it stands alone")
+    before_drop: tuple[str, ...] | None = Field(default=None, description="The last moment its rows exist")
+    after_drop: tuple[str, ...] | None = Field(default=None, description="After the table is gone")
+
+    def commands(self) -> dict[HookPhase, tuple[str, ...]]:
+        """The phases a command was given for, in lifecycle order."""
+        return {phase: command for phase in HookPhase if (command := getattr(self, phase.value)) is not None}
+
+    @property
+    def is_empty(self) -> bool:
+        """True when the section names no command at all."""
+        return not self.commands()
+
+
 class PartitionsDocument(BaseModel):
     """Every table a deployment maintains, and the wiring it maintains them through.
 
@@ -217,6 +260,14 @@ class PartitionsDocument(BaseModel):
 
     ``dsn`` is for whoever connects; the library opens no connection of its own,
     and a deployment is free to keep the DSN out of the file entirely.
+
+    ``hooks`` names commands to run around the lifecycle. They are code this
+    file causes to run in a process holding DDL credentials -- which is not a
+    new privilege boundary, since the same file already authorises dropping
+    tables, but it stops being true the moment the document is assembled from
+    somewhere less trusted than the DSN. Whoever runs the document decides
+    whether they are honoured; the CLI refuses to apply a document declaring
+    hooks unless it is told to.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -226,6 +277,9 @@ class PartitionsDocument(BaseModel):
     defaults: dict[str, Any] = Field(default_factory=dict, description="Fields every table starts from")
     tables: tuple[PartitionTableSpec, ...] = Field(..., min_length=1, description="The tables to maintain")
     runtime: ToolkitOptions = Field(default_factory=ToolkitOptions, description="How the collaborators are wired")
+    hooks: HookOptions | None = Field(
+        default=None, description="Commands to run around the lifecycle; they fire during apply only"
+    )
 
     @model_validator(mode="before")
     @classmethod

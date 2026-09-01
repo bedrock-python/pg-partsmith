@@ -11,6 +11,7 @@ whatever the policy had measured.
 from __future__ import annotations
 
 import inspect
+import os
 from collections.abc import Iterable
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -169,3 +170,26 @@ def validate_hook_signatures(hooks: Iterable[object]) -> None:
                     f"event.table_name, event.window, event.operation.reason."
                 )
                 raise ValueError(msg) from None
+
+
+def hook_environment(event: PartitionEvent) -> dict[str, str]:
+    """The process environment a command hook is run with.
+
+    The whole event arrives on stdin; these are the three facts a shell script
+    reaches for often enough that parsing JSON to get them would be silly. The
+    parent environment is inherited, because a hook needs its own credentials,
+    its ``PATH`` and its proxy settings, and stripping those would leave it
+    unable to do the one thing it exists for.
+    """
+    environment = dict(os.environ)
+    environment.update(
+        PG_PARTSMITH_PHASE=event.phase.value,
+        PG_PARTSMITH_TABLE=event.table_name,
+        PG_PARTSMITH_PARTITION=event.partition.name,
+    )
+    if event.window is not None:
+        environment.update(
+            PG_PARTSMITH_WINDOW_START=event.window.start.isoformat(),
+            PG_PARTSMITH_WINDOW_END=event.window.end.isoformat(),
+        )
+    return environment

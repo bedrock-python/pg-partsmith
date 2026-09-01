@@ -63,6 +63,10 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
   5 connection, 6 lock held, 1 unexpected. `--output json` is the model dump under a
   versioned envelope. See `guide/cli.md`.
+* `CommandHooks` (both mirrors) runs a configured command per phase with the
+  `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. In a document
+  it is the `hooks` section, honoured only under `apply --allow-hooks`. Hooks never fire
+  during `plan`. See `guide/hooks-in-config.md`.
 * The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command
   as its entrypoint; tags are the exact version and a moving minor, never `latest`. See
   `guide/container.md`.

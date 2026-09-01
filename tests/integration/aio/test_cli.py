@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -34,7 +35,9 @@ async def _run_cli(*args: str) -> int:
     return await asyncio.to_thread(main, list(args))
 
 
-def _document(tmp_path: Path, table: str, dsn: str, *, retention: int = 12) -> str:
+def _document(
+    tmp_path: Path, table: str, dsn: str, *, retention: int = 12, hooks: dict[str, list[str]] | None = None
+) -> str:
     """A document describing that one table, written where the CLI will read it."""
     schema, _, relname = table.rpartition(".")
     payload = {
@@ -50,6 +53,8 @@ def _document(tmp_path: Path, table: str, dsn: str, *, retention: int = 12) -> s
             }
         ],
     }
+    if hooks is not None:
+        payload["hooks"] = hooks
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "partitions.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -237,3 +242,62 @@ async def test__apply__a_plan_made_under_another_configuration__is_refused(
     # that stopped being true
     assert await _run_cli("apply", "-c", edited, "--plan", str(saved)) == ExitCode.CONFIG
     assert await _run_cli("apply", "-c", edited, "--plan", str(saved), "--allow-config-drift") == ExitCode.OK
+
+
+async def test__apply__a_command_hook__runs_around_the_real_drop(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: the export-before-destroy case, as a non-Python team would write it
+    await _with_an_expired_partition(db_engine, table)
+    marker = tmp_path / "archived.json"
+    body = f"import sys, pathlib; pathlib.Path({str(marker)!r}).write_text(sys.stdin.read(), encoding='utf-8')"
+    config = _document(
+        tmp_path,
+        table,
+        _dsn(db_engine),
+        retention=1,
+        hooks={"before_drop": [sys.executable, "-c", body]},
+    )
+
+    # Act
+    code = await _run_cli("apply", "-c", config, "--allow-destructive", "--allow-hooks")
+
+    # Assert: it ran, and it was told which partition and why
+    assert code == ExitCode.OK
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["phase"] == "before_drop"
+    assert payload["partition"]["name"].endswith(f"{table}__2020_01")
+    assert payload["operation"]["reason"] in {"grace_elapsed", "follows_detach"}
+
+
+async def test__apply__a_hook_that_refuses__leaves_the_partition_alone(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: an archiver that says "not yet"
+    await _with_an_expired_partition(db_engine, table)
+    config = _document(
+        tmp_path,
+        table,
+        _dsn(db_engine),
+        retention=1,
+        hooks={"before_drop": [sys.executable, "-c", "import sys; sys.exit(1)"]},
+    )
+
+    # Act
+    code = await _run_cli("apply", "-c", config, "--allow-destructive", "--allow-hooks", "--continue-on-error")
+
+    # Assert: detached, and still there to be dropped once the archiver agrees
+    assert code == ExitCode.FINDINGS
+    async with db_engine.begin() as conn:
+        exists = await conn.execute(text("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"{table}__2020_01"})
+    assert exists.scalar_one() is True
+
+
+async def test__apply__hooks_declared_but_not_allowed__refuses_before_connecting(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange
+    config = _document(tmp_path, table, _dsn(db_engine), hooks={"before_drop": [sys.executable, "-c", "pass"]})
+
+    # Act / Assert
+    assert await _run_cli("apply", "-c", config) == ExitCode.CONFIG

@@ -1,5 +1,6 @@
 """Async implementations for partition management."""
 
+from .command_hooks import CommandHookError, CommandHooks
 from .hooks import BasePartitionLifecycleHooks, PartitionLifecycleHooks
 from .lock import PostgresAdvisoryLockManager, RedisDistributedLockManager
 from .maintainer import PartitionMaintainer, maintain_partitions
@@ -17,6 +18,8 @@ from .toolkit import PartitionToolkit
 
 __all__ = [
     "BasePartitionLifecycleHooks",
+    "CommandHookError",
+    "CommandHooks",
     "LockManager",
     "PartitionInspector",
     "PartitionLifecycle",

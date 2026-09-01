@@ -64,6 +64,7 @@ runtime:
 | `defaults` | mapping | `{}` | fields every table starts from |
 | `tables` | list | required, at least one | the tables to maintain |
 | `runtime` | mapping | library defaults | how the collaborators are wired |
+| `hooks` | mapping | — | commands to run around the lifecycle; `apply --allow-hooks` only |
 
 A table entry takes the same fields as
 [`PartitionTableSettings`](settings.md) — the environment and the file are one field list,
@@ -99,6 +100,12 @@ tables:
   - { table_name: events, partition_column: created_at, granularity: month }   # keeps 12
   - { table_name: audit, partition_column: at, granularity: day, retention_count: 400 }
 ```
+
+## Hooks
+
+`hooks` names a command to run at each lifecycle moment — see
+[Commands around the lifecycle](../guide/hooks-in-config.md). They fire during `apply`
+only, and the CLI refuses a document declaring them unless `--allow-hooks` is passed.
 
 ## Building the wiring from it
 

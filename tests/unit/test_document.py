@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from pg_partsmith.boundaries import UUIDv7BoundaryCodec
 from pg_partsmith.document import PartitionsDocument, PartitionTableSpec, ToolkitOptions
 from pg_partsmith.entities import PartitionGranularity
+from pg_partsmith.events import HookPhase
 
 
 def _document(**overrides: Any) -> dict[str, Any]:
@@ -175,3 +176,43 @@ def test__document__round_trips_through_its_own_dump() -> None:
 
     # Act / Assert
     assert PartitionsDocument.model_validate_json(document.model_dump_json(by_alias=True)) == document
+
+
+# ── Hooks ───────────────────────────────────────────────────────────────────────
+
+
+def test__hooks__commands__come_back_in_lifecycle_order() -> None:
+    # Arrange / Act
+    document = PartitionsDocument.model_validate(
+        _document(hooks={"after_create": ["/bin/notify"], "before_drop": ["/bin/archive", "--to", "s3"]})
+    )
+
+    # Assert: declaration order in the file does not decide when they run
+    assert document.hooks is not None
+    assert [phase.value for phase in document.hooks.commands()] == ["after_create", "before_drop"]
+    assert document.hooks.commands()[HookPhase.BEFORE_DROP] == ("/bin/archive", "--to", "s3")
+
+
+def test__hooks__a_misspelled_phase__is_refused_where_it_is_written() -> None:
+    # Silently never running the command that exports data before a DROP is the
+    # difference between an archive and no archive.
+    with pytest.raises(ValidationError):
+        PartitionsDocument.model_validate(_document(hooks={"befor_drop": ["/bin/archive"]}))
+
+
+def test__hooks__omitted__is_no_hooks_at_all() -> None:
+    # Arrange / Act
+    document = PartitionsDocument.model_validate(_document())
+
+    # Assert
+    assert document.hooks is None
+
+
+def test__hooks__a_section_naming_no_command__knows_it_is_empty() -> None:
+    # Arrange / Act
+    document = PartitionsDocument.model_validate(_document(hooks={"timeout_seconds": 30}))
+
+    # Assert
+    assert document.hooks is not None
+    assert document.hooks.is_empty
+    assert document.hooks.timeout_seconds == 30

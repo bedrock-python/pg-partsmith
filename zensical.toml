@@ -36,6 +36,7 @@ nav = [
         { "Schedule maintenance" = "guide/scheduling.md" },
         { "The command line" = "guide/cli.md" },
         { "The container image" = "guide/container.md" },
+        { "Commands around the lifecycle" = "guide/hooks-in-config.md" },
         { "Monitor and alert" = "guide/monitoring.md" },
         { "Query a partitioned table" = "guide/querying.md" },
         { "Backfill partitions for existing data" = "guide/backfill.md" },
