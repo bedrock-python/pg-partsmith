@@ -165,6 +165,21 @@ Both mirrors run the command through one implementation, so it does not depend o
 event loop being able to spawn processes — a hook that works in production works on a
 developer's machine too.
 
+### A block of Python instead of a command
+
+A hook phase in a document can take a block of Python — inline as `python`, or from a
+file as `python_file` relative to the document — evaluated with `event` and `log` in
+scope, raising to refuse. `PythonHooks` is the same from code, in both mirrors.
+
+Every block is compiled when the document is read, and a file-backed one by `validate`: a
+`SyntaxError` is a validation error with a line number in it, not something a CronJob
+finds at 03:00 after some of the run's DDL has committed. Tracebacks name the phase, or
+the file, rather than `<string>`.
+
+It is behind the same `--allow-hooks` as a command, for the same reason, and no sandbox is
+claimed: `exec` with a filtered `__builtins__` is not a security boundary, and the
+documentation says so rather than pretending otherwise.
+
 ### What a plan will lock
 
 Every operation now serializes its `capabilities` — the heaviest lock it takes and on

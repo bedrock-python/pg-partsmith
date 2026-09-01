@@ -11,6 +11,7 @@ from .protocols import (
     PartitionMetadataProvider,
     PartitionRepository,
 )
+from .python_hooks import PythonHookError, PythonHooks
 from .repositories import PostgresPartitionRepository
 from .service import PartitionLifecycleService
 from .services import PartitionInspector, PartitionValidationService, PlanExecutor
@@ -34,6 +35,8 @@ __all__ = [
     "PostgresAdvisoryLockManager",
     "PostgresMetadataProvider",
     "PostgresPartitionRepository",
+    "PythonHookError",
+    "PythonHooks",
     "RedisDistributedLockManager",
     "maintain_partitions",
 ]

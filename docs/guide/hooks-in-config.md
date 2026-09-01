@@ -93,6 +93,50 @@ There is **no sandbox**, and none is claimed. If you need real isolation, the co
 the answer rather than a restricted namespace: put it in a sidecar or a mounted binary
 with its own credentials, and let the container boundary be the boundary.
 
+## A block of Python instead of a command
+
+For the Python-adjacent audience, a phase can take a block instead of a binary — the
+authentik model: a snippet in the document, evaluated with a prepared namespace when the
+moment comes.
+
+```yaml
+hooks:
+  before_drop:
+    python: |
+      if event.operation.size_bytes and event.operation.size_bytes > 10 * 2**30:
+          log.warning("exporting %s before drop", event.partition.name)
+          export_to_s3(event.partition.name, event.window)
+  after_create:
+    python_file: hooks/notify.py
+```
+
+The block sees two names: `event`, the same `PartitionEvent` a hook class is handed, and
+`log`, a logger named for the phase. Nothing else is injected — a block that needs
+`datetime` imports it, the way any Python does. Raising is how a block refuses the
+operation, exactly as a non-zero exit is for a command.
+
+Inline blocks get unreadable past a few lines and lose editor support, so `python_file`
+points at a file instead, resolved relative to the document. A file can be tested on its
+own.
+
+**Every block is compiled by `validate`**, and inline ones the moment the document is
+read: a `SyntaxError` is a validation error with a line number in it, not something a
+CronJob discovers at 03:00 after some of the run's DDL has committed. A missing or broken
+`python_file` fails `validate` by name.
+
+The block runs inline, in the process and on the loop that fires it. That is the same
+footing as a hook written as a class, and the same responsibility: a block that blocks,
+blocks maintenance.
+
+### What this is not
+
+A sandbox. `exec` with a filtered `__builtins__` is not a security boundary and is
+trivially escaped; documenting one would be worse than not having one. The block runs as
+the process runs, with every credential the process holds — which is why it is behind
+the same `--allow-hooks` as a command, and why the trust argument above applies to it word
+for word. If isolation is what you need, a command hook in a container of its own is the
+answer, not a restricted namespace.
+
 ## From Python
 
 The same class, without a document:
@@ -110,6 +154,17 @@ kit = PartitionToolkit.from_engine(
 `pg_partsmith.sync.CommandHooks` is the same thing on a sync engine. Both run the command
 the same way, which does not depend on the event loop being able to spawn processes — so a
 hook that works in production works on a developer's machine too.
+
+`PythonHooks` is the block form, and takes the source per phase:
+
+```python
+from pg_partsmith.aio import PythonHooks
+
+hooks = PythonHooks({HookPhase.BEFORE_DROP: "log.warning('dropping %s', event.partition.name)"})
+```
+
+Every block is compiled when the object is built, so a typo is a `SyntaxError` at wiring
+time rather than at the first drop.
 
 For anything that wants to stay inside Python, write an ordinary hook class instead — see
 [Extend the library](extending.md).

@@ -42,9 +42,10 @@ from .constants import (
 )
 from .entities import PartitionGranularity, PartitionStrategy, PartitionType, TablePartitionConfig
 from .events import HookPhase
+from .python_hooks import compile_hook_source
 from .strategies import BasePeriodCalculator, get_period_calculator
 
-__all__ = ["HookOptions", "PartitionTableSpec", "PartitionsDocument", "ToolkitOptions"]
+__all__ = ["HookAction", "HookOptions", "PartitionTableSpec", "PartitionsDocument", "PythonHook", "ToolkitOptions"]
 
 
 class PartitionTableSpec(BaseModel):
@@ -208,16 +209,59 @@ class ToolkitOptions(BaseModel):
         return {**self.model_dump(), "boundary_codec": resolve_codec(self.boundary_codec)}
 
 
+class PythonHook(BaseModel):
+    """A block of Python to run at one lifecycle moment, inline or from a file.
+
+    Exactly one of the two. An inline block is compiled the moment the document
+    is validated, so a ``SyntaxError`` is a validation error with a line number
+    in it rather than something a CronJob finds at 03:00. A file is resolved
+    and compiled by whoever reads the document, relative to where the document
+    lives, since only they know where that is.
+
+    Attributes:
+        python: The block itself.
+        python_file: A path to it, for blocks past a few lines -- editor
+            support, and a file that can be tested on its own.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    python: str | None = Field(default=None, description="The block, inline")
+    python_file: str | None = Field(default=None, description="A path to the block, relative to the document")
+
+    @model_validator(mode="after")
+    def _one_source_that_compiles(self) -> PythonHook:
+        """Exactly one of the two, and the inline one parses."""
+        if (self.python is None) == (self.python_file is None):
+            msg = "a Python hook is either 'python' (a block) or 'python_file' (a path), not both and not neither"
+            raise ValueError(msg)
+        if self.python is not None:
+            if not self.python.strip():
+                msg = "the Python block is empty"
+                raise ValueError(msg)
+            try:
+                compile_hook_source(self.python, name="<hooks>")
+            except SyntaxError as exc:
+                msg = f"the Python block does not parse: {exc.msg} (line {exc.lineno})"
+                raise ValueError(msg) from exc
+        return self
+
+
+HookAction = tuple[str, ...] | PythonHook
+"""What a phase runs: a command as an argument vector, or a block of Python."""
+
+
 class HookOptions(BaseModel):
-    """A command to run at each lifecycle moment, as a file writes them.
+    """What to run at each lifecycle moment, as a file writes it.
 
     One field per phase, spelled out rather than a free mapping, so a
     misspelled ``befor_drop`` is refused where it is written instead of
     silently never running -- which, for the phase that exports data before a
     ``DROP``, is the difference between an archive and no archive.
 
-    Each command is an argument vector. Nothing is passed through a shell, so a
-    partition name can never be read as syntax.
+    A phase takes either a command -- an argument vector, never a shell string,
+    so a partition name can never be read as syntax -- or a block of Python,
+    inline as ``python`` or from a file as ``python_file``.
 
     Hooks fire during ``apply`` only. ``plan`` issues no DDL and runs no hook,
     which is what makes a plan safe to compute anywhere.
@@ -230,23 +274,31 @@ class HookOptions(BaseModel):
         gt=0,
         description="How long a command may run before it is killed; it holds the table's lock",
     )
-    before_create: tuple[str, ...] | None = Field(default=None, description="Before a partition exists")
-    after_create: tuple[str, ...] | None = Field(default=None, description="After it is created and attached")
-    before_attach: tuple[str, ...] | None = Field(default=None, description="Before a detached partition returns")
-    after_attach: tuple[str, ...] | None = Field(default=None, description="After it is taking rows again")
-    before_detach: tuple[str, ...] | None = Field(default=None, description="While its rows are still reachable")
-    after_detach: tuple[str, ...] | None = Field(default=None, description="After it stands alone")
-    before_drop: tuple[str, ...] | None = Field(default=None, description="The last moment its rows exist")
-    after_drop: tuple[str, ...] | None = Field(default=None, description="After the table is gone")
+    before_create: HookAction | None = Field(default=None, description="Before a partition exists")
+    after_create: HookAction | None = Field(default=None, description="After it is created and attached")
+    before_attach: HookAction | None = Field(default=None, description="Before a detached partition returns")
+    after_attach: HookAction | None = Field(default=None, description="After it is taking rows again")
+    before_detach: HookAction | None = Field(default=None, description="While its rows are still reachable")
+    after_detach: HookAction | None = Field(default=None, description="After it stands alone")
+    before_drop: HookAction | None = Field(default=None, description="The last moment its rows exist")
+    after_drop: HookAction | None = Field(default=None, description="After the table is gone")
+
+    def actions(self) -> dict[HookPhase, HookAction]:
+        """Everything a phase was given, in lifecycle order."""
+        return {phase: action for phase in HookPhase if (action := getattr(self, phase.value)) is not None}
 
     def commands(self) -> dict[HookPhase, tuple[str, ...]]:
         """The phases a command was given for, in lifecycle order."""
-        return {phase: command for phase in HookPhase if (command := getattr(self, phase.value)) is not None}
+        return {phase: action for phase, action in self.actions().items() if isinstance(action, tuple)}
+
+    def python_blocks(self) -> dict[HookPhase, PythonHook]:
+        """The phases a block of Python was given for, in lifecycle order."""
+        return {phase: action for phase, action in self.actions().items() if isinstance(action, PythonHook)}
 
     @property
     def is_empty(self) -> bool:
-        """True when the section names no command at all."""
-        return not self.commands()
+        """True when the section names nothing to run at all."""
+        return not self.actions()
 
 
 class PartitionsDocument(BaseModel):

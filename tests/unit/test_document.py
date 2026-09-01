@@ -216,3 +216,54 @@ def test__hooks__a_section_naming_no_command__knows_it_is_empty() -> None:
     assert document.hooks is not None
     assert document.hooks.is_empty
     assert document.hooks.timeout_seconds == 30
+
+
+def test__hooks__a_block_of_python__is_compiled_where_it_is_written() -> None:
+    # Arrange / Act
+    document = PartitionsDocument.model_validate(
+        _document(hooks={"before_drop": {"python": "log.info('dropping %s', event.partition.name)"}})
+    )
+
+    # Assert
+    assert document.hooks is not None
+    assert document.hooks.commands() == {}
+    assert [phase.value for phase in document.hooks.python_blocks()] == ["before_drop"]
+    assert not document.hooks.is_empty
+
+
+def test__hooks__a_block_that_does_not_parse__is_a_validation_error_with_a_line_number() -> None:
+    # A SyntaxError found at 03:00 by a CronJob is the failure mode to design out.
+    broken = "if event.partition.name\n    pass"
+    with pytest.raises(ValidationError, match="line 1"):
+        PartitionsDocument.model_validate(_document(hooks={"before_drop": {"python": broken}}))
+
+
+def test__hooks__a_block_naming_both_a_source_and_a_file__is_refused() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="not both"):
+        PartitionsDocument.model_validate(
+            _document(hooks={"before_drop": {"python": "pass", "python_file": "hooks/export.py"}})
+        )
+
+
+def test__hooks__a_file_reference__is_kept_for_the_reader_to_resolve() -> None:
+    # Only the reader knows where the document lives, so the path stays a path.
+    document = PartitionsDocument.model_validate(_document(hooks={"before_drop": {"python_file": "hooks/export.py"}}))
+
+    # Assert
+    assert document.hooks is not None
+    block = document.hooks.python_blocks()[HookPhase.BEFORE_DROP]
+    assert block.python is None
+    assert block.python_file == "hooks/export.py"
+
+
+def test__hooks__commands_and_blocks__mix_across_phases() -> None:
+    # Arrange / Act
+    document = PartitionsDocument.model_validate(
+        _document(hooks={"after_create": ["/bin/notify"], "before_drop": {"python": "pass"}})
+    )
+
+    # Assert
+    assert document.hooks is not None
+    assert list(document.hooks.commands()) == [HookPhase.AFTER_CREATE]
+    assert list(document.hooks.python_blocks()) == [HookPhase.BEFORE_DROP]

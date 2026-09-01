@@ -13,9 +13,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-from pg_partsmith.document import PartitionsDocument
+from pg_partsmith.document import HookOptions, PartitionsDocument
 from pg_partsmith.entities import TablePartitionConfig
+from pg_partsmith.events import HookPhase
 from pg_partsmith.plan import MaintenancePlan
+from pg_partsmith.python_hooks import compile_hook_source
 
 from .render import OUTPUT_VERSION
 
@@ -30,6 +32,7 @@ __all__ = [
     "async_url",
     "load_document",
     "load_plans",
+    "load_python_hooks",
     "resolve_dsn",
     "select_configs",
 ]
@@ -226,3 +229,44 @@ def load_plans(path: Path) -> dict[str, MaintenancePlan]:
         msg = f"{path} names no table"
         raise ConfigError(msg)
     return plans
+
+
+def load_python_hooks(hooks: HookOptions, base_dir: Path) -> tuple[dict[HookPhase, str], dict[HookPhase, str]]:
+    """Every Python block the document names, with file-backed ones read and compiled.
+
+    Inline blocks were compiled when the document validated. A ``python_file``
+    is resolved here, relative to the document, because only the reader knows
+    where the document lives -- and it is compiled here for the same reason the
+    inline ones were: a mistake belongs to ``validate``, not to 03:00.
+
+    Args:
+        hooks: The document's hooks section.
+        base_dir: The directory the document was read from.
+
+    Returns:
+        The source per phase, and what tracebacks should call each one.
+
+    Raises:
+        ConfigError: If a file cannot be read or does not parse.
+    """
+    sources: dict[HookPhase, str] = {}
+    names: dict[HookPhase, str] = {}
+    for phase, block in hooks.python_blocks().items():
+        if block.python is not None:
+            sources[phase] = block.python
+            names[phase] = f"<hooks.{phase.value}>"
+            continue
+        path = (base_dir / str(block.python_file)).resolve()
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            msg = f"Cannot read the {phase.value} hook {path}: {exc.strerror or exc}"
+            raise ConfigError(msg) from exc
+        try:
+            compile_hook_source(source, name=str(path))
+        except SyntaxError as exc:
+            msg = f"The {phase.value} hook {path} does not parse: {exc.msg} (line {exc.lineno})"
+            raise ConfigError(msg) from exc
+        sources[phase] = source
+        names[phase] = str(path)
+    return sources, names

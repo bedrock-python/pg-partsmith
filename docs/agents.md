@@ -66,9 +66,12 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   textfile, all gauges, prefixed `pg_partsmith_`; `plan --locks` prints the heaviest lock
   each operation takes. There is deliberately no `--sql`. See `guide/cli.md`.
 * `CommandHooks` (both mirrors) runs a configured command per phase with the
-  `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. In a document
-  it is the `hooks` section, honoured only under `apply --allow-hooks`. Hooks never fire
-  during `plan`. See `guide/hooks-in-config.md`.
+  `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. `PythonHooks`
+  runs a block of Python per phase with `event` and `log` in scope; raising refuses. In a
+  document both are the `hooks` section (a command list, or `{python: ...}` /
+  `{python_file: ...}`), honoured only under `apply --allow-hooks`; every block is compiled
+  by `validate`. No sandbox is claimed. Hooks never fire during `plan`. See
+  `guide/hooks-in-config.md`.
 * The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command
   as its entrypoint; tags are the exact version and a moving minor, never `latest`. See
   `guide/container.md`.

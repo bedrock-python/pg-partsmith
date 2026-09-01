@@ -13,7 +13,7 @@ from .boundaries import (
     UUIDv7BoundaryCodec,
     Window,
 )
-from .document import HookOptions, PartitionsDocument, PartitionTableSpec, ToolkitOptions
+from .document import HookOptions, PartitionsDocument, PartitionTableSpec, PythonHook, ToolkitOptions
 from .entities import (
     DefaultBounds,
     HashBounds,
@@ -206,6 +206,7 @@ __all__ = [
     "PlanningContext",
     "PositionedCalculator",
     "Predicate",
+    "PythonHook",
     "QuarterPeriodCalculator",
     "RangeBoundaries",
     "RangeBoundaryCodec",

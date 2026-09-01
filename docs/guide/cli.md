@@ -240,9 +240,9 @@ stopped being true the moment someone wrote `120`.
 
 ## Commands around the lifecycle
 
-A document can name a command to run before a drop, after a create, and at six other
-moments. They fire during `apply` only, and only with `--allow-hooks` — see
-[Commands around the lifecycle](hooks-in-config.md).
+A document can name a command, or a block of Python, to run before a drop, after a
+create, and at six other moments. They fire during `apply` only, and only with
+`--allow-hooks` — see [Commands around the lifecycle](hooks-in-config.md).
 
 ## In a container
 

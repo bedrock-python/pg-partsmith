@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import pytest_asyncio
@@ -35,9 +35,7 @@ async def _run_cli(*args: str) -> int:
     return await asyncio.to_thread(main, list(args))
 
 
-def _document(
-    tmp_path: Path, table: str, dsn: str, *, retention: int = 12, hooks: dict[str, list[str]] | None = None
-) -> str:
+def _document(tmp_path: Path, table: str, dsn: str, *, retention: int = 12, hooks: dict[str, Any] | None = None) -> str:
     """A document describing that one table, written where the CLI will read it."""
     schema, _, relname = table.rpartition(".")
     payload = {
@@ -318,3 +316,47 @@ async def test__output_metrics__a_real_run__is_a_textfile_a_collector_can_serve(
     assert "# TYPE pg_partsmith_pending_operations gauge" in printed
     assert f'pg_partsmith_pending_operations{{table="{table}",kind="create"}} 2' in printed
     assert f'pg_partsmith_pending_operations{{table="{table}",kind="drop"}} 0' in printed
+
+
+async def test__apply__a_python_hook__runs_around_the_real_drop(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: the same export-before-destroy case, written as a block rather than a binary
+    await _with_an_expired_partition(db_engine, table)
+    marker = tmp_path / "archived.txt"
+    block = f"""
+import pathlib
+pathlib.Path({str(marker)!r}).write_text(f"{{event.phase.value}} {{event.partition.name}}", encoding="utf-8")
+"""
+    config = _document(tmp_path, table, _dsn(db_engine), retention=1, hooks={"before_drop": {"python": block}})
+
+    # Act
+    code = await _run_cli("apply", "-c", config, "--allow-destructive", "--allow-hooks")
+
+    # Assert
+    assert code == ExitCode.OK
+    assert marker.read_text(encoding="utf-8").endswith(f"{table}__2020_01")
+    assert marker.read_text(encoding="utf-8").startswith("before_drop")
+
+
+async def test__apply__a_python_hook_that_raises__leaves_the_partition_alone(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: raising is how a block says "not yet"
+    await _with_an_expired_partition(db_engine, table)
+    config = _document(
+        tmp_path,
+        table,
+        _dsn(db_engine),
+        retention=1,
+        hooks={"before_drop": {"python": "raise RuntimeError('archive first')"}},
+    )
+
+    # Act
+    code = await _run_cli("apply", "-c", config, "--allow-destructive", "--allow-hooks", "--continue-on-error")
+
+    # Assert: detached, and still there to be dropped once the block agrees
+    assert code == ExitCode.FINDINGS
+    async with db_engine.begin() as conn:
+        exists = await conn.execute(text("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"{table}__2020_01"})
+    assert exists.scalar_one() is True

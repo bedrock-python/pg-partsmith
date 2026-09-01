@@ -103,7 +103,8 @@ tables:
 
 ## Hooks
 
-`hooks` names a command to run at each lifecycle moment — see
+`hooks` names a command, or a block of Python (`python`, or `python_file` relative to the
+document), to run at each lifecycle moment — see
 [Commands around the lifecycle](../guide/hooks-in-config.md). They fire during `apply`
 only, and the CLI refuses a document declaring them unless `--allow-hooks` is passed.
 

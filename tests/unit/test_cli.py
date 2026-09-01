@@ -20,6 +20,7 @@ from pg_partsmith.cli.loader import (
     async_url,
     load_document,
     load_plans,
+    load_python_hooks,
     resolve_dsn,
     select_configs,
 )
@@ -559,3 +560,58 @@ async def test__plan__locks__are_printed_after_the_operations_only_when_asked() 
     assert "locks:" not in without
     assert "locks:" in with_locks
     assert "SHARE UPDATE EXCLUSIVE" in with_locks
+
+
+# ── Python in the document ──────────────────────────────────────────────────────
+
+
+def test__hooks__a_python_block__is_built_alongside_the_commands(tmp_path: Path) -> None:
+    # Arrange
+    payload = {
+        **DOCUMENT,
+        "dsn": "postgresql://app@localhost/app",
+        "hooks": {"after_create": ["/bin/notify"], "before_drop": {"python": "log.info('x')"}},
+    }
+    document = load_document(_write(tmp_path, "partitions.json", json.dumps(payload)))
+    args = build_parser().parse_args(["apply", "-c", str(tmp_path / "partitions.json"), "--allow-hooks"])
+
+    # Act
+    hooks = _cli_hooks(document, args)
+
+    # Assert: one object per kind, each knowing its own phases
+    assert hooks is not None
+    assert [type(hook).__name__ for hook in hooks] == ["CommandHooks", "PythonHooks"]
+
+
+def test__hooks__a_python_file__is_read_relative_to_the_document(tmp_path: Path) -> None:
+    # Arrange
+    (tmp_path / "hooks").mkdir()
+    (tmp_path / "hooks" / "export.py").write_text("log.info('exporting %s', event.partition.name)", encoding="utf-8")
+    payload = {**DOCUMENT, "dsn": "x", "hooks": {"before_drop": {"python_file": "hooks/export.py"}}}
+    document = load_document(_write(tmp_path, "partitions.json", json.dumps(payload)))
+
+    # Act
+    sources, names = load_python_hooks(document.hooks, tmp_path)  # type: ignore[arg-type]
+
+    # Assert
+    assert sources[HookPhase.BEFORE_DROP].startswith("log.info")
+    assert names[HookPhase.BEFORE_DROP].endswith("export.py")
+
+
+def test__hooks__a_python_file_that_does_not_parse__fails_validate_by_name(tmp_path: Path) -> None:
+    # Arrange: validate is the command that should find this, not apply at 03:00
+    (tmp_path / "export.py").write_text("def broken(:", encoding="utf-8")
+    payload = {**DOCUMENT, "dsn": "x", "hooks": {"before_drop": {"python_file": "export.py"}}}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    # Act / Assert: refused before any connection is attempted
+    assert main(["validate", "-c", str(config)]) == ExitCode.CONFIG
+
+
+def test__hooks__a_python_file_that_is_missing__fails_validate_by_name(tmp_path: Path) -> None:
+    # Arrange
+    payload = {**DOCUMENT, "dsn": "x", "hooks": {"before_drop": {"python_file": "absent.py"}}}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    # Act / Assert
+    assert main(["validate", "-c", str(config)]) == ExitCode.CONFIG

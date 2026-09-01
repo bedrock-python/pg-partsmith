@@ -22,7 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
-from pg_partsmith.aio import CommandHooks, PartitionToolkit
+from pg_partsmith.aio import CommandHooks, PartitionToolkit, PythonHooks
 from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError, PlanConfigMismatchError
 
 from .commands import CommandResult, run_apply, run_inspect, run_plan, run_validate
@@ -33,6 +33,7 @@ from .loader import (
     async_url,
     load_document,
     load_plans,
+    load_python_hooks,
     resolve_dsn,
     select_configs,
 )
@@ -134,6 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 async def _run(args: argparse.Namespace) -> CommandResult:
     """Read the document, bring up the engine, and dispatch one command."""
     document = load_document(Path(args.config))
+    _check_python_hooks(document, args)
     configs = select_configs(document, tuple(args.table))
     url = async_url(resolve_dsn(document, override=args.dsn))
 
@@ -178,16 +180,32 @@ def _hooks(document: PartitionsDocument, args: argparse.Namespace) -> list[Parti
     if args.command != "apply":
         return None
     if not getattr(args, "allow_hooks", False):
-        named = ", ".join(phase.value for phase in hooks.commands())
+        named = ", ".join(phase.value for phase in hooks.actions())
         msg = (
-            f"This document runs commands ({named}). They execute in a process holding DDL credentials, "
-            "so they run only when asked for: pass --allow-hooks, or remove the hooks section."
+            f"This document runs code at {named}. It executes in a process holding DDL credentials, "
+            "so it runs only when asked for: pass --allow-hooks, or remove the hooks section."
         )
         raise ConfigError(msg)
     # Annotated as the protocol, not the class: a list is invariant, and the
     # toolkit takes any hook implementation.
-    configured: list[PartitionLifecycleHooks] = [CommandHooks(hooks.commands(), timeout_seconds=hooks.timeout_seconds)]
+    configured: list[PartitionLifecycleHooks] = []
+    if hooks.commands():
+        configured.append(CommandHooks(hooks.commands(), timeout_seconds=hooks.timeout_seconds))
+    sources, names = load_python_hooks(hooks, Path(args.config).resolve().parent)
+    if sources:
+        configured.append(PythonHooks(sources, names=names))
     return configured
+
+
+def _check_python_hooks(document: PartitionsDocument, args: argparse.Namespace) -> None:
+    """Read and compile every file-backed block, whatever the command.
+
+    Inline blocks were compiled when the document validated; a file has to be
+    found and read first, and ``validate`` is the command that should find it
+    missing or broken -- not ``apply``, and not at 03:00.
+    """
+    if document.hooks is not None and document.hooks.python_blocks():
+        load_python_hooks(document.hooks, Path(args.config).resolve().parent)
 
 
 def _add_apply_arguments(parser: argparse.ArgumentParser) -> None:
