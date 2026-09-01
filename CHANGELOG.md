@@ -38,7 +38,7 @@ now takes one `PartitionEvent`:
 | `before_drop(table_name, partition_name)` | `before_drop(event)` — and now `event.window`, `event.operation.reason` |
 | `after_drop(table_name, partition_name)` | `after_drop(event)` |
 | — | `before_attach(event)` / `after_attach(event)`, new: a detached partition going back into the tree |
-| — | `on_event(event)`, new: fires for every phase in addition to the method named for it |
+| — | `on_event(event)`, new: fires for every phase, just before the method named for it |
 
 ### Also breaking, in the same area
 
@@ -53,7 +53,9 @@ now takes one `PartitionEvent`:
 
 - `PartitionEvent`, `HookPhase` (exported from `pg_partsmith`), and `on_event` — one
   method for an audit trail or a metrics counter across every phase, instead of one
-  identical delegating method per phase, plus another with every phase added.
+  identical delegating method per phase, plus another with every phase added. It runs
+  before the method named for the phase, so a `before_*` that refuses an operation by
+  raising still leaves the audit trail with the attempt in it.
 - `before_attach` / `after_attach`: a partition retention released is re-attached when its
   window is wanted again — retention grew, or create-ahead reached back to it — and that
   transition used to happen silently. An export taken while it was detached goes stale the

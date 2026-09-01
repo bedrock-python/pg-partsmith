@@ -123,6 +123,9 @@ def _window_of(config: TablePartitionConfig, bounds: PartitionBounds | None) -> 
 HOOK_METHODS: tuple[str, ...] = (*(phase.value for phase in HookPhase), "on_event")
 """Every method a hook may implement: one per phase, plus the catch-all."""
 
+_EVENT_PLACEHOLDER = object()
+"""Stands in for the event while a hook's signature is tried against it."""
+
 
 def validate_hook_signatures(hooks: Iterable[object]) -> None:
     """Refuse a hook whose methods still take the arguments they took before 1.1.
@@ -134,11 +137,15 @@ def validate_hook_signatures(hooks: Iterable[object]) -> None:
     middle of a maintenance run and after some of its DDL had committed.
     Reading the signature at wiring time turns that into a refusal to start.
 
-    Methods whose signature cannot be read (built-ins, mocks, anything taking
-    ``*args``) are left alone rather than guessed at.
+    The test is whether the method can be called with one event and nothing
+    else, which accepts ``(event)``, ``(*args)`` and ``(event, extra=None)``
+    alike. Some descriptors -- ``functools.singledispatchmethod`` among them --
+    report their receiver even when bound, so a leading ``self`` or ``cls`` is
+    dropped before judging. Methods whose signature cannot be read (built-ins,
+    mocks) are left alone rather than guessed at.
 
     Raises:
-        ValueError: If a hook method requires more than the event.
+        ValueError: If a hook method cannot be called with one event.
     """
     for hook in hooks:
         for name in HOOK_METHODS:
@@ -146,21 +153,19 @@ def validate_hook_signatures(hooks: Iterable[object]) -> None:
             if method is None or not callable(method):
                 continue
             try:
-                parameters = inspect.signature(method).parameters.values()
+                signature = inspect.signature(method)
             except (TypeError, ValueError):
                 continue
-            required = [
-                parameter
-                for parameter in parameters
-                if parameter.kind in {parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD}
-                and parameter.default is parameter.empty
-            ]
-            if len(required) > 1:
-                taken = ", ".join(parameter.name for parameter in required)
+            parameters = list(signature.parameters.values())
+            if parameters and parameters[0].name in {"self", "cls"}:
+                parameters = parameters[1:]
+            try:
+                signature.replace(parameters=parameters).bind(_EVENT_PLACEHOLDER)
+            except TypeError:
                 msg = (
-                    f"{type(hook).__name__}.{name} takes ({taken}); since 1.1 every hook method takes one "
-                    f"PartitionEvent. The event carries the config, the partition, the window it covers and "
-                    f"the operation: {name}(self, event) -> None, then event.partition.name, event.table_name, "
-                    f"event.window, event.operation.reason."
+                    f"{type(hook).__name__}.{name}{signature} cannot be called with one PartitionEvent; since 1.1 "
+                    f"every hook method takes exactly that: {name}(self, event) -> None. The event carries the "
+                    f"config, the partition, the window it covers and the operation -- event.partition.name, "
+                    f"event.table_name, event.window, event.operation.reason."
                 )
-                raise ValueError(msg)
+                raise ValueError(msg) from None

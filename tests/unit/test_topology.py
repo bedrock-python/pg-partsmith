@@ -275,6 +275,11 @@ def test__parse_range_boundaries__non_range_expression__returns_nones(expression
         ("2026-02-01 00:00:00+00", False),
         ("2026-02-01T00:00:00Z", False),
         ("MAXVALUE", False),
+        # reduced ISO forms isoparse would read as timestamps, but a text or
+        # encoded key may well look like one
+        ("2024-01", False),
+        ("2024-W01", False),
+        ("2024-001", False),
         ("100000", False),
         ("019a0000-0000-7000-8000-000000000000", False),
         ("", False),

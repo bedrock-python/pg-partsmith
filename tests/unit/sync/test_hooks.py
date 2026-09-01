@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from functools import singledispatchmethod
 from unittest.mock import patch
 
 import pytest
@@ -168,6 +169,17 @@ def test__base_hooks_subclass__overriding_one_method__the_others_stay_quiet(even
 # ── refusing a hook from before 1.1 ─────────────────────────────────────────────
 
 
+def test__validate_hook_signatures__descriptor_reporting_its_receiver__is_accepted() -> None:
+    # Arrange -- singledispatchmethod reports (self, event) even bound; judging by arity
+    # alone would reject a hook that is written exactly right
+    class Dispatching(BasePartitionLifecycleHooks):
+        @singledispatchmethod
+        def before_create(self, event: PartitionEvent) -> None: ...
+
+    # Act / Assert
+    validate_hook_signatures([Dispatching()])
+
+
 def test__validate_hook_signatures__event_shaped_hooks__pass() -> None:
     # Arrange
     class Ported(BasePartitionLifecycleHooks):
@@ -182,11 +194,12 @@ def test__validate_hook_signatures__event_shaped_hooks__pass() -> None:
     [
         pytest.param(type("Old", (), {"before_create": lambda self, config, partition: None})(), id="create"),
         pytest.param(type("Old", (), {"before_drop": lambda self, table, name: None})(), id="drop"),
+        pytest.param(type("Old", (), {"after_drop": lambda self: None})(), id="no-argument"),
     ],
 )
 def test__validate_hook_signatures__pre_1_1_shape__is_refused_at_wiring_time(hook: object) -> None:
     # Arrange / Act / Assert -- otherwise it is accepted here and fails mid-run
-    with pytest.raises(ValueError, match="takes one PartitionEvent"):
+    with pytest.raises(ValueError, match="cannot be called with one PartitionEvent"):
         validate_hook_signatures([hook])
 
 

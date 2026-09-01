@@ -223,6 +223,7 @@ Two behavioural differences: `ddl_timeout_seconds` is enforced server-side via
 ## Hooks
 
 ```python
+from pg_partsmith import PartitionEvent
 from pg_partsmith.aio import BasePartitionLifecycleHooks
 
 

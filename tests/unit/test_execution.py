@@ -51,7 +51,7 @@ from pg_partsmith.plan import (
     PartitionBy,
     Reason,
 )
-from pg_partsmith.scheme import HashPartitioning, RangePartitioning
+from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning
 from pg_partsmith.topology import PartitionBounds
 
 NOW = datetime(2024, 3, 15, 12, 0, tzinfo=UTC)
@@ -1614,12 +1614,12 @@ async def test__apply__hooks_with_on_event__it_fires_for_every_phase_beside_the_
     # Act
     await executor.apply(_config(), _plan(_create_op(), _drop_op()))
 
-    # Assert -- both, and the named one first
+    # Assert -- both, and the watcher before the method that may refuse the operation
     assert seen == [
         ("before_create", "events__2024_04"),
         ("after_create", "events__2024_04"),
-        ("named", "events__2023_12"),
         ("before_drop", "events__2023_12"),
+        ("named", "events__2023_12"),
         ("after_drop", "events__2023_12"),
     ]
 
@@ -1679,6 +1679,98 @@ async def test__apply__reattached_orphan__attach_hooks_fire_around_it(repo: Magi
 
     # Assert -- not attached when asked, attached when told
     assert seen == [("before_attach", False), ("after_attach", True)]
+
+
+async def test__apply__named_hook_refuses__on_event_still_recorded_it(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- an auditor and a veto in the same run: a refusal must not leave the
+    # audit trail with nothing in it
+    seen: list[str] = []
+
+    class _Audit(BasePartitionLifecycleHooks):
+        async def on_event(self, event: PartitionEvent) -> None:
+            seen.append(event.phase.value)
+
+    class _Veto(BasePartitionLifecycleHooks):
+        async def before_drop(self, event: PartitionEvent) -> None:
+            raise RuntimeError("not exported yet")
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Audit(), _Veto()])
+
+    # Act
+    result = await executor.apply(_config(), _plan(_drop_op()), continue_on_error=True)
+
+    # Assert -- the drop was refused, and the auditor saw the attempt
+    assert seen == ["before_drop"]
+    assert result.dropped_count == 0
+    repo.drop_partition.assert_not_awaited()
+
+
+async def test__apply__after_attach_hook_raises__the_attach_is_still_counted(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the DDL committed; a failing after-hook must not make the result lie
+    class _Loud(BasePartitionLifecycleHooks):
+        async def after_attach(self, event: PartitionEvent) -> None:
+            raise RuntimeError("notification failed")
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Loud()])
+    metadata.get_relation_oid.return_value = 77
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+
+    # Act
+    result = await executor.apply(_config(), _plan(_attach_op()), continue_on_error=True)
+
+    # Assert
+    assert result.attached_count == 1
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.ATTACH]
+
+
+async def test__apply__attach_of_a_branch__the_event_names_how_it_partitions_its_children(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- a RANGE branch coming back holds a HASH subtree
+    events: list[PartitionEvent] = []
+
+    class _Watching(BasePartitionLifecycleHooks):
+        async def before_attach(self, event: PartitionEvent) -> None:
+            events.append(event)
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Watching()])
+    metadata.get_relation_oid.return_value = 77
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+    op = _attach_op().model_copy(
+        update={"partition_by": PartitionBy(method=PartitionType.HASH, columns=("tenant_id",))}
+    )
+
+    # Act
+    await executor.apply(_config(), _plan(op))
+
+    # Assert
+    assert events[0].partition.subpartition_type is PartitionType.HASH
+
+
+async def test__apply__default_member_of_a_list_root__the_event_names_the_roots_method(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- DEFAULT bounds say nothing about the parent's method; the config does
+    events: list[PartitionEvent] = []
+
+    class _Watching(BasePartitionLifecycleHooks):
+        async def before_create(self, event: PartitionEvent) -> None:
+            events.append(event)
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Watching()])
+    config = TablePartitionConfig(
+        table_name="events",
+        scheme=ListPartitioning(key="region", groups=(ListGroup(name="eu", values=("de",)),)),
+    )
+
+    # Act
+    await executor.apply(config, _plan(_create_op("events__other", bounds=DefaultBounds(), key_columns=("region",))))
+
+    # Assert
+    assert events[0].partition.is_default is True
+    assert events[0].partition.partition_type is PartitionType.LIST
 
 
 # ── the legacy BasePartitionService hook runner ─────────────────────────────────

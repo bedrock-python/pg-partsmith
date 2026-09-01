@@ -410,13 +410,13 @@ class PlanExecutor:
             # same relation before it goes live (the attach re-checks under
             # its own lock either way).
             await self._require_same_relation(op.target, op.oid)
-        info = _attach_info(op)
+        info = _attach_info(config, op)
         await self._fire(HookPhase.BEFORE_ATTACH, config, info, op)
         await self._attach_with_reconcile(
             config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns, expected_oid=op.oid
         )
-        await self._fire(HookPhase.AFTER_ATTACH, config, info.model_copy(update={"is_attached": True}), op)
         tally.attached += 1
+        await self._fire(HookPhase.AFTER_ATTACH, config, info.model_copy(update={"is_attached": True}), op)
         return True
 
     async def _attach_with_reconcile(
@@ -652,7 +652,7 @@ class PlanExecutor:
         if not await self._metadata.is_partition_attached(op.parent_name, op.target):
             raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
 
-        info = _detach_info(op)
+        info = _detach_info(config, op)
         await self._fire(HookPhase.BEFORE_DETACH, config, info, op)
         await self._repo.detach_partition(op.parent_name, op.target, mode=op.mode, expected_oid=op.oid)
         await self._fire(HookPhase.AFTER_DETACH, config, info.model_copy(update={"is_attached": False}), op)
@@ -673,7 +673,7 @@ class PlanExecutor:
             without a drain) when the partition was dropped; None when it is
             still attached (logged and skipped).
         """
-        info = _drop_info(op)
+        info = _drop_info(config, op)
         await self._fire(HookPhase.BEFORE_DROP, config, info, op)
         try:
             drained = await self._repo.drop_partition(op.target, expected_oid=op.oid, drain_into=drain_into)
@@ -704,17 +704,19 @@ class PlanExecutor:
         partition: PartitionInfo,
         operation: Operation,
     ) -> None:
-        """Hand one event to the method named after its phase, and to ``on_event``.
+        """Hand one event to ``on_event``, then to the method named after its phase.
 
-        Both, always: the named method is where a hook does something to one
-        moment, ``on_event`` is where it watches all of them. A hook that
-        implements both is called twice on purpose.
+        That order is the contract: ``on_event`` sees every event the library
+        reaches, and the named method -- where a hook does something about one
+        moment, and where a ``before_*`` may refuse it by raising -- runs after.
+        Were it the other way round, a refusal would leave an audit trail with
+        nothing in it. A hook implementing both is called twice, on purpose.
         """
         if not self._hooks:
             return
         event = PartitionEvent.build(phase, config, partition, operation)
-        await self._run_hooks(lambda h: getattr(h, phase.value)(event), phase.value, partition_name=partition.name)
         await self._run_hooks(lambda h: h.on_event(event), "on_event", partition_name=partition.name)
+        await self._run_hooks(lambda h: getattr(h, phase.value)(event), phase.value, partition_name=partition.name)
 
     async def _run_hooks(
         self,
@@ -775,7 +777,7 @@ def _step_of(op: Operation) -> MaintenanceIssueStep:
     return MaintenanceIssueStep.DROP
 
 
-def _detach_info(op: DetachPartition) -> PartitionInfo:
+def _detach_info(config: TablePartitionConfig, op: DetachPartition) -> PartitionInfo:
     """What hooks see of a partition about to be detached.
 
     Built without validation: the plan may know the partition only by name and
@@ -790,7 +792,7 @@ def _detach_info(op: DetachPartition) -> PartitionInfo:
     return PartitionInfo.model_construct(
         name=op.target,
         oid=op.oid,
-        partition_type=_parent_method(bounds),
+        partition_type=_parent_method(bounds) or config.partition_type,
         from_value=from_value,
         to_value=to_value,
         boundaries_expr=None if bounds is None else bounds.kind,
@@ -803,7 +805,7 @@ def _detach_info(op: DetachPartition) -> PartitionInfo:
     )
 
 
-def _attach_info(op: AttachPartition) -> PartitionInfo:
+def _attach_info(config: TablePartitionConfig, op: AttachPartition) -> PartitionInfo:
     """What hooks see of a detached partition on its way back into the tree."""
     bounds = op.bounds
     from_value = to_value = None
@@ -812,7 +814,7 @@ def _attach_info(op: AttachPartition) -> PartitionInfo:
     return PartitionInfo.model_construct(
         name=op.target,
         oid=op.oid,
-        partition_type=_parent_method(bounds),
+        partition_type=_parent_method(bounds) or config.partition_type,
         from_value=from_value,
         to_value=to_value,
         boundaries_expr=bounds.kind,
@@ -820,12 +822,12 @@ def _attach_info(op: AttachPartition) -> PartitionInfo:
         is_attached=False,
         is_default=bounds.kind == "default",
         relkind=RelationKind.TABLE,
-        subpartition_type=None,
+        subpartition_type=None if op.partition_by is None else op.partition_by.method,
         parent_table=op.parent_name,
     )
 
 
-def _drop_info(op: DropPartition) -> PartitionInfo:
+def _drop_info(config: TablePartitionConfig, op: DropPartition) -> PartitionInfo:
     """What hooks see of a partition about to be dropped.
 
     Detached by definition, and by then the catalog no longer records where it
@@ -839,7 +841,7 @@ def _drop_info(op: DropPartition) -> PartitionInfo:
     return PartitionInfo.model_construct(
         name=op.target,
         oid=op.oid,
-        partition_type=_parent_method(bounds),
+        partition_type=_parent_method(bounds) or config.partition_type,
         from_value=from_value,
         to_value=to_value,
         boundaries_expr=None if bounds is None else bounds.kind,
@@ -867,8 +869,16 @@ def _partition_info(config: TablePartitionConfig, op: CreatePartition) -> Partit
     )
 
 
-def _parent_method(bounds: PartitionBounds | None) -> PartitionType:
-    if bounds is None or bounds.kind in {"range", "default"}:
+def _parent_method(bounds: PartitionBounds | None) -> PartitionType | None:
+    """How the parent partitions a relation with these bounds, when they say.
+
+    A DEFAULT partition's bounds say nothing about its parent's method -- every
+    method may have one -- and neither does a partition the plan knows only by
+    name. Both answer None, and the caller falls back to the configured root.
+    """
+    if bounds is None or bounds.kind == "default":
+        return None
+    if bounds.kind == "range":
         return PartitionType.RANGE
     return PartitionType.HASH if bounds.kind == "hash" else PartitionType.LIST
 

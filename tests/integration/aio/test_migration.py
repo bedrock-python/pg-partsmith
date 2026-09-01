@@ -424,7 +424,7 @@ async def test__partition_data__window_of_a_detached_owned_partition__filled_and
     await service.ensure_partitions(config, [Period(year=2026, month=3)])
     march = f"{events}__2026_03"
     listed = await PostgresMetadataProvider(db_engine).list_partitions(events)
-    await service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    await service.detach_old_partitions(config, [p for p in listed if p.relname == march])
     assert await is_attached(db_engine, march) is False
     await _default_with_rows(db_engine, events, months=(3,), per_month=4)
 
@@ -554,7 +554,7 @@ async def test__partition_data__orphan_swapped_during_the_fill__stale_not_misfil
     await service.ensure_partitions(config, [Period(year=2026, month=3)])
     march = f"{events}__2026_03"
     listed = await PostgresMetadataProvider(db_engine).list_partitions(events)
-    await service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    await service.detach_old_partitions(config, [p for p in listed if p.relname == march])
     await _default_with_rows(db_engine, events, months=(3,), per_month=4)
 
     original = PostgresPartitionRepository.reconcile_default_rows
@@ -867,7 +867,7 @@ async def test__ensure_partitions__reattached_branch_replaced_before_its_childre
     await service.ensure_partitions(config, [when])
     branch = f"{tenants}__2026_w35"
     listed = await PostgresMetadataProvider(db_engine).list_partitions(tenants)
-    await service.detach_old_partitions(tenants, [p for p in listed if p.relname == branch])
+    await service.detach_old_partitions(config, [p for p in listed if p.relname == branch])
     await exec_sql(db_engine, f'DROP TABLE "{branch}__h1"')
     original = PostgresPartitionRepository.create_table_like
     hijacked: list[str] = []

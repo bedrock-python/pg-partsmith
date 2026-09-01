@@ -229,7 +229,7 @@ async def test__service__hook_from_before_1_1__refused_at_wiring_time(
         async def before_drop(self, table_name: str, partition_name: str) -> None: ...
 
     # Act / Assert
-    with pytest.raises(ValueError, match=r"_Old\.before_drop takes \(table_name, partition_name\)"):
+    with pytest.raises(ValueError, match=r"_Old\.before_drop.* cannot be called with one PartitionEvent"):
         PartitionLifecycleService(repo, metadata, locks, hooks=[_Old()])
 
 
@@ -1181,7 +1181,7 @@ async def test__detach_old_partitions__hooks_fire_around_the_detach(
 
 
 async def test__detach_old_partitions__attached_partition_with_only_a_raw_bound__is_still_detached(
-    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange -- the catalog bound could not be parsed, so only the raw expression is known
     metadata.is_partition_attached.return_value = True
@@ -1202,7 +1202,7 @@ async def test__detach_old_partitions__attached_partition_with_only_a_raw_bound_
 
 
 async def test__drop_detached_partitions__drops_each_and_counts(
-    service: PartitionLifecycleService, repo: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange / Act
     count = await service.drop_detached_partitions(config, ["events__2023_11", "events__2023_12"])
@@ -1214,7 +1214,7 @@ async def test__drop_detached_partitions__drops_each_and_counts(
 
 
 async def test__drop_detached_partitions__still_attached__is_skipped(
-    service: PartitionLifecycleService, repo: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
     repo.drop_partition.side_effect = [PartitionAttachedError("events__2024_04", "events"), 0]
@@ -1227,7 +1227,7 @@ async def test__drop_detached_partitions__still_attached__is_skipped(
 
 
 async def test__drop_detached_partitions__db_error__propagates(
-    service: PartitionLifecycleService, repo: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
     repo.drop_partition.side_effect = SQLAlchemyError("drop error")

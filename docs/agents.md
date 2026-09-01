@@ -239,8 +239,8 @@ Every method takes the `TablePartitionConfig` as its first argument.
 | `unpartition(config, into, *, batch_rows=10_000, max_batches=None, drop_emptied=False)` | **yes** | yes | `MigrationResult` |
 | `create_future_partitions(config)` | no | yes | `list[PartitionInfo]` |
 | `get_partitions_for_pruning(config)` | no | no | `list[PartitionInfo]` |
-| `detach_old_partitions(table_name, partitions)` | no | yes | `list[str]` |
-| `drop_detached_partitions(table_name, partition_names)` | no | yes | `int` |
+| `detach_old_partitions(config, partitions)` | no | yes | `list[str]` |
+| `drop_detached_partitions(config, partition_names)` | no | yes | `int` |
 
 `maintain_lifecycle` is the same method as `maintain`. `PartitionMaintainer(service)` adds
 `run_maintenance(...)` and `run_maintenance_safe(...)` — same keywords; the *safe* one never
@@ -269,7 +269,7 @@ Results:
 ```python
 class ColdStorageHooks(BasePartitionLifecycleHooks):
     async def before_drop(self, event: PartitionEvent) -> None:
-        await export(partition_name)      # raising aborts this drop; it is retried next tick
+        await export(event.partition.name)   # raising aborts this drop; it is retried next tick
 ```
 
 Nine methods, each taking one `PartitionEvent(phase, config, partition, window, operation)`:

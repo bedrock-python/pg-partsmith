@@ -149,7 +149,7 @@ drop=DropNever()
 
 Expired partitions are detached, marked, and left alone. A cold-storage pipeline or a DBA
 owns them from there: `list_partitions` reports them with `is_attached=False`, and
-`drop_detached_partitions(table, names)` drops them on request through the same guarded
+`drop_detached_partitions(config, names)` drops them on request through the same guarded
 path. Under `DropNever` orphans are never re-attached either — they belong to whatever
 process the policy hands them to.
 

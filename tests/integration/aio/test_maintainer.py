@@ -57,6 +57,15 @@ async def partitioned_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]
         yield name
 
 
+def _monthly(table_name: str) -> TablePartitionConfig:
+    """The plain monthly config, for the methods that take one to build hook events."""
+    return TablePartitionConfig(
+        table_name=table_name,
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+    )
+
+
 def _make_components(
     engine: AsyncEngine,
 ) -> tuple[PostgresPartitionRepository, PostgresMetadataProvider, PostgresAdvisoryLockManager]:
@@ -164,7 +173,7 @@ async def test__maintainer__still_attached_partition__skips_drop(
     await repo.detach_partition(partitioned_table, p1, mode=DetachMode.BLOCKING)
 
     # Act — try to drop both; only p1 is an orphan
-    dropped = await service.drop_detached_partitions(partitioned_table, [p1, p2])
+    dropped = await service.drop_detached_partitions(_monthly(partitioned_table), [p1, p2])
 
     # Assert
     assert dropped == 1

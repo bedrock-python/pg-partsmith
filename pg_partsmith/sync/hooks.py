@@ -101,6 +101,10 @@ class BasePartitionLifecycleHooks:
         is about to go stale: this is where to say so. Raising aborts the
         attach; the relation stays detached and the next run plans it again.
 
+        The guarantee is that *this run* has not attached it yet, not that
+        nothing else has: a partition someone else attached under the planned
+        name in the meantime is recognised as a benign race after this fires.
+
         Args:
             event: The partition about to go live, its subtree already
                 complete.

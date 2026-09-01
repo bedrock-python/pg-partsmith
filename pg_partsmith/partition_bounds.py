@@ -33,6 +33,7 @@ _HASH_BOUND_PATTERN = re.compile(
 )
 _LIST_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+IN\s*\((?P<values>.*)\)\s*$", re.IGNORECASE | re.DOTALL)
 _DATE_ONLY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DATE_PREFIX_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}[T ]")
 
 # Bound spellings that carry no instant at all.
 _UNBOUNDED_LITERALS = frozenset({"MINVALUE", "MAXVALUE"})
@@ -267,7 +268,10 @@ def is_naive_timestamp_literal(value: str | None) -> bool:
         return False
     if _DATE_ONLY_PATTERN.fullmatch(v):
         return True
-    if "-" not in v and ":" not in v:
+    if not _DATE_PREFIX_PATTERN.match(v):
+        # ``isoparse`` reads reduced forms -- "2024-01", "2024-W01", "2024-001" --
+        # as timestamps, and a text or encoded key may well look like one. Only a
+        # full calendar date is taken as evidence that this is a timestamp at all.
         return False
     try:
         parsed = isoparse(v)

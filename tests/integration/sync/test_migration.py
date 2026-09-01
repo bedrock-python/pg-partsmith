@@ -409,7 +409,7 @@ def test__partition_data__window_of_a_detached_owned_partition__filled_and_reatt
     service.ensure_partitions(config, [Period(year=2026, month=3)])
     march = f"{events}__2026_03"
     listed = PostgresMetadataProvider(sync_db_engine).list_partitions(events)
-    service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    service.detach_old_partitions(config, [p for p in listed if p.relname == march])
     assert is_attached(sync_db_engine, march) is False
     _default_with_rows(sync_db_engine, events, months=(3,), per_month=4)
 
