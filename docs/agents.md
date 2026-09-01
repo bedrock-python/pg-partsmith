@@ -52,6 +52,9 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   deliberately did not touch.
 * `apply()` runs a plan under the table's lock, revalidating every destructive operation
   against the catalog first, and refusing a plan this configuration did not produce.
+* `PartitionToolkit.from_engine(engine, ...)` builds the repository, the metadata provider,
+  the locks, the service and the maintainer around one engine, giving each setting that
+  belongs to two of them (`marker_prefix`, `ddl_timezone`, `boundary_codec`) exactly once.
 * `maintain()` is both under one lock, and is what a scheduled tick calls.
 
 Two kinds of level:

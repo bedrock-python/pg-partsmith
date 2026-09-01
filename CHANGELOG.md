@@ -84,6 +84,18 @@ In one process the pair cannot disagree; written to a file by one run and read b
 - `validate_plan_for_config(config, plan, *, allow_config_drift=False)` is exported for
   anything that pairs a plan with a configuration itself.
 
+### `PartitionToolkit`
+
+`PartitionToolkit.from_engine(engine, ...)` in both mirrors builds the repository, the
+metadata provider, the lock manager, the service and the maintainer around one engine, and
+returns them by name. Three settings live on two objects and have to agree — `marker_prefix`
+(one writes the orphan marker, the other looks for it), `ddl_timezone` (one writes naive
+boundary literals, the other reads them back, and the two constructors do not even default
+to the same value) and `boundary_codec` — and each is now given once. Parts rather than
+just a maintainer, so code calling `metadata.is_partition_closed` or `locks.acquire_lock`
+directly does not build a second set to keep in step. Construct `PartitionToolkit(...)`
+directly to hold parts of your own.
+
 ## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
 
 

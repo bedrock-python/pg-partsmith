@@ -13,6 +13,7 @@ from .protocols import (
 from .repositories import PostgresPartitionRepository
 from .service import PartitionLifecycleService
 from .services import PartitionInspector, PartitionValidationService, PlanExecutor
+from .toolkit import PartitionToolkit
 
 __all__ = [
     "BasePartitionLifecycleHooks",
@@ -24,6 +25,7 @@ __all__ = [
     "PartitionMaintainer",
     "PartitionMetadataProvider",
     "PartitionRepository",
+    "PartitionToolkit",
     "PartitionValidationService",
     "PlanExecutor",
     "PostgresAdvisoryLockManager",
