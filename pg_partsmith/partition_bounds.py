@@ -251,6 +251,33 @@ def parse_boundary_literal(value: str | None, boundary_tz: tzinfo) -> datetime |
     return parsed.astimezone(UTC)
 
 
+def is_naive_timestamp_literal(value: str | None) -> bool:
+    """True when a boundary literal is a timestamp carrying no UTC offset.
+
+    A ``timestamp`` or ``date`` key renders its bounds without one, so reading
+    such a literal back means resolving it in *some* timezone -- and only the
+    one it was written under gives the same instant. Anything that is not a
+    timestamp at all (an encoded identifier, an integer, ``MAXVALUE``) is not
+    naive in this sense: it answers False.
+    """
+    if value is None:
+        return False
+    v = value.strip()
+    if not v or v.upper() in _UNBOUNDED_LITERALS:
+        return False
+    if _DATE_ONLY_PATTERN.fullmatch(v):
+        return True
+    if "-" not in v and ":" not in v:
+        return False
+    try:
+        parsed = isoparse(v)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except (ValueError, TypeError):
+        return False
+    return parsed.tzinfo is None
+
+
 def _leading_value(expr: str) -> str:
     """Normalise a bound element, taking the leading one of a composite tuple."""
     parts = _split_top_level(expr)

@@ -185,3 +185,10 @@ the point of the architecture:
 - **Later, if asked for.** Explicit migration tooling for a topology change that *does* need
   a rewrite (hash 4 → 8 across history), kept separate from maintenance so that the safety
   rule — maintenance never rewrites history — stays absolute.
+- **Next major.** One context for all six lifecycle hooks. `before_create`, `after_create`
+  and `before_detach` are handed a `PartitionInfo`; `after_detach`, `before_drop` and
+  `after_drop` still get a bare name, so a hook that wants the window decodes it from the
+  name or reads it off the plan — both documented, neither as direct as being handed it.
+  Widening those three signatures breaks every existing hook at call time rather than at
+  import, which is not a 1.x change; it is queued for the next major, and until then
+  `DropPartition.bounds` carries the same information through the plan.

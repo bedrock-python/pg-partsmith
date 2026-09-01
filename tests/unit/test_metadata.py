@@ -1108,6 +1108,62 @@ async def test__is_partition_closed__boundaries_given__override_the_providers_ow
     assert compare.args[1]["upper_bound"] == datetime(2026, 9, 7, tzinfo=UTC)
 
 
+async def test__is_partition_closed__naive_bound_without_a_timezone__warns_that_the_session_decides() -> None:
+    # Arrange -- a timestamp/date key renders its bounds without an offset, and neither the
+    # provider nor a caller said which zone wrote them
+    engine = _make_engine("2026-02-01 00:00:00", True)
+    provider = PostgresMetadataProvider(engine)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.aio.metadata.logger", logger):
+        result = await provider.is_partition_closed("events__2026_01")
+
+    # Assert -- the answer still comes back; the reader is told what it rests on
+    assert result is True
+    assert "no timezone" in logger.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    ("bound", "kwargs"),
+    [
+        # an offset in the literal answers the question by itself
+        ("2026-02-01 00:00:00+00", {}),
+        # so does a zone the caller pinned
+        ("2026-02-01 00:00:00", {"ddl_timezone": "Europe/Moscow"}),
+    ],
+)
+async def test__is_partition_closed__timezone_is_not_in_doubt__stays_quiet(bound: str, kwargs: dict) -> None:
+    # Arrange
+    engine = _make_engine(*([None] if kwargs else []), bound, True)
+    provider = PostgresMetadataProvider(engine, **kwargs)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.aio.metadata.logger", logger):
+        result = await provider.is_partition_closed("events__2026_01")
+
+    # Assert
+    assert result is True
+    logger.warning.assert_not_called()
+
+
+async def test__is_partition_closed__boundaries_carry_the_zone__stays_quiet() -> None:
+    # Arrange -- the table's own boundaries answer for both the zone and the codec
+    engine = _make_engine(None, "2026-02-01 00:00:00", True)
+    provider = PostgresMetadataProvider(engine)
+    boundaries = TimeBoundaries(granularity=PartitionGranularity.MONTH, tz="Europe/Moscow")
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.aio.metadata.logger", logger):
+        result = await provider.is_partition_closed("events__2026_01", boundaries=boundaries)
+
+    # Assert
+    assert result is True
+    logger.warning.assert_not_called()
+
+
 async def test__is_partition_closed__codec__decodes_the_bound_and_compares_the_instant() -> None:
     # Arrange
     instant = datetime(2024, 2, 1, tzinfo=UTC)
