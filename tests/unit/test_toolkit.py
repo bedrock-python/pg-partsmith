@@ -16,6 +16,8 @@ from pg_partsmith.aio import (
     PostgresMetadataProvider,
     PostgresPartitionRepository,
 )
+from pg_partsmith.boundaries import UUIDv7BoundaryCodec
+from pg_partsmith.document import ToolkitOptions
 
 
 @pytest.fixture
@@ -106,3 +108,36 @@ def test__toolkit__is_frozen(engine: MagicMock) -> None:
     # Act / Assert
     with pytest.raises(FrozenInstanceError):
         kit.repo = MagicMock()  # type: ignore[misc]
+
+
+def test__from_options__the_runtime_section_of_a_document__is_the_wiring(engine: MagicMock) -> None:
+    # Arrange: what a file says, in the words a file says it in
+    options = ToolkitOptions(marker_prefix="acme", ddl_timezone="Europe/Berlin", boundary_codec="uuidv7")
+
+    # Act
+    kit = PartitionToolkit.from_options(engine, options)
+
+    # Assert
+    assert kit.repo.marker_prefix == kit.metadata.marker_prefix
+    assert kit.repo.ddl_timezone == "Europe/Berlin"
+    assert kit.metadata._ddl_timezone == "Europe/Berlin"
+    assert isinstance(kit.metadata._boundary_codec, UUIDv7BoundaryCodec)
+
+
+def test__from_options__hooks_and_a_lock_manager__are_passed_through(engine: MagicMock) -> None:
+    # Arrange
+    hooks = BasePartitionLifecycleHooks()
+    locks = MagicMock()
+
+    # Act
+    kit = PartitionToolkit.from_options(engine, ToolkitOptions(), hooks=[hooks], locks=locks)
+
+    # Assert
+    assert kit.locks is locks
+    assert kit.service._executor._hooks == [hooks]
+
+
+def test__from_options__a_codec_name_nothing_answers_to__is_refused(engine: MagicMock) -> None:
+    # Act / Assert: the file is wrong, and says so before any connection is opened
+    with pytest.raises(ValueError, match="uuidv8"):
+        PartitionToolkit.from_options(engine, ToolkitOptions(boundary_codec="uuidv8"))

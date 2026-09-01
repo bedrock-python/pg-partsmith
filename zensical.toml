@@ -51,6 +51,7 @@ nav = [
     { "Reference" = [
         { "API" = "reference/index.md" },
         { "Configuration fields" = "reference/configuration.md" },
+        { "The configuration document" = "reference/document.md" },
         { "Findings and issues" = "reference/findings.md" },
         { "Environment settings" = "reference/settings.md" },
         { "Glossary" = "reference/glossary.md" },

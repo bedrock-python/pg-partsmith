@@ -96,6 +96,24 @@ just a maintainer, so code calling `metadata.is_partition_closed` or `locks.acqu
 directly does not build a second set to keep in step. Construct `PartitionToolkit(...)`
 directly to hold parts of your own.
 
+### A configuration written down
+
+`PartitionsDocument` describes every table a deployment maintains, and the wiring it
+maintains them through, as one validated model — what a ConfigMap, a mounted YAML or a
+JSON blob parses into. `document.configs()` yields the `TablePartitionConfig` of each,
+`config_for(name)` one by name, and `PartitionToolkit.from_options(engine, document.runtime)`
+builds the collaborators the file describes. The library still reads no files and opens no
+connections: parsing belongs to whoever owns the format.
+
+`PartitionTableSpec` is one table's entry, and `PartitionTableSettings` is now that same
+model read from the environment rather than a second field list beside it — so a field
+added once is available in both. `ToolkitOptions` is the `runtime` section, one field per
+keyword of `PartitionToolkit.from_engine`.
+
+Unknown keys are refused wherever they appear, including in `defaults`, where a typo would
+otherwise reach every table at once. A document with no tables, and one relation described
+twice, are refused for the same reason: both are silent at 03:00 otherwise.
+
 ## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
 
 

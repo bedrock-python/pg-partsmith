@@ -35,6 +35,7 @@ from pg_partsmith.constants import (
     DEFAULT_DROP_RETRY_DELAY,
     DEFAULT_LOCK_PREFIX,
 )
+from pg_partsmith.document import ToolkitOptions
 
 from .lock import PostgresAdvisoryLockManager
 from .maintainer import PartitionMaintainer
@@ -153,3 +154,29 @@ class PartitionToolkit:
             service=service,
             maintainer=PartitionMaintainer(service),
         )
+
+    @classmethod
+    def from_options(
+        cls,
+        engine: Engine,
+        options: ToolkitOptions,
+        *,
+        hooks: list[PartitionLifecycleHooks] | None = None,
+        locks: LockManager | None = None,
+    ) -> PartitionToolkit:
+        """Wire every part from the ``runtime`` section of a document.
+
+        Args:
+            engine: The engine every part works through.
+            options: The wiring, as a file writes it -- one field per keyword
+                of :meth:`from_engine`, with ``boundary_codec`` as a name.
+            hooks: Lifecycle hooks, handed to the service.
+            locks: A lock manager of your own, as in :meth:`from_engine`.
+
+        Returns:
+            The parts, wired consistently.
+
+        Raises:
+            ValueError: If ``options.boundary_codec`` names no known codec.
+        """
+        return cls.from_engine(engine, hooks=hooks, locks=locks, **options.to_kwargs())

@@ -13,6 +13,7 @@ from .boundaries import (
     UUIDv7BoundaryCodec,
     Window,
 )
+from .document import PartitionsDocument, PartitionTableSpec, ToolkitOptions
 from .entities import (
     DefaultBounds,
     HashBounds,
@@ -192,8 +193,10 @@ __all__ = [
     "PartitionReferencedError",
     "PartitionScheme",
     "PartitionStrategy",
+    "PartitionTableSpec",
     "PartitionTopologyError",
     "PartitionType",
+    "PartitionsDocument",
     "Period",
     "PeriodCalculator",
     "PlanConfigMismatchError",
@@ -218,6 +221,7 @@ __all__ = [
     "TablePartitionConfig",
     "TimeBoundaries",
     "TimezoneAwareCalculator",
+    "ToolkitOptions",
     "UUIDv7BoundaryCodec",
     "UnmanagedPartitionDropError",
     "Unreferenced",

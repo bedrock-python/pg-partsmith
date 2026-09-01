@@ -55,6 +55,11 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
 * `PartitionToolkit.from_engine(engine, ...)` builds the repository, the metadata provider,
   the locks, the service and the maintainer around one engine, giving each setting that
   belongs to two of them (`marker_prefix`, `ddl_timezone`, `boundary_codec`) exactly once.
+* `PartitionsDocument` is several tables and their wiring as one validated model — what a
+  YAML or JSON file parses into. `document.configs()` gives every `TablePartitionConfig`,
+  `document.config_for(name)` one of them, and
+  `PartitionToolkit.from_options(engine, document.runtime)` the wiring. The library parses
+  no files: hand it `yaml.safe_load(...)` / `json.loads(...)` output.
 * `maintain()` is both under one lock, and is what a scheduled tick calls.
 
 Two kinds of level:
