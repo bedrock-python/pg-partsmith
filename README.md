@@ -242,6 +242,7 @@ planned and the size the policy measured, when it asked for one.
 | Method | When |
 |--------|------|
 | `before_create` / `after_create` | around the creation of a partition directly under the root (its subtree included) |
+| `before_attach` / `after_attach` | around bringing a detached partition back into the tree |
 | `before_detach` / `after_detach` | around a detach |
 | `before_drop` / `after_drop` | around a drop — `before_drop` is the last chance to read the data |
 | `on_event` | every one of the above, for an audit trail or metrics in one method |

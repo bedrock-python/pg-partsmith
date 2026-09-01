@@ -1652,6 +1652,29 @@ def test__apply__hooks__the_event_carries_the_operation_and_the_window(repo: Mag
     assert event.partition.is_attached is False
 
 
+def test__apply__reattached_orphan__attach_hooks_fire_around_it(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- a partition retention released comes back; anything derived from it
+    # while it was out is about to go stale, which is what the hooks are for
+    seen: list[tuple[str, bool]] = []
+
+    class _Watching(BasePartitionLifecycleHooks):
+        def before_attach(self, event: PartitionEvent) -> None:
+            seen.append((event.phase.value, event.partition.is_attached))
+
+        def after_attach(self, event: PartitionEvent) -> None:
+            seen.append((event.phase.value, event.partition.is_attached))
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Watching()])
+    metadata.get_relation_oid.return_value = 77  # the relation the plan decided about
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+
+    # Act
+    executor.apply(_config(), _plan(_attach_op()))
+
+    # Assert -- not attached when asked, attached when told
+    assert seen == [("before_attach", False), ("after_attach", True)]
+
+
 # ── the legacy BasePartitionService hook runner ─────────────────────────────────
 
 

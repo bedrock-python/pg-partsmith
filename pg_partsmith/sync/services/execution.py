@@ -409,9 +409,12 @@ class PlanExecutor:
             # same relation before it goes live (the attach re-checks under
             # its own lock either way).
             self._require_same_relation(op.target, op.oid)
+        info = _attach_info(op)
+        self._fire(HookPhase.BEFORE_ATTACH, config, info, op)
         self._attach_with_reconcile(
             config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns, expected_oid=op.oid
         )
+        self._fire(HookPhase.AFTER_ATTACH, config, info.model_copy(update={"is_attached": True}), op)
         tally.attached += 1
         return True
 
@@ -783,6 +786,28 @@ def _detach_info(op: DetachPartition) -> PartitionInfo:
         bounds=bounds,
         is_attached=True,
         is_default=bounds is not None and bounds.kind == "default",
+        relkind=RelationKind.TABLE,
+        subpartition_type=None,
+        parent_table=op.parent_name,
+    )
+
+
+def _attach_info(op: AttachPartition) -> PartitionInfo:
+    """What hooks see of a detached partition on its way back into the tree."""
+    bounds = op.bounds
+    from_value = to_value = None
+    if isinstance(bounds, RangeBounds):
+        from_value, to_value = bounds.from_value, bounds.to_value
+    return PartitionInfo.model_construct(
+        name=op.target,
+        oid=op.oid,
+        partition_type=_parent_method(bounds),
+        from_value=from_value,
+        to_value=to_value,
+        boundaries_expr=bounds.kind,
+        bounds=bounds,
+        is_attached=False,
+        is_default=bounds.kind == "default",
         relkind=RelationKind.TABLE,
         subpartition_type=None,
         parent_table=op.parent_name,

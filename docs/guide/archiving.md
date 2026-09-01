@@ -7,14 +7,16 @@ at all. This guide combines the three tools for that — hooks, the grace period
 
 ## The hooks
 
-Six phases fire around create, detach and drop, once per **lifecycle unit** — the partition
-directly under the root, never once per leaf of its subtree — and once per member of a
-root `HASH` or `LIST`:
+Eight phases fire around create, attach, detach and drop, once per **lifecycle unit** —
+the partition directly under the root, never once per leaf of its subtree — and once per
+member of a root `HASH` or `LIST`:
 
 | Hook | When |
 |---|---|
 | `before_create(event)` | before the partition is created |
 | `after_create(event)` | after it is created, its subtree built, and attached |
+| `before_attach(event)` | before a detached partition goes back into the tree — anything derived from it while it was out is about to go stale |
+| `after_attach(event)` | after it is attached and taking rows again |
 | `before_detach(event)` | before detaching — the data is still reachable through the parent |
 | `after_detach(event)` | after a successful detach — the table exists, standalone |
 | `before_drop(event)` | before the table is dropped — the last chance to read it |

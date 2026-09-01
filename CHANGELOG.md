@@ -37,6 +37,7 @@ now takes one `PartitionEvent`:
 | `after_detach(table_name, partition_name)` | `after_detach(event)` — `event.partition.name` |
 | `before_drop(table_name, partition_name)` | `before_drop(event)` — and now `event.window`, `event.operation.reason` |
 | `after_drop(table_name, partition_name)` | `after_drop(event)` |
+| — | `before_attach(event)` / `after_attach(event)`, new: a detached partition going back into the tree |
 | — | `on_event(event)`, new: fires for every phase in addition to the method named for it |
 
 ### Also breaking, in the same area
@@ -51,8 +52,12 @@ now takes one `PartitionEvent`:
 ### Added
 
 - `PartitionEvent`, `HookPhase` (exported from `pg_partsmith`), and `on_event` — one
-  method for an audit trail or a metrics counter across every phase, instead of six
-  identical delegating methods that would need a seventh when a phase is added.
+  method for an audit trail or a metrics counter across every phase, instead of one
+  identical delegating method per phase, plus another with every phase added.
+- `before_attach` / `after_attach`: a partition retention released is re-attached when its
+  window is wanted again — retention grew, or create-ahead reached back to it — and that
+  transition used to happen silently. An export taken while it was detached goes stale the
+  moment it comes back, and this is where a hook is told.
 - Hook signatures are read when the service is constructed; one still taking the 1.0
   arguments is refused there, naming the class, the method and the shape to move to.
 

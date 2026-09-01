@@ -31,6 +31,9 @@ class HookPhase(StrEnum):
     Attributes:
         BEFORE_CREATE: Before the partition exists.
         AFTER_CREATE: After it is created, its subtree built, and attached.
+        BEFORE_ATTACH: Before a detached partition goes back into the tree —
+            its subtree complete, not yet receiving rows.
+        AFTER_ATTACH: After it is attached and taking rows again.
         BEFORE_DETACH: Before it leaves its parent — the rows are still
             reachable through the root.
         AFTER_DETACH: After the detach — the table stands alone.
@@ -40,6 +43,8 @@ class HookPhase(StrEnum):
 
     BEFORE_CREATE = "before_create"
     AFTER_CREATE = "after_create"
+    BEFORE_ATTACH = "before_attach"
+    AFTER_ATTACH = "after_attach"
     BEFORE_DETACH = "before_detach"
     AFTER_DETACH = "after_detach"
     BEFORE_DROP = "before_drop"

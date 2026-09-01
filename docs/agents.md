@@ -272,9 +272,10 @@ class ColdStorageHooks(BasePartitionLifecycleHooks):
         await export(partition_name)      # raising aborts this drop; it is retried next tick
 ```
 
-Seven methods, each taking one `PartitionEvent(phase, config, partition, window, operation)`:
-`before_create` / `after_create`, `before_detach` / `after_detach`, `before_drop` /
-`after_drop`, and `on_event`, which fires for every phase in addition to the named method.
+Nine methods, each taking one `PartitionEvent(phase, config, partition, window, operation)`:
+`before_create` / `after_create`, `before_attach` / `after_attach` (a detached partition
+coming back), `before_detach` / `after_detach`, `before_drop` / `after_drop`, and
+`on_event`, which fires for every phase in addition to the named method.
 `event.table_name` is the root; `event.operation.reason` says why the operation is in the
 plan; `event.window` is the period, or None for a member of a root HASH or LIST.
 `before_*` exceptions abort that operation; `after_*` exceptions are logged. Hooks fire for

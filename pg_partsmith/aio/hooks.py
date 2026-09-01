@@ -7,8 +7,8 @@ to Kafka after a partition is created, or archiving rows before detachment.
 Every hook takes one :class:`~pg_partsmith.events.PartitionEvent`: the phase,
 the configuration, the partition, the window it covers, and the planned
 operation with the reason it was planned. A hook that wants every phase - an
-audit trail, metrics - implements :meth:`on_event` once instead of six
-delegating methods.
+audit trail, metrics - implements :meth:`on_event` once instead of one
+delegating method per phase.
 
 Hooks fire once per **lifecycle unit** -- the partition directly under the
 root -- never per leaf of its subtree: a cold-storage export wants the whole
@@ -53,6 +53,10 @@ class PartitionLifecycleHooks(Protocol):
 
     async def after_create(self, event: PartitionEvent) -> None: ...
 
+    async def before_attach(self, event: PartitionEvent) -> None: ...
+
+    async def after_attach(self, event: PartitionEvent) -> None: ...
+
     async def before_detach(self, event: PartitionEvent) -> None: ...
 
     async def after_detach(self, event: PartitionEvent) -> None: ...
@@ -86,6 +90,27 @@ class BasePartitionLifecycleHooks:
 
         Args:
             event: The partition, now attached.
+        """
+
+    async def before_attach(self, event: PartitionEvent) -> None:
+        """Called before a detached partition is brought back into the tree.
+
+        A partition retention released is re-attached when its window is
+        wanted again -- retention grew, or create-ahead reached back to it.
+        Anything derived from it while it was out (an export, a cold copy)
+        is about to go stale: this is where to say so. Raising aborts the
+        attach; the relation stays detached and the next run plans it again.
+
+        Args:
+            event: The partition about to go live, its subtree already
+                complete.
+        """
+
+    async def after_attach(self, event: PartitionEvent) -> None:
+        """Called after a detached partition is attached and taking rows again.
+
+        Args:
+            event: The partition, back in the tree.
         """
 
     async def before_detach(self, event: PartitionEvent) -> None:
@@ -131,8 +156,8 @@ class BasePartitionLifecycleHooks:
         """Called for **every** phase, in addition to the method named above it.
 
         One place for the cross-cutting things -- an audit trail, metrics, a
-        log line per operation -- that would otherwise be six identical
-        methods, and one more with every phase added later.
+        log line per operation -- that would otherwise be one identical method
+        per phase, and another with every phase added later.
 
         Args:
             event: The event, whose ``phase`` says which moment this is.
