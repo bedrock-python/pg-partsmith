@@ -243,6 +243,9 @@ service = PartitionLifecycleService(repo, metadata, locks, hooks=[ColdStorageHoo
 - [How-to guides](https://bedrock-python.github.io/pg-partsmith/guide/configuration/) — scheduling, monitoring, backfilling, partitioning an existing table, migrating from pg_partman, changing a scheme, archiving, foreign keys, cold tiering, troubleshooting, recipes
 - [Reference](https://bedrock-python.github.io/pg-partsmith/reference/) — the API, every configuration field, every finding and error
 - [Design](https://bedrock-python.github.io/pg-partsmith/design/rfc-0001-partition-schemes/) — RFC 0001, the OSS research, PostgreSQL semantics verified on real servers
+- [For AI agents](https://bedrock-python.github.io/pg-partsmith/agents/) — the whole API
+  surface, the rules that break code when broken and a map of the rest, on one page to hand
+  to a coding assistant
 
 ## Development
 

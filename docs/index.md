@@ -76,6 +76,13 @@ result = await service.apply(config, plan)   # takes the table's lock, runs the 
 
     [API reference →](reference/index.md)
 
+- **For AI agents**
+
+    One page holding the whole API surface, the rules that break code when broken,
+    and a map of everything else — to hand to a coding assistant instead of the site.
+
+    [Agent context →](agents.md)
+
 </div>
 
 ## At a glance
