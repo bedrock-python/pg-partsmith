@@ -32,9 +32,13 @@ Documentation = "https://bedrock-python.github.io/pg-partsmith/"
 Changelog = "https://github.com/bedrock-python/pg-partsmith/blob/master/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/bedrock-python/pg-partsmith/issues"
 
+[project.scripts]
+pg-partsmith = "pg_partsmith.cli:main"
+
 [project.optional-dependencies]
 redis-locks = ["redis>=4.2.0"]
 pydantic-settings = ["pydantic-settings>=2.0.0,<3.0.0"]
+cli = ["pyyaml>=6.0,<7.0", "asyncpg>=0.29.0"]
 
 [dependency-groups]
 test = [
@@ -47,6 +51,9 @@ test = [
     "tzdata>=2024.1",
     "psycopg2-binary>=2.9.11",
     "types-python-dateutil~=2.9.0",
+    "pyyaml>=6.0,<7.0",
+    "types-pyyaml>=6.0",
+    "pydantic-settings>=2.0.0,<3.0.0",
 ]
 docs = [
     "zensical>=0.0.37",

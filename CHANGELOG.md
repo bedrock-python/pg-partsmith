@@ -114,6 +114,31 @@ Unknown keys are refused wherever they appear, including in `defaults`, where a 
 otherwise reach every table at once. A document with no tables, and one relation described
 twice, are refused for the same reason: both are silent at 03:00 otherwise.
 
+### A command line
+
+`pip install "pg-partsmith[cli]"` installs `pg-partsmith`, which runs the library's
+read-only half over a document and a DSN — no Python in the calling application at all.
+Three commands so far, none of which issues DDL, takes a lock or fires a hook:
+
+- `inspect` — the tree that actually exists.
+- `plan` — what maintenance would do and why, straight from `MaintenancePlan`.
+- `validate` — the document against the catalog. The one that belongs in CI.
+
+Exit codes are the point of a CLI a CronJob runs, so they are distinguishable: `2` for
+drift under `plan --check` (what "maintenance has stopped running" looks like), `3` for
+findings that need a person, which outranks drift, `4` configuration, `5` connection, and
+`6` for a lock another maintainer holds — ordinary operation, and the first false page
+every deployment gets if it is reported as a failure.
+
+`--output json` is the models' own dump under a versioned envelope, `by_alias=True`, so
+what comes out of `plan` and what goes into a document are one vocabulary; logs go to
+stderr. The connection comes from `--dsn`, then `$PG_PARTSMITH_DSN`, then the document.
+`--version` reads `pg_partsmith.__version__`: one number for the library and the CLI.
+
+`apply` is deliberately not in this release. The plan/apply split is what makes an
+external tool trustworthy with `DROP`, and the applying half ships once the artifact
+between them has been used in anger.
+
 ## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
 
 

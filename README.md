@@ -44,6 +44,8 @@ serialize, filter and apply. No extension, no superuser, no scheduler of its own
   at their own modulus; partitions the scheme did not produce are reported, never touched;
   foreign tables are inspected, never dropped
 - **Async and sync** — `pg_partsmith.aio` on `AsyncEngine`, `pg_partsmith.sync` on `Engine`
+- **A command line** — `pg-partsmith inspect / plan / validate` over a YAML or JSON
+  document, with exit codes a CronJob and a CI step can read
 - **Hooks, locks, schemas** — six lifecycle hooks; PostgreSQL advisory or Redis locks;
   schema-qualified everything
 - **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15, 16 and 17 via testcontainers
