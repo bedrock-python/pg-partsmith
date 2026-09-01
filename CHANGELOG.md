@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### ⚠ BREAKING CHANGES
 
-* partition schemes, lifecycle policies and the maintenance plan (core + aio/sync, tests pending)
+* partition schemes, lifecycle policies and the maintenance plan, in the core and in both the aio and sync packages
 
 ### Features
 
@@ -54,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * cut 1.0.0 ([7a2c6d0](https://github.com/bedrock-python/pg-partsmith/commit/7a2c6d0c9a57d753267f6f2ccb4040b98250ab52))
 
-## [Unreleased] — 1.0.0
+## 1.0.0 — the long version
 
 Version 1.0 rebuilds the core around four separated concerns — partition scheme, range
 boundaries, lifecycle policy, and a maintenance plan — after reading how ten production
