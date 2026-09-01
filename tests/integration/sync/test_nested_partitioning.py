@@ -17,7 +17,8 @@ import pytest
 from sqlalchemy import text
 
 from pg_partsmith.boundaries import TimeBoundaries
-from pg_partsmith.entities import MaintenanceIssueStep, PartitionInfo, PartitionType, Period, TablePartitionConfig
+from pg_partsmith.entities import MaintenanceIssueStep, PartitionType, Period, TablePartitionConfig
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
 from pg_partsmith.plan import FindingReason, Reason
@@ -927,14 +928,14 @@ def test__nested__hooks__fire_once_for_the_branch_not_per_leaf(sync_db_engine: E
     events: list[str] = []
 
     class RecordingHooks(BasePartitionLifecycleHooks):
-        def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            events.append(f"before_create:{partition.name}:{partition.subpartition_type}")
+        def before_create(self, event: PartitionEvent) -> None:
+            events.append(f"before_create:{event.partition.name}:{event.partition.subpartition_type}")
 
-        def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            events.append(f"after_create:{partition.name}")
+        def after_create(self, event: PartitionEvent) -> None:
+            events.append(f"after_create:{event.partition.name}")
 
-        def before_drop(self, table_name: str, partition_name: str) -> None:
-            events.append(f"before_drop:{partition_name}")
+        def before_drop(self, event: PartitionEvent) -> None:
+            events.append(f"before_drop:{event.partition.name}")
 
     config = nested_config(table, modulus=4, retention=1)
     maintainer = make_maintainer(sync_db_engine, hooks=[RecordingHooks()])

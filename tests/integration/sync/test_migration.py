@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, text
 from testcontainers.postgres import PostgresContainer
 
 from pg_partsmith.entities import MaintenanceIssueStep, Period
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
@@ -335,7 +336,7 @@ class _LateWriter(BasePartitionLifecycleHooks):
         self._table = table
         self._when = when
 
-    def before_detach(self, table_name: str, partition: object) -> None:
+    def before_detach(self, event: PartitionEvent) -> None:
         exec_sql(
             self._engine,
             f"INSERT INTO \"{self._table}\" (created_at, payload) VALUES (:ts, 'late')",  # noqa: S608
@@ -408,7 +409,7 @@ def test__partition_data__window_of_a_detached_owned_partition__filled_and_reatt
     service.ensure_partitions(config, [Period(year=2026, month=3)])
     march = f"{events}__2026_03"
     listed = PostgresMetadataProvider(sync_db_engine).list_partitions(events)
-    service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    service.detach_old_partitions(config, [p for p in listed if p.relname == march])
     assert is_attached(sync_db_engine, march) is False
     _default_with_rows(sync_db_engine, events, months=(3,), per_month=4)
 
@@ -452,8 +453,8 @@ class _DetachedWriter(BasePartitionLifecycleHooks):
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
-    def before_drop(self, table_name: str, partition_name: str) -> None:
-        quoted = ".".join(f'"{part}"' for part in partition_name.split("."))
+    def before_drop(self, event: PartitionEvent) -> None:
+        quoted = ".".join(f'"{part}"' for part in event.partition.name.split("."))
         exec_sql(
             self._engine,
             f"INSERT INTO {quoted} (created_at, payload) VALUES ('2026-03-20T12:00:00+00:00', 'dropwrite')",  # noqa: S608

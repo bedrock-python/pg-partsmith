@@ -21,6 +21,7 @@ from pg_partsmith.entities import (
     RangeBounds,
     TablePartitionConfig,
 )
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionAlreadyExistsError, PartitionAttachedError
 from pg_partsmith.lifecycle import (
     CreateAhead,
@@ -215,6 +216,19 @@ def test__plan__column_mismatch__raises_invalid_config(
     # Act / Assert
     with pytest.raises(InvalidPartitionConfigError, match="Partition column mismatch"):
         service.plan(config)
+
+
+def test__service__hook_from_before_1_1__refused_at_wiring_time(
+    repo: MagicMock, metadata: MagicMock, locks: MagicMock
+) -> None:
+    # Arrange -- the protocol is runtime-checkable, so this hook would be accepted here
+    # and fail at its first call instead, mid-run and after some DDL had committed
+    class _Old:
+        def before_drop(self, table_name: str, partition_name: str) -> None: ...
+
+    # Act / Assert
+    with pytest.raises(ValueError, match=r"_Old\.before_drop.* cannot be called with one PartitionEvent"):
+        PartitionLifecycleService(repo, metadata, locks, hooks=[_Old()])
 
 
 def test__service__marker_prefixes_disagree__refused_at_wiring_time(
@@ -656,8 +670,8 @@ def test__maintain__hooks_given_to_the_service__reach_the_executor(
     seen: list[str] = []
 
     class _Hooks(BasePartitionLifecycleHooks):
-        def after_create(self, cfg: TablePartitionConfig, partition: PartitionInfo) -> None:
-            seen.append(partition.name)
+        def after_create(self, event: PartitionEvent) -> None:
+            seen.append(event.partition.name)
 
     service = PartitionLifecycleService(repo, metadata, locks, hooks=[_Hooks()])
 
@@ -1066,7 +1080,7 @@ def test__detach_old_partitions__attached_partition__is_detached_via_its_own_par
     )
 
     # Act
-    detached = service.detach_old_partitions("events", [partition])
+    detached = service.detach_old_partitions(config, [partition])
 
     # Assert
     assert detached == ["public.events__2024_01"]
@@ -1077,7 +1091,7 @@ def test__detach_old_partitions__attached_partition__is_detached_via_its_own_par
 
 
 def test__detach_old_partitions__no_parent_on_the_partition__falls_back_to_the_table(
-    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
     metadata.is_partition_attached.return_value = True
@@ -1090,7 +1104,7 @@ def test__detach_old_partitions__no_parent_on_the_partition__falls_back_to_the_t
     )
 
     # Act
-    service.detach_old_partitions("events", [partition])
+    service.detach_old_partitions(config, [partition])
 
     # Assert
     repo.detach_partition.assert_called_once_with("events", "events__2024_01", mode=DetachMode.AUTO, expected_oid=None)
@@ -1103,7 +1117,7 @@ def test__detach_old_partitions__already_detached_input__counted_without_ddl(
     partition = PartitionInfo(name="events__2024_01", partition_type=PartitionType.RANGE, is_attached=False)
 
     # Act
-    detached = service.detach_old_partitions("events", [partition])
+    detached = service.detach_old_partitions(config, [partition])
 
     # Assert
     assert detached == ["events__2024_01"]
@@ -1112,7 +1126,7 @@ def test__detach_old_partitions__already_detached_input__counted_without_ddl(
 
 
 def test__detach_old_partitions__db_error__propagates(
-    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
     metadata.is_partition_attached.return_value = True
@@ -1127,21 +1141,21 @@ def test__detach_old_partitions__db_error__propagates(
 
     # Act / Assert
     with pytest.raises(SQLAlchemyError, match="db error"):
-        service.detach_old_partitions("events", [partition])
+        service.detach_old_partitions(config, [partition])
 
 
 def test__detach_old_partitions__hooks_fire_around_the_detach(
-    repo: MagicMock, metadata: MagicMock, locks: MagicMock
+    repo: MagicMock, metadata: MagicMock, locks: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
     calls: list[str] = []
 
     class _Hooks(BasePartitionLifecycleHooks):
-        def before_detach(self, table_name: str, partition: PartitionInfo) -> None:
-            calls.append(f"before_detach:{table_name}:{partition.name}")
+        def before_detach(self, event: PartitionEvent) -> None:
+            calls.append(f"before_detach:{event.table_name}:{event.partition.name}")
 
-        def after_detach(self, table_name: str, partition_name: str) -> None:
-            calls.append(f"after_detach:{table_name}:{partition_name}")
+        def after_detach(self, event: PartitionEvent) -> None:
+            calls.append(f"after_detach:{event.table_name}:{event.partition.name}")
 
     metadata.is_partition_attached.return_value = True
     service = PartitionLifecycleService(repo, metadata, locks, hooks=[_Hooks()])
@@ -1154,14 +1168,14 @@ def test__detach_old_partitions__hooks_fire_around_the_detach(
     )
 
     # Act
-    service.detach_old_partitions("events", [partition])
+    service.detach_old_partitions(config, [partition])
 
     # Assert
     assert calls == ["before_detach:events:events__2024_01", "after_detach:events:events__2024_01"]
 
 
 def test__detach_old_partitions__attached_partition_with_only_a_raw_bound__is_still_detached(
-    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange -- the catalog bound could not be parsed, so only the raw expression is known
     metadata.is_partition_attached.return_value = True
@@ -1174,16 +1188,18 @@ def test__detach_old_partitions__attached_partition_with_only_a_raw_bound__is_st
     )
 
     # Act
-    detached = service.detach_old_partitions("events", [partition])
+    detached = service.detach_old_partitions(config, [partition])
 
     # Assert
     assert detached == ["events__weird"]
     repo.detach_partition.assert_called_once_with("events", "events__weird", mode=DetachMode.AUTO, expected_oid=None)
 
 
-def test__drop_detached_partitions__drops_each_and_counts(service: PartitionLifecycleService, repo: MagicMock) -> None:
+def test__drop_detached_partitions__drops_each_and_counts(
+    service: PartitionLifecycleService, repo: MagicMock, config: TablePartitionConfig
+) -> None:
     # Arrange / Act
-    count = service.drop_detached_partitions("events", ["events__2023_11", "events__2023_12"])
+    count = service.drop_detached_partitions(config, ["events__2023_11", "events__2023_12"])
 
     # Assert
     assert count == 2
@@ -1192,48 +1208,50 @@ def test__drop_detached_partitions__drops_each_and_counts(service: PartitionLife
 
 
 def test__drop_detached_partitions__still_attached__is_skipped(
-    service: PartitionLifecycleService, repo: MagicMock
+    service: PartitionLifecycleService, repo: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
     repo.drop_partition.side_effect = [PartitionAttachedError("events__2024_04", "events"), 0]
 
     # Act
-    count = service.drop_detached_partitions("events", ["events__2024_04", "events__2023_12"])
+    count = service.drop_detached_partitions(config, ["events__2024_04", "events__2023_12"])
 
     # Assert
     assert count == 1
 
 
-def test__drop_detached_partitions__db_error__propagates(service: PartitionLifecycleService, repo: MagicMock) -> None:
+def test__drop_detached_partitions__db_error__propagates(
+    service: PartitionLifecycleService, repo: MagicMock, config: TablePartitionConfig
+) -> None:
     # Arrange
     repo.drop_partition.side_effect = SQLAlchemyError("drop error")
 
     # Act / Assert
     with pytest.raises(SQLAlchemyError, match="drop error"):
-        service.drop_detached_partitions("events", ["events__2024_04"])
+        service.drop_detached_partitions(config, ["events__2024_04"])
 
 
 def test__drop_detached_partitions__hooks_fire_in_registration_order(
-    repo: MagicMock, metadata: MagicMock, locks: MagicMock
+    repo: MagicMock, metadata: MagicMock, locks: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
     calls: list[str] = []
 
     class _HookA(BasePartitionLifecycleHooks):
-        def before_drop(self, table_name: str, partition_name: str) -> None:
+        def before_drop(self, event: PartitionEvent) -> None:
             calls.append("A:before")
 
-        def after_drop(self, table_name: str, partition_name: str) -> None:
+        def after_drop(self, event: PartitionEvent) -> None:
             calls.append("A:after")
 
     class _HookB(BasePartitionLifecycleHooks):
-        def before_drop(self, table_name: str, partition_name: str) -> None:
+        def before_drop(self, event: PartitionEvent) -> None:
             calls.append("B:before")
 
     service = PartitionLifecycleService(repo, metadata, locks, hooks=[_HookA(), _HookB()])
 
     # Act
-    service.drop_detached_partitions("events", ["events__2024_04"])
+    service.drop_detached_partitions(config, ["events__2024_04"])
 
     # Assert
     assert calls == ["A:before", "B:before", "A:after"]

@@ -2,6 +2,7 @@
 
 import logging
 from datetime import UTC, datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 
 from pg_partsmith.partition_bounds import (
     is_addressable,
+    is_naive_timestamp_literal,
     parse_boundary_literal,
     parse_partition_bounds,
     parse_range_boundaries,
@@ -260,6 +262,43 @@ def test__parse_range_boundaries__range_expression__returns_the_pair() -> None:
 def test__parse_range_boundaries__non_range_expression__returns_nones(expression: str | None) -> None:
     # Arrange / Act / Assert -- a LIST value could contain ") TO (" and must not be mis-parsed
     assert parse_range_boundaries(expression) == (None, None)
+
+
+# -- is_naive_timestamp_literal -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        ("2026-02-01", True),
+        ("2026-02-01 00:00:00", True),
+        ("2026-02-01 00:00:00+00", False),
+        ("2026-02-01T00:00:00Z", False),
+        ("MAXVALUE", False),
+        # reduced ISO forms isoparse would read as timestamps, but a text or
+        # encoded key may well look like one
+        ("2024-01", False),
+        ("2024-W01", False),
+        ("2024-001", False),
+        ("100000", False),
+        ("019a0000-0000-7000-8000-000000000000", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test__is_naive_timestamp_literal__reports_whether_a_zone_is_missing(literal: str | None, expected: bool) -> None:
+    # Arrange / Act / Assert -- only a timestamp that carries no offset leaves the zone open
+    assert is_naive_timestamp_literal(literal) is expected
+
+
+def test__is_naive_timestamp_literal__interrupted__propagates() -> None:
+    # Arrange -- the parse is guarded against bad input, never against a stop signal
+    with (
+        patch("pg_partsmith.partition_bounds.isoparse", side_effect=KeyboardInterrupt),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        # Act / Assert
+        is_naive_timestamp_literal("2026-02-01 00:00:00")
 
 
 # -- parse_boundary_literal ------------------------------------------------------------------

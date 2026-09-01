@@ -22,11 +22,11 @@ from pg_partsmith.aio.service import PartitionLifecycleService
 from pg_partsmith.entities import (
     MaintenanceResult,
     PartitionGranularity,
-    PartitionInfo,
     PartitionStrategy,
     PartitionType,
     TablePartitionConfig,
 )
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import LockAcquisitionError, PlanStaleError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import Reason
@@ -55,6 +55,15 @@ pytestmark = pytest.mark.integration
 async def partitioned_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
     async for name in make_table(db_engine, MONTHLY_TABLE_DDL, prefix="maint"):
         yield name
+
+
+def _monthly(table_name: str) -> TablePartitionConfig:
+    """The plain monthly config, for the methods that take one to build hook events."""
+    return TablePartitionConfig(
+        table_name=table_name,
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+    )
 
 
 def _make_components(
@@ -164,7 +173,7 @@ async def test__maintainer__still_attached_partition__skips_drop(
     await repo.detach_partition(partitioned_table, p1, mode=DetachMode.BLOCKING)
 
     # Act — try to drop both; only p1 is an orphan
-    dropped = await service.drop_detached_partitions(partitioned_table, [p1, p2])
+    dropped = await service.drop_detached_partitions(_monthly(partitioned_table), [p1, p2])
 
     # Assert
     assert dropped == 1
@@ -208,14 +217,14 @@ async def test__maintainer__hooks_called_at_lifecycle_points(db_engine: AsyncEng
     hook_events: list[str] = []
 
     class AuditHooks(BasePartitionLifecycleHooks):
-        async def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            hook_events.append(f"created:{partition.name}")
+        async def after_create(self, event: PartitionEvent) -> None:
+            hook_events.append(f"created:{event.partition.name}")
 
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
-            hook_events.append(f"before_drop:{partition_name}")
+        async def before_drop(self, event: PartitionEvent) -> None:
+            hook_events.append(f"before_drop:{event.partition.name}")
 
-        async def after_drop(self, table_name: str, partition_name: str) -> None:
-            hook_events.append(f"dropped:{partition_name}")
+        async def after_drop(self, event: PartitionEvent) -> None:
+            hook_events.append(f"dropped:{event.partition.name}")
 
     service = PartitionLifecycleService(repo, metadata, locks, hooks=[AuditHooks()])
     maintainer = PartitionMaintainer(service)
@@ -436,9 +445,9 @@ class _SwapHooks(BasePartitionLifecycleHooks):
         self._engine = engine
         self._parent = parent
 
-    async def before_detach(self, table_name: str, partition: object) -> None:
-        name = partition.relname  # type: ignore[attr-defined]
-        lower, upper = partition.from_value, partition.to_value  # type: ignore[attr-defined]
+    async def before_detach(self, event: PartitionEvent) -> None:
+        name = event.partition.relname  # type: ignore[attr-defined]
+        lower, upper = event.partition.from_value, event.partition.to_value  # type: ignore[attr-defined]
         async with self._engine.begin() as conn:
             await conn.execute(text(f'ALTER TABLE "{self._parent}" DETACH PARTITION "{name}"'))
             await conn.execute(text(f'DROP TABLE "{name}"'))

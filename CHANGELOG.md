@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.1.0 — one event for every hook
+
+**This breaks every hook written against 1.0.** It is shipped in a minor version on
+purpose: the library is days old and has no dependants to protect, and carrying the old
+shape until a major would mean carrying it for years. Ported hooks are two lines of change
+each; unported ones are refused when the service is constructed, with the fix in the
+message, rather than failing at their first call in the middle of a maintenance run.
+
+### What changed
+
+Three of the six phases were handed a rich object and three a bare string, so a
+`before_drop` that archived a partition could not know which period it was archiving —
+and could not look it up either, because `DETACH` clears `relpartbound`. Every hook method
+now takes one `PartitionEvent`:
+
+| Field | What it is |
+|---|---|
+| `phase` | which moment this is (`HookPhase`) |
+| `config` | the table's configuration — no longer something a hook has to be given separately |
+| `partition` | `PartitionInfo`: name, bounds, OID, `subpartition_type` |
+| `window` | the period covered; `None` for a member of a root `HASH` or `LIST` |
+| `operation` | the planned operation: `reason`, `detail`, `oid`, `size_bytes`, `row_estimate`, `detached_at` |
+| `table_name` | the root table, derived from `config` |
+
+| Before | After |
+|---|---|
+| `before_create(config, partition)` | `before_create(event)` — `event.config`, `event.partition` |
+| `after_create(config, partition)` | `after_create(event)` |
+| `before_detach(table_name, partition)` | `before_detach(event)` — `event.table_name`, `event.partition` |
+| `after_detach(table_name, partition_name)` | `after_detach(event)` — `event.partition.name` |
+| `before_drop(table_name, partition_name)` | `before_drop(event)` — and now `event.window`, `event.operation.reason` |
+| `after_drop(table_name, partition_name)` | `after_drop(event)` |
+| — | `before_attach(event)` / `after_attach(event)`, new: a detached partition going back into the tree |
+| — | `on_event(event)`, new: fires for every phase, just before the method named for it |
+
+### Also breaking, in the same area
+
+- `PlanExecutor.detach_single_partition` and `drop_single_partition` take the
+  `TablePartitionConfig` instead of the parent's name — it is what the event is built
+  from, and every other entry point already took the config.
+- `PartitionLifecycleService.detach_old_partitions` and `drop_detached_partitions` take
+  the config for the same reason: `detach_old_partitions(config, partitions)`,
+  `drop_detached_partitions(config, names)`.
+
+### Added
+
+- `PartitionEvent`, `HookPhase` (exported from `pg_partsmith`), and `on_event` — one
+  method for an audit trail or a metrics counter across every phase, instead of one
+  identical delegating method per phase, plus another with every phase added. It runs
+  before the method named for the phase, so a `before_*` that refuses an operation by
+  raising still leaves the audit trail with the attempt in it.
+- `before_attach` / `after_attach`: a partition retention released is re-attached when its
+  window is wanted again — retention grew, or create-ahead reached back to it — and that
+  transition used to happen silently. An export taken while it was detached goes stale the
+  moment it comes back, and this is where a hook is told.
+- Hook signatures are read when the service is constructed; one still taking the 1.0
+  arguments is refused there, naming the class, the method and the shape to move to.
+
 ## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
 
 

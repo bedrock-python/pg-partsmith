@@ -185,3 +185,11 @@ the point of the architecture:
 - **Later, if asked for.** Explicit migration tooling for a topology change that *does* need
   a rewrite (hash 4 → 8 across history), kept separate from maintenance so that the safety
   rule — maintenance never rewrites history — stays absolute.
+- **Done in 1.1.** One event for every lifecycle hook. Three of the six phases used to be
+  handed a `PartitionInfo` and three a bare name, so a drop hook could not know the period
+  it was archiving without decoding the name itself. Every method now takes one
+  `PartitionEvent` — phase, config, partition, window, and the planned operation with the
+  reason and the size behind it — and `on_event` serves every phase at once, which is what
+  an audit or metrics hook wanted all along. It breaks every hook written against 1.0;
+  shipped in a minor deliberately, while the library has no dependants to protect, rather
+  than carried as a wart to the next major.

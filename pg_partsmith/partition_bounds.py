@@ -33,6 +33,7 @@ _HASH_BOUND_PATTERN = re.compile(
 )
 _LIST_BOUND_PATTERN = re.compile(r"^\s*FOR\s+VALUES\s+IN\s*\((?P<values>.*)\)\s*$", re.IGNORECASE | re.DOTALL)
 _DATE_ONLY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DATE_PREFIX_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}[T ]")
 
 # Bound spellings that carry no instant at all.
 _UNBOUNDED_LITERALS = frozenset({"MINVALUE", "MAXVALUE"})
@@ -249,6 +250,36 @@ def parse_boundary_literal(value: str | None, boundary_tz: tzinfo) -> datetime |
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=boundary_tz).astimezone(UTC)
     return parsed.astimezone(UTC)
+
+
+def is_naive_timestamp_literal(value: str | None) -> bool:
+    """True when a boundary literal is a timestamp carrying no UTC offset.
+
+    A ``timestamp`` or ``date`` key renders its bounds without one, so reading
+    such a literal back means resolving it in *some* timezone -- and only the
+    one it was written under gives the same instant. Anything that is not a
+    timestamp at all (an encoded identifier, an integer, ``MAXVALUE``) is not
+    naive in this sense: it answers False.
+    """
+    if value is None:
+        return False
+    v = value.strip()
+    if not v or v.upper() in _UNBOUNDED_LITERALS:
+        return False
+    if _DATE_ONLY_PATTERN.fullmatch(v):
+        return True
+    if not _DATE_PREFIX_PATTERN.match(v):
+        # ``isoparse`` reads reduced forms -- "2024-01", "2024-W01", "2024-001" --
+        # as timestamps, and a text or encoded key may well look like one. Only a
+        # full calendar date is taken as evidence that this is a timestamp at all.
+        return False
+    try:
+        parsed = isoparse(v)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except (ValueError, TypeError):
+        return False
+    return parsed.tzinfo is None
 
 
 def _leading_value(expr: str) -> str:

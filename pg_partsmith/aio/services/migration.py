@@ -302,7 +302,7 @@ class DataMover:
             reason=Reason.EXPLICIT,
             detail=detail,
         )
-        await self._executor.detach_single_partition(config.qualified_name, detach)
+        await self._executor.detach_single_partition(config, detach)
         # Rows routed into the partition between its last batch and the
         # detach. Nothing routes into it any more, so one pass takes them
         # all; it runs outside the batch budget -- a detached table must not
@@ -311,7 +311,7 @@ class DataMover:
         if tail:
             tally.batch(tail)
         drop = DropPartition(target=child.name, oid=child.oid, reason=Reason.EXPLICIT, detail=detail)
-        drained = await self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
+        drained = await self._executor.drop_single_partition(config, drop, drain_into=into)
         if drained:
             # Rows that slipped in after the tail, moved inside the drop's own
             # transaction: theirs is a row count, not another budgeted batch.
@@ -359,7 +359,7 @@ class DataMover:
         drop = DropPartition(
             target=orphan.name, oid=orphan.oid, reason=Reason.EXPLICIT, detail="emptied by unpartition"
         )
-        drained = await self._executor.drop_single_partition(config.qualified_name, drop, drain_into=into)
+        drained = await self._executor.drop_single_partition(config, drop, drain_into=into)
         if drained:
             tally.rows_moved += drained
 

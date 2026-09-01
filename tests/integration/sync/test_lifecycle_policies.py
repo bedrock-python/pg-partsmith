@@ -615,7 +615,7 @@ def test__orphan_reattach__window_in_the_create_ahead_set__reattached_not_recrea
     oid_before = relation_oid(sync_db_engine, september)
     listed = PostgresMetadataProvider(sync_db_engine).list_partitions(table)
     with freezegun.freeze_time(NOW):
-        make_service(sync_db_engine).detach_old_partitions(table, [p for p in listed if p.relname == september])
+        make_service(sync_db_engine).detach_old_partitions(config, [p for p in listed if p.relname == september])
     assert is_attached(sync_db_engine, september) is False
 
     # Act

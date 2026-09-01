@@ -239,8 +239,8 @@ Every method takes the `TablePartitionConfig` as its first argument.
 | `unpartition(config, into, *, batch_rows=10_000, max_batches=None, drop_emptied=False)` | **yes** | yes | `MigrationResult` |
 | `create_future_partitions(config)` | no | yes | `list[PartitionInfo]` |
 | `get_partitions_for_pruning(config)` | no | no | `list[PartitionInfo]` |
-| `detach_old_partitions(table_name, partitions)` | no | yes | `list[str]` |
-| `drop_detached_partitions(table_name, partition_names)` | no | yes | `int` |
+| `detach_old_partitions(config, partitions)` | no | yes | `list[str]` |
+| `drop_detached_partitions(config, partition_names)` | no | yes | `int` |
 
 `maintain_lifecycle` is the same method as `maintain`. `PartitionMaintainer(service)` adds
 `run_maintenance(...)` and `run_maintenance_safe(...)` — same keywords; the *safe* one never
@@ -268,13 +268,16 @@ Results:
 
 ```python
 class ColdStorageHooks(BasePartitionLifecycleHooks):
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        await export(partition_name)      # raising aborts this drop; it is retried next tick
+    async def before_drop(self, event: PartitionEvent) -> None:
+        await export(event.partition.name)   # raising aborts this drop; it is retried next tick
 ```
 
-Six methods: `before_create(config, partition)` / `after_create(config, partition)`,
-`before_detach(table_name, partition)` / `after_detach(table_name, partition_name)`,
-`before_drop(table_name, partition_name)` / `after_drop(table_name, partition_name)`.
+Nine methods, each taking one `PartitionEvent(phase, config, partition, window, operation)`:
+`before_create` / `after_create`, `before_attach` / `after_attach` (a detached partition
+coming back), `before_detach` / `after_detach`, `before_drop` / `after_drop`, and
+`on_event`, which fires for every phase in addition to the named method.
+`event.table_name` is the root; `event.operation.reason` says why the operation is in the
+plan; `event.window` is the period, or None for a member of a root HASH or LIST.
 `before_*` exceptions abort that operation; `after_*` exceptions are logged. Hooks fire for
 lifecycle units — partitions directly under the root — never once per leaf of a subtree.
 

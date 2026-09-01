@@ -1,11 +1,21 @@
-"""Unit tests for the sync lifecycle hooks: the no-op base and the protocol."""
+"""Unit tests for the sync lifecycle hooks: the no-op base, the protocol and the event."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from functools import singledispatchmethod
+from unittest.mock import patch
+
 import pytest
 
+from pg_partsmith.boundaries import TimeBoundaries
 from pg_partsmith.entities import PartitionGranularity, PartitionInfo, PartitionType, RangeBounds, TablePartitionConfig
+from pg_partsmith.events import HOOK_METHODS, HookPhase, PartitionEvent, validate_hook_signatures
+from pg_partsmith.plan import CreatePartition, DropPartition, Reason
+from pg_partsmith.scheme import HashPartitioning
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks, PartitionLifecycleHooks
+
+APRIL = RangeBounds(from_value="2024-04-01", to_value="2024-05-01")
 
 
 @pytest.fixture
@@ -20,139 +30,197 @@ def config() -> TablePartitionConfig:
 @pytest.fixture
 def partition_info() -> PartitionInfo:
     return PartitionInfo(
-        name="events__2024_01",
+        name="events__2024_04",
         partition_type=PartitionType.RANGE,
-        bounds=RangeBounds(from_value="2024-01-01", to_value="2024-02-01"),
+        bounds=APRIL,
         is_attached=False,
         subpartition_type=PartitionType.HASH,
         parent_table="events",
     )
 
 
-def test__base_hooks__before_create__is_noop(config: TablePartitionConfig, partition_info: PartitionInfo) -> None:
+@pytest.fixture
+def event(config: TablePartitionConfig, partition_info: PartitionInfo) -> PartitionEvent:
+    return PartitionEvent.build(
+        HookPhase.BEFORE_CREATE,
+        config,
+        partition_info,
+        CreatePartition(
+            target="events__2024_04",
+            parent_name="public.events",
+            bounds=APRIL,
+            key_columns=("created_at",),
+            reason=Reason.CREATE_AHEAD,
+            detail="2024_04 under 'create 3 ahead'",
+        ),
+    )
+
+
+# ── the event ───────────────────────────────────────────────────────────────────
+
+
+def test__event__table_name__is_the_configs_qualified_name(event: PartitionEvent) -> None:
+    # Arrange / Act / Assert -- derived, so the two cannot drift
+    assert event.table_name == event.config.qualified_name
+
+
+def test__event__range_root__carries_the_window_the_bounds_stand_for(event: PartitionEvent) -> None:
     # Arrange
-    hooks = BasePartitionLifecycleHooks()
+    months = TimeBoundaries(granularity=PartitionGranularity.MONTH)
 
-    # Act / Assert -- must not raise
-    assert hooks.before_create(config, partition_info) is None
-
-
-def test__base_hooks__after_create__is_noop(config: TablePartitionConfig, partition_info: PartitionInfo) -> None:
-    # Arrange
-    hooks = BasePartitionLifecycleHooks()
-
-    # Act / Assert -- must not raise
-    assert hooks.after_create(config, partition_info) is None
+    # Act / Assert -- the period the hook actually wants, not a pair of literals
+    assert event.window == months.window_at(datetime(2024, 4, 15, tzinfo=UTC))
 
 
-def test__base_hooks__before_detach__is_noop(partition_info: PartitionInfo) -> None:
-    # Arrange
-    hooks = BasePartitionLifecycleHooks()
+def test__event__hash_root__has_no_window(config: TablePartitionConfig, partition_info: PartitionInfo) -> None:
+    # Arrange -- a set divides a keyspace, not an axis: its members cover no period
+    hashed = config.model_copy(update={"scheme": HashPartitioning(key="tenant_id", modulus=4)})
 
-    # Act / Assert -- must not raise
-    assert hooks.before_detach("events", partition_info) is None
+    # Act
+    event = PartitionEvent.build(HookPhase.BEFORE_CREATE, hashed, partition_info, _drop_op())
 
-
-def test__base_hooks__after_detach__is_noop() -> None:
-    # Arrange
-    hooks = BasePartitionLifecycleHooks()
-
-    # Act / Assert -- must not raise
-    assert hooks.after_detach("events", "events__2024_01") is None
+    # Assert
+    assert event.window is None
 
 
-def test__base_hooks__before_drop__is_noop() -> None:
-    # Arrange
-    hooks = BasePartitionLifecycleHooks()
+def test__event__partition_the_plan_knows_only_by_name__is_not_refused(config: TablePartitionConfig) -> None:
+    # Arrange -- an attached RANGE partition without bounds breaks the listing invariant,
+    # but a hook must still get its event: the operation never needed the bound
+    bare = PartitionInfo.model_construct(name="events__2024_04", partition_type=PartitionType.RANGE, is_attached=True)
 
-    # Act / Assert -- must not raise
-    assert hooks.before_drop("events", "events__2024_01") is None
+    # Act
+    event = PartitionEvent.build(HookPhase.BEFORE_DETACH, config, bare, _drop_op())
 
-
-def test__base_hooks__after_drop__is_noop() -> None:
-    # Arrange
-    hooks = BasePartitionLifecycleHooks()
-
-    # Act / Assert -- must not raise
-    assert hooks.after_drop("events", "events__2024_01") is None
+    # Assert
+    assert event.partition.name == "events__2024_04"
+    assert event.window is None
 
 
-def test__base_hooks__satisfies_the_protocol() -> None:
+def test__event__is_frozen(event: PartitionEvent) -> None:
     # Arrange / Act / Assert
-    assert isinstance(BasePartitionLifecycleHooks(), PartitionLifecycleHooks)
+    with pytest.raises(ValueError, match="frozen"):
+        event.phase = HookPhase.AFTER_DROP  # type: ignore[misc]
 
 
-def test__protocol__object_missing_a_hook__is_not_an_instance() -> None:
+def test__hook_phase__values_are_the_method_names() -> None:
+    # Arrange / Act / Assert -- what lets the executor dispatch by phase
+    assert HOOK_METHODS == (
+        "before_create",
+        "after_create",
+        "before_attach",
+        "after_attach",
+        "before_detach",
+        "after_detach",
+        "before_drop",
+        "after_drop",
+        "on_event",
+    )
+    assert all(hasattr(BasePartitionLifecycleHooks(), name) for name in HOOK_METHODS)
+
+
+# ── the no-op base ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("method", HOOK_METHODS)
+def test__base_hooks__every_method__is_a_noop(method: str, event: PartitionEvent) -> None:
     # Arrange
-    class _Partial:
-        def before_drop(self, table_name: str, partition_name: str) -> None:
-            return None
+    hooks = BasePartitionLifecycleHooks()
 
-    # Act / Assert
-    assert not isinstance(_Partial(), PartitionLifecycleHooks)
+    # Act / Assert -- must not raise
+    assert getattr(hooks, method)(event) is None
 
 
 def test__protocol__duck_typed_implementation__is_an_instance() -> None:
-    # Arrange -- no inheritance, every method present
-    class _Ducky:
-        def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            return None
-
-        def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            return None
-
-        def before_detach(self, table_name: str, partition: PartitionInfo) -> None:
-            return None
-
-        def after_detach(self, table_name: str, partition_name: str) -> None:
-            return None
-
-        def before_drop(self, table_name: str, partition_name: str) -> None:
-            return None
-
-        def after_drop(self, table_name: str, partition_name: str) -> None:
-            return None
+    # Arrange
+    class Custom:
+        def before_create(self, event: PartitionEvent) -> None: ...
+        def after_create(self, event: PartitionEvent) -> None: ...
+        def before_attach(self, event: PartitionEvent) -> None: ...
+        def after_attach(self, event: PartitionEvent) -> None: ...
+        def before_detach(self, event: PartitionEvent) -> None: ...
+        def after_detach(self, event: PartitionEvent) -> None: ...
+        def before_drop(self, event: PartitionEvent) -> None: ...
+        def after_drop(self, event: PartitionEvent) -> None: ...
+        def on_event(self, event: PartitionEvent) -> None: ...
 
     # Act / Assert
-    assert isinstance(_Ducky(), PartitionLifecycleHooks)
+    assert isinstance(Custom(), PartitionLifecycleHooks)
 
 
-def test__base_hooks_subclass__before_create__receives_the_partition_about_to_be_created(
-    config: TablePartitionConfig, partition_info: PartitionInfo
-) -> None:
+def test__base_hooks_subclass__overriding_one_method__the_others_stay_quiet(event: PartitionEvent) -> None:
     # Arrange
-    seen: list[PartitionInfo] = []
+    seen: list[str] = []
 
-    class _Hooks(BasePartitionLifecycleHooks):
-        def before_create(self, cfg: TablePartitionConfig, partition: PartitionInfo) -> None:
-            seen.append(partition)
+    class Partial(BasePartitionLifecycleHooks):
+        def before_drop(self, event: PartitionEvent) -> None:
+            seen.append(event.partition.name)
+
+    hooks = Partial()
 
     # Act
-    _Hooks().before_create(config, partition_info)
-
-    # Assert -- the new signature carries the whole partition, bounds and subpartitioning included
-    assert seen == [partition_info]
-    assert seen[0].from_value == "2024-01-01"
-    assert seen[0].to_value == "2024-02-01"
-    assert seen[0].subpartition_type is PartitionType.HASH
-    assert seen[0].is_attached is False
-
-
-def test__base_hooks_subclass__overriding_one_method__only_overridden_method_fires(
-    config: TablePartitionConfig, partition_info: PartitionInfo
-) -> None:
-    # Arrange
-    called: list[str] = []
-
-    class _Hooks(BasePartitionLifecycleHooks):
-        def before_drop(self, table_name: str, partition_name: str) -> None:
-            called.append(f"before_drop:{table_name}:{partition_name}")
-
-    hooks = _Hooks()
-
-    # Act
-    hooks.before_create(config, partition_info)
-    hooks.before_drop("events", "events__2024_01")
+    hooks.before_create(event)
+    hooks.before_drop(event)
+    hooks.on_event(event)
 
     # Assert
-    assert called == ["before_drop:events:events__2024_01"]
+    assert seen == ["events__2024_04"]
+
+
+# ── refusing a hook from before 1.1 ─────────────────────────────────────────────
+
+
+def test__validate_hook_signatures__descriptor_reporting_its_receiver__is_accepted() -> None:
+    # Arrange -- singledispatchmethod reports (self, event) even bound; judging by arity
+    # alone would reject a hook that is written exactly right
+    class Dispatching(BasePartitionLifecycleHooks):
+        @singledispatchmethod
+        def before_create(self, event: PartitionEvent) -> None: ...
+
+    # Act / Assert
+    validate_hook_signatures([Dispatching()])
+
+
+def test__validate_hook_signatures__event_shaped_hooks__pass() -> None:
+    # Arrange
+    class Ported(BasePartitionLifecycleHooks):
+        def before_drop(self, event: PartitionEvent) -> None: ...
+
+    # Act / Assert
+    validate_hook_signatures([Ported(), BasePartitionLifecycleHooks()])
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        pytest.param(type("Old", (), {"before_create": lambda self, config, partition: None})(), id="create"),
+        pytest.param(type("Old", (), {"before_drop": lambda self, table, name: None})(), id="drop"),
+        pytest.param(type("Old", (), {"after_drop": lambda self: None})(), id="no-argument"),
+    ],
+)
+def test__validate_hook_signatures__pre_1_1_shape__is_refused_at_wiring_time(hook: object) -> None:
+    # Arrange / Act / Assert -- otherwise it is accepted here and fails mid-run
+    with pytest.raises(ValueError, match="cannot be called with one PartitionEvent"):
+        validate_hook_signatures([hook])
+
+
+def test__validate_hook_signatures__signature_that_cannot_be_read__is_left_alone() -> None:
+    # Arrange -- a C callable or a decorator that hides its parameters is not ours to judge
+    class Opaque(BasePartitionLifecycleHooks):
+        def before_drop(self, event: PartitionEvent) -> None: ...
+
+    # Act / Assert
+    with patch("pg_partsmith.events.inspect.signature", side_effect=ValueError("no signature")):
+        validate_hook_signatures([Opaque()])
+
+
+def test__validate_hook_signatures__unreadable_or_variadic__is_left_alone() -> None:
+    # Arrange -- a decorated method, a mock, anything taking *args: not ours to judge
+    class Variadic:
+        def before_drop(self, *args: object, **kwargs: object) -> None: ...
+
+    # Act / Assert
+    validate_hook_signatures([Variadic(), object()])
+
+
+def _drop_op() -> DropPartition:
+    return DropPartition(target="events__2024_04", reason=Reason.GRACE_ELAPSED, detail="grace elapsed")

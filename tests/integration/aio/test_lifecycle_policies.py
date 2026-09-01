@@ -624,7 +624,7 @@ async def test__orphan_reattach__window_in_the_create_ahead_set__reattached_not_
     oid_before = await relation_oid(db_engine, september)
     listed = await PostgresMetadataProvider(db_engine).list_partitions(table)
     with freezegun.freeze_time(NOW):
-        await make_service(db_engine).detach_old_partitions(table, [p for p in listed if p.relname == september])
+        await make_service(db_engine).detach_old_partitions(config, [p for p in listed if p.relname == september])
     assert await is_attached(db_engine, september) is False
 
     # Act

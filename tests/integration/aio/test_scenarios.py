@@ -15,10 +15,9 @@ from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.entities import (
     MaintenanceIssueStep,
     PartitionGranularity,
-    PartitionInfo,
     Period,
-    TablePartitionConfig,
 )
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import PartitionAttachedError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import FindingReason, Reason
@@ -167,23 +166,25 @@ async def test__scenario__lifecycle_hooks__fired_at_correct_points(
     hook_calls: list[str] = []
 
     class TrackingHooks(BasePartitionLifecycleHooks):
-        async def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            hook_calls.append(f"before_create:{partition.name}:{partition.from_value}:{partition.to_value}")
+        async def before_create(self, event: PartitionEvent) -> None:
+            hook_calls.append(
+                f"before_create:{event.partition.name}:{event.partition.from_value}:{event.partition.to_value}"
+            )
 
-        async def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            hook_calls.append(f"after_create:{partition.name}")
+        async def after_create(self, event: PartitionEvent) -> None:
+            hook_calls.append(f"after_create:{event.partition.name}")
 
-        async def before_detach(self, table_name: str, partition: PartitionInfo) -> None:
-            hook_calls.append(f"before_detach:{partition.name}")
+        async def before_detach(self, event: PartitionEvent) -> None:
+            hook_calls.append(f"before_detach:{event.partition.name}")
 
-        async def after_detach(self, table_name: str, partition_name: str) -> None:
-            hook_calls.append(f"after_detach:{partition_name}")
+        async def after_detach(self, event: PartitionEvent) -> None:
+            hook_calls.append(f"after_detach:{event.partition.name}")
 
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
-            hook_calls.append(f"before_drop:{partition_name}")
+        async def before_drop(self, event: PartitionEvent) -> None:
+            hook_calls.append(f"before_drop:{event.partition.name}")
 
-        async def after_drop(self, table_name: str, partition_name: str) -> None:
-            hook_calls.append(f"after_drop:{partition_name}")
+        async def after_drop(self, event: PartitionEvent) -> None:
+            hook_calls.append(f"after_drop:{event.partition.name}")
 
     ctx = await partition_builder.with_create_ahead(1).with_retention(1).with_hooks([TrackingHooks()]).build()
     january = f"public.{ctx.table_name}__2024_01"

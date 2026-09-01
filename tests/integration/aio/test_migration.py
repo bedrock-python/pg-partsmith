@@ -22,6 +22,7 @@ from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import MaintenanceIssueStep, Period
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
 from tests.integration.aio.support import (
     child_count,
@@ -346,7 +347,7 @@ class _LateWriter(BasePartitionLifecycleHooks):
         self._table = table
         self._when = when
 
-    async def before_detach(self, table_name: str, partition: object) -> None:
+    async def before_detach(self, event: PartitionEvent) -> None:
         await exec_sql(
             self._engine,
             f"INSERT INTO \"{self._table}\" (created_at, payload) VALUES (:ts, 'late')",  # noqa: S608
@@ -423,7 +424,7 @@ async def test__partition_data__window_of_a_detached_owned_partition__filled_and
     await service.ensure_partitions(config, [Period(year=2026, month=3)])
     march = f"{events}__2026_03"
     listed = await PostgresMetadataProvider(db_engine).list_partitions(events)
-    await service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    await service.detach_old_partitions(config, [p for p in listed if p.relname == march])
     assert await is_attached(db_engine, march) is False
     await _default_with_rows(db_engine, events, months=(3,), per_month=4)
 
@@ -467,8 +468,8 @@ class _DetachedWriter(BasePartitionLifecycleHooks):
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
 
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        quoted = ".".join(f'"{part}"' for part in partition_name.split("."))
+    async def before_drop(self, event: PartitionEvent) -> None:
+        quoted = ".".join(f'"{part}"' for part in event.partition.name.split("."))
         await exec_sql(
             self._engine,
             f"INSERT INTO {quoted} (created_at, payload) VALUES ('2026-03-20T12:00:00+00:00', 'dropwrite')",  # noqa: S608
@@ -553,7 +554,7 @@ async def test__partition_data__orphan_swapped_during_the_fill__stale_not_misfil
     await service.ensure_partitions(config, [Period(year=2026, month=3)])
     march = f"{events}__2026_03"
     listed = await PostgresMetadataProvider(db_engine).list_partitions(events)
-    await service.detach_old_partitions(events, [p for p in listed if p.relname == march])
+    await service.detach_old_partitions(config, [p for p in listed if p.relname == march])
     await _default_with_rows(db_engine, events, months=(3,), per_month=4)
 
     original = PostgresPartitionRepository.reconcile_default_rows
@@ -866,7 +867,7 @@ async def test__ensure_partitions__reattached_branch_replaced_before_its_childre
     await service.ensure_partitions(config, [when])
     branch = f"{tenants}__2026_w35"
     listed = await PostgresMetadataProvider(db_engine).list_partitions(tenants)
-    await service.detach_old_partitions(tenants, [p for p in listed if p.relname == branch])
+    await service.detach_old_partitions(config, [p for p in listed if p.relname == branch])
     await exec_sql(db_engine, f'DROP TABLE "{branch}__h1"')
     original = PostgresPartitionRepository.create_table_like
     hijacked: list[str] = []

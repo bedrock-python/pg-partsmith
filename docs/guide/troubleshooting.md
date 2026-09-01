@@ -223,6 +223,30 @@ composite LIST key, two levels on one column, a table name too long for the sche
 suffixes, `CreateAhead` on a sliding list, a negative grace, a foreign-table option
 template with an unknown placeholder. The message names the field.
 
+## `Orphan marker mismatch` at construction
+
+```text
+Orphan marker mismatch: the repository marks detached partitions with 'app:orphan-parent=' but the metadata provider looks for 'pg-partsmith:orphan-parent='.
+```
+
+`marker_prefix` was passed to one of the two and not the other. The repository stamps the
+marker on detach; the provider finds orphans by it. Left alone, nothing detached would
+ever be seen again — no error, just partitions accumulating — so the pair is refused where
+it is wired. Pass the same prefix to both, or to neither.
+
+## `Partition upper bound carries no timezone and none was given` (WARNING)
+
+`is_partition_closed` read a bound with no offset — which is what a `timestamp` or `date`
+key produces — while neither the provider's `ddl_timezone` nor a `boundaries` argument said
+which zone wrote it, so the server's session default decided. The answer may be hours early
+or late. Pass the table's own boundaries, which know both the zone and the codec:
+
+```python
+await metadata.is_partition_closed(name, boundaries=config.time_boundaries)
+```
+
+A `timestamptz` key never triggers this: its literals carry an offset.
+
 ## Rows are being rejected: `no partition of relation "events" found for row`
 
 PostgreSQL's error, not the library's: a row's key falls into a window with no partition.

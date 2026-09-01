@@ -31,6 +31,7 @@ from .entities import (
     RangeBounds,
     TablePartitionConfig,
 )
+from .events import HookPhase, PartitionEvent
 from .exceptions import (
     DropRetryExhaustedError,
     InvalidPartitionConfigError,
@@ -147,6 +148,7 @@ __all__ = [
     "ForeignLeaves",
     "HashBounds",
     "HashPartitioning",
+    "HookPhase",
     "HourPeriodCalculator",
     "IntegerSequence",
     "InvalidPartitionConfigError",
@@ -179,6 +181,7 @@ __all__ = [
     "PartitionBy",
     "PartitionDetachInProgressError",
     "PartitionError",
+    "PartitionEvent",
     "PartitionFacts",
     "PartitionGranularity",
     "PartitionInfo",

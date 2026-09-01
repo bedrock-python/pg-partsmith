@@ -27,6 +27,7 @@ from pg_partsmith.entities import (
     RangeBounds,
     TablePartitionConfig,
 )
+from pg_partsmith.events import HookPhase, PartitionEvent
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionAttachedError,
@@ -50,7 +51,7 @@ from pg_partsmith.plan import (
     PartitionBy,
     Reason,
 )
-from pg_partsmith.scheme import HashPartitioning, RangePartitioning
+from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning
 from pg_partsmith.topology import PartitionBounds
 
 NOW = datetime(2024, 3, 15, 12, 0, tzinfo=UTC)
@@ -66,26 +67,36 @@ class _RecordingHooks(BasePartitionLifecycleHooks):
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
 
-    async def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-        self.calls.append(("before_create", partition))
+    async def before_create(self, event: PartitionEvent) -> None:
+        self.calls.append(("before_create", event.partition))
 
-    async def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-        self.calls.append(("after_create", partition))
+    async def after_create(self, event: PartitionEvent) -> None:
+        self.calls.append(("after_create", event.partition))
 
-    async def before_detach(self, table_name: str, partition: PartitionInfo) -> None:
-        self.calls.append(("before_detach", (table_name, partition)))
+    async def before_detach(self, event: PartitionEvent) -> None:
+        self.calls.append(("before_detach", (event.table_name, event.partition)))
 
-    async def after_detach(self, table_name: str, partition_name: str) -> None:
-        self.calls.append(("after_detach", (table_name, partition_name)))
+    async def after_detach(self, event: PartitionEvent) -> None:
+        self.calls.append(("after_detach", (event.table_name, event.partition.name)))
 
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        self.calls.append(("before_drop", (table_name, partition_name)))
+    async def before_drop(self, event: PartitionEvent) -> None:
+        self.calls.append(("before_drop", (event.table_name, event.partition.name)))
 
-    async def after_drop(self, table_name: str, partition_name: str) -> None:
-        self.calls.append(("after_drop", (table_name, partition_name)))
+    async def after_drop(self, event: PartitionEvent) -> None:
+        self.calls.append(("after_drop", (event.table_name, event.partition.name)))
 
     def names(self) -> list[str]:
         return [name for name, _ in self.calls]
+
+
+def _hook_event(target: str = "events__2023_12", phase: HookPhase = HookPhase.BEFORE_DROP) -> PartitionEvent:
+    """An event of the shape the executor builds, for testing the runner directly."""
+    return PartitionEvent.build(
+        phase,
+        _config(),
+        PartitionInfo(name=target, partition_type=PartitionType.RANGE, is_attached=False),
+        _drop_op(target=target),
+    )
 
 
 class _BoomError(Exception):
@@ -409,7 +420,7 @@ async def test__apply__hash_and_list_and_default_bounds__partition_info_reports_
 async def test__apply__before_create_hook_raises__create_never_happens(repo: MagicMock, metadata: MagicMock) -> None:
     # Arrange
     class _Refusing(BasePartitionLifecycleHooks):
-        async def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
+        async def before_create(self, event: PartitionEvent) -> None:
             raise RuntimeError("hook failed")
 
     executor = PlanExecutor(repo, metadata, hooks=[_Refusing()])
@@ -1182,7 +1193,7 @@ async def test__detach_single_partition__non_range_bounds__hook_sees_the_parent_
     metadata.is_partition_attached.return_value = True
 
     # Act
-    await executor.detach_single_partition("events", _detach_op(oid=None, bounds=bounds))
+    await executor.detach_single_partition(_config(), _detach_op(oid=None, bounds=bounds))
 
     # Assert
     _, info = hooks.calls[0][1]
@@ -1283,7 +1294,7 @@ async def test__drop_single_partition__attached__returns_false(executor: PlanExe
     repo.drop_partition.side_effect = PartitionAttachedError("events__2023_12", "events")
 
     # Act / Assert
-    assert await executor.drop_single_partition("events", _drop_op()) is None
+    assert await executor.drop_single_partition(_config(), _drop_op()) is None
 
 
 async def test__apply__drop_following_a_failed_detach__is_skipped(
@@ -1464,7 +1475,7 @@ async def test__apply__topology_error_raised_while_executing__is_logged_as_a_war
 async def test__run_hooks__runtime_error__logged_as_warning_and_reraised(repo: MagicMock, metadata: MagicMock) -> None:
     # Arrange
     class _Hooks(BasePartitionLifecycleHooks):
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
+        async def before_drop(self, event: PartitionEvent) -> None:
             raise RuntimeError("no export today")
 
     executor = PlanExecutor(repo, metadata, hooks=[_Hooks()])
@@ -1472,7 +1483,7 @@ async def test__run_hooks__runtime_error__logged_as_warning_and_reraised(repo: M
 
     # Act / Assert
     with patch("pg_partsmith.aio.services.execution.logger", logger), pytest.raises(RuntimeError, match="no export"):
-        await executor.drop_single_partition("events", _drop_op())
+        await executor.drop_single_partition(_config(), _drop_op())
 
     logger.warning.assert_called_once()
     assert logger.warning.call_args.args[0] == "before_drop hook failed"
@@ -1487,7 +1498,7 @@ async def test__run_hooks__unexpected_error__logged_with_traceback_and_reraised(
 ) -> None:
     # Arrange
     class _Hooks(BasePartitionLifecycleHooks):
-        async def after_drop(self, table_name: str, partition_name: str) -> None:
+        async def after_drop(self, event: PartitionEvent) -> None:
             raise _BoomError("kafka down")
 
     executor = PlanExecutor(repo, metadata, hooks=[_Hooks()])
@@ -1495,7 +1506,7 @@ async def test__run_hooks__unexpected_error__logged_with_traceback_and_reraised(
 
     # Act / Assert
     with patch("pg_partsmith.aio.services.execution.logger", logger), pytest.raises(_BoomError):
-        await executor.drop_single_partition("events", _drop_op())
+        await executor.drop_single_partition(_config(), _drop_op())
 
     logger.exception.assert_called_once()
     assert logger.exception.call_args.args[0] == "after_drop hook failed with unexpected error"
@@ -1505,7 +1516,7 @@ async def test__run_hooks__unexpected_error__logged_with_traceback_and_reraised(
 async def test__run_hooks__cancelled__propagates_without_logging(repo: MagicMock, metadata: MagicMock) -> None:
     # Arrange
     class _Hooks(BasePartitionLifecycleHooks):
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
+        async def before_drop(self, event: PartitionEvent) -> None:
             raise asyncio.CancelledError()
 
     executor = PlanExecutor(repo, metadata, hooks=[_Hooks()])
@@ -1513,7 +1524,7 @@ async def test__run_hooks__cancelled__propagates_without_logging(repo: MagicMock
 
     # Act / Assert
     with patch("pg_partsmith.aio.services.execution.logger", logger), pytest.raises(asyncio.CancelledError):
-        await executor.drop_single_partition("events", _drop_op())
+        await executor.drop_single_partition(_config(), _drop_op())
 
     logger.warning.assert_not_called()
     logger.exception.assert_not_called()
@@ -1585,6 +1596,183 @@ async def test__apply__detached_branch_with_numeric_windows__replans_from_the_pl
     assert result.repaired_count == 1
 
 
+async def test__apply__hooks_with_on_event__it_fires_for_every_phase_beside_the_named_one(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the audit shape: one method, every phase, no six delegating stubs
+    seen: list[tuple[str, str]] = []
+
+    class _Audit(BasePartitionLifecycleHooks):
+        async def on_event(self, event: PartitionEvent) -> None:
+            seen.append((event.phase.value, event.partition.name))
+
+        async def before_drop(self, event: PartitionEvent) -> None:
+            seen.append(("named", event.partition.name))
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Audit()])
+
+    # Act
+    await executor.apply(_config(), _plan(_create_op(), _drop_op()))
+
+    # Assert -- both, and the watcher before the method that may refuse the operation
+    assert seen == [
+        ("before_create", "events__2024_04"),
+        ("after_create", "events__2024_04"),
+        ("before_drop", "events__2023_12"),
+        ("named", "events__2023_12"),
+        ("after_drop", "events__2023_12"),
+    ]
+
+
+async def test__apply__hooks__the_event_carries_the_operation_and_the_window(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- what a drop hook could not know before: why, how big, and which period
+    events: list[PartitionEvent] = []
+
+    class _Watching(BasePartitionLifecycleHooks):
+        async def before_drop(self, event: PartitionEvent) -> None:
+            events.append(event)
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Watching()])
+    op = DropPartition(
+        target="events__2023_12",
+        oid=55,
+        bounds=RangeBounds(from_value="2023-12-01", to_value="2024-01-01"),
+        reason=Reason.GRACE_ELAPSED,
+        detail="grace of 7 days elapsed",
+        size_bytes=1024,
+    )
+
+    # Act
+    await executor.apply(_config(), _plan(op))
+
+    # Assert
+    (event,) = events
+    assert event.phase is HookPhase.BEFORE_DROP
+    assert event.table_name == "events"  # the config carries no schema here
+    assert event.operation.reason is Reason.GRACE_ELAPSED
+    assert event.operation.size_bytes == 1024
+    assert event.window is not None
+    assert event.window.start == datetime(2023, 12, 1, tzinfo=UTC)
+    assert event.partition.is_attached is False
+
+
+async def test__apply__reattached_orphan__attach_hooks_fire_around_it(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- a partition retention released comes back; anything derived from it
+    # while it was out is about to go stale, which is what the hooks are for
+    seen: list[tuple[str, bool]] = []
+
+    class _Watching(BasePartitionLifecycleHooks):
+        async def before_attach(self, event: PartitionEvent) -> None:
+            seen.append((event.phase.value, event.partition.is_attached))
+
+        async def after_attach(self, event: PartitionEvent) -> None:
+            seen.append((event.phase.value, event.partition.is_attached))
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Watching()])
+    metadata.get_relation_oid.return_value = 77  # the relation the plan decided about
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+
+    # Act
+    await executor.apply(_config(), _plan(_attach_op()))
+
+    # Assert -- not attached when asked, attached when told
+    assert seen == [("before_attach", False), ("after_attach", True)]
+
+
+async def test__apply__named_hook_refuses__on_event_still_recorded_it(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange -- an auditor and a veto in the same run: a refusal must not leave the
+    # audit trail with nothing in it
+    seen: list[str] = []
+
+    class _Audit(BasePartitionLifecycleHooks):
+        async def on_event(self, event: PartitionEvent) -> None:
+            seen.append(event.phase.value)
+
+    class _Veto(BasePartitionLifecycleHooks):
+        async def before_drop(self, event: PartitionEvent) -> None:
+            raise RuntimeError("not exported yet")
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Audit(), _Veto()])
+
+    # Act
+    result = await executor.apply(_config(), _plan(_drop_op()), continue_on_error=True)
+
+    # Assert -- the drop was refused, and the auditor saw the attempt
+    assert seen == ["before_drop"]
+    assert result.dropped_count == 0
+    repo.drop_partition.assert_not_awaited()
+
+
+async def test__apply__after_attach_hook_raises__the_attach_is_still_counted(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the DDL committed; a failing after-hook must not make the result lie
+    class _Loud(BasePartitionLifecycleHooks):
+        async def after_attach(self, event: PartitionEvent) -> None:
+            raise RuntimeError("notification failed")
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Loud()])
+    metadata.get_relation_oid.return_value = 77
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+
+    # Act
+    result = await executor.apply(_config(), _plan(_attach_op()), continue_on_error=True)
+
+    # Assert
+    assert result.attached_count == 1
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.ATTACH]
+
+
+async def test__apply__attach_of_a_branch__the_event_names_how_it_partitions_its_children(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- a RANGE branch coming back holds a HASH subtree
+    events: list[PartitionEvent] = []
+
+    class _Watching(BasePartitionLifecycleHooks):
+        async def before_attach(self, event: PartitionEvent) -> None:
+            events.append(event)
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Watching()])
+    metadata.get_relation_oid.return_value = 77
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+    op = _attach_op().model_copy(
+        update={"partition_by": PartitionBy(method=PartitionType.HASH, columns=("tenant_id",))}
+    )
+
+    # Act
+    await executor.apply(_config(), _plan(op))
+
+    # Assert
+    assert events[0].partition.subpartition_type is PartitionType.HASH
+
+
+async def test__apply__default_member_of_a_list_root__the_event_names_the_roots_method(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- DEFAULT bounds say nothing about the parent's method; the config does
+    events: list[PartitionEvent] = []
+
+    class _Watching(BasePartitionLifecycleHooks):
+        async def before_create(self, event: PartitionEvent) -> None:
+            events.append(event)
+
+    executor = PlanExecutor(repo, metadata, hooks=[_Watching()])
+    config = TablePartitionConfig(
+        table_name="events",
+        scheme=ListPartitioning(key="region", groups=(ListGroup(name="eu", values=("de",)),)),
+    )
+
+    # Act
+    await executor.apply(config, _plan(_create_op("events__other", bounds=DefaultBounds(), key_columns=("region",))))
+
+    # Assert
+    assert events[0].partition.is_default is True
+    assert events[0].partition.partition_type is PartitionType.LIST
+
+
 # ── the legacy BasePartitionService hook runner ─────────────────────────────────
 
 
@@ -1593,15 +1781,15 @@ async def test__base_partition_service__hooks_run_in_order_and_failures_are_logg
     calls: list[str] = []
 
     class _Fine(BasePartitionLifecycleHooks):
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
-            calls.append(partition_name)
+        async def before_drop(self, event: PartitionEvent) -> None:
+            calls.append(event.partition.name)
 
     class _Loud(BasePartitionLifecycleHooks):
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
+        async def before_drop(self, event: PartitionEvent) -> None:
             raise _BoomError("kafka down")
 
     class _Typed(BasePartitionLifecycleHooks):
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
+        async def before_drop(self, event: PartitionEvent) -> None:
             raise ValueError("bad value")
 
     logger = MagicMock()
@@ -1609,15 +1797,15 @@ async def test__base_partition_service__hooks_run_in_order_and_failures_are_logg
     # Act / Assert
     with patch("pg_partsmith.aio.services.base.logger", logger):
         await BasePartitionService([_Fine()])._run_hooks(
-            lambda h: h.before_drop("events", "events__x"), "before_drop", partition_name="events__x"
+            lambda h: h.before_drop(_hook_event("events__x")), "before_drop", partition_name="events__x"
         )
         with pytest.raises(_BoomError):
             await BasePartitionService([_Loud()])._run_hooks(
-                lambda h: h.before_drop("events", "events__x"), "before_drop", partition_name="events__x"
+                lambda h: h.before_drop(_hook_event("events__x")), "before_drop", partition_name="events__x"
             )
         with pytest.raises(ValueError, match="bad value"):
             await BasePartitionService([_Typed()])._run_hooks(
-                lambda h: h.before_drop("events", "events__x"), "before_drop", partition_name="events__x"
+                lambda h: h.before_drop(_hook_event("events__x")), "before_drop", partition_name="events__x"
             )
 
     assert calls == ["events__x"]
@@ -1641,7 +1829,7 @@ async def test__base_partition_service__no_hooks__runs_nothing() -> None:
 async def test__base_partition_service__cancelled_hook__propagates_without_logging() -> None:
     # Arrange
     class _Cancelled(BasePartitionLifecycleHooks):
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
+        async def before_drop(self, event: PartitionEvent) -> None:
             raise asyncio.CancelledError()
 
     logger = MagicMock()
@@ -1649,7 +1837,7 @@ async def test__base_partition_service__cancelled_hook__propagates_without_loggi
     # Act / Assert
     with patch("pg_partsmith.aio.services.base.logger", logger), pytest.raises(asyncio.CancelledError):
         await BasePartitionService([_Cancelled()])._run_hooks(
-            lambda h: h.before_drop("events", "events__x"), "before_drop", partition_name="events__x"
+            lambda h: h.before_drop(_hook_event("events__x")), "before_drop", partition_name="events__x"
         )
 
     logger.warning.assert_not_called()
@@ -1862,7 +2050,7 @@ async def test__detach_single_partition__passes_the_expected_oid_to_the_reposito
     metadata.is_partition_attached.return_value = True
 
     # Act
-    await executor.detach_single_partition("events", _detach_op(oid=77))
+    await executor.detach_single_partition(_config(), _detach_op(oid=77))
 
     # Assert -- the repository re-checks the identity under its own lock
     repo.detach_partition.assert_awaited_once_with("events", "events__2024_03", mode=DetachMode.AUTO, expected_oid=77)

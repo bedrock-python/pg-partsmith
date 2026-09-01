@@ -29,7 +29,12 @@ from pg_partsmith.catalog_queries import (
 )
 from pg_partsmith.entities import PartitionInfo, PartitionType
 from pg_partsmith.exceptions import InvalidPartitionConfigError
-from pg_partsmith.partition_bounds import is_addressable, parse_partition_bounds, parse_range_boundaries
+from pg_partsmith.partition_bounds import (
+    is_addressable,
+    is_naive_timestamp_literal,
+    parse_partition_bounds,
+    parse_range_boundaries,
+)
 from pg_partsmith.topology import (
     ActualTree,
     DefaultBounds,
@@ -638,6 +643,9 @@ class PostgresMetadataProvider:
                 # No upper bound to read: DEFAULT, non-RANGE, detached, or unknown.
                 return False
 
+            if codec is None and ddl_timezone is None and is_naive_timestamp_literal(raw_bound):
+                self._warn_naive_bound(partition_name, raw_bound)
+
             if codec is not None:
                 instant = codec.decode(raw_bound)
                 if instant is None:
@@ -663,6 +671,22 @@ class PostgresMetadataProvider:
                 return False
 
             return bool(result.scalar())
+
+    def _warn_naive_bound(self, partition_name: str, raw_bound: str) -> None:
+        """Say that the answer rests on whatever timezone the session happens to be in.
+
+        A bound without an offset means the same instant only when it is read
+        in the zone it was written under. With neither this provider's
+        ``ddl_timezone`` nor a table's boundaries to say what that was, the
+        server's session default decides, and it need not be the same -- so the
+        partition can report as closed hours early or late, silently.
+        """
+        logger.warning(
+            "Partition upper bound carries no timezone and none was given, so the server's session "
+            "timezone decides when it falls; pass boundaries=config.time_boundaries, or construct the "
+            "provider with the repository's ddl_timezone",
+            extra={"partition_name": partition_name, "upper_bound": raw_bound},
+        )
 
     def _warn_unreadable_bound(self, partition_name: str, raw_bound: str) -> None:
         """Explain a partition that can never report as closed.
