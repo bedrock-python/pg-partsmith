@@ -138,7 +138,10 @@ row's account.
 
 Every refusal is `RowMoveRefusedError` and rolls the move back whole; widen the range,
 quiesce the writers and reset the sequence yourself, or take the identity off the column
-for the migration.
+for the migration. A destination with more than one identity column is decided in full
+before any of its sequences moves — PostgreSQL does not roll a sequence back with the
+transaction, so a second column refusing must not leave the first one advanced over rows
+that went back where they came from.
 
 ## Locks
 

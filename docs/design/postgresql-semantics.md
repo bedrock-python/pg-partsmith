@@ -191,13 +191,23 @@ before `seqstart` were never issued and are left alone. Measured on 17: session 
 `nextval` returns `1` and keeps `2..5`; session B's returns `6` and moves `last_value` to
 `10`; `2` is still A's to issue.
 
+A sequence is not transactional: `setval` stands whatever becomes of the transaction
+around it. So every identity column of a destination is decided before any of its
+sequences is moved — otherwise a refusal on the second column would leave the first one
+spent on rows that rolled back, and a bounded one could be exhausted by a move that never
+happened. What no amount of ordering can undo is a rollback *after* the move was accepted:
+the sequence stays where the move put it, past ids that are no longer there. That direction
+is safe — a sequence too far ahead skips values, it does not repeat them.
+
 Which rows those questions are about is settled by the move statement itself. Its
 `INSERT` returns the identity values it placed, and one enclosing `INSERT` parks them in a
 temporary relation for the length of the transaction — one statement, so what it reports
 is exactly what it moved, with no second look at the destination to confuse a moved id
 with one the destination already held. An identity column the source does not carry is
 skipped: the sequence fills it as it would in any ordinary insert, so the move takes
-nothing from it.
+nothing from it. The relation is named per move (`pg_partsmith_moved_` and a fresh
+suffix): the temporary schema belongs to the session, and a caller may be holding names in
+it of its own.
 
 A cycling sequence is decided before any of that, and on its whole range: `CYCLE` restarts
 it at `seqmin` (ascending) or `seqmax` (descending), which need not lie on the residue

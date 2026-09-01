@@ -114,7 +114,9 @@ ColdFront, pg_partman, pg_clickhouse) manage PostgreSQL partitions. See
   since `START` counts — is refused instead of quietly broken. Every one of those
   questions is about the ids the move carries, which the move statement hands over as it
   places them: a row the destination already held came from that sequence itself and
-  never refuses a move.
+  never refuses a move. A destination with several identity columns is decided in full
+  before any of its sequences moves, since PostgreSQL does not roll a sequence back with
+  the transaction.
 - `unpartition` refuses a destination that is the root, a member or an orphan of its tree,
   or a partition of any other table; empties this library's detached partitions too; and —
   under `drop_emptied` — detaches, drains the tail, and lets the drop move whatever

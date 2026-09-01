@@ -80,10 +80,6 @@ class _Catalog:
 _IDENTITY_SOURCE_COLUMNS = ["id", "created_at", "tenant_id", "data"]
 # Where a move parks the identity values it brought in, and where every
 # sequence decision reads them back from.
-_MOVED_IDENTITY = '"pg_temp"."pg_partsmith_moved_identity"'
-_MOVED_MAX = 'SELECT MAX("id") FROM "pg_temp"."pg_partsmith_moved_identity"'
-_MOVED_MIN = 'SELECT MIN("id") FROM "pg_temp"."pg_partsmith_moved_identity"'
-_MOVED_CAPTURE = 'INSERT INTO "pg_temp"."pg_partsmith_moved_identity" ("id") SELECT "id" FROM placed'
 
 
 def _next(value: object) -> object:
@@ -127,7 +123,11 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
     if "attidentity" in sql:
         return _scalar(_next(catalog.identity_always))
     if "seqincrement" in sql:
-        return _first(SimpleNamespace(**catalog.sequence))
+        # A list answers one identity column after another.
+        parameters = catalog.sequence
+        if isinstance(parameters, list):
+            parameters = parameters.pop(0)
+        return _first(SimpleNamespace(**parameters))
     if sql.startswith("SELECT EXISTS (SELECT 1 FROM"):
         return _scalar(catalog.holds_value)
     if sql.startswith(("SELECT MAX(", "SELECT MIN(")):
@@ -185,6 +185,12 @@ def _locks(conn: AsyncMock) -> list[str]:
 
 def _attach_statement(conn: AsyncMock) -> str:
     return next(s for s in _statements(conn) if "ATTACH PARTITION" in s)
+
+
+def _parked_identity_of(conn: AsyncMock) -> str:
+    """The relation one move parked its identity values in, as its probes name it."""
+    (created,) = [s for s in _statements(conn) if s.startswith("CREATE TEMP TABLE")]
+    return '"pg_temp".' + created.split()[3]
 
 
 def _move_statement_of(conn: AsyncMock) -> str:
@@ -1885,7 +1891,8 @@ async def test__move_rows__identity_target__sets_the_sequence_past_the_ids_it_co
     assert moved == 4
     statements = _statements(conn)
     move_at = statements.index(_move_statement_of(conn))
-    reach_at = next(i for i, s in enumerate(statements) if s.startswith(_MOVED_MAX))
+    parked = _parked_identity_of(conn)
+    reach_at = next(i for i, s in enumerate(statements) if s.startswith("SELECT MAX(") and parked in s)
     setval_at = next(i for i, s in enumerate(statements) if "setval(" in s)
     assert move_at < reach_at < setval_at
     engine.begin.assert_called_once()
@@ -1914,7 +1921,8 @@ async def test__move_rows__descending_identity_target__chases_the_low_water_mark
 
     # Assert
     statements = _statements(conn)
-    assert any(s.startswith(_MOVED_MIN) for s in statements)
+    parked = _parked_identity_of(conn)
+    assert any(s.startswith("SELECT MIN(") and parked in s for s in statements)
     assert any("setval(" in s for s in statements)
 
 
@@ -2157,13 +2165,15 @@ async def test__move_rows__identity_target__keeps_the_ids_it_moved_and_asks_abou
     # and the relation it parked them in is opened before and released after
     statements = _statements(conn)
     move = _move_statement_of(conn)
+    parked = _parked_identity_of(conn)
     assert 'placed AS (INSERT INTO "b" ("id", "created_at", "tenant_id", "data") ' in move
     assert 'RETURNING "id") ' in move
-    assert _MOVED_CAPTURE in move
+    assert parked in move
+    assert move.endswith('("id") SELECT "id" FROM placed')
     opened = next(i for i, s in enumerate(statements) if s.startswith("CREATE TEMP TABLE"))
     released = next(i for i, s in enumerate(statements) if s.startswith("DROP TABLE"))
     assert opened < statements.index(move) < released
-    assert all(_MOVED_IDENTITY in s for s in statements if s.startswith(("SELECT MAX(", "SELECT MIN(")))
+    assert all(parked in s for s in statements if s.startswith(("SELECT MAX(", "SELECT MIN(")))
 
 
 async def test__move_rows__identity_column_the_source_does_not_carry__is_left_to_its_sequence() -> None:
@@ -2181,3 +2191,52 @@ async def test__move_rows__identity_column_the_source_does_not_carry__is_left_to
     assert "placed AS" not in _move_statement_of(conn)
     assert not any(s.startswith("CREATE TEMP TABLE") for s in statements)
     assert not any("setval(" in s for s in statements)
+
+
+async def test__move_rows__two_moves__park_their_ids_in_relations_of_their_own() -> None:
+    # Arrange -- the temporary schema is the session's, and a caller may be
+    # holding names in it; nothing the library opens may be a name it guessed
+    engine, conn = _engine(_Catalog(moved_rows=1, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    await repo.move_rows("a", "b")
+    await repo.move_rows("a", "b")
+
+    # Assert -- each move opens its own relation and gives that one back
+    opened = [s.split()[3] for s in _statements(conn) if s.startswith("CREATE TEMP TABLE")]
+    released = [s.split()[2] for s in _statements(conn) if s.startswith("DROP TABLE")]
+    assert len(opened) == 2
+    assert opened[0] != opened[1]
+    assert opened == released
+
+
+async def test__move_rows__a_later_identity_column_refuses__no_sequence_was_moved() -> None:
+    # Arrange -- the first column would be set to 4, the second cycles onto the
+    # ids the move carries. A sequence does not roll back with the transaction,
+    # so the first must not have been touched.
+    reachable = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 5,
+        "cycles": False,
+        "cache": 1,
+        "start_value": 1,
+        "last_value": None,
+    }
+    cycling = {**reachable, "maximum": 10, "cycles": True}
+    catalog = _Catalog(
+        moved_rows=1,
+        identity_columns=["id", "ref"],
+        columns=["id", "ref", "created_at"],
+        sequence=[reachable, cycling],
+        extreme_value=4,
+        holds_value=True,
+    )
+    engine, conn = _engine(catalog)
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="cycles"):
+        await repo.move_rows("a", "b")
+    assert not any("setval(" in s for s in _statements(conn))

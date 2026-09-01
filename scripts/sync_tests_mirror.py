@@ -42,6 +42,7 @@ RULES: list[tuple[str, str]] = [
         r"from sqlalchemy\.ext\.asyncio import AsyncEngine, create_async_engine",
         "from sqlalchemy import Engine, create_engine",
     ),
+    (r"from sqlalchemy\.ext\.asyncio import create_async_engine", "from sqlalchemy import create_engine"),
     (r"from sqlalchemy\.ext\.asyncio import AsyncEngine", "from sqlalchemy import Engine"),
     (r"from sqlalchemy\.ext\.asyncio import AsyncConnection, AsyncEngine", "from sqlalchemy import Connection, Engine"),
     # redis-py keeps its async client in ``redis.asyncio``; the sync one is at the package root.
