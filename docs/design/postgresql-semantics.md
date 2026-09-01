@@ -195,9 +195,14 @@ A sequence is not transactional: `setval` stands whatever becomes of the transac
 around it. So every identity column of a destination is decided before any of its
 sequences is moved — otherwise a refusal on the second column would leave the first one
 spent on rows that rolled back, and a bounded one could be exhausted by a move that never
-happened. What no amount of ordering can undo is a rollback *after* the move was accepted:
-the sequence stays where the move put it, past ids that are no longer there. That direction
-is safe — a sequence too far ahead skips values, it does not repeat them.
+happened. What no amount of ordering can undo is a sequence that moves once the decision
+is already made: a rollback *after* the move was accepted, or a failure partway through
+issuing the `setval`s — a role holding `UPDATE` on one of a destination's sequences and
+not the next fails the second with `42501`, and the first stays where it was put. Either
+way the rows go back and the sequence does not, leaving it past ids that are no longer
+there. That direction is safe — a sequence too far ahead skips values, it does not repeat
+them — and it is why the ordering is worth having even though it cannot cover this: what
+it prevents is a *semantic* refusal spending a sequence, which is the case that recurs.
 
 Which rows those questions are about is settled by the move statement itself. Its
 `INSERT` returns the identity values it placed, and one enclosing `INSERT` parks them in a
