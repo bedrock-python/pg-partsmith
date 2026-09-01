@@ -5,7 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.0
+## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* partition schemes, lifecycle policies and the maintenance plan, in the core and in both the aio and sync packages
+
+### Features
+
+* batched data movement -- partition_data drains DEFAULT, unpartition moves everything back ([9644df3](https://github.com/bedrock-python/pg-partsmith/commit/9644df3ddf3576e27dce52fd331043d35c24a044))
+* foreign-key aware retention -- Unreferenced() and detach refusals as issues ([4257502](https://github.com/bedrock-python/pg-partsmith/commit/4257502d23121ce6d463e6e5a8b43a217a1ec14f))
+* leaf backends -- local tablespace/storage/privileges and foreign leaves ([1cecc57](https://github.com/bedrock-python/pg-partsmith/commit/1cecc57208c2dc2e58a99d29d48a421f3e00332d))
+* partition schemes, lifecycle policies and the maintenance plan (core + aio/sync, tests pending) ([90af1bb](https://github.com/bedrock-python/pg-partsmith/commit/90af1bb78a186bc25e87996590ad0016189baced))
+* sliding LIST progression and Redis lock integration tests ([7cf7a4c](https://github.com/bedrock-python/pg-partsmith/commit/7cf7a4cae229ef55b5fe932089272c5a20410308))
+
+
+### Bug Fixes
+
+* close every finding of the external review (F-001..F-016) ([927c8e0](https://github.com/bedrock-python/pg-partsmith/commit/927c8e0b7f1a08d860f2ce9826a4bf660206e2ce))
+* close the verification round -- referenced rows, pinned detaches, identity sequences ([1fed77f](https://github.com/bedrock-python/pg-partsmith/commit/1fed77f3a3a3cb63c0e1b1e1ea0e877a402655bb))
+* count every allocated identity value as possibly cached, not just the newest block ([4571ad1](https://github.com/bedrock-python/pg-partsmith/commit/4571ad1787a2b6e5f23a31c898cc1e7229ecd44b))
+* decide cycling identity sequences on their whole range, bound the cached region at START ([343034e](https://github.com/bedrock-python/pg-partsmith/commit/343034e11afeab835eaac2281ef6780033fecb8d))
+* decide every identity column before any sequence moves, and park under a name of our own ([9a618c2](https://github.com/bedrock-python/pg-partsmith/commit/9a618c2f24eeef1dd5f309530aca5a9ef1d44df5))
+* decide identity sequences on the ids a move carries, not on the destination's own rows ([07b9d9a](https://github.com/bedrock-python/pg-partsmith/commit/07b9d9add44e0687e3c92d875c9d1835800f8518))
+* finish interrupted concurrent detaches and accept positional rule arguments ([b93adc1](https://github.com/bedrock-python/pg-partsmith/commit/b93adc192e0b60b8b1b647001f6c2625cfe94f80))
+* hold created relations by OID; transactional FINALIZE; deferred FKs; descending identities ([b541b3f](https://github.com/bedrock-python/pg-partsmith/commit/b541b3f70f6f79ba73bcb9cfa827b9c75e5cf1d7))
+* hold identities through subtrees, restores and pins; model identity sequences ([5fd0bc6](https://github.com/bedrock-python/pg-partsmith/commit/5fd0bc608582d5675fa108a0d1aba24c6fd5f799))
+* measure plain detached tables, re-attach orphans retention wants back, report lifecycle units only ([ce14093](https://github.com/bedrock-python/pg-partsmith/commit/ce14093dd3ea377ab8adff7f0ecc55e4cc09e0cd))
+* refuse cached identity blocks, read each identity once, carry it into re-attached subtrees ([cc3d72e](https://github.com/bedrock-python/pg-partsmith/commit/cc3d72eef01d94a2cdb9f4398a5063d2d58e67e3))
+* retention rules combine as predicates, no childless branches, foreign leaves satisfy windows, CreateUntil survives JSON ([4e4d955](https://github.com/bedrock-python/pg-partsmith/commit/4e4d955d133e0f7307242d11eabbd97f4d781ce6))
+
+
+### Documentation
+
+* 1.0 guides, RFC companions, changelog, and the sync mirror scripts ([14252f9](https://github.com/bedrock-python/pg-partsmith/commit/14252f9132632fc5ae0170228fb8e3f73b7bcc10))
+* hand any page over as Markdown, from the page itself ([994a06b](https://github.com/bedrock-python/pg-partsmith/commit/994a06bfa464485e46b5984381603db0daaf2c22))
+* keep the Markdown emitter inside the linter's rules ([4715336](https://github.com/bedrock-python/pg-partsmith/commit/47153362bbadf3d81b6c14a956cec19dbd686154))
+* leaf backends, sliding LIST, data movement and FK semantics; CI matrix on PostgreSQL 15/16/17 ([1235a3e](https://github.com/bedrock-python/pg-partsmith/commit/1235a3eaa00ecaa08d18f99d59fd3485f1c6f652))
+* let a page decline the Copy page control ([1a76685](https://github.com/bedrock-python/pg-partsmith/commit/1a76685502e3794b64559e347d2e922fe5bdb713))
+* name every way a sequence outlives the move that set it ([ae58bbb](https://github.com/bedrock-python/pg-partsmith/commit/ae58bbb728f2fb56288f8b3707f9e9fff3f23567))
+* one page of context for AI agents, with a map of the rest ([3c1474a](https://github.com/bedrock-python/pg-partsmith/commit/3c1474ac2b12d93a6813b30255de2fa6a1c53ac2))
+* rebuild the documentation around tutorials, concepts, how-to guides and reference ([0baa5b0](https://github.com/bedrock-python/pg-partsmith/commit/0baa5b006f1a4d6c3360576f650ad7f0216008ed))
+* say on the front page that a page for agents exists ([0fbf947](https://github.com/bedrock-python/pg-partsmith/commit/0fbf94758d4cadade0bc9681d4d513c44d287e00))
+
+
+### Miscellaneous Chores
+
+* cut 1.0.0 ([7a2c6d0](https://github.com/bedrock-python/pg-partsmith/commit/7a2c6d0c9a57d753267f6f2ccb4040b98250ab52))
+
+## 1.0.0 — the long version
 
 Version 1.0 rebuilds the core around four separated concerns — partition scheme, range
 boundaries, lifecycle policy, and a maintenance plan — after reading how ten production
