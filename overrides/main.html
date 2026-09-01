@@ -7,6 +7,9 @@
   the build; the two data attributes are all the script needs to find it.
 -#}
 {% block content %}
+  {#- A page whose Markdown would not read as the page declines the control
+     with `copy_page: false` in its front matter. -#}
+  {% if page.meta.copy_page != false %}
   <div class="md-copy-page" data-copy-base="{{ base_url }}" data-copy-page="{{ page.url }}"
        data-copy-title="{{ page.title }}">
     <div class="md-copy-page__group">
@@ -76,5 +79,6 @@
       </a>
     </div>
   </div>
+  {% endif %}
   {% include "partials/content.html" %}
 {% endblock %}

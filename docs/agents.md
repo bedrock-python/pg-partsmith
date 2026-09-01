@@ -18,8 +18,11 @@
 Every page of this site is also served as raw Markdown at its own URL with `.md` in
 place of the trailing slash — this page is `/agents.md`, the foreign-key guide is
 `/guide/foreign-keys.md` — so anything the map below points at can be fetched as plain
-text rather than scraped out of HTML. The **Copy page** control at the top of every page
-does the same thing for a human with a chat window open.
+text rather than scraped out of HTML. The **Copy page** control at the top of a page does
+the same thing for a human with a chat window open. The one exception is the API
+reference: its Markdown is a list of instructions to a docstring renderer rather than the
+API, so it carries neither the control nor a `.md` twin — read it as HTML, or read the
+docstrings in the source.
 
 Top to bottom before writing code. [Rules that hold or break the code](#rules-that-hold-or-break-the-code)
 is the section correctness lives in — those are the things the library will not save you
@@ -402,7 +405,7 @@ Fetch a page when the task is the one named beside it.
 | [Extend the library](guide/extending.md) | replacing a repository, provider, lock or executor |
 | [Troubleshoot](guide/troubleshooting.md) | a specific error message or a run that did nothing |
 | [Recipes](guide/recipes.md) | the shape of a real system close to yours |
-| [API reference](reference/index.md) | an exact signature, field or docstring |
+| [API reference](reference/index.md) | an exact signature, field or docstring — HTML only, see above |
 | [Configuration fields](reference/configuration.md) | every field, type and default |
 | [Findings and issues](reference/findings.md) | what a reason code means and what to do |
 | [Environment settings](reference/settings.md) | configuring a table from env vars or JSON |

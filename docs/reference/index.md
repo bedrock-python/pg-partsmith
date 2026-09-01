@@ -1,3 +1,7 @@
+---
+copy_page: false
+---
+
 # API Reference
 
 Auto-generated from source using [mkdocstrings](https://mkdocstrings.github.io/).

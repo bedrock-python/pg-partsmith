@@ -17,12 +17,32 @@ the site to try it.
 from __future__ import annotations
 
 import pathlib
-import shutil
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 SITE = ROOT / "site"
+
+
+def declines(text: str) -> bool:
+    """Whether a page has asked not to be handed over as Markdown.
+
+    The control above each page is hidden by ``copy_page: false`` in the front
+    matter, and a page hidden there must not be written here either -- a file
+    nothing links to is worse than no file when its content would mislead.
+    This reads that one key rather than the front matter as a whole: the docs
+    build has no YAML parser of its own, and one key is all that is at stake.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return False
+        key, _, value = line.partition(":")
+        if key.strip() == "copy_page":
+            return value.strip().lower() == "false"
+    return False
 
 
 def target_for(source: pathlib.Path) -> pathlib.Path:
@@ -46,15 +66,21 @@ def main() -> None:
         sys.exit(f"{SITE} does not exist -- build the site first")
 
     written: dict[pathlib.Path, pathlib.Path] = {}
+    skipped = 0
     for source in sorted(DOCS.rglob("*.md")):
+        text = source.read_text(encoding="utf-8")
+        if declines(text):
+            skipped += 1
+            continue
         target = target_for(source)
         if target in written:
             sys.exit(f"{source} and {written[target]} both claim {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+        target.write_text(text, encoding="utf-8")
         written[target] = source
 
-    sys.stdout.write(f"wrote {len(written)} Markdown pages into {SITE.name}/\n")
+    tail = f", {skipped} declined" if skipped else ""
+    sys.stdout.write(f"wrote {len(written)} Markdown pages into {SITE.name}/{tail}\n")
 
 
 if __name__ == "__main__":
