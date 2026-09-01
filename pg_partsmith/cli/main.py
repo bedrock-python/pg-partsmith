@@ -120,7 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         return _failed("interrupted", ExitCode.FAILED)
 
-    text = result.render(as_json=args.output == "json")
+    text = result.render(output=args.output)
     if text:
         sys.stdout.write(text + "\n")
     return result.code
@@ -256,6 +256,10 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="only this table, qualified or bare; repeatable (default: every table in the document)",
     )
     parser.add_argument(
-        "-o", "--output", choices=("human", "json"), default="human", help="output format (default: human)"
+        "-o",
+        "--output",
+        choices=("human", "json", "metrics"),
+        default="human",
+        help="output format: human, json, or Prometheus text for a node_exporter textfile (default: human)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="log what it is doing, to stderr")

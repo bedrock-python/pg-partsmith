@@ -102,6 +102,53 @@ versioned envelope, in the vocabulary a configuration file is written in:
 It is the dump, never a shape assembled by the CLI — a hand-rolled one drifts from the
 library the first time a field is added. Logs go to stderr, so stdout stays parseable.
 
+## Monitoring, for free
+
+`--output metrics` renders the same run as Prometheus text exposition, for a node_exporter
+textfile collector:
+
+```bash
+pg-partsmith plan -c partitions.yaml --output metrics > /var/lib/node_exporter/textfile/partsmith.prom
+```
+
+```
+# HELP pg_partsmith_pending_operations Operations a maintenance run would carry out.
+# TYPE pg_partsmith_pending_operations gauge
+pg_partsmith_pending_operations{table="public.events",kind="create"} 2
+pg_partsmith_pending_operations{table="public.events",kind="drop"} 0
+# HELP pg_partsmith_findings What the planner saw and left alone. A warning needs a person.
+# TYPE pg_partsmith_findings gauge
+pg_partsmith_findings{table="public.events",severity="warning"} 0
+```
+
+Every command emits something:
+
+| Command | Series |
+|---|---|
+| `plan` | `pending_operations{table,kind}`, `pending_relations{table}`, `findings{table,severity}` |
+| `inspect` | `partitioned{table}`, `partitions{table}`, `detached_partitions{table}`, `oldest_detached_age_seconds{table}` |
+| `validate` | `config_valid{table}` |
+| `apply` | `applied_operations{table,operation}`, `issues{table}` |
+
+All prefixed `pg_partsmith_`, all gauges — a one-shot job cannot own a counter, since the
+next run is a new process with no memory of this one. Every run also emits
+`pg_partsmith_run_timestamp_seconds{command}`, so a textfile nothing has refreshed is
+visible as stale rather than as good news.
+
+A converged table reports zeroes rather than nothing: a missing series and a zero are
+different alerts.
+
+The numbers are read off the same envelope the JSON is, so a metric cannot disagree with
+what the same run printed.
+
+Three alerts worth having, in the order they will save you:
+
+- `pg_partsmith_pending_operations` above zero for longer than your schedule — maintenance
+  has stopped running, and inserts will start being rejected.
+- `pg_partsmith_findings{severity="warning"}` above zero — something needs a person.
+- `time() - pg_partsmith_run_timestamp_seconds` above a couple of intervals — the job
+  itself is not running, which no other metric here can tell you.
+
 ## One table at a time
 
 `--table events` (or `--table public.events`), repeatable. A name that no table in the

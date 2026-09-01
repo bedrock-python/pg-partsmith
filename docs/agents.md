@@ -62,7 +62,8 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   configuration that has since changed (`--allow-config-drift` overrides). Exit codes: 0
   nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
   5 connection, 6 lock held, 1 unexpected. `--output json` is the model dump under a
-  versioned envelope. See `guide/cli.md`.
+  versioned envelope; `--output metrics` is Prometheus text exposition for a node_exporter
+  textfile, all gauges, prefixed `pg_partsmith_`. See `guide/cli.md`.
 * `CommandHooks` (both mirrors) runs a configured command per phase with the
   `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. In a document
   it is the `hooks` section, honoured only under `apply --allow-hooks`. Hooks never fire

@@ -18,6 +18,7 @@ from pg_partsmith.plan import MaintenancePlan, OperationKind
 
 from .exit_codes import ExitCode
 from .loader import ConfigError
+from .metrics import render_metrics
 from .render import describe_tree, envelope, plan_entry, to_json, tree_entry
 
 if TYPE_CHECKING:
@@ -44,10 +45,17 @@ class CommandResult:
     lines: list[str] = field(default_factory=list)
     payload: dict[str, Any] | None = None
 
-    def render(self, *, as_json: bool) -> str:
-        """The text to print, in the form that was asked for."""
-        if as_json and self.payload is not None:
-            return to_json(self.payload)
+    def render(self, *, output: str = "human") -> str:
+        """The text to print, in the form that was asked for.
+
+        The JSON and the metrics are read off the same envelope, so a number in
+        one cannot disagree with a number in the other.
+        """
+        if self.payload is not None:
+            if output == "json":
+                return to_json(self.payload)
+            if output == "metrics":
+                return render_metrics(self.payload).rstrip("\n")
         return "\n\n".join(self.lines)
 
 

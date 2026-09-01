@@ -301,3 +301,20 @@ async def test__apply__hooks_declared_but_not_allowed__refuses_before_connecting
 
     # Act / Assert
     assert await _run_cli("apply", "-c", config) == ExitCode.CONFIG
+
+
+async def test__output_metrics__a_real_run__is_a_textfile_a_collector_can_serve(
+    db_engine: AsyncEngine, table: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange
+    config = _document(tmp_path, table, _dsn(db_engine))
+
+    # Act
+    code = await _run_cli("plan", "-c", config, "--check", "--output", "metrics")
+    printed = capsys.readouterr().out
+
+    # Assert: the drift the same run reports on its exit code, as a number
+    assert code == ExitCode.DRIFT
+    assert "# TYPE pg_partsmith_pending_operations gauge" in printed
+    assert f'pg_partsmith_pending_operations{{table="{table}",kind="create"}} 2' in printed
+    assert f'pg_partsmith_pending_operations{{table="{table}",kind="drop"}} 0' in printed

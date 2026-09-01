@@ -165,6 +165,24 @@ Both mirrors run the command through one implementation, so it does not depend o
 event loop being able to spawn processes — a hook that works in production works on a
 developer's machine too.
 
+### Monitoring, for free
+
+`--output metrics` renders any command as Prometheus text exposition for a node_exporter
+textfile collector. Most systems that partition PostgreSQL have no monitoring of it at all
+— they find out at 03:00, from an insert PostgreSQL rejected — and a CronJob already runs
+this on a schedule, so the cheapest monitoring available is for that run to leave a file
+behind.
+
+`plan` emits pending operations by kind and findings by severity, `inspect` the size of the
+tree and the age of the oldest orphan, `validate` whether each table still matches its
+configuration, and `apply` what it did and what it could not. Every run also stamps
+`pg_partsmith_run_timestamp_seconds`, so a textfile nothing refreshed reads as stale rather
+than as good news, and a converged table reports zeroes rather than nothing — a missing
+series and a zero are different alerts.
+
+The numbers come off the same envelope the JSON does, so a metric cannot disagree with what
+the same run printed.
+
 ### A container image
 
 `ghcr.io/bedrock-python/pg-partsmith:<version>`, published from the release workflow, so a

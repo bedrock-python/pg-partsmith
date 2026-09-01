@@ -246,7 +246,7 @@ async def test__plan__an_actionable_finding__outranks_drift() -> None:
 async def test__plan__json__is_the_model_dump_under_a_versioned_envelope() -> None:
     # Arrange / Act
     result = await run_plan(_kit(_plan()), _configs(), check=False)
-    payload = json.loads(result.render(as_json=True))
+    payload = json.loads(result.render(output="json"))
 
     # Assert: the vocabulary a configuration file is written in, not one of ours
     assert payload["version"] == 1
@@ -270,7 +270,7 @@ async def test__validate__a_table_the_catalog_disagrees_with__exits_config(monke
 
     # Assert
     assert result.code is ExitCode.CONFIG
-    assert json.loads(result.render(as_json=True))["tables"][0]["ok"] is False
+    assert json.loads(result.render(output="json"))["tables"][0]["ok"] is False
 
 
 async def test__validate__a_table_the_catalog_agrees_with__exits_ok(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -282,7 +282,7 @@ async def test__validate__a_table_the_catalog_agrees_with__exits_ok(monkeypatch:
 
     # Assert
     assert result.code is ExitCode.OK
-    assert json.loads(result.render(as_json=True))["tables"][0] == {
+    assert json.loads(result.render(output="json"))["tables"][0] == {
         "table": "public.events",
         "ok": True,
         "error": None,
@@ -361,7 +361,7 @@ async def test__apply__by_default__withholds_every_destructive_operation() -> No
     # Assert
     applied = kit.service.apply.await_args.args[1]
     assert [op.kind.value for op in applied.operations] == ["create"]
-    assert "--allow-destructive" in result.render(as_json=False)
+    assert "--allow-destructive" in result.render(output="human")
 
 
 async def test__apply__allow_destructive__carries_the_drop_out_too() -> None:
@@ -409,7 +409,7 @@ async def test__apply__issues_reported_by_the_run__exit_findings() -> None:
 
     # Assert
     assert result.code is ExitCode.FINDINGS
-    assert "refused" in result.render(as_json=False)
+    assert "refused" in result.render(output="human")
 
 
 async def test__apply__json__carries_the_plan_beside_the_result() -> None:
@@ -419,7 +419,7 @@ async def test__apply__json__carries_the_plan_beside_the_result() -> None:
 
     # Act
     result = await run_apply(kit, _configs(), plans={"public.events": _plan()})
-    payload = json.loads(result.render(as_json=True))
+    payload = json.loads(result.render(output="json"))
 
     # Assert
     entry = payload["tables"][0]

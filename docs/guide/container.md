@@ -125,6 +125,18 @@ a `python:3.13-slim` base plus the venv: pydantic, SQLAlchemy, python-dateutil, 
 and PyYAML, with pip, the build backend and every `__pycache__` left behind in the
 discarded build stage.
 
+## Monitoring
+
+`--output metrics` writes Prometheus text exposition, which in a CronJob means mounting a
+node_exporter textfile directory and redirecting into it:
+
+```yaml
+args: ["plan", "-c", "/etc/partitions.yaml", "--check", "--output", "metrics"]
+```
+
+See [the CLI page](cli.md#monitoring-for-free) for the series and the alerts worth
+building on them.
+
 ## Exit codes
 
 The same ones [the CLI](cli.md#exit-codes) documents. `0` nothing pending, `2` drift under
