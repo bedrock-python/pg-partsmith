@@ -30,7 +30,7 @@ Operations are typed, ordered as they must execute, and nested where order matte
 | `CreatePartition` | create a partition, build its subtree, attach it | `parent_name`, `bounds`, `partition_by` (for a branch), `children`, `counts_as` |
 | `AttachPartition` | re-attach a detached orphan whose window is wanted again | `parent_name`, `bounds` |
 | `DetachPartition` | detach an expired partition, subtree included | `parent_name`, `mode`, `oid` |
-| `DropPartition` | drop a detached, marker-tagged orphan | `oid`, `detached_at`, `follows_detach` |
+| `DropPartition` | drop a detached, marker-tagged orphan | `oid`, `detached_at`, `follows_detach`, `bounds` |
 
 Creations come first (each with its subtree inside it), then re-attachments, then
 detaches, then drops. Every operation records:
@@ -125,5 +125,27 @@ What the planner does with each state it can meet, in one table:
 | a partition pending an interrupted `DETACH CONCURRENTLY` | complete the detach with `FINALIZE` (`detach_finalize`); report it (`detach_pending`, INFO) |
 | a wanted name held by a relation with other bounds, or over 63 bytes | report (`name_unusable`) |
 
-A converged tree produces no operation at all, so a tick against it costs one catalog
-read and no DDL.
+A converged tree produces no operation at all, so a tick against it costs the catalog
+reads below and no DDL.
+
+## What a plan costs
+
+Planning itself is a pure function over the configuration and the tree: it never queries
+the database, and it is linear in the number of nodes. Reading the tree is a fixed number
+of statements, whatever the table's size:
+
+| Step | Statements | Grows with the tree? |
+|---|---|---|
+| the whole tree — every level, bounds, `relkind`, oids | 1 | no |
+| detached orphans and their markers | 1 | no |
+| sizes and row estimates | 1, and only when a policy asks for them | no |
+
+There is no query per partition anywhere in the path. Facts are measured for lifecycle
+units only — the partitions retention decides over — so a nested tree does not multiply
+them: 2 000 monthly branches with eight buckets each are 2 000 targets, not 16 000.
+
+For scale, a table of 18 001 nodes (2 000 monthly branches × 8 hash buckets, fifty years
+of history) plans in roughly 0.15 s on a developer machine, and a converged one plans to a
+no-op. Both the statement counts and a loose time budget are pinned by
+`tests/unit/test_scale.py`, so a planner that turned quadratic would fail the suite rather
+than a maintenance window.

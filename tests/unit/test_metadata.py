@@ -10,7 +10,8 @@ import pytest
 from sqlalchemy.exc import DBAPIError
 
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
-from pg_partsmith.entities import PartitionType
+from pg_partsmith.boundaries import TimeBoundaries, UUIDv7BoundaryCodec
+from pg_partsmith.entities import PartitionGranularity, PartitionType
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.lifecycle import SqlPredicate
 from pg_partsmith.topology import (
@@ -1086,6 +1087,25 @@ async def test__is_partition_closed__ddl_timezone__is_applied_to_the_session_fir
     # Assert
     assert result is True
     assert _statements(engine)[0] == "SET LOCAL TIME ZONE 'Europe/Moscow'"
+
+
+async def test__is_partition_closed__boundaries_given__override_the_providers_own_settings() -> None:
+    # Arrange -- the provider was wired with settings that disagree with this table's;
+    # the boundaries that wrote the partition are the ones that can read it back
+    codec = UUIDv7BoundaryCodec()
+    upper = str(codec.min_uuid_for(datetime(2026, 9, 7, tzinfo=UTC)))
+    engine = _make_engine(None, upper, True)
+    provider = PostgresMetadataProvider(engine, ddl_timezone="America/Los_Angeles")
+    boundaries = TimeBoundaries(granularity=PartitionGranularity.WEEK, tz="Europe/Moscow", codec=codec)
+
+    # Act
+    result = await provider.is_partition_closed("events__2026_w36", boundaries=boundaries)
+
+    # Assert -- the calendar's zone was pinned, and the UUID bound was decoded to its instant
+    assert result is True
+    assert _statements(engine)[0] == "SET LOCAL TIME ZONE 'Europe/Moscow'"
+    compare = _conn(engine).execute.call_args
+    assert compare.args[1]["upper_bound"] == datetime(2026, 9, 7, tzinfo=UTC)
 
 
 async def test__is_partition_closed__codec__decodes_the_bound_and_compares_the_instant() -> None:

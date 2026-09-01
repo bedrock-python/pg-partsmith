@@ -46,6 +46,16 @@ Every method takes and returns plain domain objects (`PartitionBounds`, `Partiti
 `DetachMode`, `LocalLeaves`), so an implementation never needs to know how the planner
 works.
 
+One thing to know about errors: the executor recognises a failed `attach_partition` by the
+**SQLSTATE the exception carries**, not by its type. It reads `sqlstate` or `pgcode` off
+the exception, or off its `orig` if it wraps one — which covers a SQLAlchemy error, a bare
+`psycopg.Error` and an `asyncpg.PostgresError` alike. Let the driver's exception through
+rather than replacing it with one of your own, and three things keep working: a lost race
+with another worker is treated as benign, a DEFAULT partition holding rows for the new
+window triggers the reconcile-and-retry, and rows already moved out of DEFAULT are put back
+if the attach ultimately fails. An exception carrying no SQLSTATE is still safe — the rows
+are restored and it propagates — but it cannot be recognised as a race or a conflict.
+
 ## Subclass the metadata provider
 
 Override a catalog query for an unusual setup — a read replica for the reads, a cache, a
@@ -60,8 +70,11 @@ class ReplicaMetadata(PostgresMetadataProvider):
         super().__init__(replica_engine, **kwargs)
 ```
 
-Constructor knobs: `marker_prefix` (pass the repository's), `boundary_codec` (only for
-`is_partition_closed`), `ddl_timezone` (for reading naive bounds).
+Constructor knobs: `marker_prefix` (pass the repository's — the service refuses a pair
+that disagrees), `boundary_codec` (only for `is_partition_closed`), `ddl_timezone` (for
+reading naive bounds). Rather than keeping the last two in step with each table by hand,
+pass the table's boundaries to the one method that uses them:
+`is_partition_closed(name, boundaries=config.time_boundaries)`.
 
 The protocol's reads: `get_partition_type`, `get_partition_columns`, `get_actual_tree`,
 `measure`, `get_partition_tree`, `get_default_partition`, `partition_exists`,

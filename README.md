@@ -248,9 +248,9 @@ service = PartitionLifecycleService(repo, metadata, locks, hooks=[ColdStorageHoo
 
 - [Getting started](https://bedrock-python.github.io/pg-partsmith/getting-started/installation/) — install, your first partitioned table, running it in production, a multi-tenant event store
 - [Concepts](https://bedrock-python.github.io/pg-partsmith/concepts/overview/) — how it works: schemes, boundaries, lifecycle policies, the plan, ownership, executing DDL, leaf backends
-- [How-to guides](https://bedrock-python.github.io/pg-partsmith/guide/configuration/) — scheduling, monitoring, backfilling, partitioning an existing table, migrating from pg_partman, changing a scheme, archiving, foreign keys, cold tiering, troubleshooting, recipes
+- [How-to guides](https://bedrock-python.github.io/pg-partsmith/guide/configuration/) — scheduling, monitoring, querying, backfilling, partitioning an existing table, migrating from pg_partman, changing a scheme, archiving, foreign keys, cold tiering, troubleshooting, recipes
 - [Reference](https://bedrock-python.github.io/pg-partsmith/reference/) — the API, every configuration field, every finding and error
-- [Design](https://bedrock-python.github.io/pg-partsmith/design/rfc-0001-partition-schemes/) — RFC 0001, the OSS research, PostgreSQL semantics verified on real servers
+- [Design](https://bedrock-python.github.io/pg-partsmith/design/rfc-0001-partition-schemes/) — RFC 0001, the OSS research, PostgreSQL semantics verified on real servers, and the final report on what 1.0 changed
 - [For AI agents](https://bedrock-python.github.io/pg-partsmith/agents/) — the whole API
   surface, the rules that break code when broken and a map of the rest, on one page to hand
   to a coding assistant

@@ -10,6 +10,7 @@ from .periods import Period
 __all__ = [
     "BoundaryDecoder",
     "DdlTimezoneAware",
+    "OrphanMarkerAware",
     "PeriodCalculator",
     "PositionedCalculator",
     "TimezoneAwareCalculator",
@@ -143,6 +144,16 @@ class DdlTimezoneAware(Protocol):
     @property
     def ddl_timezone(self) -> str | None:
         """Timezone applied via ``SET LOCAL TIME ZONE``; None trusts the session."""
+        ...
+
+
+@runtime_checkable
+class OrphanMarkerAware(Protocol):
+    """Component that declares the COMMENT prefix it marks detached partitions with."""
+
+    @property
+    def marker_prefix(self) -> str:
+        """Prefix of the ownership marker written on detach and read when discovering orphans."""
         ...
 
 

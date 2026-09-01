@@ -55,7 +55,7 @@ from pg_partsmith.utils import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from pg_partsmith.boundaries import RangeBoundaryCodec
+    from pg_partsmith.boundaries import RangeBoundaryCodec, TimeBoundaries
     from pg_partsmith.lifecycle import SqlPredicate
 
 
@@ -103,6 +103,11 @@ class PostgresMetadataProvider:
         self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
         self._boundary_codec = boundary_codec
         self._ddl_timezone = ddl_timezone
+
+    @property
+    def marker_prefix(self) -> str:
+        """Prefix of the COMMENT marker orphan discovery looks for."""
+        return self._marker_prefix
 
     # ── The root ────────────────────────────────────────────────────────────────
 
@@ -577,7 +582,9 @@ class PostgresMetadataProvider:
 
         return None
 
-    async def is_partition_closed(self, partition_name: str, *, settle_seconds: int = 0) -> bool:
+    async def is_partition_closed(
+        self, partition_name: str, *, settle_seconds: int = 0, boundaries: TimeBoundaries | None = None
+    ) -> bool:
         """True when the partition's upper bound (+ settle buffer) has passed.
 
         ``now()`` is evaluated on the server rather than on the client, so the
@@ -590,14 +597,21 @@ class PostgresMetadataProvider:
         subtree closes with it.
 
         A naive bound -- which is what a ``timestamp`` or ``date`` key produces
-        -- is resolved under this provider's ``ddl_timezone``. Configure it with
-        the same value the repository writes partitions with, or the two
-        disagree about when the bound falls.
+        -- is resolved under this provider's ``ddl_timezone``, and an encoded
+        bound is read with its ``boundary_codec``. Both have to match what wrote
+        the partition, so the simplest way to ask is to hand over the table's
+        own ``TimeBoundaries``: it is the object that decided the calendar, the
+        timezone and the encoding in the first place, and it overrides whatever
+        this provider was constructed with.
 
         Args:
             partition_name: Attached partition table name.
             settle_seconds: Extra buffer after the upper bound for late writers
                 still holding open transactions.
+            boundaries: The RANGE boundaries of the table this partition belongs
+                to -- ``config.time_boundaries``. When given, its timezone and
+                codec are used instead of this provider's, which is the way to
+                be sure reader and writer agree.
 
         Returns:
             True when ``now() >= upper_bound + settle_seconds``. False for the
@@ -605,12 +619,15 @@ class PostgresMetadataProvider:
             (MAXVALUE / infinity), detached tables, unresolvable names, and
             boundaries that carry no instant this provider can read.
         """
+        ddl_timezone = boundaries.timezone_name if boundaries is not None else self._ddl_timezone
+        codec = boundaries.codec if boundaries is not None else self._boundary_codec
+
         async with self._engine.connect() as conn:
-            if self._ddl_timezone is not None:
+            if ddl_timezone is not None:
                 # A naive bound is resolved by the session timezone, so this has
                 # to be the one the partition was written with. Without it the
                 # server default decides, and the two need not agree.
-                await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
+                await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(ddl_timezone)}"))
 
             bound_result = await conn.execute(
                 text(PARTITION_UPPER_BOUND_SQL),
@@ -621,8 +638,8 @@ class PostgresMetadataProvider:
                 # No upper bound to read: DEFAULT, non-RANGE, detached, or unknown.
                 return False
 
-            if self._boundary_codec is not None:
-                instant = self._boundary_codec.decode(raw_bound)
+            if codec is not None:
+                instant = codec.decode(raw_bound)
                 if instant is None:
                     self._warn_unreadable_bound(partition_name, raw_bound)
                     return False

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -250,6 +251,70 @@ async def test__timezone__moscow_calendar__maintenance_creates_and_prunes_on_mos
         assert second.created_count == 1
         july = await _partition_bound_expr(engine, f"{parent}__2024_07")
         assert "2024-06-30 21:00:00+00" in july
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text(f"DROP TABLE IF EXISTS {parent} CASCADE"))
+        await engine.dispose()
+
+
+async def test__timezone__berlin_calendar_over_a_clock_change__bounds_and_routing_follow_local_midnight(
+    postgres_container: PostgresContainer,
+) -> None:
+    # Arrange — Berlin skips 02:00 on 29 March 2026, so that local day is 23 hours long and its
+    # two ends carry different UTC offsets.
+    engine = _create_async_engine(postgres_container, session_timezone="America/Los_Angeles")
+
+    table_relname = f"tz_events_{uuid4().hex[:8]}"
+    parent = qualify("public", table_relname)
+    config = TablePartitionConfig(
+        schema="public",
+        table_name=table_relname,
+        partition_column="created_at",
+        granularity=PartitionGranularity.DAY,
+        tz=ZoneInfo("Europe/Berlin"),
+        create_ahead_count=3,
+        retention_count=12,
+    )
+
+    try:
+        await _create_parent_table(engine, parent)
+        repo = PostgresPartitionRepository(engine, ddl_timezone="Europe/Berlin")
+        service = PartitionLifecycleService(repo, PostgresMetadataProvider(engine), PostgresAdvisoryLockManager(engine))
+
+        # Act — the day before the clocks move
+        with freezegun.freeze_time("2026-03-28 12:00:00"):
+            result = await service.maintain(config)
+
+        # Assert — every partition runs from local midnight to local midnight; the short day
+        # ends at 22:00 UTC because Berlin is already on summer time by then
+        assert result.created_count == 3
+        before = await _partition_bound_expr(engine, f"{parent}__2026_03_28")
+        assert "2026-03-27 23:00:00+00" in before
+        assert "2026-03-28 23:00:00+00" in before
+        short_day = await _partition_bound_expr(engine, f"{parent}__2026_03_29")
+        assert "2026-03-28 23:00:00+00" in short_day
+        assert "2026-03-29 22:00:00+00" in short_day
+        after = await _partition_bound_expr(engine, f"{parent}__2026_03_30")
+        assert "2026-03-29 22:00:00+00" in after
+        assert "2026-03-30 22:00:00+00" in after
+
+        # Act — rows on either side of the instant the clocks moved
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(f"INSERT INTO {parent} (created_at) VALUES (:last), (:first)"),  # noqa: S608
+                {
+                    "last": datetime(2026, 3, 29, 21, 30, tzinfo=UTC),
+                    "first": datetime(2026, 3, 29, 22, 30, tzinfo=UTC),
+                },
+            )
+            routed = (
+                await conn.execute(
+                    text(f"SELECT tableoid::regclass::text FROM {parent} ORDER BY created_at")  # noqa: S608
+                )
+            ).scalars()
+
+        # Assert — 23:30 and 00:30 in Berlin, one local day apart
+        assert list(routed) == [f"{table_relname}__2026_03_29", f"{table_relname}__2026_03_30"]
     finally:
         async with engine.begin() as conn:
             await conn.execute(text(f"DROP TABLE IF EXISTS {parent} CASCADE"))

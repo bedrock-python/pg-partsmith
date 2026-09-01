@@ -243,6 +243,18 @@ def _default_conflict() -> SQLAlchemyError:
     return _sqlstate_error("23514", "updated partition constraint for default partition would be violated by some row")
 
 
+class _DriverError(Exception):
+    """What a repository built on psycopg or asyncpg raises: no SQLAlchemy in sight."""
+
+    def __init__(self, message: str, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+def _driver_default_conflict() -> _DriverError:
+    return _DriverError("updated partition constraint for default partition would be violated by some row", "23514")
+
+
 def _default_partition() -> PartitionInfo:
     return PartitionInfo(name="events_default", partition_type=PartitionType.RANGE, is_default=True, is_attached=True)
 
@@ -916,6 +928,84 @@ async def test__apply__cancelled_during_attach_after_reconcile__restores_rows_an
     restore = repo.reconcile_default_rows.call_args_list[-1].kwargs
     assert restore["default_partition_name"] == "events__2024_04"
     assert restore["target_partition_name"] == "events_default"
+
+
+# ── attach: a repository that is not built on SQLAlchemy ────────────────────────
+#
+# The executor is built from protocols, so a repository may raise a psycopg or
+# asyncpg error rather than a SQLAlchemyError. Recovery is keyed to the SQLSTATE
+# the exception carries, so all three behaviours -- the benign race, the DEFAULT
+# retry, and the compensating move-back -- have to survive that.
+
+
+@pytest.mark.parametrize("sqlstate", ["42P07", "42710", "42809"])
+async def test__apply__driver_error_attach_conflict__is_benign_like_a_sqlalchemy_one(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock, sqlstate: str
+) -> None:
+    # Arrange
+    repo.attach_partition.side_effect = _DriverError("already a partition", sqlstate)
+    metadata.is_partition_attached.return_value = True
+    metadata.get_partition_tree.return_value = PartitionNode(name="events__2024_04", bounds=APRIL)
+
+    # Act
+    result = await executor.apply(_config(), _plan(_create_op()))
+
+    # Assert
+    assert result.issues == ()
+    assert result.created_count == 1
+
+
+async def test__apply__driver_error_default_conflict__moves_rows_and_retries(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    repo.attach_partition.side_effect = [_driver_default_conflict(), None]
+    repo.reconcile_default_rows.return_value = 5
+    metadata.get_default_partition.return_value = _default_partition()
+
+    # Act
+    result = await executor.apply(_config(), _plan(_create_op()))
+
+    # Assert
+    assert repo.attach_partition.await_count == 2
+    assert repo.reconcile_default_rows.await_count == 1
+    assert result.created_count == 1
+    assert result.issues == ()
+
+
+async def test__apply__driver_error_on_attach__propagates_after_restoring_rows(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    repo.attach_partition.side_effect = [_driver_default_conflict(), _DriverError("disk full", "53100")]
+    repo.reconcile_default_rows.return_value = 3
+    metadata.get_default_partition.return_value = _default_partition()
+
+    # Act / Assert
+    with pytest.raises(_DriverError, match="disk full"):
+        await executor.apply(_config(), _plan(_create_op()))
+
+    # the rows moved out of DEFAULT are put back rather than stranded in a
+    # table nothing can reach through the parent
+    move, restore = repo.reconcile_default_rows.call_args_list
+    assert move.kwargs["default_partition_name"] == "events_default"
+    assert restore.kwargs["default_partition_name"] == "events__2024_04"
+    assert restore.kwargs["target_partition_name"] == "events_default"
+
+
+async def test__apply__repository_error_without_a_sqlstate__propagates_after_restoring_rows(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- a stub or a caching layer failing on its own terms
+    repo.attach_partition.side_effect = [_driver_default_conflict(), RuntimeError("stub repository")]
+    repo.reconcile_default_rows.return_value = 3
+    metadata.get_default_partition.return_value = _default_partition()
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="stub repository"):
+        await executor.apply(_config(), _plan(_create_op()))
+
+    assert repo.reconcile_default_rows.await_count == 2
 
 
 # ── re-attach ───────────────────────────────────────────────────────────────────

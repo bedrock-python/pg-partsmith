@@ -82,7 +82,11 @@ repo = PostgresPartitionRepository(engine, marker_prefix="app")
 metadata = PostgresMetadataProvider(engine, marker_prefix="app")
 ```
 
-Pass the same prefix to both.
+Pass the same prefix to both — the repository stamps the marker, the metadata provider
+looks for it, and a partition detached under one prefix is invisible to the other, so it
+would simply never be dropped. `PartitionLifecycleService` refuses a pair that disagrees
+when it is constructed rather than letting the orphans pile up quietly. (A custom
+repository or provider that declares no prefix is trusted and not checked.)
 
 ## Revalidation before anything destructive
 

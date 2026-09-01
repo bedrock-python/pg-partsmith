@@ -348,7 +348,7 @@ class _Planner:
                     occupied.add(wanted)
                     self.attaches.append(self._reattach(level, node, orphan, wanted))
                     continue
-                self._plan_orphan_drop(orphan, cursor_window, boundaries)
+                self._plan_orphan_drop(level, orphan, cursor_window, boundaries)
         elif self.ctx.mode is PlanMode.RECONCILE:
             recurse_into.extend(m.node for m in managed.values() if m.window not in desired_set)
 
@@ -599,6 +599,7 @@ class _Planner:
                 DropPartition(
                     target=member.node.name,
                     oid=member.node.oid,
+                    bounds=member.node.bounds,
                     reason=Reason.FOLLOWS_DETACH,
                     detail=f"dropped in the same run as its detach ('{drop.describe()}')",
                     follows_detach=True,
@@ -642,7 +643,13 @@ class _Planner:
             return window
         return None if self.policy.retention.evaluate(candidate) else window
 
-    def _plan_orphan_drop(self, orphan: DetachedPartition, cursor_window: Window, boundaries: RangeBoundaries) -> None:
+    def _plan_orphan_drop(
+        self,
+        level: _ProgressionLevel,
+        orphan: DetachedPartition,
+        cursor_window: Window,
+        boundaries: RangeBoundaries,
+    ) -> None:
         drop = self.policy.drop
         if not isinstance(drop, DropAfter):
             return  # DropNever: something else owns the drop
@@ -667,9 +674,13 @@ class _Planner:
             return
 
         facts = orphan.facts or PartitionFacts()
+        # A detached table has no relpartbound left; its name is the only
+        # record of the window it held, and the same reading serves both the
+        # drop rule and the plan a reader sees.
+        window = boundaries.parse_child_name(orphan.relname)
         if drop.when is not None:
             candidate = Candidate(
-                window=boundaries.parse_child_name(orphan.relname),
+                window=window,
                 now=self.ctx.now,
                 cursor_window=cursor_window,
                 boundaries=boundaries,
@@ -692,6 +703,7 @@ class _Planner:
             DropPartition(
                 target=orphan.name,
                 oid=orphan.oid,
+                bounds=None if window is None else level.bounds_for(window),
                 reason=Reason.GRACE_ELAPSED,
                 detail=detail,
                 detached_at=orphan.detached_at,

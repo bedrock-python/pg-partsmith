@@ -12,7 +12,7 @@ from datetime import UTC, datetime, tzinfo
 from sqlalchemy import TextClause, text
 
 from .constants import DEFAULT_LOCK_PREFIX, MAX_IDENTIFIER_LENGTH, PG_CHECK_VIOLATION
-from .protocols import DdlTimezoneAware, TimezoneAwareCalculator
+from .protocols import DdlTimezoneAware, OrphanMarkerAware, TimezoneAwareCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -307,9 +307,12 @@ def comment_without_markers(comment: str | None, *, marker_prefix: str | None = 
 
 
 def pg_sqlstate(exc: BaseException) -> str | None:
-    """Extract PostgreSQL SQLSTATE code from SQLAlchemy/DBAPI exception.
+    """Extract the PostgreSQL SQLSTATE code an exception carries.
 
-    Works with asyncpg (exc.orig.sqlstate) and psycopg2 (exc.orig.pgcode).
+    Driver-neutral: it reads ``sqlstate`` or ``pgcode`` off the exception, or
+    off its ``orig`` if it wraps one, so a SQLAlchemy error, a bare
+    ``psycopg.Error`` and an ``asyncpg.PostgresError`` all answer alike. That
+    is what lets the executor recognise a conflict without naming a driver.
 
     Args:
         exc: Exception from database operation.
@@ -419,6 +422,34 @@ def validate_timezone_alignment(repo: object, calculator: object) -> None:
             f"Timezone mismatch: the period calculator works in {calc_tz!r} but repository "
             f"DDL runs in {ddl_tz!r}. Pass ddl_timezone={calc_tz!r} to the repository, or "
             "align the calculator's tz."
+        )
+        raise ValueError(msg)
+
+
+def validate_marker_alignment(repo: object, metadata: object) -> None:
+    """Refuse a wiring whose repository and metadata provider mark orphans differently.
+
+    The marker prefix is one setting living on two objects: the repository
+    stamps it on detach and reads it back before a drop, the metadata provider
+    looks for it when discovering orphans. Passing it to one of them only is
+    silent -- detached partitions are simply never seen again, so they are
+    never dropped -- which is why the disagreement is refused here, where the
+    two first meet. Implementations that do not declare a prefix (a custom
+    repository, a stub) are not checked.
+    """
+    if not isinstance(repo, OrphanMarkerAware) or not isinstance(metadata, OrphanMarkerAware):
+        return
+    # Runtime-checkable protocols only verify attribute presence, so mocks and
+    # loose implementations may still yield non-string values -- re-check them.
+    repo_prefix: object = repo.marker_prefix
+    metadata_prefix: object = metadata.marker_prefix
+    if not isinstance(repo_prefix, str) or not isinstance(metadata_prefix, str):
+        return
+    if repo_prefix != metadata_prefix:
+        msg = (
+            f"Orphan marker mismatch: the repository marks detached partitions with {repo_prefix!r} but the "
+            f"metadata provider looks for {metadata_prefix!r}. Pass the same marker_prefix to both, or to "
+            "neither -- partitions detached under one prefix are invisible to the other and would never be dropped."
         )
         raise ValueError(msg)
 

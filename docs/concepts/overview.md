@@ -123,7 +123,8 @@ The [glossary](../reference/glossary.md) lists every term with links.
 - **Not a scheduler.** It runs when you call it. Cron, Celery, APScheduler, a CronJob, a
   start-up hook — any of them.
 - **Not a query rewriter.** Partition pruning depends on your queries constraining the
-  partition key; the codec helps you compute the bounds, nothing more.
+  partition key; the codec helps you compute the bounds, nothing more. See
+  [Query a partitioned table](../guide/querying.md).
 - **Not an extension.** Plain SQL through SQLAlchemy, as the table's owner. Nothing to
   install in the database.
 - **Not a schema migration tool.** It creates, attaches, detaches and drops partitions of a
