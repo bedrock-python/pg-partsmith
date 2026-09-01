@@ -1,17 +1,31 @@
-"""Shared pg_catalog SQL used by both the resolvers and the metadata providers.
+"""Shared pg_catalog SQL used by both the repositories and the metadata providers.
 
-Plain-string constants (bind names ``:table_name`` / ``:partition_name``) so
-the aio and sync mirrors wrap one canonical query text instead of hand-copying
-it.
+Plain-string constants (bind names ``:table_name`` / ``:partition_name`` and
+friends) so the aio and sync mirrors wrap one canonical query text instead of
+hand-copying it.
 """
 
+# A relation that can be a partition: a table, a partitioned table, or a
+# foreign table.
 RELATION_EXISTS_SQL = """
     SELECT EXISTS (
         SELECT 1
         FROM pg_class
         WHERE oid = to_regclass(:partition_name)
-          AND relkind IN ('r', 'p')
+          AND relkind IN ('r', 'p', 'f')
     )
+"""
+
+RELATION_KIND_SQL = """
+    SELECT c.relkind
+    FROM pg_class c
+    WHERE c.oid = to_regclass(:name)
+"""
+
+RELATION_OID_SQL = """
+    SELECT c.oid
+    FROM pg_class c
+    WHERE c.oid = to_regclass(:name)
 """
 
 PARTITION_IS_ATTACHED_SQL = """
@@ -27,20 +41,41 @@ PARTITION_IS_ATTACHED_SQL = """
 
 # Whole partition tree below one relation, in a single round-trip.
 #
-# ``pg_partition_tree`` walks the hierarchy for us, so nested trees cost one
-# query no matter how deep they go. Each row carries both halves of a node's
-# identity: ``relpartbound`` says how it sits inside its parent, while
-# ``partstrat``/``partkeydef`` say how it partitions its own children — a
-# branch has both, a leaf only the first.
+# The hierarchy is walked over ``pg_inherits`` rather than with
+# ``pg_partition_tree``: once the first transaction of a ``DETACH CONCURRENTLY``
+# has committed, the function omits the half-detached partition -- the same
+# rule that hides it from queries through the parent -- and the planner would
+# never learn that it needs finalizing. A recursive walk over the catalog sees
+# it, with ``inhdetachpending`` set. The root is a partitioned table or a
+# partition, as for ``pg_partition_tree``; a plain table yields no rows.
+#
+# Each row carries both halves of a node's identity: ``relpartbound`` says how
+# it sits inside its parent, while ``partstrat``/``partattrs`` say how it
+# partitions its own children -- a branch has both, a leaf only the first.
+# ``relkind`` tells a foreign leaf from a local one, and ``oid`` is what a
+# destructive operation is revalidated against.
 PARTITION_TREE_SQL = """
+    WITH RECURSIVE t AS (
+        SELECT root.oid AS relid, CAST(NULL AS oid) AS parentrelid, 0 AS level
+        FROM pg_class root
+        WHERE root.oid = to_regclass(:table_name)
+          AND (root.relkind = 'p' OR root.relispartition)
+        UNION ALL
+        SELECT child.inhrelid, child.inhparent, t.level + 1
+        FROM pg_inherits child
+        JOIN t ON child.inhparent = t.relid
+    )
     SELECT
         t.level AS level,
+        cl.oid AS oid,
+        cl.relkind AS relkind,
         ns.nspname AS partition_schema,
         cl.relname AS partition_name,
         pns.nspname AS parent_schema,
         p.relname AS parent_name,
         pg_get_expr(cl.relpartbound, cl.oid) AS boundaries,
         cl.relispartition AS is_attached,
+        COALESCE(inh.inhdetachpending, false) AS detach_pending,
         pt.partstrat AS partstrat,
         (
             SELECT array_agg(a.attname ORDER BY k.ord)
@@ -52,14 +87,100 @@ PARTITION_TREE_SQL = """
         -- than the relation has, and a shortened key compares *equal* to a
         -- one-column spec -- so the mismatch guard would never fire.
         pt.partnatts AS key_arity
-    FROM pg_partition_tree(to_regclass(:table_name)) t
+    FROM t
     JOIN pg_class cl ON cl.oid = t.relid
     JOIN pg_namespace ns ON ns.oid = cl.relnamespace
     LEFT JOIN pg_class p ON p.oid = t.parentrelid
     LEFT JOIN pg_namespace pns ON pns.oid = p.relnamespace
+    LEFT JOIN pg_inherits inh ON inh.inhrelid = cl.oid AND inh.inhparent = t.parentrelid
     LEFT JOIN pg_partitioned_table pt ON pt.partrelid = cl.oid
-    WHERE t.relid IS NOT NULL
     ORDER BY t.level, ns.nspname, cl.relname
+"""
+
+# Marker-tagged detached tables whose marker names one of ``:markers``.
+#
+# The first comment line is the ownership marker; the whole comment is
+# returned so the detach instant on the second line can be read too.
+ORPHANS_SQL = """
+    SELECT
+        c.oid AS oid,
+        c.relkind AS relkind,
+        ns.nspname AS partition_schema,
+        c.relname AS partition_name,
+        d.description AS description
+    FROM pg_class c
+    JOIN pg_namespace ns ON c.relnamespace = ns.oid
+    JOIN pg_description d
+      ON d.objoid = c.oid
+     AND d.classoid = 'pg_class'::regclass
+     AND d.objsubid = 0
+    WHERE c.relkind IN ('r', 'p', 'f')
+      AND c.relispartition = false
+      AND split_part(d.description, E'\\n', 1) = ANY(CAST(:markers AS text[]))
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_inherits inh
+          WHERE inh.inhrelid = c.oid
+      )
+    ORDER BY ns.nspname, c.relname
+"""
+
+# Size and row estimate of each relation in ``:oids``, subtree included.
+#
+# ``pg_total_relation_size`` of a partitioned relation is 0 -- it has no
+# storage of its own -- so sizes are summed over the leaves of each subtree.
+# ``pg_partition_tree`` returns nothing for a relation that is neither
+# partitioned nor a partition -- a detached leaf, exactly the kind an orphan
+# usually is -- so such a relation is measured as its own single leaf.
+# Rows come from the statistics collector, never from ``COUNT(*)``: a plan
+# must not scan a 500 GB partition to decide what to do with it.
+PARTITION_FACTS_SQL = """
+    SELECT
+        root.oid AS oid,
+        COALESCE(SUM(pg_total_relation_size(t.relid)), 0) AS size_bytes,
+        COALESCE(SUM(COALESCE(s.n_live_tup, 0)), 0) AS row_estimate
+    FROM unnest(CAST(:oids AS oid[])) AS root(oid)
+    CROSS JOIN LATERAL (
+        SELECT pt.relid
+        FROM pg_partition_tree(root.oid) pt
+        WHERE pt.isleaf
+        UNION ALL
+        SELECT root.oid
+        WHERE NOT EXISTS (SELECT 1 FROM pg_partition_tree(root.oid))
+    ) t
+    LEFT JOIN pg_stat_user_tables s ON s.relid = t.relid
+    GROUP BY root.oid
+"""
+
+# Foreign keys pointing at any of ``:oids`` -- a partitioned parent or a
+# partition itself -- with the referencing relation spelled ready to splice
+# into SQL and both column lists in constraint order.
+#
+# Only top-level constraints (``conparentid = 0``): the clone PostgreSQL keeps
+# on every partition for a foreign key that references the parent has the same
+# referencing side, and would be counted twice.
+INCOMING_FOREIGN_KEYS_SQL = """
+    SELECT
+        con.conname AS constraint_name,
+        con.confrelid AS referenced_oid,
+        quote_ident(ns.nspname) || '.' || quote_ident(c.relname) AS referencing,
+        (
+            SELECT array_agg(a.attname ORDER BY k.ord)
+            FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+        ) AS referencing_columns,
+        (
+            SELECT array_agg(a.attname ORDER BY k.ord)
+            FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+        ) AS referenced_columns
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    WHERE con.contype = 'f'
+      AND con.conparentid = 0
+      AND con.confrelid = ANY(CAST(:oids AS oid[]))
+    ORDER BY con.conname
 """
 
 # A relation's live column names, in its own physical order.
@@ -75,7 +196,117 @@ RELATION_COLUMNS_SQL = """
     WHERE a.attrelid = to_regclass(:table_name)
       AND a.attnum > 0
       AND NOT a.attisdropped
+      AND a.attgenerated = ''
     ORDER BY a.attnum
+"""
+
+# Whether a relation has a ``GENERATED ALWAYS AS IDENTITY`` column.
+#
+# Moving rows spells their values out, and PostgreSQL refuses an explicit
+# value for such a column unless the INSERT says ``OVERRIDING SYSTEM VALUE``.
+# A moved row keeps its identity value either way -- that is the point.
+RELATION_HAS_IDENTITY_ALWAYS_SQL = """
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_attribute a
+        WHERE a.attrelid = to_regclass(:table_name)
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attidentity = 'a'
+    )
+"""
+
+# Identity columns of a relation, for advancing their sequences after a move.
+#
+# Both flavours: a moved row carries an explicit value either way, and a
+# sequence left behind would hand the next ordinary INSERT an id a moved row
+# already owns.
+RELATION_IDENTITY_COLUMNS_SQL = """
+    SELECT a.attname
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass(:table_name)
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attidentity IN ('a', 'd')
+    ORDER BY a.attnum
+"""
+
+# Everything needed to reason about an identity column's sequence.
+#
+# ``pg_sequence_last_value`` is NULL until the sequence has been read, so the
+# next value it would issue is ``seqstart`` then, and ``last_value +
+# seqincrement`` afterwards. The declared range and ``seqcycle`` decide
+# whether a moved value can ever be reissued -- and whether the sequence can
+# be synchronized at all. ``seqcache`` matters too: a session that fetched a
+# block of values holds the ones below ``last_value`` privately, where no
+# ``setval`` can reach them.
+SEQUENCE_PARAMETERS_SQL = """
+    SELECT
+        s.seqincrement AS increment,
+        s.seqmin AS minimum,
+        s.seqmax AS maximum,
+        s.seqcycle AS cycles,
+        s.seqcache AS cache,
+        s.seqstart AS start_value,
+        pg_sequence_last_value(s.seqrelid) AS last_value
+    FROM pg_sequence s
+    WHERE s.seqrelid = CAST(pg_get_serial_sequence(:table_name, :column) AS regclass)
+"""
+
+# Foreign keys referencing a relation whose ON DELETE action would fire on
+# a row move.
+#
+# A move deletes the row from one partition and inserts it into another in
+# a single statement. CASCADE, SET NULL and SET DEFAULT act on the DELETE
+# alone and would delete or rewrite the referencing rows, so they are refused
+# here, before anything moves. NO ACTION and RESTRICT are left to PostgreSQL:
+# an unreferenced row moves freely, and a referenced one fails the statement
+# atomically, because mid-move it sits outside the referenced tree.
+# A foreign key referencing a partitioned table is cloned onto each of its
+# partitions with ``confrelid`` pointing at the partition, so one lookup by
+# the source relation finds what would fire on it.
+DESTRUCTIVE_INCOMING_FOREIGN_KEYS_SQL = """
+    SELECT
+        con.conname AS constraint_name,
+        quote_ident(ns.nspname) || '.' || quote_ident(c.relname) AS referencing,
+        con.confdeltype AS on_delete
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    WHERE con.contype = 'f'
+      AND con.confrelid = to_regclass(:table_name)
+      AND con.confdeltype IN ('c', 'n', 'd')
+    ORDER BY con.conname, referencing
+"""
+
+# A relation's live columns with their types, for a foreign table shaped like it.
+#
+# ``format_type`` renders the type the way ``CREATE TABLE`` accepts it,
+# typmod included (``numeric(10,2)``, ``character varying(80)``); names of
+# custom types come back quoted where they need to be.
+RELATION_COLUMN_DEFINITIONS_SQL = """
+    SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type_name, a.attnotnull
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass(:table_name)
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY a.attnum
+"""
+
+# A relation's owner and every grant on it, one row per grant (one row with
+# no grant when the ACL is empty, which is how a fresh table looks).
+#
+# ``aclexplode`` reports PUBLIC as grantee 0, which ``regrole`` cannot name.
+RELATION_PRIVILEGES_SQL = """
+    SELECT
+        pg_get_userbyid(c.relowner) AS owner,
+        CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE acl.grantee::regrole::text END AS grantee,
+        acl.privilege_type AS privilege_type,
+        acl.is_grantable AS is_grantable
+    FROM pg_class c
+    LEFT JOIN LATERAL aclexplode(c.relacl) acl ON true
+    WHERE c.oid = to_regclass(:table_name)
+    ORDER BY grantee, privilege_type
 """
 
 # Columns of every uniqueness-enforcing structure on a relation.
@@ -175,4 +406,18 @@ PARTITION_COLUMNS_SQL = """
     LEFT JOIN pg_attribute a ON a.attrelid = t.partrelid AND a.attnum = k.attnum
     WHERE t.partrelid = to_regclass(:table_name)
     ORDER BY k.ord
+"""
+
+# Last value handed out by the serial/identity sequence feeding a column.
+#
+# NULL when the column has no sequence, or the sequence was never used.
+SEQUENCE_LAST_VALUE_SQL = """
+    SELECT pg_sequence_last_value(CAST(pg_get_serial_sequence(:table_name, :column) AS regclass))
+"""
+
+# A relation's own partitioning, for one name.
+PARTITION_STRATEGY_SQL = """
+    SELECT partstrat
+    FROM pg_partitioned_table t
+    WHERE t.partrelid = to_regclass(:table_name)
 """

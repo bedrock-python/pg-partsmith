@@ -1,32 +1,33 @@
-"""Nested RANGE → HASH partitioning against a real PostgreSQL (sync)."""
+"""Nested partition trees against a real PostgreSQL (sync).
+
+RANGE → HASH and RANGE → LIST subtrees, static HASH and LIST roots, LIST → RANGE
+progressions inside groups, UUIDv7 boundaries, composite keys, and every shape
+of existing tree the planner has to recognise rather than rebuild.
+"""
 
 from __future__ import annotations
 
-import contextlib
 import re
-from collections.abc import Generator
 from datetime import UTC, date, datetime
-from typing import TYPE_CHECKING, Any
-from uuid import uuid4
+from itertools import pairwise
+from typing import TYPE_CHECKING
 
 import freezegun
 import pytest
-from sqlalchemy import Engine, text
+from sqlalchemy import text
 
-from pg_partsmith.entities import MaintenanceIssueStep, PartitionType, Period, TablePartitionConfig
+from pg_partsmith.boundaries import TimeBoundaries
+from pg_partsmith.entities import MaintenanceIssueStep, PartitionInfo, PartitionType, Period, TablePartitionConfig
 from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
+from pg_partsmith.plan import FindingReason, Reason
+from pg_partsmith.scheme import HashPartitioning, RangePartitioning
 from pg_partsmith.strategies import WeekPeriodCalculator
-from pg_partsmith.subpartition_plan import TopologyReason
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
-from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
-from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
-from pg_partsmith.sync.repositories import PostgresPartitionRepository
-from pg_partsmith.sync.service import PartitionLifecycleService
 from pg_partsmith.topology import ListBounds
 from tests.integration.nested_support import (
     BARE_UNIQUE_INDEX_TABLE_DDL,
-    CHILD_BOUNDS_SQL,
     COMPOSITE_TABLE_DDL,
     EXPRESSION_TABLE_DDL,
     FROZEN_WEEK,
@@ -40,33 +41,50 @@ from tests.integration.nested_support import (
     NULLABLE_LIST_TABLE_DDL,
     PREVIOUS_WEEK_BOUNDS,
     PREVIOUS_WEEK_SUFFIX,
-    RELKIND_SQL,
     SORTABLE_ID_TABLE_DDL,
+    TASKS_TABLE_DDL,
+    TIERED_TABLE_DDL,
     TIMESTAMP_TABLE_DDL,
     TRANSPOSED_DEFAULT_TABLE_DDL,
     TWO_LEVEL_TABLE_DDL,
     UNCONSTRAINED_TABLE_DDL,
+    UUID7_ORG_TABLE_DDL,
     UUID7_TABLE_DDL,
     WEEK_BOUNDS,
     WEEK_SUFFIX,
-    DdlCounter,
     composite_config,
-    ddl_counter,
     flat_config,
-    hash_children,
+    glitchtip_config,
     hash_root_config,
-    list_children,
     list_config,
     list_root_config,
     nested_config,
     nullable_composite_config,
+    tasks_config,
+    tiered_config,
     uuid7_codec,
+)
+from tests.integration.sync.support import (
+    child_count,
+    count_ddl,
+    exec_sql,
+    hash_children_of,
+    is_attached,
+    list_children_of,
+    make_maintainer,
+    make_service,
+    make_table,
+    range_children_of,
+    relkind,
+    routed_leaves,
+    run_maintenance,
+    scalar,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
-    from pg_partsmith.boundaries import RangeBoundaryCodec
+    from sqlalchemy import Engine
 
 pytestmark = pytest.mark.integration
 
@@ -74,238 +92,99 @@ pytestmark = pytest.mark.integration
 # ── Fixtures ────────────────────────────────────────────────────────────────────
 
 
-def _make_table(engine: Engine, ddl: str) -> Generator[str, None, None]:
-    table = f"nested_{uuid4().hex[:8]}"
-    with engine.begin() as conn:
-        conn.execute(text(ddl.format(table=table)))
-    yield table
-    with engine.begin() as conn:
-        conn.execute(text(f'DROP TABLE IF EXISTS "{table}" CASCADE'))
+@pytest.fixture
+def table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, TIMESTAMP_TABLE_DDL)
 
 
 @pytest.fixture
-def table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, TIMESTAMP_TABLE_DDL)
+def uuid_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, UUID7_TABLE_DDL)
 
 
 @pytest.fixture
-def uuid_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, UUID7_TABLE_DDL)
+def uuid_org_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, UUID7_ORG_TABLE_DDL)
 
 
 @pytest.fixture
-def two_level_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, TWO_LEVEL_TABLE_DDL)
+def two_level_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, TWO_LEVEL_TABLE_DDL)
 
 
 @pytest.fixture
-def unconstrained_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, UNCONSTRAINED_TABLE_DDL)
+def unconstrained_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, UNCONSTRAINED_TABLE_DDL)
 
 
 @pytest.fixture
-def identity_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, IDENTITY_TABLE_DDL)
+def identity_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, IDENTITY_TABLE_DDL)
 
 
 @pytest.fixture
-def list_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, LIST_TABLE_DDL)
+def list_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, LIST_TABLE_DDL)
 
 
 @pytest.fixture
-def hash_root_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, HASH_ROOT_TABLE_DDL)
+def hash_root_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, HASH_ROOT_TABLE_DDL)
 
 
 @pytest.fixture
-def list_root_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, LIST_ROOT_TABLE_DDL)
+def tasks_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, TASKS_TABLE_DDL)
 
 
 @pytest.fixture
-def composite_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, COMPOSITE_TABLE_DDL)
+def list_root_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, LIST_ROOT_TABLE_DDL)
 
 
 @pytest.fixture
-def nullable_composite_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, NULLABLE_COMPOSITE_TABLE_DDL)
+def tiered_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, TIERED_TABLE_DDL)
 
 
 @pytest.fixture
-def expression_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, EXPRESSION_TABLE_DDL)
+def composite_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, COMPOSITE_TABLE_DDL)
 
 
 @pytest.fixture
-def sortable_id_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, SORTABLE_ID_TABLE_DDL)
+def nullable_composite_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, NULLABLE_COMPOSITE_TABLE_DDL)
 
 
 @pytest.fixture
-def nullable_list_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, NULLABLE_LIST_TABLE_DDL)
+def expression_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, EXPRESSION_TABLE_DDL)
 
 
 @pytest.fixture
-def transposed_default_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, TRANSPOSED_DEFAULT_TABLE_DDL)
+def sortable_id_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, SORTABLE_ID_TABLE_DDL)
 
 
 @pytest.fixture
-def bare_unique_index_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, BARE_UNIQUE_INDEX_TABLE_DDL)
+def nullable_list_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, NULLABLE_LIST_TABLE_DDL)
 
 
 @pytest.fixture
-def no_constraint_table(sync_db_engine: Engine) -> Generator[str, None, None]:
-    yield from _make_table(sync_db_engine, NO_CONSTRAINT_TABLE_DDL)
+def transposed_default_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, TRANSPOSED_DEFAULT_TABLE_DDL)
 
 
-def _maintainer(engine: Engine, *, codec: RangeBoundaryCodec | None = None) -> PartitionMaintainer:
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(engine),
-        metadata=PostgresMetadataProvider(engine, boundary_codec=codec),
-        locks=PostgresAdvisoryLockManager(engine),
-        period_calculator=WeekPeriodCalculator(boundary_codec=codec),
-    )
-    return PartitionMaintainer(service)
+@pytest.fixture
+def bare_unique_index_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, BARE_UNIQUE_INDEX_TABLE_DDL)
 
 
-def _run(
-    engine: Engine,
-    config: TablePartitionConfig,
-    *,
-    at_time: str = FROZEN_WEEK,
-    codec: RangeBoundaryCodec | None = None,
-) -> object:
-    with freezegun.freeze_time(at_time):
-        return _maintainer(engine, codec=codec).run_maintenance(config)
-
-
-def _children(engine: Engine, parent: str) -> dict[str, tuple[int, int]]:
-    with engine.connect() as conn:
-        result = conn.execute(text(CHILD_BOUNDS_SQL), {"parent": f'"{parent}"'})
-        return hash_children(list(result.fetchall()))
-
-
-def _relkind(engine: Engine, name: str) -> str | None:
-    with engine.connect() as conn:
-        result = conn.execute(text(RELKIND_SQL), {"name": f'"{name}"'})
-        value = result.scalar()
-    if value is None:
-        return None
-    return value.decode() if isinstance(value, bytes) else str(value)
-
-
-def _exec(engine: Engine, sql: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(text(sql))
-
-
-@contextlib.contextmanager
-def _count_ddl(engine: Engine) -> Iterator[DdlCounter]:
-    yield from ddl_counter(engine)
-
-
-def _list_children(engine: Engine, parent: str) -> dict[str, tuple[str, ...]]:
-    """Map child relname -> the LIST values it owns."""
-    with engine.connect() as conn:
-        result = conn.execute(text(CHILD_BOUNDS_SQL), {"parent": f'"{parent}"'})
-        rows = list(result.fetchall())
-    return list_children(rows)
-
-
-# ── A. Fresh creation ───────────────────────────────────────────────────────────
-
-
-def test__nested__fresh_table__creates_the_branch_and_every_bucket(sync_db_engine: Engine, table: str) -> None:
-    # Arrange
-    config = nested_config(table, modulus=2)
-
-    # Act
-    result = _run(sync_db_engine, config)
-
-    # Assert
-    branch = f"{table}{WEEK_SUFFIX}"
-    assert result.success  # type: ignore[attr-defined]
-    assert result.created_count == 1  # type: ignore[attr-defined]
-    assert _relkind(sync_db_engine, branch) == "p"
-    assert _children(sync_db_engine, branch) == {
-        f"{branch}__h0": (2, 0),
-        f"{branch}__h1": (2, 1),
-    }
-
-
-def test__nested__fresh_table__branch_is_attached_to_the_root(sync_db_engine: Engine, table: str) -> None:
-    # Arrange / Act
-    _run(sync_db_engine, nested_config(table, modulus=2))
-
-    # Act
-    with sync_db_engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT relispartition FROM pg_class WHERE oid = to_regclass(:n)"),
-            {"n": f'"{table}{WEEK_SUFFIX}"'},
-        )
-
-    # Assert
-    assert result.scalar() is True
-
-
-def test__nested__fresh_table__rows_route_through_the_branch_into_a_leaf(sync_db_engine: Engine, table: str) -> None:
-    # Arrange
-    _run(sync_db_engine, nested_config(table, modulus=2))
-
-    # Act
-    with sync_db_engine.begin() as conn:
-        for tenant in range(1, 9):
-            conn.execute(
-                text(f'INSERT INTO "{table}" (tenant_id, created_at) VALUES (:t, :d)'),  # noqa: S608
-                {"t": tenant, "d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
-            )
-        result = conn.execute(text(f'SELECT DISTINCT tableoid::regclass::text FROM "{table}"'))  # noqa: S608
-        leaves = {str(r[0]) for r in result.fetchall()}
-
-    # Assert: every row landed in one of the branch's own leaves.
-    branch = f"{table}{WEEK_SUFFIX}"
-    assert leaves <= {f"{branch}__h0", f"{branch}__h1"}
-    assert leaves
-
-
-def test__nested__deeper_spec__builds_the_whole_two_level_subtree(sync_db_engine: Engine, two_level_table: str) -> None:
-    # Arrange
-    table = two_level_table
-    config = nested_config(table, modulus=2, inner_modulus=2)
-
-    # Act
-    _run(sync_db_engine, config)
-
-    # Assert
-    branch = f"{table}{WEEK_SUFFIX}"
-    assert set(_children(sync_db_engine, branch)) == {f"{branch}__h0", f"{branch}__h1"}
-    assert set(_children(sync_db_engine, f"{branch}__h0")) == {f"{branch}__h0__h0", f"{branch}__h0__h1"}
-
-
-# ── B. Already complete ─────────────────────────────────────────────────────────
-
-
-def test__nested__second_run_on_a_converged_tree__executes_zero_ddl(sync_db_engine: Engine, table: str) -> None:
-    # Arrange
-    config = nested_config(table, modulus=2)
-    _run(sync_db_engine, config)
-
-    # Act
-    with _count_ddl(sync_db_engine) as counter:
-        result = _run(sync_db_engine, config)
-
-    # Assert: nothing to do must cost nothing, so no heavy locks are taken.
-    assert result.created_count == 0  # type: ignore[attr-defined]
-    assert result.repaired_count == 0  # type: ignore[attr-defined]
-    assert counter.statements == []
-
-
-# ── C. Missing hash child ───────────────────────────────────────────────────────
+@pytest.fixture
+def no_constraint_table(sync_db_engine: Engine) -> Generator[str, None]:
+    yield from make_table(sync_db_engine, NO_CONSTRAINT_TABLE_DDL)
 
 
 def _build_branch(
@@ -321,19 +200,132 @@ def _build_branch(
 ) -> str:
     """Create a branch with an arbitrary (possibly incomplete) bucket set."""
     branch = f"{table}{suffix}"
-    _exec(engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH ({hash_column})')
+    exec_sql(engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH ({hash_column})')
     for remainder in remainders:
-        _exec(
+        exec_sql(
             engine,
             f'CREATE TABLE "{branch}__h{remainder}" PARTITION OF "{branch}" '
             f"FOR VALUES WITH (MODULUS {modulus}, REMAINDER {remainder})",
         )
     if attach:
-        _exec(
+        exec_sql(
             engine,
             f"ALTER TABLE \"{table}\" ATTACH PARTITION \"{branch}\" FOR VALUES FROM ('{bounds[0]}') TO ('{bounds[1]}')",
         )
     return branch
+
+
+def _attach(engine: Engine, table: str, partition: str, bounds: tuple[str, str]) -> None:
+    exec_sql(
+        engine,
+        f"ALTER TABLE \"{table}\" ATTACH PARTITION \"{partition}\" FOR VALUES FROM ('{bounds[0]}') TO ('{bounds[1]}')",
+    )
+
+
+# ── A. Fresh creation ───────────────────────────────────────────────────────────
+
+
+def test__nested__fresh_table__creates_the_branch_and_every_bucket(sync_db_engine: Engine, table: str) -> None:
+    # Arrange
+    config = nested_config(table, modulus=2)
+
+    # Act
+    result = run_maintenance(sync_db_engine, config)
+
+    # Assert
+    branch = f"{table}{WEEK_SUFFIX}"
+    assert result.success
+    assert result.created_count == 1
+    assert result.repaired_count == 0
+    assert relkind(sync_db_engine, branch) == "p"
+    assert hash_children_of(sync_db_engine, branch) == {
+        f"{branch}__h0": (2, 0),
+        f"{branch}__h1": (2, 1),
+    }
+
+
+def test__nested__fresh_table__plan_nests_the_buckets_inside_the_branch(sync_db_engine: Engine, table: str) -> None:
+    # Arrange
+    config = nested_config(table, modulus=2)
+
+    # Act
+    with freezegun.freeze_time(FROZEN_WEEK):
+        plan = make_service(sync_db_engine).plan(config)
+
+    # Assert: one lifecycle unit, its subtree nested and counted as such.
+    branch = f"public.{table}{WEEK_SUFFIX}"
+    assert [op.target for op in plan.creates] == [branch]
+    assert plan.creates[0].lifecycle_unit is True
+    assert plan.creates[0].reason is Reason.CREATE_AHEAD
+    assert [(c.target, c.reason, c.counts_as) for c in plan.creates[0].children] == [
+        (f"{branch}__h0", Reason.SUBTREE, "subtree"),
+        (f"{branch}__h1", Reason.SUBTREE, "subtree"),
+    ]
+    assert plan.relation_count == 3
+
+
+def test__nested__fresh_table__branch_is_attached_to_the_root(sync_db_engine: Engine, table: str) -> None:
+    # Arrange / Act
+    run_maintenance(sync_db_engine, nested_config(table, modulus=2))
+
+    # Assert
+    assert is_attached(sync_db_engine, f"{table}{WEEK_SUFFIX}") is True
+
+
+def test__nested__fresh_table__rows_route_through_the_branch_into_a_leaf(sync_db_engine: Engine, table: str) -> None:
+    # Arrange
+    run_maintenance(sync_db_engine, nested_config(table, modulus=2))
+
+    # Act
+    with sync_db_engine.begin() as conn:
+        for tenant in range(1, 9):
+            conn.execute(
+                text(f'INSERT INTO "{table}" (tenant_id, created_at) VALUES (:t, :d)'),  # noqa: S608
+                {"t": tenant, "d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
+            )
+    leaves = routed_leaves(sync_db_engine, table)
+
+    # Assert: every row landed in one of the branch's own leaves.
+    branch = f"{table}{WEEK_SUFFIX}"
+    assert leaves <= {f"{branch}__h0", f"{branch}__h1"}
+    assert leaves
+
+
+def test__nested__deeper_spec__builds_the_whole_two_level_subtree(sync_db_engine: Engine, two_level_table: str) -> None:
+    # Arrange
+    table = two_level_table
+    config = nested_config(table, modulus=2, inner_modulus=2)
+
+    # Act
+    run_maintenance(sync_db_engine, config)
+
+    # Assert
+    branch = f"{table}{WEEK_SUFFIX}"
+    assert set(hash_children_of(sync_db_engine, branch)) == {f"{branch}__h0", f"{branch}__h1"}
+    assert set(hash_children_of(sync_db_engine, f"{branch}__h0")) == {f"{branch}__h0__h0", f"{branch}__h0__h1"}
+
+
+# ── B. Already complete ─────────────────────────────────────────────────────────
+
+
+def test__nested__second_run_on_a_converged_tree__executes_zero_ddl(sync_db_engine: Engine, table: str) -> None:
+    # Arrange
+    config = nested_config(table, modulus=2)
+    run_maintenance(sync_db_engine, config)
+
+    # Act
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, config)
+
+    # Assert: nothing to do must cost nothing, so no heavy locks are taken.
+    assert result.created_count == 0
+    assert result.repaired_count == 0
+    assert result.maintenance_plan is not None
+    assert result.maintenance_plan.is_noop
+    assert counter.statements == []
+
+
+# ── C. Missing hash child ───────────────────────────────────────────────────────
 
 
 def test__nested__branch_missing_one_bucket__creates_only_that_bucket(sync_db_engine: Engine, table: str) -> None:
@@ -341,12 +333,13 @@ def test__nested__branch_missing_one_bucket__creates_only_that_bucket(sync_db_en
     branch = _build_branch(sync_db_engine, table, modulus=4, remainders=(0, 1, 3))
 
     # Act
-    with _count_ddl(sync_db_engine) as counter:
-        result = _run(sync_db_engine, nested_config(table, modulus=4))
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, nested_config(table, modulus=4))
 
     # Assert
-    assert result.repaired_count == 1  # type: ignore[attr-defined]
-    assert _children(sync_db_engine, branch) == {
+    assert result.repaired_count == 1
+    assert result.created_count == 0
+    assert hash_children_of(sync_db_engine, branch) == {
         f"{branch}__h0": (4, 0),
         f"{branch}__h1": (4, 1),
         f"{branch}__h2": (4, 2),
@@ -354,6 +347,10 @@ def test__nested__branch_missing_one_bucket__creates_only_that_bucket(sync_db_en
     }
     created = [s for s in counter.statements if s.startswith("CREATE TABLE")]
     assert len(created) == 1
+    assert result.maintenance_plan is not None
+    assert [(op.target, op.reason) for op in result.maintenance_plan.creates] == [
+        (f"public.{branch}__h2", Reason.HASH_GAP)
+    ]
 
 
 def test__nested__branch_missing_a_bucket__ingest_recovers_for_the_orphaned_hash_slice(
@@ -361,18 +358,15 @@ def test__nested__branch_missing_a_bucket__ingest_recovers_for_the_orphaned_hash
 ) -> None:
     # Arrange: find a tenant that hashes into the missing bucket.
     branch = _build_branch(sync_db_engine, table, modulus=4, remainders=(0, 1, 3))
-    with sync_db_engine.connect() as conn:
-        result = conn.execute(
-            text(
-                f"SELECT g FROM generate_series(1, 200) g WHERE satisfies_hash_partition("  # noqa: S608
-                f"to_regclass('\"{branch}\"'), 4, 2, g::bigint) LIMIT 1"
-            )
-        )
-        stranded_tenant = result.scalar()
+    stranded_tenant = scalar(
+        sync_db_engine,
+        f"SELECT g FROM generate_series(1, 200) g WHERE satisfies_hash_partition("  # noqa: S608
+        f"to_regclass('\"{branch}\"'), 4, 2, g::bigint) LIMIT 1",
+    )
     assert stranded_tenant is not None
 
     # Act
-    _run(sync_db_engine, nested_config(table, modulus=4))
+    run_maintenance(sync_db_engine, nested_config(table, modulus=4))
 
     # Assert: the previously rejected row now has somewhere to go.
     with sync_db_engine.begin() as conn:
@@ -405,12 +399,15 @@ def test__nested__historical_complete_set_at_another_modulus__left_untouched(
     )
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
-    # Assert
-    assert result.repaired_count == 0  # type: ignore[attr-defined]
-    assert result.issues == ()  # type: ignore[attr-defined]
-    assert _children(sync_db_engine, old_branch) == {f"{old_branch}__h{r}": (4, r) for r in range(4)}
+    # Assert: an expected steady state, reported as information rather than an issue.
+    assert result.repaired_count == 0
+    assert result.issues == ()
+    assert result.maintenance_plan is not None
+    findings = {f.partition_name: f.reason for f in result.maintenance_plan.findings}
+    assert findings == {f"public.{old_branch}": FindingReason.MODULUS_PRESERVED}
+    assert hash_children_of(sync_db_engine, old_branch) == {f"{old_branch}__h{r}": (4, r) for r in range(4)}
 
 
 def test__nested__historical_complete_set_at_another_modulus__new_period_uses_the_new_count(
@@ -427,11 +424,11 @@ def test__nested__historical_complete_set_at_another_modulus__new_period_uses_th
     )
 
     # Act
-    _run(sync_db_engine, nested_config(table, modulus=2))
+    run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert: rolling the bucket count forward never rewrites history.
     new_branch = f"{table}{WEEK_SUFFIX}"
-    assert _children(sync_db_engine, new_branch) == {
+    assert hash_children_of(sync_db_engine, new_branch) == {
         f"{new_branch}__h0": (2, 0),
         f"{new_branch}__h1": (2, 1),
     }
@@ -454,18 +451,21 @@ def test__nested__historical_incomplete_set_at_another_modulus__repaired_at_its_
     )
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert: filled at modulus 4, never at the configured 2.
-    assert result.repaired_count == 1  # type: ignore[attr-defined]
-    assert _children(sync_db_engine, old_branch) == {f"{old_branch}__h{r}": (4, r) for r in range(4)}
+    assert result.repaired_count == 1
+    assert hash_children_of(sync_db_engine, old_branch) == {f"{old_branch}__h{r}": (4, r) for r in range(4)}
+    assert result.maintenance_plan is not None
+    repairs = [op for op in result.maintenance_plan.creates if op.target == f"public.{old_branch}__h2"]
+    assert [op.reason for op in repairs] == [Reason.HASH_GAP_HISTORICAL_MODULUS]
 
 
 def test__nested__historical_incomplete_set__repair_is_not_reported_as_a_problem(
     sync_db_engine: Engine, table: str
 ) -> None:
     # Arrange
-    _build_branch(
+    old_branch = _build_branch(
         sync_db_engine,
         table,
         modulus=4,
@@ -475,96 +475,89 @@ def test__nested__historical_incomplete_set__repair_is_not_reported_as_a_problem
     )
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert
-    assert result.issues == ()  # type: ignore[attr-defined]
+    assert result.issues == ()
+    assert result.maintenance_plan is not None
+    findings = {f.partition_name: f.reason for f in result.maintenance_plan.findings}
+    assert findings == {f"public.{old_branch}": FindingReason.MODULUS_REPAIRED}
 
 
 # ── F. Inconsistent moduli ──────────────────────────────────────────────────────
 
 
+def _build_gapped_mixed_branch(engine: Engine, table: str) -> str:
+    """(2,0) plus (4,1) leaves residue 3 (mod 4) unowned."""
+    branch = f"{table}{PREVIOUS_WEEK_SUFFIX}"
+    exec_sql(engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
+    exec_sql(
+        engine,
+        f'CREATE TABLE "{branch}__h0" PARTITION OF "{branch}" FOR VALUES WITH (MODULUS 2, REMAINDER 0)',
+    )
+    exec_sql(
+        engine,
+        f'CREATE TABLE "{branch}__h1" PARTITION OF "{branch}" FOR VALUES WITH (MODULUS 4, REMAINDER 1)',
+    )
+    _attach(engine, table, branch, PREVIOUS_WEEK_BOUNDS)
+    return branch
+
+
 def test__nested__hash_children_with_a_gap_across_moduli__reported_and_not_mutated(
     sync_db_engine: Engine, table: str
 ) -> None:
-    # Arrange: (2,0) plus (4,1) leaves residue 3 (mod 4) unowned.
-    branch = f"{table}{PREVIOUS_WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
-    _exec(
-        sync_db_engine,
-        f'CREATE TABLE "{branch}__h0" PARTITION OF "{branch}" FOR VALUES WITH (MODULUS 2, REMAINDER 0)',
-    )
-    _exec(
-        sync_db_engine,
-        f'CREATE TABLE "{branch}__h1" PARTITION OF "{branch}" FOR VALUES WITH (MODULUS 4, REMAINDER 1)',
-    )
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{PREVIOUS_WEEK_BOUNDS[0]}') TO ('{PREVIOUS_WEEK_BOUNDS[1]}')",
-    )
-    before = _children(sync_db_engine, branch)
+    # Arrange
+    branch = _build_gapped_mixed_branch(sync_db_engine, table)
+    before = hash_children_of(sync_db_engine, branch)
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert
-    assert _children(sync_db_engine, branch) == before
-    issues = [i for i in result.issues if i.partition_name == f"public.{branch}"]  # type: ignore[attr-defined]
+    assert hash_children_of(sync_db_engine, branch) == before
+    issues = [i for i in result.issues if i.partition_name == f"public.{branch}"]
     assert len(issues) == 1
     assert issues[0].step == MaintenanceIssueStep.RECONCILE
-    assert TopologyReason.NON_UNIFORM_INCOMPLETE.value in issues[0].error or "inconsistent moduli" in issues[0].error
+    assert "inconsistent moduli" in issues[0].error
+    assert result.maintenance_plan is not None
+    reasons = {f.reason for f in result.maintenance_plan.findings if f.partition_name == f"public.{branch}"}
+    assert reasons == {FindingReason.NON_UNIFORM_INCOMPLETE}
 
 
 def test__nested__inconsistent_branch__does_not_stop_the_rest_of_the_run(sync_db_engine: Engine, table: str) -> None:
     # Arrange
-    branch = f"{table}{PREVIOUS_WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
-    _exec(
-        sync_db_engine,
-        f'CREATE TABLE "{branch}__h0" PARTITION OF "{branch}" FOR VALUES WITH (MODULUS 2, REMAINDER 0)',
-    )
-    _exec(
-        sync_db_engine,
-        f'CREATE TABLE "{branch}__h1" PARTITION OF "{branch}" FOR VALUES WITH (MODULUS 4, REMAINDER 1)',
-    )
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{PREVIOUS_WEEK_BOUNDS[0]}') TO ('{PREVIOUS_WEEK_BOUNDS[1]}')",
-    )
+    _build_gapped_mixed_branch(sync_db_engine, table)
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert: the current week is still created normally.
-    assert result.success  # type: ignore[attr-defined]
+    assert result.success
     new_branch = f"{table}{WEEK_SUFFIX}"
-    assert len(_children(sync_db_engine, new_branch)) == 2
+    assert len(hash_children_of(sync_db_engine, new_branch)) == 2
 
 
 def test__nested__mixed_moduli_that_still_tile__left_alone_without_an_issue(sync_db_engine: Engine, table: str) -> None:
     # Arrange: (2,1) plus (4,0) and (4,2) covers the whole keyspace.
     branch = f"{table}{PREVIOUS_WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
+    exec_sql(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
     for modulus, remainder in ((2, 1), (4, 0), (4, 2)):
-        _exec(
+        exec_sql(
             sync_db_engine,
             f'CREATE TABLE "{branch}__h{modulus}_{remainder}" PARTITION OF "{branch}" '
             f"FOR VALUES WITH (MODULUS {modulus}, REMAINDER {remainder})",
         )
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{PREVIOUS_WEEK_BOUNDS[0]}') TO ('{PREVIOUS_WEEK_BOUNDS[1]}')",
-    )
+    _attach(sync_db_engine, table, branch, PREVIOUS_WEEK_BOUNDS)
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert
-    assert [i for i in result.issues if i.partition_name == f"public.{branch}"] == []  # type: ignore[attr-defined]
-    assert len(_children(sync_db_engine, branch)) == 3
+    assert [i for i in result.issues if i.partition_name == f"public.{branch}"] == []
+    assert len(hash_children_of(sync_db_engine, branch)) == 3
+    assert result.maintenance_plan is not None
+    reasons = {f.reason for f in result.maintenance_plan.findings if f.partition_name == f"public.{branch}"}
+    assert reasons == {FindingReason.NON_UNIFORM_COMPLETE}
 
 
 # ── G. Unexpected subpartition strategy ─────────────────────────────────────────
@@ -573,23 +566,22 @@ def test__nested__mixed_moduli_that_still_tile__left_alone_without_an_issue(sync
 def test__nested__branch_subpartitioned_by_list__reported_without_hash_ddl(sync_db_engine: Engine, table: str) -> None:
     # Arrange
     branch = f"{table}{PREVIOUS_WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY LIST (tenant_id)')
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}__eu" PARTITION OF "{branch}" FOR VALUES IN (1, 2)')
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{PREVIOUS_WEEK_BOUNDS[0]}') TO ('{PREVIOUS_WEEK_BOUNDS[1]}')",
-    )
+    exec_sql(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY LIST (tenant_id)')
+    exec_sql(sync_db_engine, f'CREATE TABLE "{branch}__eu" PARTITION OF "{branch}" FOR VALUES IN (1, 2)')
+    _attach(sync_db_engine, table, branch, PREVIOUS_WEEK_BOUNDS)
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert
-    assert result.success  # type: ignore[attr-defined]
-    issues = [i for i in result.issues if i.partition_name == f"public.{branch}"]  # type: ignore[attr-defined]
+    assert result.success
+    issues = [i for i in result.issues if i.partition_name == f"public.{branch}"]
     assert len(issues) == 1
     assert "LIST" in issues[0].error
-    assert set(_children(sync_db_engine, branch)) == set()  # no hash children were added
+    assert result.maintenance_plan is not None
+    reasons = {f.reason for f in result.maintenance_plan.findings if f.partition_name == f"public.{branch}"}
+    assert reasons == {FindingReason.STRATEGY_MISMATCH}
+    assert set(hash_children_of(sync_db_engine, branch)) == set()  # no hash children were added
 
 
 # ── H. Legacy leaf ──────────────────────────────────────────────────────────────
@@ -598,20 +590,19 @@ def test__nested__branch_subpartitioned_by_list__reported_without_hash_ddl(sync_
 def test__nested__legacy_leaf_partition__left_valid_and_untouched(sync_db_engine: Engine, table: str) -> None:
     # Arrange: a partition created under the old flat policy.
     legacy = f"{table}{PREVIOUS_WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{legacy}" (LIKE "{table}" INCLUDING ALL)')
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{table}" ATTACH PARTITION "{legacy}" '
-        f"FOR VALUES FROM ('{PREVIOUS_WEEK_BOUNDS[0]}') TO ('{PREVIOUS_WEEK_BOUNDS[1]}')",
-    )
+    exec_sql(sync_db_engine, f'CREATE TABLE "{legacy}" (LIKE "{table}" INCLUDING ALL)')
+    _attach(sync_db_engine, table, legacy, PREVIOUS_WEEK_BOUNDS)
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
-    # Assert: still a plain, writable leaf; no issue raised.
-    assert result.success  # type: ignore[attr-defined]
-    assert result.issues == ()  # type: ignore[attr-defined]
-    assert _relkind(sync_db_engine, legacy) == "r"
+    # Assert: still a plain, writable leaf; recognised, not reported as a problem.
+    assert result.success
+    assert result.issues == ()
+    assert result.maintenance_plan is not None
+    findings = {f.partition_name: f.reason for f in result.maintenance_plan.findings}
+    assert findings == {f"public.{legacy}": FindingReason.LEGACY_LEAF}
+    assert relkind(sync_db_engine, legacy) == "r"
 
     with sync_db_engine.begin() as conn:
         conn.execute(
@@ -627,20 +618,16 @@ def test__nested__legacy_leaf_present__new_periods_still_get_the_new_topology(
 ) -> None:
     # Arrange
     legacy = f"{table}{PREVIOUS_WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{legacy}" (LIKE "{table}" INCLUDING ALL)')
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{table}" ATTACH PARTITION "{legacy}" '
-        f"FOR VALUES FROM ('{PREVIOUS_WEEK_BOUNDS[0]}') TO ('{PREVIOUS_WEEK_BOUNDS[1]}')",
-    )
+    exec_sql(sync_db_engine, f'CREATE TABLE "{legacy}" (LIKE "{table}" INCLUDING ALL)')
+    _attach(sync_db_engine, table, legacy, PREVIOUS_WEEK_BOUNDS)
 
     # Act
-    _run(sync_db_engine, nested_config(table, modulus=2))
+    run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert
     new_branch = f"{table}{WEEK_SUFFIX}"
-    assert _relkind(sync_db_engine, new_branch) == "p"
-    assert len(_children(sync_db_engine, new_branch)) == 2
+    assert relkind(sync_db_engine, new_branch) == "p"
+    assert len(hash_children_of(sync_db_engine, new_branch)) == 2
 
 
 # ── I. Partial failure ──────────────────────────────────────────────────────────
@@ -653,17 +640,14 @@ def test__nested__branch_created_but_never_attached__next_run_completes_and_atta
     branch = _build_branch(sync_db_engine, table, modulus=2, remainders=(0,), attach=False)
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert
-    assert result.success  # type: ignore[attr-defined]
-    assert _children(sync_db_engine, branch) == {f"{branch}__h0": (2, 0), f"{branch}__h1": (2, 1)}
-    with sync_db_engine.connect() as conn:
-        attached = conn.execute(
-            text("SELECT relispartition FROM pg_class WHERE oid = to_regclass(:n)"),
-            {"n": f'"{branch}"'},
-        )
-    assert attached.scalar() is True
+    assert result.success
+    assert result.created_count == 1
+    assert result.repaired_count == 1
+    assert hash_children_of(sync_db_engine, branch) == {f"{branch}__h0": (2, 0), f"{branch}__h1": (2, 1)}
+    assert is_attached(sync_db_engine, branch) is True
 
 
 def test__nested__branch_is_attached_only_after_all_its_buckets_exist(sync_db_engine: Engine, table: str) -> None:
@@ -672,8 +656,8 @@ def test__nested__branch_is_attached_only_after_all_its_buckets_exist(sync_db_en
     branch = f"{table}{WEEK_SUFFIX}".upper()
 
     # Act
-    with _count_ddl(sync_db_engine) as ddl:
-        _run(sync_db_engine, config)
+    with count_ddl(sync_db_engine) as ddl:
+        run_maintenance(sync_db_engine, config)
 
     # Assert: the ordering is the whole recovery story. A branch becomes
     # reachable at the moment it is attached, and a reachable branch missing a
@@ -689,69 +673,50 @@ def test__nested__branch_is_attached_only_after_all_its_buckets_exist(sync_db_en
     assert max(buckets) < attach
 
 
-# ── J/K. UUIDv7 boundaries ──────────────────────────────────────────────────────
+# ── J/K. UUIDv7 boundaries (flat spelling, tenant-keyed) ────────────────────────
+
+
+def _partition_bound_expr(engine: Engine, name: str) -> str:
+    value = scalar(
+        engine,
+        "SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = to_regclass(:n)",
+        n=f'"{name}"',
+    )
+    return str(value)
 
 
 def test__uuid7__weekly_periods__branch_bounds_are_uuid_literals(sync_db_engine: Engine, uuid_table: str) -> None:
     # Arrange
     codec = uuid7_codec()
-    config = nested_config(uuid_table, modulus=2, partition_column="id")
+    config = nested_config(uuid_table, modulus=2, partition_column="id", codec=codec)
 
     # Act
-    _run(sync_db_engine, config, codec=codec)
+    run_maintenance(sync_db_engine, config)
 
     # Assert
-    branch = f"{uuid_table}{WEEK_SUFFIX}"
-    with sync_db_engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = to_regclass(:n)"),
-            {"n": f'"{branch}"'},
-        )
-        bounds = str(result.scalar())
-
+    bounds = _partition_bound_expr(sync_db_engine, f"{uuid_table}{WEEK_SUFFIX}")
     assert str(codec.min_uuid_for(datetime(2026, 8, 24, tzinfo=UTC))) in bounds
     assert str(codec.min_uuid_for(datetime(2026, 8, 31, tzinfo=UTC))) in bounds
 
 
 def test__uuid7__adjacent_periods__bounds_meet_without_a_gap(sync_db_engine: Engine, uuid_table: str) -> None:
     # Arrange
-    codec = uuid7_codec()
-    config = nested_config(uuid_table, modulus=1, partition_column="id", create_ahead=2)
+    config = nested_config(uuid_table, modulus=1, partition_column="id", create_ahead=2, codec=uuid7_codec())
 
     # Act
-    _run(sync_db_engine, config, codec=codec)
+    run_maintenance(sync_db_engine, config)
 
     # Assert
-    with sync_db_engine.connect() as conn:
-        result = conn.execute(
-            text(
-                "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) FROM pg_inherits i "
-                "JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass(:n) ORDER BY c.relname"
-            ),
-            {"n": f'"{uuid_table}"'},
-        )
-        rows = {str(r[0]): str(r[1]) for r in result.fetchall()}
-
-    def upper(expr: str) -> str:
-        match = re.search(r"TO \('([^']+)'\)", expr)
-        assert match
-        return match.group(1)
-
-    def lower(expr: str) -> str:
-        match = re.search(r"FROM \('([^']+)'\)", expr)
-        assert match
-        return match.group(1)
-
-    assert upper(rows[f"{uuid_table}{WEEK_SUFFIX}"]) == lower(rows[f"{uuid_table}{NEXT_WEEK_SUFFIX}"])
+    rows = range_children_of(sync_db_engine, uuid_table)
+    assert rows[f"{uuid_table}{WEEK_SUFFIX}"][1] == rows[f"{uuid_table}{NEXT_WEEK_SUFFIX}"][0]
 
 
 def test__uuid7_with_hash__rows_route_to_the_expected_leaf(sync_db_engine: Engine, uuid_table: str) -> None:
     # Arrange
     codec = uuid7_codec()
-    _run(sync_db_engine, nested_config(uuid_table, modulus=2, partition_column="id"), codec=codec)
+    run_maintenance(sync_db_engine, nested_config(uuid_table, modulus=2, partition_column="id", codec=codec))
 
     branch = f"{uuid_table}{WEEK_SUFFIX}"
-    inside_week = codec.min_uuid_for(datetime(2026, 8, 26, 12, tzinfo=UTC))
 
     # Act
     with sync_db_engine.begin() as conn:
@@ -777,34 +742,31 @@ def test__uuid7_with_hash__rows_route_to_the_expected_leaf(sync_db_engine: Engin
             expected[tenant] = f"{branch}__h0" if check.scalar() else f"{branch}__h1"
 
     # Assert: the time dimension picked the branch, the hash dimension the leaf.
-    assert str(inside_week) != ""
     assert routed == expected
 
 
 def test__uuid7__retention__prunes_by_decoding_the_uuid_upper_bound(sync_db_engine: Engine, uuid_table: str) -> None:
     # Arrange: a branch two weeks old, with retention of one period.
-    codec = uuid7_codec()
-    config = nested_config(uuid_table, modulus=1, partition_column="id", retention=1)
-    with freezegun.freeze_time("2026-08-12"):
-        _maintainer(sync_db_engine, codec=codec).run_maintenance(config)
+    config = nested_config(uuid_table, modulus=1, partition_column="id", retention=1, codec=uuid7_codec())
+    run_maintenance(sync_db_engine, config, at_time="2026-08-12")
     old_branch = f"{uuid_table}__2026_w33"
-    assert _relkind(sync_db_engine, old_branch) == "p"
+    assert relkind(sync_db_engine, old_branch) == "p"
 
     # Act
-    result = _run(sync_db_engine, config, codec=codec)
+    result = run_maintenance(sync_db_engine, config)
 
     # Assert: retention works on encoded bounds, which needs the codec to decode.
-    assert result.dropped_count == 1  # type: ignore[attr-defined]
-    assert _relkind(sync_db_engine, old_branch) is None
+    assert result.detached_count == 1
+    assert result.dropped_count == 1
+    assert relkind(sync_db_engine, old_branch) is None
 
 
 def test__uuid7__is_partition_closed__decodes_the_encoded_upper_bound(sync_db_engine: Engine, uuid_table: str) -> None:
     # Arrange
     codec = uuid7_codec()
-    with freezegun.freeze_time("2026-08-12"):
-        _maintainer(sync_db_engine, codec=codec).run_maintenance(
-            nested_config(uuid_table, modulus=1, partition_column="id")
-        )
+    run_maintenance(
+        sync_db_engine, nested_config(uuid_table, modulus=1, partition_column="id", codec=codec), at_time="2026-08-12"
+    )
     metadata = PostgresMetadataProvider(sync_db_engine, boundary_codec=codec)
 
     # Act / Assert: the 2026-W33 branch closed long ago in real time.
@@ -815,17 +777,116 @@ def test__uuid7_without_codec__is_partition_closed__reports_false_instead_of_rai
     sync_db_engine: Engine, uuid_table: str
 ) -> None:
     # Arrange
-    codec = uuid7_codec()
-    with freezegun.freeze_time("2026-08-12"):
-        _maintainer(sync_db_engine, codec=codec).run_maintenance(
-            nested_config(uuid_table, modulus=1, partition_column="id")
-        )
+    run_maintenance(
+        sync_db_engine,
+        nested_config(uuid_table, modulus=1, partition_column="id", codec=uuid7_codec()),
+        at_time="2026-08-12",
+    )
 
     # Act: a provider with no codec cannot read a UUID bound.
     plain = PostgresMetadataProvider(sync_db_engine)
 
     # Assert: it must not try to cast one to a timestamp.
     assert plain.is_partition_closed(f"{uuid_table}__2026_w33") is False
+
+
+# ── UUIDv7 weekly root → HASH(organization_id), composed spelling ───────────────
+
+
+def test__uuid7_org__fresh_table__bounds_are_uuid_literals_on_week_boundaries(
+    sync_db_engine: Engine, uuid_org_table: str
+) -> None:
+    # Arrange
+    codec = uuid7_codec()
+    config = glitchtip_config(uuid_org_table, modulus=2)
+
+    # Act
+    result = run_maintenance(sync_db_engine, config)
+
+    # Assert
+    branch = f"{uuid_org_table}{WEEK_SUFFIX}"
+    assert result.created_count == 1
+    bounds = range_children_of(sync_db_engine, uuid_org_table)
+    assert bounds == {
+        branch: (
+            str(codec.min_uuid_for(datetime(2026, 8, 24, tzinfo=UTC))),
+            str(codec.min_uuid_for(datetime(2026, 8, 31, tzinfo=UTC))),
+        )
+    }
+    assert hash_children_of(sync_db_engine, branch) == {f"{branch}_h0": (2, 0), f"{branch}_h1": (2, 1)}
+
+
+def test__uuid7_org__adjacent_periods__are_contiguous(sync_db_engine: Engine, uuid_org_table: str) -> None:
+    # Arrange / Act
+    run_maintenance(sync_db_engine, glitchtip_config(uuid_org_table, create_ahead=3))
+
+    # Assert: each window's upper bound is the next window's lower bound.
+    bounds = range_children_of(sync_db_engine, uuid_org_table)
+    ordered = sorted(bounds.values())
+    assert len(ordered) == 3
+    for (_, upper), (lower, _) in pairwise(ordered):
+        assert upper == lower
+
+
+def test__uuid7_org__rows__route_by_tableoid_into_the_organization_bucket(
+    sync_db_engine: Engine, uuid_org_table: str
+) -> None:
+    # Arrange
+    codec = uuid7_codec()
+    run_maintenance(sync_db_engine, glitchtip_config(uuid_org_table, modulus=2))
+    branch = f"{uuid_org_table}{WEEK_SUFFIX}"
+
+    # Act
+    with sync_db_engine.begin() as conn:
+        for org in (10, 11, 12, 13):
+            row_id = codec.min_uuid_for(datetime(2026, 8, 27, 9, 0, org, tzinfo=UTC))
+            conn.execute(
+                text(f'INSERT INTO "{uuid_org_table}" (id, organization_id) VALUES (:i, :o)'),  # noqa: S608
+                {"i": row_id, "o": org},
+            )
+        result = conn.execute(
+            text(f'SELECT organization_id, tableoid::regclass::text FROM "{uuid_org_table}"')  # noqa: S608
+        )
+        routed = {int(r[0]): str(r[1]) for r in result.fetchall()}
+        expected = {}
+        for org in (10, 11, 12, 13):
+            check = conn.execute(
+                text("SELECT satisfies_hash_partition(to_regclass(:b), 2, 0, CAST(:o AS bigint))"),
+                {"b": f'"{branch}"', "o": org},
+            )
+            expected[org] = f"{branch}_h0" if check.scalar() else f"{branch}_h1"
+
+    # Assert
+    assert routed == expected
+
+
+def test__uuid7_org__retention__decodes_the_uuid_upper_bound(sync_db_engine: Engine, uuid_org_table: str) -> None:
+    # Arrange
+    config = glitchtip_config(uuid_org_table, retention=1)
+    run_maintenance(sync_db_engine, config, at_time="2026-08-12")
+    old_branch = f"{uuid_org_table}__2026_w33"
+    assert relkind(sync_db_engine, old_branch) == "p"
+
+    # Act
+    result = run_maintenance(sync_db_engine, config)
+
+    # Assert
+    assert result.detached_count == 1
+    assert result.dropped_count == 1
+    assert relkind(sync_db_engine, old_branch) is None
+    assert relkind(sync_db_engine, f"{old_branch}_h0") is None
+
+
+def test__uuid7_org__is_partition_closed__with_the_codec_on_the_provider(
+    sync_db_engine: Engine, uuid_org_table: str
+) -> None:
+    # Arrange
+    run_maintenance(sync_db_engine, glitchtip_config(uuid_org_table), at_time="2026-08-12")
+    metadata = PostgresMetadataProvider(sync_db_engine, boundary_codec=uuid7_codec())
+
+    # Act / Assert
+    assert metadata.is_partition_closed(f"{uuid_org_table}__2026_w33") is True
+    assert metadata.is_partition_closed(f"{uuid_org_table}__2026_w33", settle_seconds=10**9) is False
 
 
 # ── Lifecycle of a whole branch ─────────────────────────────────────────────────
@@ -836,56 +897,47 @@ def test__nested__expired_branch__detached_and_dropped_with_its_whole_subtree(
 ) -> None:
     # Arrange
     config = nested_config(table, modulus=2, retention=1)
-    with freezegun.freeze_time("2026-08-10"):
-        _maintainer(sync_db_engine).run_maintenance(config)
+    run_maintenance(sync_db_engine, config, at_time="2026-08-10")
     old_branch = f"{table}__2026_w33"
-    assert _relkind(sync_db_engine, old_branch) == "p"
+    assert relkind(sync_db_engine, old_branch) == "p"
 
     # Act
-    result = _run(sync_db_engine, config)
+    result = run_maintenance(sync_db_engine, config)
 
     # Assert: the branch is the lifecycle unit; its leaves go with it.
-    assert result.dropped_count == 1  # type: ignore[attr-defined]
-    assert _relkind(sync_db_engine, old_branch) is None
-    assert _relkind(sync_db_engine, f"{old_branch}__h0") is None
-    assert _relkind(sync_db_engine, f"{old_branch}__h1") is None
+    assert result.detached_count == 1
+    assert result.dropped_count == 1
+    assert relkind(sync_db_engine, old_branch) is None
+    assert relkind(sync_db_engine, f"{old_branch}__h0") is None
+    assert relkind(sync_db_engine, f"{old_branch}__h1") is None
 
 
 def test__nested__retention_counts_time_periods_not_leaves(sync_db_engine: Engine, table: str) -> None:
     # Arrange: 4 buckets per week would exhaust a leaf-counted retention of 2.
     config = nested_config(table, modulus=4, retention=2)
     for week in ("2026-08-10", "2026-08-17", "2026-08-24"):
-        with freezegun.freeze_time(week):
-            _maintainer(sync_db_engine).run_maintenance(config)
+        run_maintenance(sync_db_engine, config, at_time=week)
 
-    # Act
-    with sync_db_engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass(:n)"),
-            {"n": f'"{table}"'},
-        )
-
-    # Assert: two weekly branches retained, not two hash leaves.
-    assert result.scalar() == 2
+    # Act / Assert: two weekly branches retained, not two hash leaves.
+    assert child_count(sync_db_engine, table) == 2
 
 
-def test__nested__before_drop_hook__fires_once_for_the_branch_not_per_leaf(sync_db_engine: Engine, table: str) -> None:
+def test__nested__hooks__fire_once_for_the_branch_not_per_leaf(sync_db_engine: Engine, table: str) -> None:
     # Arrange
-    dropped: list[str] = []
+    events: list[str] = []
 
     class RecordingHooks(BasePartitionLifecycleHooks):
+        def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
+            events.append(f"before_create:{partition.name}:{partition.subpartition_type}")
+
+        def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
+            events.append(f"after_create:{partition.name}")
+
         def before_drop(self, table_name: str, partition_name: str) -> None:
-            dropped.append(partition_name)
+            events.append(f"before_drop:{partition_name}")
 
     config = nested_config(table, modulus=4, retention=1)
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(sync_db_engine),
-        metadata=PostgresMetadataProvider(sync_db_engine),
-        locks=PostgresAdvisoryLockManager(sync_db_engine),
-        period_calculator=WeekPeriodCalculator(),
-        hooks=[RecordingHooks()],
-    )
-    maintainer = PartitionMaintainer(service)
+    maintainer = make_maintainer(sync_db_engine, hooks=[RecordingHooks()])
     with freezegun.freeze_time("2026-08-10"):
         maintainer.run_maintenance(config)
 
@@ -894,7 +946,13 @@ def test__nested__before_drop_hook__fires_once_for_the_branch_not_per_leaf(sync_
         maintainer.run_maintenance(config)
 
     # Assert: cold-storage export sees one time slice, not four fragments.
-    assert dropped == [f"public.{table}__2026_w33"]
+    assert events == [
+        f"before_create:public.{table}__2026_w33:hash",
+        f"after_create:public.{table}__2026_w33",
+        f"before_create:public.{table}{WEEK_SUFFIX}:hash",
+        f"after_create:public.{table}{WEEK_SUFFIX}",
+        f"before_drop:public.{table}__2026_w33",
+    ]
 
 
 # ── DEFAULT partition reconciliation ────────────────────────────────────────────
@@ -904,7 +962,7 @@ def test__nested__rows_in_default__moved_into_the_new_branch_and_routed_to_leave
     sync_db_engine: Engine, table: str
 ) -> None:
     # Arrange
-    _exec(sync_db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
     with sync_db_engine.begin() as conn:
         for tenant in range(1, 7):
             conn.execute(
@@ -913,11 +971,11 @@ def test__nested__rows_in_default__moved_into_the_new_branch_and_routed_to_leave
             )
 
     # Act
-    result = _run(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
     # Assert
     branch = f"{table}{WEEK_SUFFIX}"
-    assert result.success  # type: ignore[attr-defined]
+    assert result.success
     with sync_db_engine.connect() as conn:
         rows = conn.execute(
             text(f'SELECT tableoid::regclass::text, count(*) FROM "{table}" GROUP BY 1')  # noqa: S608
@@ -938,10 +996,10 @@ def test__nested__hash_column_missing_from_primary_key__refused_before_any_ddl(
     config = nested_config(unconstrained_table, modulus=2)
 
     # Act / Assert
-    with freezegun.freeze_time(FROZEN_WEEK), pytest.raises(InvalidPartitionConfigError, match="tenant_id"):
-        _maintainer(sync_db_engine).run_maintenance(config)
+    with pytest.raises(InvalidPartitionConfigError, match="tenant_id"):
+        run_maintenance(sync_db_engine, config)
 
-    assert _relkind(sync_db_engine, f"{unconstrained_table}{WEEK_SUFFIX}") is None
+    assert relkind(sync_db_engine, f"{unconstrained_table}{WEEK_SUFFIX}") is None
 
 
 # ── Backward compatibility ──────────────────────────────────────────────────────
@@ -949,20 +1007,20 @@ def test__nested__hash_column_missing_from_primary_key__refused_before_any_ddl(
 
 def test__flat_config_on_the_same_table__still_creates_a_plain_leaf(sync_db_engine: Engine, table: str) -> None:
     # Arrange / Act
-    result = _run(sync_db_engine, flat_config(table))
+    result = run_maintenance(sync_db_engine, flat_config(table))
 
     # Assert
-    assert result.created_count == 1  # type: ignore[attr-defined]
-    assert _relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") == "r"
+    assert result.created_count == 1
+    assert relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") == "r"
 
 
 def test__flat_config__maintenance_result_reports_no_repairs(sync_db_engine: Engine, table: str) -> None:
     # Arrange / Act
-    result = _run(sync_db_engine, flat_config(table))
+    result = run_maintenance(sync_db_engine, flat_config(table))
 
     # Assert
-    assert result.repaired_count == 0  # type: ignore[attr-defined]
-    assert result.issues == ()  # type: ignore[attr-defined]
+    assert result.repaired_count == 0
+    assert result.issues == ()
 
 
 # ── Tree introspection ──────────────────────────────────────────────────────────
@@ -972,7 +1030,7 @@ def test__get_partition_tree__nested_table__reports_levels_bounds_and_strategies
     sync_db_engine: Engine, table: str
 ) -> None:
     # Arrange
-    _run(sync_db_engine, nested_config(table, modulus=2))
+    run_maintenance(sync_db_engine, nested_config(table, modulus=2))
     metadata = PostgresMetadataProvider(sync_db_engine)
 
     # Act
@@ -982,33 +1040,35 @@ def test__get_partition_tree__nested_table__reports_levels_bounds_and_strategies
     assert tree is not None
     assert tree.partition_type == PartitionType.RANGE
     assert tree.partition_columns == ("created_at",)
+    assert tree.oid is not None
 
     branch = tree.children[0]
     assert branch.level == 1
     assert branch.partition_type == PartitionType.HASH
     assert branch.partition_columns == ("tenant_id",)
     assert branch.bounds is not None
+    assert branch.bounds.kind == "range"
     assert [c.level for c in branch.children] == [2, 2]
     assert all(c.is_leaf for c in branch.children)
 
 
 def test__get_partition_tree__unpartitioned_relation__returns_none(sync_db_engine: Engine, table: str) -> None:
     # Arrange
-    _exec(sync_db_engine, f'CREATE TABLE "{table}_plain" (i int)')
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}_plain" (i int)')
     metadata = PostgresMetadataProvider(sync_db_engine)
 
     # Act / Assert
     try:
         assert metadata.get_partition_tree(f"{table}_plain") is None
     finally:
-        _exec(sync_db_engine, f'DROP TABLE IF EXISTS "{table}_plain"')
+        exec_sql(sync_db_engine, f'DROP TABLE IF EXISTS "{table}_plain"')
 
 
 def test__list_partitions__nested_table__reports_the_branch_as_subpartitioned(
     sync_db_engine: Engine, table: str
 ) -> None:
     # Arrange
-    _run(sync_db_engine, nested_config(table, modulus=2))
+    run_maintenance(sync_db_engine, nested_config(table, modulus=2))
     metadata = PostgresMetadataProvider(sync_db_engine)
 
     # Act
@@ -1025,18 +1085,27 @@ def test__ensure_partition__existing_branch_with_a_gap__completes_it_for_the_wri
 ) -> None:
     # Arrange
     branch = _build_branch(sync_db_engine, table, modulus=4, remainders=(0, 1, 3))
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(sync_db_engine),
-        metadata=PostgresMetadataProvider(sync_db_engine),
-        locks=PostgresAdvisoryLockManager(sync_db_engine),
-        period_calculator=WeekPeriodCalculator(),
-    )
+    service = make_service(sync_db_engine)
 
     # Act
     service.ensure_partition(nested_config(table, modulus=4), Period(year=2026, week=35))
 
     # Assert
-    assert len(_children(sync_db_engine, branch)) == 4
+    assert len(hash_children_of(sync_db_engine, branch)) == 4
+
+
+def test__ensure_partition__existing_branch_with_a_gap__reports_nothing_created(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange
+    _build_branch(sync_db_engine, table, modulus=4, remainders=(0, 1, 3))
+    service = make_service(sync_db_engine)
+
+    # Act
+    created = service.ensure_partition(nested_config(table, modulus=4), Period(year=2026, week=35))
+
+    # Assert: the window already had its partition; the repair is not a created window.
+    assert created is None
 
 
 # ── Adopting a tree built by another partitioner ────────────────────────────────
@@ -1059,70 +1128,75 @@ class LegacyNamedWeekCalculator(WeekPeriodCalculator):
 def _adopt_foreign_branch(engine: Engine, table: str) -> str:
     """Create a branch named the way another tool would, with one bucket missing."""
     branch = f"{table}_20260824"
-    _exec(engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
-    _exec(
+    exec_sql(engine, f'CREATE TABLE "{branch}" (LIKE "{table}" INCLUDING ALL) PARTITION BY HASH (tenant_id)')
+    exec_sql(
         engine,
         f'CREATE TABLE "{branch}_h0" PARTITION OF "{branch}" FOR VALUES WITH (MODULUS 2, REMAINDER 0)',
     )
-    _exec(
-        engine,
-        f'ALTER TABLE "{table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')",
-    )
+    _attach(engine, table, branch, WEEK_BOUNDS)
     return branch
 
 
-def test__adoption__foreign_named_tree__reconciled_without_recreating_anything(
+def _legacy_named_config(table: str) -> TablePartitionConfig:
+    return TablePartitionConfig(
+        table_name=table,
+        scheme=RangePartitioning(
+            key="created_at",
+            boundaries=TimeBoundaries(calculator=LegacyNamedWeekCalculator()),
+            child=HashPartitioning(key="tenant_id", modulus=2, name_suffix="_h{remainder}"),
+        ),
+        lifecycle=LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(count=12)),
+    )
+
+
+def test__adoption__foreign_named_tree_with_a_custom_calculator__reconciled_without_recreating_anything(
     sync_db_engine: Engine, table: str
 ) -> None:
     # Arrange: an existing tree this library did not create.
     branch = _adopt_foreign_branch(sync_db_engine, table)
-    config = nested_config(table, modulus=2)
-    config = config.model_copy(
-        update={"subpartition": config.subpartition.model_copy(update={"name_suffix": "_h{remainder}"})}
-    )
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(sync_db_engine),
-        metadata=PostgresMetadataProvider(sync_db_engine),
-        locks=PostgresAdvisoryLockManager(sync_db_engine),
-        period_calculator=LegacyNamedWeekCalculator(),
-    )
+    config = _legacy_named_config(table)
 
     # Act
-    with freezegun.freeze_time(FROZEN_WEEK):
-        result = PartitionMaintainer(service).run_maintenance(config)
+    result = run_maintenance(sync_db_engine, config)
 
     # Assert: the gap is filled in place, under the foreign naming convention.
     assert result.success
     assert result.created_count == 0
     assert result.repaired_count == 1
-    assert set(_children(sync_db_engine, branch)) == {f"{branch}_h0", f"{branch}_h1"}
+    assert set(hash_children_of(sync_db_engine, branch)) == {f"{branch}_h0", f"{branch}_h1"}
 
 
-def test__adoption__foreign_names_with_the_default_calculator__fails_loudly_not_silently(
+def test__adoption__custom_calculator__names_new_periods_its_own_way(sync_db_engine: Engine, table: str) -> None:
+    # Arrange / Act
+    result = run_maintenance(sync_db_engine, _legacy_named_config(table))
+
+    # Assert
+    assert result.created_count == 1
+    assert relkind(sync_db_engine, f"{table}_20260824") == "p"
+    assert set(hash_children_of(sync_db_engine, f"{table}_20260824")) == {
+        f"{table}_20260824_h0",
+        f"{table}_20260824_h1",
+    }
+
+
+def test__adoption__foreign_named_tree_with_the_default_calculator__recognised_by_its_bounds(
     sync_db_engine: Engine, table: str
 ) -> None:
-    # Arrange: the same tree, but the calculator cannot recognise its names.
-    _adopt_foreign_branch(sync_db_engine, table)
+    # Arrange: the same tree, under names the default calculator cannot parse.
+    branch = _adopt_foreign_branch(sync_db_engine, table)
 
     # Act
-    result = _run_safe(sync_db_engine, nested_config(table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
-    # Assert: PostgreSQL refuses the overlapping ATTACH and the run reports it,
-    # rather than quietly creating a second partition for the same period.
-    assert not result.success
-    assert "overlap" in str(result.error)
-
-
-def _run_safe(
-    engine: Engine,
-    config: TablePartitionConfig,
-    *,
-    at_time: str = FROZEN_WEEK,
-) -> Any:
-    """Run maintenance without raising, for the cases that are expected to fail."""
-    with freezegun.freeze_time(at_time):
-        return _maintainer(engine).run_maintenance_safe(config)
+    # Assert: ownership is decided by the catalog bounds, not by the name, so
+    # the week is recognised as covered and only its missing bucket is added --
+    # under the configured naming -- rather than a second partition for the same
+    # period being attempted.
+    assert result.success
+    assert result.created_count == 0
+    assert result.repaired_count == 1
+    assert relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") is None
+    assert set(hash_children_of(sync_db_engine, branch)) == {f"{branch}_h0", f"{branch}__h1"}
 
 
 # ── Backfill ────────────────────────────────────────────────────────────────────
@@ -1133,13 +1207,10 @@ def test__backfill__past_periods__creates_each_branch_with_a_complete_bucket_set
 ) -> None:
     # Arrange: data already in the table predates create-ahead's window.
     config = nested_config(table, modulus=2)
-    calculator = WeekPeriodCalculator()
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(sync_db_engine),
-        metadata=PostgresMetadataProvider(sync_db_engine),
-        locks=PostgresAdvisoryLockManager(sync_db_engine),
-        period_calculator=calculator,
-    )
+    boundaries = config.time_boundaries
+    assert boundaries is not None
+    calculator = boundaries.period_calculator
+    service = make_service(sync_db_engine)
 
     with freezegun.freeze_time(FROZEN_WEEK):
         current = calculator.current_period()
@@ -1148,33 +1219,28 @@ def test__backfill__past_periods__creates_each_branch_with_a_complete_bucket_set
     # Act
     created = service.ensure_partitions(config, past)
 
-    # Assert
+    # Assert: reported in chronological order, each with its whole subtree.
     assert [p.relname for p in created] == [
-        f"{table}__2026_w34",
-        f"{table}__2026_w33",
         f"{table}__2026_w32",
+        f"{table}__2026_w33",
+        f"{table}__2026_w34",
     ]
+    assert all(p.subpartition_type == PartitionType.HASH for p in created)
     for suffix in ("__2026_w34", "__2026_w33", "__2026_w32"):
         branch = f"{table}{suffix}"
-        assert _relkind(sync_db_engine, branch) == "p"
-        assert len(_children(sync_db_engine, branch)) == 2
+        assert relkind(sync_db_engine, branch) == "p"
+        assert len(hash_children_of(sync_db_engine, branch)) == 2
 
 
 def test__backfill__rerun__is_idempotent(sync_db_engine: Engine, table: str) -> None:
     # Arrange
     config = nested_config(table, modulus=2)
-    calculator = WeekPeriodCalculator()
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(sync_db_engine),
-        metadata=PostgresMetadataProvider(sync_db_engine),
-        locks=PostgresAdvisoryLockManager(sync_db_engine),
-        period_calculator=calculator,
-    )
+    service = make_service(sync_db_engine)
     periods = [Period(year=2026, week=30), Period(year=2026, week=31)]
     service.ensure_partitions(config, periods)
 
     # Act
-    with _count_ddl(sync_db_engine) as counter:
+    with count_ddl(sync_db_engine) as counter:
         created = service.ensure_partitions(config, periods)
 
     # Assert
@@ -1185,22 +1251,16 @@ def test__backfill__rerun__is_idempotent(sync_db_engine: Engine, table: str) -> 
 def test__backfill__then_maintenance__past_and_future_coexist(sync_db_engine: Engine, table: str) -> None:
     # Arrange
     config = nested_config(table, modulus=2)
-    calculator = WeekPeriodCalculator()
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(sync_db_engine),
-        metadata=PostgresMetadataProvider(sync_db_engine),
-        locks=PostgresAdvisoryLockManager(sync_db_engine),
-        period_calculator=calculator,
-    )
-    service.ensure_partitions(config, [Period(year=2026, week=34)])
+    make_service(sync_db_engine).ensure_partitions(config, [Period(year=2026, week=34)])
 
     # Act: create-ahead now runs over the current week.
-    result = _run(sync_db_engine, config)
+    result = run_maintenance(sync_db_engine, config)
 
     # Assert: backfilled history is untouched, the current week is added.
     assert result.success
-    assert _relkind(sync_db_engine, f"{table}__2026_w34") == "p"
-    assert _relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") == "p"
+    assert result.created_count == 1
+    assert relkind(sync_db_engine, f"{table}__2026_w34") == "p"
+    assert relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") == "p"
 
 
 # ── Identity columns ────────────────────────────────────────────────────────────
@@ -1210,29 +1270,30 @@ def test__identity_root__flat_config__partition_is_created_and_attached(
     sync_db_engine: Engine, identity_table: str
 ) -> None:
     # Arrange / Act
-    result = _run(sync_db_engine, flat_config(identity_table))
+    result = run_maintenance(sync_db_engine, flat_config(identity_table))
 
     # Assert
     assert result.success
-    assert _relkind(sync_db_engine, f"{identity_table}{WEEK_SUFFIX}") == "r"
+    assert relkind(sync_db_engine, f"{identity_table}{WEEK_SUFFIX}") == "r"
+    assert is_attached(sync_db_engine, f"{identity_table}{WEEK_SUFFIX}") is True
 
 
 def test__identity_root__nested_config__whole_branch_is_created(sync_db_engine: Engine, identity_table: str) -> None:
     # Arrange / Act
-    result = _run(sync_db_engine, nested_config(identity_table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(identity_table, modulus=2))
 
     # Assert
     branch = f"{identity_table}{WEEK_SUFFIX}"
     assert result.success
-    assert _relkind(sync_db_engine, branch) == "p"
-    assert len(_children(sync_db_engine, branch)) == 2
+    assert relkind(sync_db_engine, branch) == "p"
+    assert len(hash_children_of(sync_db_engine, branch)) == 2
 
 
 def test__identity_root__inserts__generate_ids_and_keep_generated_columns(
     sync_db_engine: Engine, identity_table: str
 ) -> None:
     # Arrange
-    _run(sync_db_engine, nested_config(identity_table, modulus=2))
+    run_maintenance(sync_db_engine, nested_config(identity_table, modulus=2))
 
     # Act
     with sync_db_engine.begin() as conn:
@@ -1257,13 +1318,13 @@ def test__identity_root__inserts__generate_ids_and_keep_generated_columns(
 
 def test__list__fresh_table__creates_one_partition_per_group(sync_db_engine: Engine, list_table: str) -> None:
     # Arrange / Act
-    result = _run(sync_db_engine, list_config(list_table))
+    result = run_maintenance(sync_db_engine, list_config(list_table))
 
     # Assert
     branch = f"{list_table}{WEEK_SUFFIX}"
     assert result.success
-    assert _relkind(sync_db_engine, branch) == "p"
-    assert _list_children(sync_db_engine, branch) == {
+    assert relkind(sync_db_engine, branch) == "p"
+    assert list_children_of(sync_db_engine, branch) == {
         f"{branch}__eu": ("de", "fr"),
         f"{branch}__us": ("us",),
     }
@@ -1271,16 +1332,16 @@ def test__list__fresh_table__creates_one_partition_per_group(sync_db_engine: Eng
 
 def test__list__include_default__adds_the_catch_all(sync_db_engine: Engine, list_table: str) -> None:
     # Arrange / Act
-    _run(sync_db_engine, list_config(list_table, include_default=True))
+    run_maintenance(sync_db_engine, list_config(list_table, include_default=True))
 
     # Assert
     branch = f"{list_table}{WEEK_SUFFIX}"
-    assert _relkind(sync_db_engine, f"{branch}__other") == "r"
+    assert relkind(sync_db_engine, f"{branch}__other") == "r"
 
 
 def test__list__rows_route_to_the_partition_owning_their_value(sync_db_engine: Engine, list_table: str) -> None:
     # Arrange
-    _run(sync_db_engine, list_config(list_table, include_default=True))
+    run_maintenance(sync_db_engine, list_config(list_table, include_default=True))
     branch = f"{list_table}{WEEK_SUFFIX}"
 
     # Act
@@ -1307,11 +1368,11 @@ def test__list__rows_route_to_the_partition_owning_their_value(sync_db_engine: E
 def test__list__second_run_on_a_converged_tree__executes_zero_ddl(sync_db_engine: Engine, list_table: str) -> None:
     # Arrange
     config = list_config(list_table, include_default=True)
-    _run(sync_db_engine, config)
+    run_maintenance(sync_db_engine, config)
 
     # Act
-    with _count_ddl(sync_db_engine) as counter:
-        result = _run(sync_db_engine, config)
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, config)
 
     # Assert
     assert result.repaired_count == 0
@@ -1321,20 +1382,18 @@ def test__list__second_run_on_a_converged_tree__executes_zero_ddl(sync_db_engine
 def test__list__branch_missing_a_group__creates_only_that_group(sync_db_engine: Engine, list_table: str) -> None:
     # Arrange: only the EU partition exists so far.
     branch = f"{list_table}{WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
-    _exec(sync_db_engine, f"""CREATE TABLE "{branch}__eu" PARTITION OF "{branch}" FOR VALUES IN ('de', 'fr')""")
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{list_table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')",
-    )
+    exec_sql(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
+    exec_sql(sync_db_engine, f"""CREATE TABLE "{branch}__eu" PARTITION OF "{branch}" FOR VALUES IN ('de', 'fr')""")
+    _attach(sync_db_engine, list_table, branch, WEEK_BOUNDS)
 
     # Act
-    result = _run(sync_db_engine, list_config(list_table))
+    result = run_maintenance(sync_db_engine, list_config(list_table))
 
     # Assert
     assert result.repaired_count == 1
-    assert set(_list_children(sync_db_engine, branch)) == {f"{branch}__eu", f"{branch}__us"}
+    assert set(list_children_of(sync_db_engine, branch)) == {f"{branch}__eu", f"{branch}__us"}
+    assert result.maintenance_plan is not None
+    assert [op.reason for op in result.maintenance_plan.creates] == [Reason.LIST_GROUP_MISSING]
 
 
 def test__list__group_matched_by_values_under_a_foreign_name__left_alone(
@@ -1342,21 +1401,17 @@ def test__list__group_matched_by_values_under_a_foreign_name__left_alone(
 ) -> None:
     # Arrange: another tool created the same value set under a different name.
     branch = f"{list_table}{WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
-    _exec(sync_db_engine, f"""CREATE TABLE "{branch}__europe" PARTITION OF "{branch}" FOR VALUES IN ('de', 'fr')""")
-    _exec(sync_db_engine, f"""CREATE TABLE "{branch}__usa" PARTITION OF "{branch}" FOR VALUES IN ('us')""")
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{list_table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')",
-    )
+    exec_sql(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
+    exec_sql(sync_db_engine, f"""CREATE TABLE "{branch}__europe" PARTITION OF "{branch}" FOR VALUES IN ('de', 'fr')""")
+    exec_sql(sync_db_engine, f"""CREATE TABLE "{branch}__usa" PARTITION OF "{branch}" FOR VALUES IN ('us')""")
+    _attach(sync_db_engine, list_table, branch, WEEK_BOUNDS)
 
     # Act
-    result = _run(sync_db_engine, list_config(list_table))
+    result = run_maintenance(sync_db_engine, list_config(list_table))
 
     # Assert: matched by the values they own, so nothing is duplicated.
     assert result.repaired_count == 0
-    assert set(_list_children(sync_db_engine, branch)) == {f"{branch}__europe", f"{branch}__usa"}
+    assert set(list_children_of(sync_db_engine, branch)) == {f"{branch}__europe", f"{branch}__usa"}
 
 
 def test__list__value_owned_by_another_partition__reported_and_not_mutated(
@@ -1364,28 +1419,27 @@ def test__list__value_owned_by_another_partition__reported_and_not_mutated(
 ) -> None:
     # Arrange: "de" sits in a partition that is not the configured EU group.
     branch = f"{list_table}{WEEK_SUFFIX}"
-    _exec(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
-    _exec(sync_db_engine, f"""CREATE TABLE "{branch}__dach" PARTITION OF "{branch}" FOR VALUES IN ('de', 'at')""")
-    _exec(
-        sync_db_engine,
-        f'ALTER TABLE "{list_table}" ATTACH PARTITION "{branch}" '
-        f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')",
-    )
+    exec_sql(sync_db_engine, f'CREATE TABLE "{branch}" (LIKE "{list_table}" INCLUDING ALL) PARTITION BY LIST (region)')
+    exec_sql(sync_db_engine, f"""CREATE TABLE "{branch}__dach" PARTITION OF "{branch}" FOR VALUES IN ('de', 'at')""")
+    _attach(sync_db_engine, list_table, branch, WEEK_BOUNDS)
 
     # Act
-    result = _run(sync_db_engine, list_config(list_table))
+    result = run_maintenance(sync_db_engine, list_config(list_table))
 
     # Assert: the non-conflicting group is still created; the clash is reported.
     assert result.success
-    assert set(_list_children(sync_db_engine, branch)) == {f"{branch}__dach", f"{branch}__us"}
+    assert set(list_children_of(sync_db_engine, branch)) == {f"{branch}__dach", f"{branch}__us"}
     issues = [i for i in result.issues if i.partition_name == f"public.{branch}"]
     assert len(issues) == 1
     assert "'de'" in issues[0].error
+    assert result.maintenance_plan is not None
+    reasons = {f.reason for f in result.maintenance_plan.findings if f.partition_name == f"public.{branch}"}
+    assert reasons == {FindingReason.LIST_VALUES_CONFLICT}
 
 
 def test__list__over_hash__builds_and_routes_through_both_levels(sync_db_engine: Engine, list_table: str) -> None:
     # Arrange: RANGE(created_at) -> LIST(region) -> HASH(tenant_id)
-    _run(sync_db_engine, list_config(list_table, inner_modulus=2))
+    run_maintenance(sync_db_engine, list_config(list_table, inner_modulus=2))
     branch = f"{list_table}{WEEK_SUFFIX}"
 
     # Act
@@ -1400,58 +1454,47 @@ def test__list__over_hash__builds_and_routes_through_both_levels(sync_db_engine:
         leaf = str(routed.scalar())
 
     # Assert
-    assert set(_children(sync_db_engine, f"{branch}__eu")) == {f"{branch}__eu__h0", f"{branch}__eu__h1"}
+    assert set(hash_children_of(sync_db_engine, f"{branch}__eu")) == {f"{branch}__eu__h0", f"{branch}__eu__h1"}
     assert leaf in {f"{branch}__eu__h0", f"{branch}__eu__h1"}
 
 
 def test__list__expired_branch__dropped_with_its_whole_subtree(sync_db_engine: Engine, list_table: str) -> None:
     # Arrange
     config = list_config(list_table, retention=1)
-    with freezegun.freeze_time("2026-08-10"):
-        _maintainer(sync_db_engine).run_maintenance(config)
+    run_maintenance(sync_db_engine, config, at_time="2026-08-10")
     old_branch = f"{list_table}__2026_w33"
-    assert _relkind(sync_db_engine, old_branch) == "p"
+    assert relkind(sync_db_engine, old_branch) == "p"
 
     # Act
-    result = _run(sync_db_engine, config)
+    result = run_maintenance(sync_db_engine, config)
 
     # Assert
     assert result.dropped_count == 1
-    assert _relkind(sync_db_engine, old_branch) is None
-    assert _relkind(sync_db_engine, f"{old_branch}__eu") is None
+    assert relkind(sync_db_engine, old_branch) is None
+    assert relkind(sync_db_engine, f"{old_branch}__eu") is None
 
 
 # ── Static roots (no time dimension) ────────────────────────────────────────────
 
 
-def _static_maintainer(engine: Engine) -> PartitionMaintainer:
-    """A lifecycle service with no period calculator, as a static root needs."""
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(engine),
-        metadata=PostgresMetadataProvider(engine),
-        locks=PostgresAdvisoryLockManager(engine),
-    )
-    return PartitionMaintainer(service)
-
-
 def test__hash_root__fresh_table__creates_every_bucket(sync_db_engine: Engine, hash_root_table: str) -> None:
     # Arrange / Act
-    result = _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=4))
+    result = run_maintenance(sync_db_engine, hash_root_config(hash_root_table, modulus=4))
 
     # Assert: the table's own partitions, not a subtree inside a period.
     assert result.success
     assert result.created_count == 4
-    assert _children(sync_db_engine, hash_root_table) == {f"{hash_root_table}__h{r}": (4, r) for r in range(4)}
+    assert hash_children_of(sync_db_engine, hash_root_table) == {f"{hash_root_table}__h{r}": (4, r) for r in range(4)}
 
 
 def test__hash_root__second_run__executes_zero_ddl(sync_db_engine: Engine, hash_root_table: str) -> None:
     # Arrange
     config = hash_root_config(hash_root_table, modulus=2)
-    _static_maintainer(sync_db_engine).run_maintenance(config)
+    run_maintenance(sync_db_engine, config)
 
     # Act
-    with _count_ddl(sync_db_engine) as counter:
-        result = _static_maintainer(sync_db_engine).run_maintenance(config)
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, config)
 
     # Assert
     assert result.created_count == 0
@@ -1461,23 +1504,23 @@ def test__hash_root__second_run__executes_zero_ddl(sync_db_engine: Engine, hash_
 def test__hash_root__missing_bucket__is_repaired(sync_db_engine: Engine, hash_root_table: str) -> None:
     # Arrange: an incomplete set, as a partial migration would leave.
     for remainder in (0, 1, 3):
-        _exec(
+        exec_sql(
             sync_db_engine,
             f'CREATE TABLE "{hash_root_table}__h{remainder}" PARTITION OF "{hash_root_table}" '
             f"FOR VALUES WITH (MODULUS 4, REMAINDER {remainder})",
         )
 
     # Act
-    result = _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=4))
+    result = run_maintenance(sync_db_engine, hash_root_config(hash_root_table, modulus=4))
 
     # Assert
     assert result.created_count == 1
-    assert len(_children(sync_db_engine, hash_root_table)) == 4
+    assert len(hash_children_of(sync_db_engine, hash_root_table)) == 4
 
 
 def test__hash_root__nothing_is_ever_pruned(sync_db_engine: Engine, hash_root_table: str) -> None:
     # Arrange / Act
-    result = _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2))
+    result = run_maintenance(sync_db_engine, hash_root_config(hash_root_table, modulus=2))
 
     # Assert: a static root has no periods, so nothing ages out of it.
     assert result.detached_count == 0
@@ -1486,7 +1529,7 @@ def test__hash_root__nothing_is_ever_pruned(sync_db_engine: Engine, hash_root_ta
 
 def test__hash_root__rows_route_into_the_buckets(sync_db_engine: Engine, hash_root_table: str) -> None:
     # Arrange
-    _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2))
+    run_maintenance(sync_db_engine, hash_root_config(hash_root_table, modulus=2))
 
     # Act
     with sync_db_engine.begin() as conn:
@@ -1495,10 +1538,7 @@ def test__hash_root__rows_route_into_the_buckets(sync_db_engine: Engine, hash_ro
                 text(f'INSERT INTO "{hash_root_table}" (tenant_id) VALUES (:t)'),  # noqa: S608
                 {"t": tenant},
             )
-        rows = conn.execute(
-            text(f'SELECT DISTINCT tableoid::regclass::text FROM "{hash_root_table}"')  # noqa: S608
-        )
-        leaves = {str(r[0]) for r in rows.fetchall()}
+    leaves = routed_leaves(sync_db_engine, hash_root_table)
 
     # Assert
     assert leaves <= {f"{hash_root_table}__h0", f"{hash_root_table}__h1"}
@@ -1507,35 +1547,96 @@ def test__hash_root__rows_route_into_the_buckets(sync_db_engine: Engine, hash_ro
 
 def test__hash_root__with_a_nested_level__builds_both(sync_db_engine: Engine, hash_root_table: str) -> None:
     # Arrange / Act: HASH(tenant_id) -> HASH(id)
-    _static_maintainer(sync_db_engine).run_maintenance(hash_root_config(hash_root_table, modulus=2, inner_modulus=2))
+    run_maintenance(sync_db_engine, hash_root_config(hash_root_table, modulus=2, inner_modulus=2))
 
     # Assert
-    assert set(_children(sync_db_engine, hash_root_table)) == {
+    assert set(hash_children_of(sync_db_engine, hash_root_table)) == {
         f"{hash_root_table}__h0",
         f"{hash_root_table}__h1",
     }
-    assert set(_children(sync_db_engine, f"{hash_root_table}__h0")) == {
+    assert set(hash_children_of(sync_db_engine, f"{hash_root_table}__h0")) == {
         f"{hash_root_table}__h0__h0",
         f"{hash_root_table}__h0__h1",
     }
 
 
-def test__list_root__fresh_table__creates_one_partition_per_group(sync_db_engine: Engine, list_root_table: str) -> None:
+def test__tasks_root__hash_by_task_id_modulus_8__creates_every_bucket(sync_db_engine: Engine, tasks_table: str) -> None:
     # Arrange / Act
-    result = _static_maintainer(sync_db_engine).run_maintenance(list_root_config(list_root_table, include_default=True))
+    result = run_maintenance(sync_db_engine, tasks_config(tasks_table, modulus=8))
 
     # Assert
     assert result.success
-    assert _list_children(sync_db_engine, list_root_table) == {
+    assert result.created_count == 8
+    assert result.detached_count == 0
+    assert hash_children_of(sync_db_engine, tasks_table) == {f"{tasks_table}__h{r}": (8, r) for r in range(8)}
+
+
+def test__tasks_root__rows__route_into_the_buckets(sync_db_engine: Engine, tasks_table: str) -> None:
+    # Arrange
+    run_maintenance(sync_db_engine, tasks_config(tasks_table, modulus=8))
+
+    # Act
+    exec_sql(
+        sync_db_engine,
+        f"INSERT INTO \"{tasks_table}\" (task_id, payload) SELECT g, 'x' FROM generate_series(1, 200) g",  # noqa: S608
+    )
+    leaves = routed_leaves(sync_db_engine, tasks_table)
+
+    # Assert: two hundred ids spread over every bucket.
+    assert leaves == {f"{tasks_table}__h{r}" for r in range(8)}
+
+
+def test__tasks_root__second_run__executes_zero_ddl(sync_db_engine: Engine, tasks_table: str) -> None:
+    # Arrange
+    config = tasks_config(tasks_table, modulus=8)
+    run_maintenance(sync_db_engine, config)
+
+    # Act
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, config)
+
+    # Assert
+    assert result.created_count == 0
+    assert result.maintenance_plan is not None
+    assert result.maintenance_plan.is_noop
+    assert counter.statements == []
+
+
+def test__tasks_root__dropped_bucket__is_repaired_on_the_next_run(sync_db_engine: Engine, tasks_table: str) -> None:
+    # Arrange
+    config = tasks_config(tasks_table, modulus=8)
+    run_maintenance(sync_db_engine, config)
+    exec_sql(sync_db_engine, f'DROP TABLE "{tasks_table}__h3"')
+
+    # Act
+    result = run_maintenance(sync_db_engine, config)
+
+    # Assert
+    assert result.created_count == 1
+    assert result.maintenance_plan is not None
+    assert [(op.target, op.reason) for op in result.maintenance_plan.creates] == [
+        (f"public.{tasks_table}__h3", Reason.HASH_GAP)
+    ]
+    assert hash_children_of(sync_db_engine, tasks_table) == {f"{tasks_table}__h{r}": (8, r) for r in range(8)}
+
+
+def test__list_root__fresh_table__creates_one_partition_per_group(sync_db_engine: Engine, list_root_table: str) -> None:
+    # Arrange / Act
+    result = run_maintenance(sync_db_engine, list_root_config(list_root_table, include_default=True))
+
+    # Assert
+    assert result.success
+    assert result.created_count == 3
+    assert list_children_of(sync_db_engine, list_root_table) == {
         f"{list_root_table}__eu": ("de", "fr"),
         f"{list_root_table}__us": ("us",),
     }
-    assert _relkind(sync_db_engine, f"{list_root_table}__other") == "r"
+    assert relkind(sync_db_engine, f"{list_root_table}__other") == "r"
 
 
 def test__list_root__rows_route_by_value(sync_db_engine: Engine, list_root_table: str) -> None:
     # Arrange
-    _static_maintainer(sync_db_engine).run_maintenance(list_root_config(list_root_table, include_default=True))
+    run_maintenance(sync_db_engine, list_root_config(list_root_table, include_default=True))
 
     # Act
     with sync_db_engine.begin() as conn:
@@ -1557,19 +1658,132 @@ def test__list_root__rows_route_by_value(sync_db_engine: Engine, list_root_table
     }
 
 
-def test__static_root__time_based_api_without_a_calculator__refused_clearly(
+def test__static_root__time_based_config__refused_as_a_type_mismatch(
     sync_db_engine: Engine, hash_root_table: str
 ) -> None:
     # Arrange
-    service = PartitionLifecycleService(
-        repo=PostgresPartitionRepository(sync_db_engine),
-        metadata=PostgresMetadataProvider(sync_db_engine),
-        locks=PostgresAdvisoryLockManager(sync_db_engine),
-    )
+    service = make_service(sync_db_engine)
 
-    # Act / Assert: create-ahead is period arithmetic and there are no periods.
-    with pytest.raises(InvalidPartitionConfigError, match="period_calculator"):
+    # Act / Assert: the config describes a RANGE root; the table is HASH.
+    with pytest.raises(InvalidPartitionConfigError, match="type mismatch"):
         service.create_future_partitions(flat_config(hash_root_table))
+    with pytest.raises(InvalidPartitionConfigError, match="progression root"):
+        service.ensure_partitions(hash_root_config(hash_root_table), [Period(year=2026, week=35)])
+
+
+# ── LIST root with a monthly progression inside each group ──────────────────────
+
+
+def test__tiered__fresh_table__creates_each_group_with_the_current_and_ahead_months_inside(
+    sync_db_engine: Engine, tiered_table: str
+) -> None:
+    # Arrange / Act
+    result = run_maintenance(sync_db_engine, tiered_config(tiered_table, create_ahead=2))
+
+    # Assert: two group branches, each carrying its own two months.
+    assert result.success
+    assert result.created_count == 2
+    for group in ("free", "paid"):
+        branch = f"{tiered_table}__{group}"
+        assert relkind(sync_db_engine, branch) == "p"
+        assert set(range_children_of(sync_db_engine, branch)) == {f"{branch}__2026_08", f"{branch}__2026_09"}
+    assert list_children_of(sync_db_engine, tiered_table) == {
+        f"{tiered_table}__free": ("free",),
+        f"{tiered_table}__paid": ("pro", "enterprise"),
+    }
+
+
+def test__tiered__rows__route_into_the_group_then_the_month(sync_db_engine: Engine, tiered_table: str) -> None:
+    # Arrange
+    run_maintenance(sync_db_engine, tiered_config(tiered_table, create_ahead=2))
+
+    # Act
+    with sync_db_engine.begin() as conn:
+        for tier, day in (("free", 25), ("pro", 26), ("enterprise", 28)):
+            conn.execute(
+                text(f'INSERT INTO "{tiered_table}" (tier, created_at) VALUES (:t, :d)'),  # noqa: S608
+                {"t": tier, "d": datetime(2026, 8, day, 10, tzinfo=UTC)},
+            )
+        conn.execute(
+            text(f'INSERT INTO "{tiered_table}" (tier, created_at) VALUES (:t, :d)'),  # noqa: S608
+            {"t": "free", "d": datetime(2026, 9, 3, 10, tzinfo=UTC)},
+        )
+        rows = conn.execute(
+            text(f'SELECT tier, created_at, tableoid::regclass::text FROM "{tiered_table}" ORDER BY created_at')  # noqa: S608
+        )
+        routed = [(str(r[0]), str(r[2])) for r in rows.fetchall()]
+
+    # Assert
+    assert routed == [
+        ("free", f"{tiered_table}__free__2026_08"),
+        ("pro", f"{tiered_table}__paid__2026_08"),
+        ("enterprise", f"{tiered_table}__paid__2026_08"),
+        ("free", f"{tiered_table}__free__2026_09"),
+    ]
+
+
+def test__tiered__later_month__appears_inside_each_existing_group(sync_db_engine: Engine, tiered_table: str) -> None:
+    # Arrange
+    config = tiered_config(tiered_table, create_ahead=2)
+    run_maintenance(sync_db_engine, config)
+
+    # Act: a month later the horizon moves; the groups themselves already exist.
+    result = run_maintenance(sync_db_engine, config, at_time="2026-09-15")
+
+    # Assert
+    assert result.success
+    assert result.created_count == 2
+    for group in ("free", "paid"):
+        branch = f"{tiered_table}__{group}"
+        assert set(range_children_of(sync_db_engine, branch)) == {
+            f"{branch}__2026_08",
+            f"{branch}__2026_09",
+            f"{branch}__2026_10",
+        }
+    assert child_count(sync_db_engine, tiered_table) == 2
+
+
+def test__tiered__second_run__executes_zero_ddl(sync_db_engine: Engine, tiered_table: str) -> None:
+    # Arrange
+    config = tiered_config(tiered_table)
+    run_maintenance(sync_db_engine, config)
+
+    # Act
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, config)
+
+    # Assert
+    assert result.created_count == 0
+    assert counter.statements == []
+
+
+def test__tiered__old_month_inside_a_group__detached_and_dropped_by_retention(
+    sync_db_engine: Engine, tiered_table: str
+) -> None:
+    # Arrange: August and September exist in both groups; retention keeps two months.
+    config = tiered_config(tiered_table, create_ahead=2, retention=2)
+    run_maintenance(sync_db_engine, config)
+
+    # Act: in October, August has aged out of every group.
+    result = run_maintenance(sync_db_engine, config, at_time="2026-10-15")
+
+    # Assert
+    assert result.success
+    assert result.detached_count == 2
+    assert result.dropped_count == 2
+    for group in ("free", "paid"):
+        branch = f"{tiered_table}__{group}"
+        assert relkind(sync_db_engine, f"{branch}__2026_08") is None
+        assert set(range_children_of(sync_db_engine, branch)) == {
+            f"{branch}__2026_09",
+            f"{branch}__2026_10",
+            f"{branch}__2026_11",
+        }
+    assert result.maintenance_plan is not None
+    assert {op.parent_name for op in result.maintenance_plan.detaches} == {
+        f"public.{tiered_table}__free",
+        f"public.{tiered_table}__paid",
+    }
 
 
 # ── Composite partition keys ────────────────────────────────────────────────────
@@ -1579,27 +1793,22 @@ def test__composite_key__fresh_table__creates_the_period_partition(
     sync_db_engine: Engine, composite_table: str
 ) -> None:
     # Arrange / Act
-    result = _run(sync_db_engine, composite_config(composite_table))
+    result = run_maintenance(sync_db_engine, composite_config(composite_table))
 
     # Assert
     assert result.success
     assert result.created_count == 1
-    assert _relkind(sync_db_engine, f"{composite_table}{WEEK_SUFFIX}") == "r"
+    assert relkind(sync_db_engine, f"{composite_table}{WEEK_SUFFIX}") == "r"
 
 
 def test__composite_key__bounds_pad_trailing_columns_with_minvalue(
     sync_db_engine: Engine, composite_table: str
 ) -> None:
     # Arrange
-    _run(sync_db_engine, composite_config(composite_table))
+    run_maintenance(sync_db_engine, composite_config(composite_table))
 
     # Act
-    with sync_db_engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = to_regclass(:n)"),
-            {"n": f'"{composite_table}{WEEK_SUFFIX}"'},
-        )
-        bounds = str(result.scalar())
+    bounds = _partition_bound_expr(sync_db_engine, f"{composite_table}{WEEK_SUFFIX}")
 
     # Assert
     assert bounds.count("MINVALUE") == 2
@@ -1609,7 +1818,7 @@ def test__composite_key__bounds_pad_trailing_columns_with_minvalue(
 
 def test__composite_key__rows_route_by_the_leading_column_alone(sync_db_engine: Engine, composite_table: str) -> None:
     # Arrange
-    _run(sync_db_engine, composite_config(composite_table, create_ahead=2))
+    run_maintenance(sync_db_engine, composite_config(composite_table, create_ahead=2))
     branch = f"{composite_table}{WEEK_SUFFIX}"
 
     # Act: wildly different trailing values, same period.
@@ -1619,10 +1828,7 @@ def test__composite_key__rows_route_by_the_leading_column_alone(sync_db_engine: 
                 text(f'INSERT INTO "{composite_table}" (tenant_id, created_at) VALUES (:t, :d)'),  # noqa: S608
                 {"t": tenant, "d": datetime(2026, 8, 25, 10, tzinfo=UTC)},
             )
-        rows = conn.execute(
-            text(f'SELECT DISTINCT tableoid::regclass::text FROM "{composite_table}"')  # noqa: S608
-        )
-        leaves = {str(r[0]) for r in rows.fetchall()}
+    leaves = routed_leaves(sync_db_engine, composite_table)
 
     # Assert: the trailing column does not affect placement.
     assert leaves == {branch}
@@ -1631,11 +1837,11 @@ def test__composite_key__rows_route_by_the_leading_column_alone(sync_db_engine: 
 def test__composite_key__second_run__executes_zero_ddl(sync_db_engine: Engine, composite_table: str) -> None:
     # Arrange
     config = composite_config(composite_table)
-    _run(sync_db_engine, config)
+    run_maintenance(sync_db_engine, config)
 
     # Act
-    with _count_ddl(sync_db_engine) as counter:
-        result = _run(sync_db_engine, config)
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, config)
 
     # Assert
     assert result.created_count == 0
@@ -1645,18 +1851,17 @@ def test__composite_key__second_run__executes_zero_ddl(sync_db_engine: Engine, c
 def test__composite_key__retention__prunes_by_the_leading_bound(sync_db_engine: Engine, composite_table: str) -> None:
     # Arrange
     config = composite_config(composite_table, retention=1)
-    with freezegun.freeze_time("2026-08-10"):
-        _maintainer(sync_db_engine).run_maintenance(config)
+    run_maintenance(sync_db_engine, config, at_time="2026-08-10")
     old = f"{composite_table}__2026_w33"
-    assert _relkind(sync_db_engine, old) == "r"
+    assert relkind(sync_db_engine, old) == "r"
 
     # Act
-    result = _run(sync_db_engine, config)
+    result = run_maintenance(sync_db_engine, config)
 
     # Assert: parsing a composite bound yields the leading value, so retention
     # compares the same instant it would for a single-column key.
     assert result.dropped_count == 1
-    assert _relkind(sync_db_engine, old) is None
+    assert relkind(sync_db_engine, old) is None
 
 
 def test__composite_key__introspection__reports_the_key_in_key_order(
@@ -1676,11 +1881,11 @@ def test__composite_key__config_disagreeing_with_the_table__refused(
     sync_db_engine: Engine, composite_table: str
 ) -> None:
     # Arrange: the real key is (created_at, tenant_id).
-    config = composite_config(composite_table).model_copy(update={"trailing_partition_columns": ("id",)})
+    config = composite_config(composite_table, trailing=("id",))
 
     # Act / Assert
-    with freezegun.freeze_time(FROZEN_WEEK), pytest.raises(InvalidPartitionConfigError, match="key mismatch"):
-        _maintainer(sync_db_engine).run_maintenance(config)
+    with pytest.raises(InvalidPartitionConfigError, match="key mismatch"):
+        run_maintenance(sync_db_engine, config)
 
 
 # ── Keys and bounds the catalog spells differently from the config ──────────────
@@ -1701,12 +1906,12 @@ def test__nullable_trailing_key__null_row_in_default__attach_still_succeeds(
         )
 
     # Act
-    result = _run(sync_db_engine, nullable_composite_config(nullable_composite_table))
+    result = run_maintenance(sync_db_engine, nullable_composite_config(nullable_composite_table))
 
     # Assert: moving the NULL row out would be rejected with the very error the
     # move exists to clear, and the retry would never converge.
     assert result.success
-    assert _relkind(sync_db_engine, f"{nullable_composite_table}{WEEK_SUFFIX}") == "r"
+    assert relkind(sync_db_engine, f"{nullable_composite_table}{WEEK_SUFFIX}") == "r"
 
     with sync_db_engine.begin() as conn:
         rows = conn.execute(
@@ -1733,6 +1938,8 @@ def test__expression_partition_key__is_refused_rather_than_silently_shortened(
     # position would report a shorter key than the table really has.
     with pytest.raises(InvalidPartitionConfigError, match="expression"):
         metadata.get_partition_columns(expression_table)
+    with pytest.raises(InvalidPartitionConfigError, match="expression"):
+        run_maintenance(sync_db_engine, flat_config(expression_table))
 
 
 def test__date_shaped_bound_that_is_not_a_date__reports_not_closed(
@@ -1741,13 +1948,11 @@ def test__date_shaped_bound_that_is_not_a_date__reports_not_closed(
     # Arrange: a sortable identifier whose prefix gets past any regex guard
     # worth writing and still fails the cast.
     partition = f"{sortable_id_table}__early"
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(
-                f'CREATE TABLE "{partition}" PARTITION OF "{sortable_id_table}" '
-                f"FOR VALUES FROM ('2020-01-01-aaaa') TO ('2026-08-28-a1b2c3')"
-            )
-        )
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{partition}" PARTITION OF "{sortable_id_table}" '
+        f"FOR VALUES FROM ('2020-01-01-aaaa') TO ('2026-08-28-a1b2c3')",
+    )
     metadata = PostgresMetadataProvider(sync_db_engine)
 
     # Act
@@ -1762,19 +1967,14 @@ def test__list_partition_holding_null__is_not_read_as_the_string_null(
     sync_db_engine: Engine, nullable_list_table: str
 ) -> None:
     # Arrange
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(
-                f'CREATE TABLE "{nullable_list_table}__unknown" '
-                f'PARTITION OF "{nullable_list_table}" FOR VALUES IN (NULL)'
-            )
-        )
-        conn.execute(
-            text(
-                f'CREATE TABLE "{nullable_list_table}__literal" '
-                f"""PARTITION OF "{nullable_list_table}" FOR VALUES IN ('NULL')"""
-            )
-        )
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{nullable_list_table}__unknown" PARTITION OF "{nullable_list_table}" FOR VALUES IN (NULL)',
+    )
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{nullable_list_table}__literal" PARTITION OF "{nullable_list_table}" FOR VALUES IN (\'NULL\')',
+    )
     metadata = PostgresMetadataProvider(sync_db_engine)
 
     # Act
@@ -1807,7 +2007,7 @@ def test__default_conflict__default_partition_ordered_differently__values_are_no
 
     # Act: the DEFAULT holds a row belonging to the period being created, so
     # the reconcile-and-retry path runs unattended.
-    result = _run(sync_db_engine, flat_config(table))
+    result = run_maintenance(sync_db_engine, flat_config(table))
 
     # Assert: moving by position would put NOTE-A in label with the source row
     # already deleted, and report success while doing it.
@@ -1823,16 +2023,15 @@ def test__bare_unique_index__missing_the_hash_column__is_refused_before_any_ddl(
 ) -> None:
     # Arrange: uniqueness comes from an index with no constraint behind it.
     table = bare_unique_index_table
-    with sync_db_engine.begin() as conn:
-        conn.execute(text(f'CREATE UNIQUE INDEX ON "{table}" (id, created_at)'))
+    exec_sql(sync_db_engine, f'CREATE UNIQUE INDEX ON "{table}" (id, created_at)')
 
     # Act / Assert: LIKE ... INCLUDING ALL copies the index, so PostgreSQL
     # rejects the branch exactly as it would a named constraint -- mid-run,
     # after other tables have already been changed.
     with pytest.raises(InvalidPartitionConfigError, match="tenant_id"):
-        _run(sync_db_engine, nested_config(table, modulus=2))
+        run_maintenance(sync_db_engine, nested_config(table, modulus=2))
 
-    assert _relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") is None
+    assert relkind(sync_db_engine, f"{table}{WEEK_SUFFIX}") is None
 
 
 def test__expression_key_branch__is_reported_rather_than_treated_as_a_match(
@@ -1842,24 +2041,20 @@ def test__expression_key_branch__is_reported_rather_than_treated_as_a_match(
     # configured column. The catalog names only the column, so a shortened key
     # compares equal to a one-column spec.
     branch = f"{no_constraint_table}{WEEK_SUFFIX}"
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(
-                f'CREATE TABLE "{branch}" (LIKE "{no_constraint_table}" INCLUDING ALL EXCLUDING IDENTITY) '
-                f"PARTITION BY HASH (tenant_id, (id + 1))"
-            )
-        )
-        conn.execute(
-            text(
-                f'ALTER TABLE "{no_constraint_table}" ATTACH PARTITION "{branch}" '
-                f"FOR VALUES FROM ('{WEEK_BOUNDS[0]}') TO ('{WEEK_BOUNDS[1]}')"
-            )
-        )
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{branch}" (LIKE "{no_constraint_table}" INCLUDING ALL EXCLUDING IDENTITY) '
+        f"PARTITION BY HASH (tenant_id, (id + 1))",
+    )
+    _attach(sync_db_engine, no_constraint_table, branch, WEEK_BOUNDS)
 
     # Act
-    result = _run(sync_db_engine, nested_config(no_constraint_table, modulus=2))
+    result = run_maintenance(sync_db_engine, nested_config(no_constraint_table, modulus=2))
 
     # Assert: planning against it would build bounds of the wrong arity.
     assert result.success
     reasons = {issue.error for issue in result.issues}
     assert any("expression" in reason for reason in reasons)
+    assert result.maintenance_plan is not None
+    findings = {f.reason for f in result.maintenance_plan.findings if f.partition_name == f"public.{branch}"}
+    assert findings == {FindingReason.COLUMN_MISMATCH}

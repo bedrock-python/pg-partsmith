@@ -1,9 +1,15 @@
+"""End-to-end lifecycle scenarios over the ordinary monthly table (sync)."""
+
+from __future__ import annotations
+
 from datetime import UTC, datetime
 
+import freezegun
 import pytest
 from dateutil.parser import isoparse
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from pg_partsmith.entities import (
     MaintenanceIssueStep,
@@ -13,11 +19,15 @@ from pg_partsmith.entities import (
     TablePartitionConfig,
 )
 from pg_partsmith.exceptions import PartitionAttachedError
+from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.plan import FindingReason, Reason
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
+from pg_partsmith.topology import RangeBounds
 from tests.integration.sync.builder import PartitioningScenarioBuilder
 
+pytestmark = pytest.mark.integration
 
-@pytest.mark.integration
+
 def test__scenario__fresh_table__creates_partitions_ahead_as_configured(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -36,7 +46,6 @@ def test__scenario__fresh_table__creates_partitions_ahead_as_configured(
     ctx.assert_partition_attached(f"{ctx.table_name}__2025_01")
 
 
-@pytest.mark.integration
 def test__scenario__second_run_same_time__creates_zero_partitions(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -50,10 +59,11 @@ def test__scenario__second_run_same_time__creates_zero_partitions(
     # Assert
     assert r1.created_count == 1
     assert r2.created_count == 0
+    assert r2.maintenance_plan is not None
+    assert r2.maintenance_plan.is_noop
     ctx.assert_partition_count(1)
 
 
-@pytest.mark.integration
 def test__scenario__partitions_beyond_retention__pruned(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -67,22 +77,19 @@ def test__scenario__partitions_beyond_retention__pruned(
     result = ctx.run_maintenance(at_time="2024-04-01")
 
     # Assert
-    assert result.dropped_count >= 2
+    assert result.detached_count == 2
+    assert result.dropped_count == 2
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2024_01")
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2024_02")
 
 
-@pytest.mark.integration
 def test__scenario__detached_orphan__cleaned_on_next_run(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
     # Arrange
     partition_name = f"{sync_partition_builder._table_name}__2024_01"
-    ctx = (
-        sync_partition_builder.with_detached_partition(partition_name, "2024-01-01", "2024-02-01")
-        .with_retention(1)
-        .build()
-    )
+    builder = sync_partition_builder.with_detached_partition(partition_name, "2024-01-01", "2024-02-01")
+    ctx = builder.with_retention(1).build()
     ctx.assert_partition_exists(partition_name)
     ctx.assert_partition_detached(partition_name)
 
@@ -90,12 +97,13 @@ def test__scenario__detached_orphan__cleaned_on_next_run(
     result = ctx.run_maintenance(at_time="2024-04-01")
 
     # Assert
-    assert result.dropped_count >= 1
+    assert result.dropped_count == 1
+    assert result.maintenance_plan is not None
+    assert [op.reason for op in result.maintenance_plan.drops] == [Reason.GRACE_ELAPSED]
     ctx.assert_partition_not_exists(partition_name)
 
 
-@pytest.mark.integration
-def test__scenario__orphan_partition_within_retention__auto_attached(
+def test__scenario__orphan_partition_within_create_ahead__reattached_not_recreated(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
     # Arrange — partition is needed (Dec) but detached
@@ -107,23 +115,29 @@ def test__scenario__orphan_partition_within_retention__auto_attached(
     )
     ctx.assert_partition_exists(partition_name)
     ctx.assert_partition_detached(partition_name)
+    oid_before = (ctx.metadata.get_relation_oid(partition_name)) or 0
 
     # Act
-    ctx.run_maintenance(at_time="2024-12-01")
+    result = ctx.run_maintenance(at_time="2024-12-01")
 
-    # Assert
+    # Assert — the same relation came back; nothing was created in its place
+    assert result.attached_count == 1
+    assert result.created_count == 0
+    assert result.maintenance_plan is not None
+    assert [op.reason for op in result.maintenance_plan.attaches] == [Reason.REATTACH]
     ctx.assert_partition_attached(partition_name)
+    assert ctx.metadata.get_relation_oid(partition_name) == oid_before
 
 
-@pytest.mark.integration
 def test__scenario__fk_on_partition__constraint_removed_before_drop(
     sync_partition_builder: PartitioningScenarioBuilder,
     sync_db_engine: Engine,
+    sync_db_session: Session,
 ) -> None:
     # Arrange
-    ref_table = "referenced_table"
-    with sync_db_engine.begin() as conn:
-        conn.execute(text(f"CREATE TABLE {ref_table} (id BIGINT PRIMARY KEY)"))
+    ref_table = f"referenced_{sync_partition_builder._table_name}"
+    sync_db_session.execute(text(f"CREATE TABLE {ref_table} (id BIGINT PRIMARY KEY)"))
+    sync_db_session.commit()
 
     partition_name = f"{sync_partition_builder._table_name}__2024_01"
     ctx = (
@@ -132,20 +146,20 @@ def test__scenario__fk_on_partition__constraint_removed_before_drop(
         .with_retention(1)
         .build()
     )
-    ctx.repo.detach_partition(ctx.table_name, partition_name, concurrent=False)
+    with freezegun.freeze_time("2024-02-01"):
+        ctx.repo.detach_partition(ctx.table_name, partition_name, mode=DetachMode.BLOCKING)
 
     # Act
     result = ctx.run_maintenance(at_time="2024-04-01")
 
     # Assert
-    assert result.dropped_count >= 1
+    assert result.dropped_count == 1
     ctx.assert_partition_not_exists(partition_name)
 
-    with sync_db_engine.begin() as conn:
-        conn.execute(text(f"DROP TABLE {ref_table}"))
+    sync_db_session.execute(text(f"DROP TABLE {ref_table}"))
+    sync_db_session.commit()
 
 
-@pytest.mark.integration
 def test__scenario__lifecycle_hooks__fired_at_correct_points(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -153,26 +167,52 @@ def test__scenario__lifecycle_hooks__fired_at_correct_points(
     hook_calls: list[str] = []
 
     class TrackingHooks(BasePartitionLifecycleHooks):
+        def before_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
+            hook_calls.append(f"before_create:{partition.name}:{partition.from_value}:{partition.to_value}")
+
         def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
             hook_calls.append(f"after_create:{partition.name}")
+
+        def before_detach(self, table_name: str, partition: PartitionInfo) -> None:
+            hook_calls.append(f"before_detach:{partition.name}")
+
+        def after_detach(self, table_name: str, partition_name: str) -> None:
+            hook_calls.append(f"after_detach:{partition_name}")
+
+        def before_drop(self, table_name: str, partition_name: str) -> None:
+            hook_calls.append(f"before_drop:{partition_name}")
 
         def after_drop(self, table_name: str, partition_name: str) -> None:
             hook_calls.append(f"after_drop:{partition_name}")
 
     ctx = sync_partition_builder.with_create_ahead(1).with_retention(1).with_hooks([TrackingHooks()]).build()
+    january = f"public.{ctx.table_name}__2024_01"
 
     # Act — create run
     ctx.run_maintenance(at_time="2024-01-01")
-    assert any(c.startswith("after_create:") for c in hook_calls)
+
+    # Assert — before_create sees the window it is about to create
+    assert hook_calls == [
+        f"before_create:{january}:2024-01-01:2024-02-01",
+        f"after_create:{january}",
+    ]
 
     # Act — drop run
+    hook_calls.clear()
     ctx.run_maintenance(at_time="2024-03-01")
 
-    # Assert
-    assert any(c.startswith("after_drop:") for c in hook_calls)
+    # Assert — the March creation, then January's detach and drop, in lifecycle order
+    march = f"public.{ctx.table_name}__2024_03"
+    assert hook_calls == [
+        f"before_create:{march}:2024-03-01:2024-04-01",
+        f"after_create:{march}",
+        f"before_detach:{january}",
+        f"after_detach:{january}",
+        f"before_drop:{january}",
+        f"after_drop:{january}",
+    ]
 
 
-@pytest.mark.integration
 def test__scenario__week_granularity__idempotent_second_run(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -188,7 +228,6 @@ def test__scenario__week_granularity__idempotent_second_run(
     assert second.created_count == 0
 
 
-@pytest.mark.integration
 def test__scenario__week_granularity__prunes_old_weeks(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -208,24 +247,23 @@ def test__scenario__week_granularity__prunes_old_weeks(
 
     # Assert
     assert result.success
-    assert result.dropped_count >= 1
+    assert result.dropped_count == 1
     ctx.assert_partition_not_exists(old_partition)
 
 
-@pytest.mark.integration
 def test__scenario__default_partition_has_conflicting_rows__reconciles_and_attaches(
     sync_partition_builder: PartitioningScenarioBuilder,
-    sync_db_engine: Engine,
+    sync_db_session: Session,
 ) -> None:
     # Arrange
     ctx = sync_partition_builder.with_default_partition().with_create_ahead(1).build()
 
     # Insert a row into DEFAULT that belongs to the upcoming April partition
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(f'INSERT INTO "{ctx.table_name}_default" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
-            {"dt": datetime(2024, 4, 15), "data": "test"},
-        )
+    sync_db_session.execute(
+        text(f'INSERT INTO "{ctx.table_name}_default" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
+        {"dt": datetime(2024, 4, 15), "data": "test"},
+    )
+    sync_db_session.commit()
 
     # Act
     result = ctx.run_maintenance(at_time="2024-04-01")
@@ -235,18 +273,16 @@ def test__scenario__default_partition_has_conflicting_rows__reconciles_and_attac
     assert result.created_count == 1
     ctx.assert_partition_attached(f"{ctx.table_name}__2024_04")
 
-    with sync_db_engine.begin() as conn:
-        count_in_default = conn.execute(
-            text(f'SELECT COUNT(*) FROM "{ctx.table_name}_default"')  # noqa: S608
-        )
-        count_in_april = conn.execute(
-            text(f'SELECT COUNT(*) FROM "{ctx.table_name}__2024_04"')  # noqa: S608
-        )
-        assert count_in_default.scalar() == 0
-        assert count_in_april.scalar() == 1
+    count_in_default = sync_db_session.execute(
+        text(f'SELECT COUNT(*) FROM "{ctx.table_name}_default"')  # noqa: S608
+    )
+    count_in_april = sync_db_session.execute(
+        text(f'SELECT COUNT(*) FROM "{ctx.table_name}__2024_04"')  # noqa: S608
+    )
+    assert count_in_default.scalar() == 0
+    assert count_in_april.scalar() == 1
 
 
-@pytest.mark.integration
 def test__scenario__hour_granularity__creates_ahead_and_prunes_old_hours(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -273,7 +309,7 @@ def test__scenario__hour_granularity__creates_ahead_and_prunes_old_hours(
 
     # Assert
     assert result.success
-    assert result.dropped_count >= 2
+    assert result.dropped_count == 2
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_08_25_14")
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_08_25_15")
     ctx.assert_partition_attached(f"{ctx.table_name}__2026_08_25_16")
@@ -290,7 +326,6 @@ def test__scenario__hour_granularity__creates_ahead_and_prunes_old_hours(
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_08_25_16")
 
 
-@pytest.mark.integration
 def test__scenario__quarter_granularity__creates_ahead_and_prunes_old_quarters(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -316,30 +351,29 @@ def test__scenario__quarter_granularity__creates_ahead_and_prunes_old_quarters(
 
     # Assert
     assert result.success
-    assert result.dropped_count >= 2
+    assert result.dropped_count == 2
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_q3")
     ctx.assert_partition_not_exists(f"{ctx.table_name}__2026_q4")
     ctx.assert_partition_attached(f"{ctx.table_name}__2027_q1")
     ctx.assert_partition_attached(f"{ctx.table_name}__2027_q2")
 
 
-@pytest.mark.integration
 def test__scenario__infinity_upper_bound__partition_never_pruned(
     sync_partition_builder: PartitioningScenarioBuilder,
-    sync_db_engine: Engine,
+    sync_db_session: Session,
 ) -> None:
     # Arrange — partition named like an ancient period but with an unbounded upper boundary
     partition_name = f"{sync_partition_builder._table_name}__1970_01"
     ctx = sync_partition_builder.with_retention(1).build()
-    ctx.repo.create_partition(ctx.config, partition_name, "1970-01-01", "infinity")
-    ctx.repo.attach_partition(ctx.table_name, partition_name, "1970-01-01", "infinity")
+    ctx.repo.create_table_like(ctx.table_name, partition_name, None)
+    ctx.repo.attach_partition(ctx.table_name, partition_name, RangeBounds(from_value="1970-01-01", to_value="infinity"))
 
     # A current row lands in the unbounded partition
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
-            {"dt": datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC), "data": "live"},
-        )
+    sync_db_session.execute(
+        text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
+        {"dt": datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC), "data": "live"},
+    )
+    sync_db_session.commit()
 
     # Act — skip create: any new range would overlap the unbounded partition
     result = ctx.run_maintenance(at_time="2026-08-15", skip_create=True)
@@ -348,39 +382,40 @@ def test__scenario__infinity_upper_bound__partition_never_pruned(
     assert result.success
     assert result.detached_count == 0
     assert result.dropped_count == 0
+    assert result.maintenance_plan is not None
+    reasons = {f.reason for f in result.maintenance_plan.findings if f.partition_name == f"public.{partition_name}"}
+    assert reasons == {FindingReason.UNBOUNDED_PARTITION}
     ctx.assert_partition_attached(partition_name)
-    with sync_db_engine.connect() as conn:
-        count = conn.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
-        assert count.scalar() == 1
+    count = sync_db_session.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
+    assert count.scalar() == 1
 
 
-@pytest.mark.integration
 def test__scenario__subpartitioned_child__detached_and_dropped(
     sync_partition_builder: PartitioningScenarioBuilder,
-    sync_db_engine: Engine,
+    sync_db_session: Session,
 ) -> None:
     # Arrange — child that is itself PARTITION BY RANGE, attached under an old period
     child = f"{sync_partition_builder._table_name}__2024_01"
     leaf = f"{child}_leaf"
     ctx = sync_partition_builder.with_create_ahead(1).with_retention(1).build()
 
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(
-                f"""
-                CREATE TABLE "{child}" (
-                    id BIGSERIAL,
-                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                    data TEXT,
-                    PRIMARY KEY (id, created_at)
-                ) PARTITION BY RANGE (created_at)
-                """
-            )
+    sync_db_session.execute(
+        text(
+            f"""
+            CREATE TABLE "{child}" (
+                id BIGSERIAL,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                data TEXT,
+                PRIMARY KEY (id, created_at)
+            ) PARTITION BY RANGE (created_at)
+            """
         )
-        conn.execute(
-            text(f"""CREATE TABLE "{leaf}" PARTITION OF "{child}" FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')""")
-        )
-    ctx.repo.attach_partition(ctx.table_name, child, "2024-01-01", "2024-02-01")
+    )
+    sync_db_session.execute(
+        text(f"""CREATE TABLE "{leaf}" PARTITION OF "{child}" FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')""")
+    )
+    sync_db_session.commit()
+    ctx.repo.attach_partition(ctx.table_name, child, RangeBounds(from_value="2024-01-01", to_value="2024-02-01"))
     ctx.assert_partition_attached(child)
 
     # Act — advance past retention
@@ -388,35 +423,34 @@ def test__scenario__subpartitioned_child__detached_and_dropped(
 
     # Assert — the partitioned child was detached and dropped along with its leaf
     assert result.success
-    assert result.detached_count >= 1
-    assert result.dropped_count >= 1
+    assert result.detached_count == 1
+    assert result.dropped_count == 1
     ctx.assert_partition_not_exists(child)
     ctx.assert_partition_not_exists(leaf)
 
 
-@pytest.mark.integration
 def test__scenario__attached_partition_with_reattached_race__drop_refused(
     sync_partition_builder: PartitioningScenarioBuilder,
-    sync_db_engine: Engine,
+    sync_db_session: Session,
 ) -> None:
     # Arrange — detached via the repo (orphan marker set), then re-attached behind its back
     partition_name = f"{sync_partition_builder._table_name}__2024_01"
     ctx = sync_partition_builder.with_attached_partition(partition_name, "2024-01-01", "2024-02-01").build()
 
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
-            {"dt": datetime(2024, 1, 15, tzinfo=UTC), "data": "keep-me"},
-        )
+    sync_db_session.execute(
+        text(f'INSERT INTO "{ctx.table_name}" (created_at, data) VALUES (:dt, :data)'),  # noqa: S608
+        {"dt": datetime(2024, 1, 15, tzinfo=UTC), "data": "keep-me"},
+    )
+    sync_db_session.commit()
 
-    ctx.repo.detach_partition(ctx.table_name, partition_name, concurrent=False)
-    with sync_db_engine.begin() as conn:
-        conn.execute(
-            text(
-                f'ALTER TABLE "{ctx.table_name}" ATTACH PARTITION "{partition_name}" '
-                f"FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
-            )
+    ctx.repo.detach_partition(ctx.table_name, partition_name, mode=DetachMode.BLOCKING)
+    sync_db_session.execute(
+        text(
+            f'ALTER TABLE "{ctx.table_name}" ATTACH PARTITION "{partition_name}" '
+            f"FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
         )
+    )
+    sync_db_session.commit()
 
     # Act / Assert — drop must refuse: the partition is attached again despite the marker
     with pytest.raises(PartitionAttachedError):
@@ -424,12 +458,10 @@ def test__scenario__attached_partition_with_reattached_race__drop_refused(
 
     ctx.assert_partition_exists(partition_name)
     ctx.assert_partition_attached(partition_name)
-    with sync_db_engine.connect() as conn:
-        count = conn.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
-        assert count.scalar() == 1
+    count = sync_db_session.execute(text(f'SELECT COUNT(*) FROM "{partition_name}"'))  # noqa: S608
+    assert count.scalar() == 1
 
 
-@pytest.mark.integration
 def test__scenario__ensure_partition__specific_past_period__created_and_attached(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -463,16 +495,15 @@ def test__scenario__ensure_partition__specific_past_period__created_and_attached
     assert ctx.metadata.get_partition_boundaries(partition_name) == boundaries
 
 
-@pytest.mark.integration
 def test__scenario__adopt_partition__legacy_detached_table__dropped_on_next_run(
     sync_partition_builder: PartitioningScenarioBuilder,
-    sync_db_engine: Engine,
+    sync_db_session: Session,
 ) -> None:
     # Arrange — a legacy-style detached table carrying no orphan marker
     legacy_name = f"{sync_partition_builder._table_name}__2020_01"
     ctx = sync_partition_builder.with_create_ahead(1).build()
-    with sync_db_engine.begin() as conn:
-        conn.execute(text(f'CREATE TABLE "{legacy_name}" (LIKE "{ctx.table_name}" INCLUDING ALL)'))
+    sync_db_session.execute(text(f'CREATE TABLE "{legacy_name}" (LIKE "{ctx.table_name}" INCLUDING ALL)'))
+    sync_db_session.commit()
 
     # Act — the unmarked table is invisible to marker-based discovery
     result = ctx.run_maintenance(at_time="2024-06-01")
@@ -491,17 +522,17 @@ def test__scenario__adopt_partition__legacy_detached_table__dropped_on_next_run(
         ctx.repo.adopt_partition(ctx.table_name, f"{ctx.table_name}__2024_06")
     assert ctx.repo.adopt_partition(ctx.table_name, f"{ctx.table_name}__1999_01") is False
 
-    # Act — the next run collects the adopted table like any other orphan
+    # Act — the next run collects the adopted table like any other orphan: its
+    # detach instant is unknown, so no grace can delay it
     result = ctx.run_maintenance(at_time="2024-06-01")
 
     # Assert
     assert result.success
-    assert result.dropped_count >= 1
+    assert result.dropped_count == 1
     ctx.assert_partition_not_exists(legacy_name)
     ctx.assert_partition_attached(f"{ctx.table_name}__2024_06")
 
 
-@pytest.mark.integration
 def test__scenario__is_partition_closed__past_and_current_periods(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
@@ -532,12 +563,12 @@ def test__scenario__is_partition_closed__past_and_current_periods(
     assert ctx.metadata.is_partition_closed(f"public.{detached_name}") is False
 
 
-@pytest.mark.integration
-def test__scenario__maintain_continue_on_error__create_failure_still_prunes(
+def test__scenario__off_grid_partition_covering_a_wanted_window__reported_not_touched_and_pruning_still_runs(
     sync_partition_builder: PartitioningScenarioBuilder,
 ) -> None:
-    # Arrange — a manually attached wider partition covers June, so the create
-    # step's ATTACH of {table}__2024_06 must fail with a partition-overlap error
+    # Arrange — a hand-attached wider partition covers June and July: not a
+    # window of the monthly grid, so it is nobody's to detach, and June cannot
+    # be created without overlapping it
     table = sync_partition_builder._table_name
     old_name = f"{table}__2024_01"
     wide_name = f"{table}__wide"
@@ -548,6 +579,46 @@ def test__scenario__maintain_continue_on_error__create_failure_still_prunes(
         .with_retention(1)
         .build()
     )
+
+    # Act
+    result = ctx.run_maintenance(at_time="2024-06-15")
+
+    # Assert — the overlap is an actionable issue, the wide partition an
+    # informational finding, and retention still pruned January
+    assert result.success
+    assert result.created_count == 0
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.RECONCILE]
+    assert wide_name in result.issues[0].error
+    plan = result.maintenance_plan
+    assert plan is not None
+    reasons = {f.partition_name: f.reason for f in plan.findings}
+    assert reasons == {
+        f"public.{table}": FindingReason.RANGE_OVERLAP,
+        f"public.{wide_name}": FindingReason.UNMANAGED_PARTITION,
+    }
+    assert result.detached_count == 1
+    assert result.dropped_count == 1
+    ctx.assert_partition_not_exists(old_name)
+    ctx.assert_partition_attached(wide_name)
+
+
+def test__scenario__maintain_continue_on_error__create_failure_still_prunes(
+    sync_partition_builder: PartitioningScenarioBuilder,
+    sync_db_session: Session,
+) -> None:
+    # Arrange — a stray standalone table holds the name June needs, with a
+    # column the parent does not have, so its ATTACH fails outright
+    table = sync_partition_builder._table_name
+    old_name = f"{table}__2024_01"
+    stray_name = f"{table}__2024_06"
+    ctx = (
+        sync_partition_builder.with_attached_partition(old_name, "2024-01-01", "2024-02-01")
+        .with_create_ahead(1)
+        .with_retention(1)
+        .build()
+    )
+    sync_db_session.execute(text(f'CREATE TABLE "{stray_name}" (LIKE "{table}" INCLUDING ALL, extra TEXT)'))
+    sync_db_session.commit()
 
     # Act / Assert — by default the create failure aborts the run: nothing pruned
     with pytest.raises(SQLAlchemyError):
@@ -562,8 +633,8 @@ def test__scenario__maintain_continue_on_error__create_failure_still_prunes(
     assert result.error is None
     assert result.created_count == 0
     assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
-    assert "overlap" in result.issues[0].error.lower()
+    assert result.issues[0].partition_name == f"public.{stray_name}"
     assert result.detached_count == 1
-    assert result.dropped_count >= 1
+    assert result.dropped_count == 1
     ctx.assert_partition_not_exists(old_name)
-    ctx.assert_partition_attached(wide_name)
+    ctx.assert_partition_detached(stray_name)

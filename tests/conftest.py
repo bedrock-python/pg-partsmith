@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys  # required for platform check below
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
@@ -13,7 +14,9 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
+from testcontainers.redis import RedisContainer
 
 from tests.integration.aio.builder import PartitioningScenarioBuilder
 from tests.integration.sync.builder import PartitioningScenarioBuilder as SyncPartitioningScenarioBuilder
@@ -74,7 +77,8 @@ def postgres_container() -> Generator[PostgresContainer, None, None]:
     """Start a PostgreSQL container for the test session."""
     if not _docker_is_available():
         pytest.skip("Docker is required for integration tests (testcontainers)")
-    with PostgresContainer("postgres:17-alpine") as postgres:
+    image = os.environ.get("PG_PARTSMITH_TEST_PG_IMAGE", "postgres:17-alpine")
+    with PostgresContainer(image) as postgres:
         yield postgres
 
 
@@ -86,6 +90,23 @@ def _docker_is_available() -> bool:
         return False
     else:
         return True
+
+
+@pytest.fixture(scope="session")
+def redis_container() -> Generator[RedisContainer, None, None]:
+    """Start a Redis container for the test session."""
+    if not _docker_is_available():
+        pytest.skip("Docker is required for integration tests (testcontainers)")
+    with RedisContainer("redis:7-alpine") as container:
+        yield container
+
+
+@pytest.fixture(scope="session")
+def redis_url(redis_container: RedisContainer) -> str:
+    """``redis://host:port/0`` of the session's Redis container."""
+    host = redis_container.get_container_host_ip()
+    port = redis_container.get_exposed_port(redis_container.port)
+    return f"redis://{host}:{port}/0"
 
 
 @pytest_asyncio.fixture
@@ -106,6 +127,13 @@ async def db_session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, Non
     """Create async database session for each test."""
     async_session_maker = async_sessionmaker(db_engine, expire_on_commit=False)
     async with async_session_maker() as session:
+        yield session
+
+
+@pytest.fixture
+def sync_db_session(sync_db_engine: Engine) -> Generator[Session, None, None]:
+    """Create sync database session for each test."""
+    with sessionmaker(sync_db_engine, expire_on_commit=False)() as session:
         yield session
 
 

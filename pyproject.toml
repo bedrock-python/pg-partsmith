@@ -8,7 +8,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "Alex Shalaev", email = "shalaevad.alexey@gmail.com" }]
 keywords = ["postgresql", "partitioning", "asyncio", "database", "partition-management"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
@@ -41,7 +41,7 @@ test = [
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
-    "testcontainers>=4.14.1",
+    "testcontainers[redis]>=4.14.1",
     "asyncpg>=0.31.0",
     "freezegun>=1.5.5",
     "tzdata>=2024.1",

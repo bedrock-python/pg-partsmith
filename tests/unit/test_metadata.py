@@ -1,3 +1,9 @@
+"""Unit tests for the aio ``PostgresMetadataProvider`` against a mocked engine."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -6,39 +12,46 @@ from sqlalchemy.exc import DBAPIError
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.entities import PartitionType
 from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.lifecycle import SqlPredicate
+from pg_partsmith.topology import (
+    ActualTree,
+    DefaultBounds,
+    DetachedPartition,
+    FactKind,
+    HashBounds,
+    ListBounds,
+    PartitionFacts,
+    PartitionNode,
+    RangeBounds,
+    RelationKind,
+)
+from pg_partsmith.utils import DETACHED_AT_MARKER, orphan_table_comment
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 
-def _make_engine(*scalar_or_rows: object) -> MagicMock:
-    """Build an engine mock where each conn.execute() call returns the next value.
+def _make_engine(*values: object) -> MagicMock:
+    """Build an engine mock where each ``conn.execute()`` call answers with the next value.
 
-    Pass scalar values for queries that use result.scalar(), or a list of row
-    objects for queries that use result.fetchall() / fetchone().
-    A tuple value sets both fetchone and scalar from the first element.
+    A list becomes ``result.fetchall()``; anything else becomes ``result.scalar()``.
+    An exception instance is raised by that call.
     """
     engine = MagicMock()
     conn = MagicMock()
-    conn.execute = AsyncMock(return_value=MagicMock())
+    conn.execute = AsyncMock()
     conn.execution_options = AsyncMock(return_value=conn)
-    results: list[MagicMock] = []
 
-    for value in scalar_or_rows:
-        r = MagicMock()
+    results: list[object] = []
+    for value in values:
+        if isinstance(value, BaseException):
+            results.append(value)
+            continue
+        result = MagicMock()
         if isinstance(value, list):
-            r.fetchall.return_value = value
-            r.fetchone.return_value = value[0] if value else None
-        elif isinstance(value, tuple):
-            r.fetchone.return_value = value
-            r.scalar.return_value = value[0]
-        elif value is None:
-            r.fetchone.return_value = None
-            r.scalar.return_value = None
+            result.fetchall.return_value = value
         else:
-            r.scalar.return_value = value
-            r.fetchone.return_value = (value,)
-        results.append(r)
-
+            result.scalar.return_value = value
+        results.append(result)
     conn.execute.side_effect = results
 
     cm = MagicMock()
@@ -46,8 +59,90 @@ def _make_engine(*scalar_or_rows: object) -> MagicMock:
     cm.__aexit__ = AsyncMock(return_value=False)
     engine.connect.return_value = cm
     engine.begin.return_value = cm
-
     return engine
+
+
+def _conn(engine: MagicMock) -> MagicMock:
+    return engine.connect.return_value.__aenter__.return_value
+
+
+def _statements(engine: MagicMock) -> list[str]:
+    return [str(call.args[0]) for call in _conn(engine).execute.call_args_list]
+
+
+def _tree_row(
+    *,
+    level: int,
+    name: str,
+    oid: int,
+    schema: str = "public",
+    parent: tuple[str, str] | None = None,
+    boundaries: str | None = None,
+    relkind: str = "r",
+    is_attached: bool = True,
+    detach_pending: bool = False,
+    partstrat: str | None = None,
+    columns: list[str | None] | None = None,
+    key_arity: int | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        level=level,
+        oid=oid,
+        relkind=relkind,
+        partition_schema=schema,
+        partition_name=name,
+        parent_schema=None if parent is None else parent[0],
+        parent_name=None if parent is None else parent[1],
+        boundaries=boundaries,
+        is_attached=is_attached,
+        detach_pending=detach_pending,
+        partstrat=partstrat,
+        partition_columns=columns,
+        key_arity=key_arity,
+    )
+
+
+def _root_row(name: str = "events", oid: int = 100, partstrat: str | None = "r") -> SimpleNamespace:
+    return _tree_row(level=0, name=name, oid=oid, relkind="p", partstrat=partstrat, columns=["created_at"], key_arity=1)
+
+
+def _orphan_row(
+    name: str, description: str | None, *, oid: int = 500, schema: str = "public", relkind: str = "r"
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        oid=oid, relkind=relkind, partition_schema=schema, partition_name=name, description=description
+    )
+
+
+def _facts_row(oid: int, size_bytes: int | None, row_estimate: int | None) -> SimpleNamespace:
+    return SimpleNamespace(oid=oid, size_bytes=size_bytes, row_estimate=row_estimate)
+
+
+def _sample_tree() -> ActualTree:
+    root = PartitionNode(
+        name="public.events",
+        oid=100,
+        partition_type=PartitionType.RANGE,
+        partition_columns=("created_at",),
+        children=(
+            PartitionNode(
+                name="public.events__2024_01",
+                oid=101,
+                parent_name="public.events",
+                level=1,
+                bounds=RangeBounds(from_value="2024-01-01", to_value="2024-02-01"),
+            ),
+            PartitionNode(
+                name="public.events__2024_02",
+                oid=102,
+                parent_name="public.events",
+                level=1,
+                bounds=RangeBounds(from_value="2024-02-01", to_value="2024-03-01"),
+            ),
+        ),
+    )
+    orphans = (DetachedPartition(name="public.events__2023_12", oid=500, parent_name="public.events"),)
+    return ActualTree(root=root, orphans=orphans)
 
 
 # ── get_partition_type ──────────────────────────────────────────────────────────
@@ -59,11 +154,12 @@ def _make_engine(*scalar_or_rows: object) -> MagicMock:
         ("r", PartitionType.RANGE),
         ("l", PartitionType.LIST),
         ("h", PartitionType.HASH),
+        (b"h", PartitionType.HASH),
         (None, None),
     ],
 )
-async def test__metadata_provider__get_partition_type__maps_pg_letter_to_enum(
-    pg_letter: str | None, expected_type: PartitionType | None
+async def test__get_partition_type__maps_pg_letter_to_enum(
+    pg_letter: str | bytes | None, expected_type: PartitionType | None
 ) -> None:
     # Arrange
     engine = _make_engine(pg_letter)
@@ -71,23 +167,51 @@ async def test__metadata_provider__get_partition_type__maps_pg_letter_to_enum(
 
     # Act / Assert
     assert await provider.get_partition_type("events") == expected_type
+    assert _conn(engine).execute.call_args.args[1] == {"table_name": '"events"'}
 
 
-# ── get_partition_column ────────────────────────────────────────────────────────
+# ── get_partition_columns / get_partition_column ────────────────────────────────
 
 
-async def test__metadata_provider__get_partition_column__single_column__returns_column_name() -> None:
+async def test__get_partition_columns__plain_columns__reports_them_in_key_order() -> None:
     # Arrange
-    row = MagicMock()
-    row.__getitem__ = MagicMock(return_value="created_at")
-    engine = _make_engine([row])
+    engine = _make_engine([("created_at",), ("tenant_id",)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_partition_columns("public.events") == ("created_at", "tenant_id")
+    assert _conn(engine).execute.call_args.args[1] == {"table_name": '"public"."events"'}
+
+
+async def test__get_partition_columns__not_partitioned__returns_empty() -> None:
+    # Arrange
+    engine = _make_engine([])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_partition_columns("public.events") == ()
+
+
+async def test__get_partition_columns__expression_key__is_refused_with_its_position() -> None:
+    # Arrange -- an expression key is recorded as attnum 0, which matches no column: the row comes back NULL
+    engine = _make_engine([("created_at",), (None,)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="expression at key position 2"):
+        await provider.get_partition_columns("public.events")
+
+
+async def test__get_partition_column__single_column__returns_column_name() -> None:
+    # Arrange
+    engine = _make_engine([("created_at",)])
     provider = PostgresMetadataProvider(engine)
 
     # Act / Assert
     assert await provider.get_partition_column("events") == "created_at"
 
 
-async def test__metadata_provider__get_partition_column__no_columns__returns_none() -> None:
+async def test__get_partition_column__no_columns__returns_none() -> None:
     # Arrange
     engine = _make_engine([])
     provider = PostgresMetadataProvider(engine)
@@ -96,180 +220,536 @@ async def test__metadata_provider__get_partition_column__no_columns__returns_non
     assert await provider.get_partition_column("events") is None
 
 
-async def test__metadata_provider__get_partition_column__composite_key__raises_value_error() -> None:
+async def test__get_partition_column__composite_key__raises_value_error() -> None:
     # Arrange
-    row1, row2 = MagicMock(), MagicMock()
-    row1.__getitem__ = MagicMock(return_value="col_a")
-    row2.__getitem__ = MagicMock(return_value="col_b")
-    engine = _make_engine([row1, row2])
+    engine = _make_engine([("col_a",), ("col_b",)])
     provider = PostgresMetadataProvider(engine)
 
     # Act / Assert
-    with pytest.raises(ValueError, match="composite"):
+    with pytest.raises(ValueError, match="composite partition key"):
         await provider.get_partition_column("events")
+
+
+async def test__get_partition_column__expression_key__is_refused() -> None:
+    # Arrange
+    engine = _make_engine([(None,)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    with pytest.raises(InvalidPartitionConfigError, match="expression"):
+        await provider.get_partition_column("public.events")
+
+
+# ── get_partition_tree ──────────────────────────────────────────────────────────
+
+
+async def test__get_partition_tree__rows__become_nodes_with_identity_and_bounds() -> None:
+    # Arrange
+    rows = [
+        _root_row(),
+        _tree_row(
+            level=1,
+            name="events__2024_01",
+            oid=101,
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+            detach_pending=True,
+        ),
+        _tree_row(
+            level=1,
+            name="events__2024_02",
+            oid=102,
+            relkind="p",
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')",
+            partstrat="h",
+            columns=["tenant_id"],
+            key_arity=1,
+        ),
+        _tree_row(
+            level=2,
+            name="events__2024_02__h0",
+            oid=103,
+            relkind="f",
+            parent=("public", "events__2024_02"),
+            boundaries="FOR VALUES WITH (modulus 2, remainder 0)",
+        ),
+    ]
+    engine = _make_engine(rows)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    root = await provider.get_partition_tree("public.events")
+
+    # Assert
+    assert root is not None
+    assert (root.name, root.oid, root.relkind, root.partition_type) == (
+        "public.events",
+        100,
+        RelationKind.PARTITIONED,
+        PartitionType.RANGE,
+    )
+    assert root.partition_columns == ("created_at",)
+    assert root.parent_name is None
+    assert root.bounds is None
+    january, february = root.children
+    assert january.name == "public.events__2024_01"
+    assert january.oid == 101
+    assert january.parent_name == "public.events"
+    assert january.bounds == RangeBounds(from_value="2024-01-01", to_value="2024-02-01")
+    assert january.detach_pending is True
+    assert january.is_leaf
+    assert february.partition_type is PartitionType.HASH
+    assert february.partition_columns == ("tenant_id",)
+    (bucket,) = february.children
+    assert bucket.relkind is RelationKind.FOREIGN
+    assert bucket.bounds == HashBounds(modulus=2, remainder=0)
+    assert _conn(engine).execute.call_args.args[1] == {"table_name": '"public"."events"'}
+
+
+async def test__get_partition_tree__expression_key__marks_the_node() -> None:
+    # Arrange -- one of two key positions is an expression, so only one column name comes back
+    root = _tree_row(
+        level=0, name="events", oid=100, relkind="p", partstrat="r", columns=[None, "created_at"], key_arity=2
+    )
+    engine = _make_engine([root])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    node = await provider.get_partition_tree("public.events")
+
+    # Assert
+    assert node is not None
+    assert node.has_expression_key is True
+    assert node.partition_columns == ("created_at",)
+
+
+async def test__get_partition_tree__no_columns_and_no_key_arity__is_not_an_expression_key() -> None:
+    # Arrange -- a plain leaf has neither
+    engine = _make_engine([_tree_row(level=0, name="events__2024_01", oid=101, boundaries="DEFAULT")])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    node = await provider.get_partition_tree("events__2024_01")
+
+    # Assert
+    assert node is not None
+    assert node.has_expression_key is False
+    assert node.bounds == DefaultBounds()
+
+
+async def test__get_partition_tree__unaddressable_child__is_skipped_and_its_parent_marked() -> None:
+    # Arrange -- a dotted relname cannot be reached by qualified-name DDL
+    rows = [
+        _root_row(),
+        _tree_row(
+            level=1,
+            name="events.2024_02",
+            oid=102,
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')",
+        ),
+        _tree_row(
+            level=1,
+            name="events__2024_01",
+            oid=101,
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+        ),
+    ]
+    engine = _make_engine(rows)
+    provider = PostgresMetadataProvider(engine)
+    mock_logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.partition_bounds.logger", mock_logger):
+        root = await provider.get_partition_tree("public.events")
+
+    # Assert
+    assert root is not None
+    assert [child.name for child in root.children] == ["public.events__2024_01"]
+    assert root.has_unaddressable_children is True
+    mock_logger.warning.assert_called_once()
+
+
+async def test__get_partition_tree__root_itself_unaddressable__returns_none() -> None:
+    # Arrange -- a level-0 row with a dotted relname has no parent to mark
+    engine = _make_engine([_tree_row(level=0, name="ev.ents", oid=1, relkind="p", partstrat="r")])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    with patch("pg_partsmith.partition_bounds.logger", MagicMock()):
+        root = await provider.get_partition_tree("public.events")
+
+    # Assert
+    assert root is None
+
+
+async def test__get_partition_tree__no_rows__returns_none() -> None:
+    # Arrange
+    engine = _make_engine([])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_partition_tree("public.nothing") is None
+
+
+# ── get_actual_tree ─────────────────────────────────────────────────────────────
+
+
+async def test__get_actual_tree__not_partitioned__returns_none_without_looking_for_orphans() -> None:
+    # Arrange -- a plain table is its own level-0 row, but partitions nothing
+    engine = _make_engine([_tree_row(level=0, name="plain", oid=1)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_actual_tree("public.plain") is None
+    assert _conn(engine).execute.await_count == 1
+
+
+async def test__get_actual_tree__unknown_relation__returns_none() -> None:
+    # Arrange
+    engine = _make_engine([])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_actual_tree("public.missing") is None
+
+
+async def test__get_actual_tree__orphan_query__carries_a_marker_for_every_partitioned_node() -> None:
+    # Arrange
+    rows = [
+        _root_row(),
+        _tree_row(
+            level=1,
+            name="events__2024_02",
+            oid=102,
+            relkind="p",
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')",
+            partstrat="h",
+            columns=["tenant_id"],
+            key_arity=1,
+        ),
+        _tree_row(
+            level=1,
+            name="events__2024_01",
+            oid=101,
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+        ),
+    ]
+    engine = _make_engine(rows, [])
+    provider = PostgresMetadataProvider(engine, marker_prefix="myapp:parent=")
+
+    # Act
+    tree = await provider.get_actual_tree("public.events")
+
+    # Assert
+    assert tree is not None
+    assert tree.orphans == ()
+    orphan_call = _conn(engine).execute.call_args_list[1]
+    assert "split_part(d.description" in str(orphan_call.args[0])
+    assert orphan_call.args[1] == {"markers": ["myapp:parent=public.events", "myapp:parent=public.events__2024_02"]}
+
+
+async def test__get_actual_tree__orphans__are_parsed_with_their_detach_instant() -> None:
+    # Arrange
+    marker = orphan_table_comment("public.events")
+    stamped = f"{marker}\n{DETACHED_AT_MARKER}2024-01-15T10:00:00+00:00\nkeep me"
+    orphans = [
+        _orphan_row("events__2023_12", stamped, oid=500),
+        _orphan_row("events__2023_11", marker, oid=501, relkind="p"),
+        _orphan_row("events__2023_10", "unrelated comment", oid=502),
+        _orphan_row("events__2023_09", None, oid=503),
+        _orphan_row("events__2023_08", marker, oid=504, schema="bad.schema"),
+    ]
+    engine = _make_engine([_root_row()], orphans)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    with patch("pg_partsmith.partition_bounds.logger", MagicMock()):
+        tree = await provider.get_actual_tree("public.events")
+
+    # Assert -- the unmarked rows and the unaddressable one are left out
+    assert tree is not None
+    assert tree.orphans == (
+        DetachedPartition(
+            name="public.events__2023_12",
+            oid=500,
+            relkind=RelationKind.TABLE,
+            parent_name="public.events",
+            detached_at=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
+        ),
+        DetachedPartition(
+            name="public.events__2023_11", oid=501, relkind=RelationKind.PARTITIONED, parent_name="public.events"
+        ),
+    )
+
+
+async def test__get_actual_tree__custom_marker_prefix__reads_orphans_marked_with_it() -> None:
+    # Arrange
+    engine = _make_engine([_root_row()], [_orphan_row("events__2023_12", "myapp:public.events", oid=500)])
+    provider = PostgresMetadataProvider(engine, marker_prefix="myapp:")
+
+    # Act
+    tree = await provider.get_actual_tree("public.events")
+
+    # Assert
+    assert tree is not None
+    assert [o.parent_name for o in tree.orphans] == ["public.events"]
+
+
+# ── measure ─────────────────────────────────────────────────────────────────────
+
+
+async def test__measure__no_targets__returns_the_tree_without_a_query() -> None:
+    # Arrange
+    engine = _make_engine()
+    provider = PostgresMetadataProvider(engine)
+    tree = _sample_tree()
+
+    # Act
+    result = await provider.measure(tree, targets=(), facts=frozenset({FactKind.SIZE}))
+
+    # Assert
+    assert result is tree
+    engine.connect.assert_not_called()
+
+
+async def test__measure__nothing_requested__returns_the_tree_without_a_query() -> None:
+    # Arrange
+    engine = _make_engine()
+    provider = PostgresMetadataProvider(engine)
+    tree = _sample_tree()
+
+    # Act
+    result = await provider.measure(tree, targets=("public.events__2024_01",))
+
+    # Assert
+    assert result is tree
+    engine.connect.assert_not_called()
+
+
+async def test__measure__facts_requested__one_query_for_every_target_by_oid() -> None:
+    # Arrange
+    engine = _make_engine([_facts_row(101, 2048, 17), _facts_row(500, 4096, 3)])
+    provider = PostgresMetadataProvider(engine)
+    tree = _sample_tree()
+
+    # Act
+    measured = await provider.measure(
+        tree,
+        targets=("public.events__2024_01", "public.events__2023_12", "public.events__missing"),
+        facts=frozenset({FactKind.SIZE, FactKind.ROWS}),
+    )
+
+    # Assert -- the target absent from the tree is ignored; the untargeted member stays unmeasured
+    assert _conn(engine).execute.await_count == 1
+    assert _conn(engine).execute.call_args.args[1] == {"oids": [101, 500]}
+    january, february = measured.root.children
+    assert january.facts == PartitionFacts(size_bytes=2048, row_estimate=17)
+    assert february.facts is None
+    assert measured.orphans[0].facts == PartitionFacts(size_bytes=4096, row_estimate=3)
+    assert measured.root.oid == 100
+
+
+async def test__measure__only_size_requested__rows_stay_unknown() -> None:
+    # Arrange
+    engine = _make_engine([_facts_row(101, 2048, 17)])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = await provider.measure(
+        _sample_tree(), targets=("public.events__2024_01",), facts=frozenset({FactKind.SIZE})
+    )
+
+    # Assert
+    assert measured.root.children[0].facts == PartitionFacts(size_bytes=2048, row_estimate=None)
+
+
+async def test__measure__target_without_a_facts_row__reads_as_empty() -> None:
+    # Arrange
+    engine = _make_engine([])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = await provider.measure(
+        _sample_tree(), targets=("public.events__2024_01",), facts=frozenset({FactKind.ROWS})
+    )
+
+    # Assert
+    assert measured.root.children[0].facts == PartitionFacts(size_bytes=None, row_estimate=0)
+
+
+async def test__measure__sql_predicates__are_asked_once_per_target_without_a_facts_query() -> None:
+    # Arrange
+    predicate = SqlPredicate(sql="SELECT count(*) = 0 FROM {partition}")
+    engine = _make_engine(True, False)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = await provider.measure(
+        _sample_tree(),
+        targets=("public.events__2024_01", "public.events__2024_02"),
+        sql_predicates=(predicate,),
+    )
+
+    # Assert
+    statements = _statements(engine)
+    assert statements == [
+        'SELECT count(*) = 0 FROM "public"."events__2024_01"',
+        'SELECT count(*) = 0 FROM "public"."events__2024_02"',
+    ]
+    january, february = measured.root.children
+    assert january.facts == PartitionFacts(predicates={predicate.id: True})
+    assert february.facts == PartitionFacts(predicates={predicate.id: False})
+
+
+async def test__measure__targets_without_oids__are_ignored() -> None:
+    # Arrange
+    engine = _make_engine()
+    provider = PostgresMetadataProvider(engine)
+    tree = ActualTree(
+        root=PartitionNode(
+            name="events",
+            partition_type=PartitionType.RANGE,
+            children=(PartitionNode(name="events__2024_01", bounds=RangeBounds(from_value="a", to_value="b")),),
+        )
+    )
+
+    # Act
+    result = await provider.measure(tree, targets=("events__2024_01",), facts=frozenset({FactKind.SIZE}))
+
+    # Assert
+    assert result.root.children[0].facts is None
+    engine.connect.assert_not_called()
+
+
+# ── evaluate_sql_predicate ──────────────────────────────────────────────────────
+
+
+async def test__evaluate_sql_predicate__substitutes_the_quoted_name_and_escapes_colons() -> None:
+    # Arrange
+    predicate = SqlPredicate(sql="SELECT max(created_at) < now() - interval '1 day' FROM {partition} -- t::text")
+    engine = _make_engine(1)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    answer = await provider.evaluate_sql_predicate(predicate, "public.events__2024_01")
+
+    # Assert -- the raw text carries escaped colons so SQLAlchemy sees no bind parameters
+    assert answer is True
+    clause = _conn(engine).execute.call_args.args[0]
+    assert (
+        clause.text
+        == 'SELECT max(created_at) < now() - interval \'1 day\' FROM "public"."events__2024_01" -- t\\:\\:text'
+    )
+    assert (
+        str(clause) == 'SELECT max(created_at) < now() - interval \'1 day\' FROM "public"."events__2024_01" -- t::text'
+    )
+
+
+async def test__evaluate_sql_predicate__null_answer__reads_as_false() -> None:
+    # Arrange
+    engine = _make_engine(None)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.evaluate_sql_predicate(SqlPredicate(sql="SELECT NULL FROM {partition}"), "events") is False
+
+
+async def test__evaluate_sql_predicate__statement_error__propagates() -> None:
+    # Arrange -- a rule that cannot be evaluated must not silently read as False
+    engine = _make_engine(DBAPIError("SELECT", {}, Exception("syntax error")))
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    with pytest.raises(DBAPIError):
+        await provider.evaluate_sql_predicate(SqlPredicate(sql="SELECT ??? FROM {partition}"), "events")
 
 
 # ── list_partitions ─────────────────────────────────────────────────────────────
 
 
-async def test__metadata_provider__list_partitions__not_partitioned_table__returns_empty_list() -> None:
-    # Arrange — get_partition_type returns None → early exit
-    engine = _make_engine(None)
+async def test__list_partitions__not_partitioned__returns_empty_list() -> None:
+    # Arrange
+    engine = _make_engine([])
     provider = PostgresMetadataProvider(engine)
 
     # Act / Assert
     assert await provider.list_partitions("events") == []
 
 
-async def test__metadata_provider__list_partitions__attached_partition__returns_partition_info() -> None:
+async def test__list_partitions__attached_children__are_rendered_as_partition_infos() -> None:
     # Arrange
-    row = MagicMock()
-    row.partition_schema = "public"
-    row.partition_name = "events__2024_01"
-    row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
-    row.is_attached = True
-    engine = _make_engine(("r", "public.events"), [row], [])
+    rows = [
+        _root_row(),
+        _tree_row(
+            level=1,
+            name="events__2024_01",
+            oid=101,
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+        ),
+        _tree_row(
+            level=1,
+            name="events_default",
+            oid=102,
+            relkind="p",
+            parent=("public", "events"),
+            boundaries="DEFAULT",
+            partstrat="h",
+            columns=["tenant_id"],
+            key_arity=1,
+        ),
+        _tree_row(
+            level=2,
+            name="events_default__h0",
+            oid=103,
+            parent=("public", "events_default"),
+            boundaries="FOR VALUES WITH (modulus 2, remainder 0)",
+        ),
+    ]
+    engine = _make_engine(rows, [])
     provider = PostgresMetadataProvider(engine)
 
     # Act
-    partitions = await provider.list_partitions("events")
+    partitions = await provider.list_partitions("public.events")
 
-    # Assert
-    assert len(partitions) == 1
-    assert partitions[0].name == "public.events__2024_01"
-    assert partitions[0].from_value == "2024-01-01"
-    assert partitions[0].to_value == "2024-02-01"
-    assert partitions[0].is_attached is True
-    assert partitions[0].parent_table == "events"
+    # Assert -- grandchildren are not direct partitions of the root
+    assert [p.name for p in partitions] == ["public.events__2024_01", "public.events_default"]
+    january, default = partitions
+    assert january.oid == 101
+    assert january.partition_type is PartitionType.RANGE
+    assert (january.from_value, january.to_value) == ("2024-01-01", "2024-02-01")
+    assert january.boundaries_expr == "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
+    assert january.bounds == RangeBounds(from_value="2024-01-01", to_value="2024-02-01")
+    assert january.is_attached is True
+    assert january.is_default is False
+    assert january.relkind is RelationKind.TABLE
+    assert january.subpartition_type is None
+    assert january.parent_table == "public.events"
+    assert default.is_default is True
+    assert default.boundaries_expr == "DEFAULT"
+    assert default.subpartition_type is PartitionType.HASH
+    assert default.relkind is RelationKind.PARTITIONED
 
 
-async def test__metadata_provider__list_partitions__unparseable_boundaries__stores_raw_expr() -> None:
+async def test__list_partitions__bare_parent__children_keep_their_own_schema() -> None:
     # Arrange
-    row = MagicMock()
-    row.partition_schema = "public"
-    row.partition_name = "events__weird"
-    row.boundaries = "FOR VALUES FROM (weird) ???"
-    row.is_attached = True
-    engine = _make_engine(("r", "public.events"), [row], [])
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    partitions = await provider.list_partitions("events")
-
-    # Assert
-    assert len(partitions) == 1
-    assert partitions[0].name == "public.events__weird"
-    assert partitions[0].is_attached is True
-    assert partitions[0].is_default is False
-    assert partitions[0].from_value is None
-    assert partitions[0].to_value is None
-    assert partitions[0].boundaries_expr == "FOR VALUES FROM (weird) ???"
-
-
-async def test__metadata_provider__list_partitions__custom_marker_prefix__uses_prefix_in_orphan_query() -> None:
-    # Arrange
-    engine = _make_engine(("r", "public.events"), [], [])
-    provider = PostgresMetadataProvider(engine, marker_prefix="myapp:")
-
-    # Act
-    await provider.list_partitions("events")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    params = conn.execute.call_args_list[2].args[1]
-    assert params["marker"] == "myapp:public.events"
-
-
-async def test__metadata_provider__list_partitions__default_partition__sets_is_default_true() -> None:
-    # Arrange
-    row = MagicMock()
-    row.partition_schema = "public"
-    row.partition_name = "events_default"
-    row.boundaries = "DEFAULT"
-    row.is_attached = True
-    engine = _make_engine(("r", "public.events"), [row], [])
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    partitions = await provider.list_partitions("events")
-
-    # Assert
-    assert len(partitions) == 1
-    assert partitions[0].is_default is True
-    assert partitions[0].from_value is None
-    assert partitions[0].to_value is None
-
-
-async def test__metadata_provider__list_partitions__dotted_relname__skipped_with_warning() -> None:
-    # Arrange — a relname containing '.' cannot be addressed as schema.relname DDL; must be skipped
-    good_row = MagicMock()
-    good_row.partition_schema = "public"
-    good_row.partition_name = "events__2024_01"
-    good_row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
-    good_row.is_attached = True
-    dotted_row = MagicMock()
-    dotted_row.partition_schema = "public"
-    dotted_row.partition_name = "events.2024_02"
-    dotted_row.boundaries = "FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')"
-    dotted_row.is_attached = True
-    engine = _make_engine(("r", "public.events"), [good_row, dotted_row], [])
-    provider = PostgresMetadataProvider(engine)
-    mock_logger = MagicMock()
-
-    # Act
-    with patch("pg_partsmith.partition_bounds.logger", mock_logger):
-        partitions = await provider.list_partitions("events")
-
-    # Assert
-    assert [p.name for p in partitions] == ["public.events__2024_01"]
-    mock_logger.warning.assert_called_once()
-
-
-async def test__metadata_provider__list_partitions__dotted_schema_orphan__skipped_with_warning() -> None:
-    # Arrange — an orphan whose schema contains '.' is equally unaddressable
-    orphan = MagicMock()
-    orphan.partition_schema = "bad.schema"
-    orphan.partition_name = "events__2023_12"
-    engine = _make_engine(("r", "public.events"), [], [orphan])
-    provider = PostgresMetadataProvider(engine)
-    mock_logger = MagicMock()
-
-    # Act
-    with patch("pg_partsmith.partition_bounds.logger", mock_logger):
-        partitions = await provider.list_partitions("events")
-
-    # Assert
-    assert partitions == []
-    mock_logger.warning.assert_called_once()
-
-
-async def test__metadata_provider__list_partitions__orphan_row__returns_detached_partition() -> None:
-    # Arrange
-    orphan = MagicMock()
-    orphan.partition_schema = "public"
-    orphan.partition_name = "events__2023_12"
-    engine = _make_engine(("r", "public.events"), [], [orphan])
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    partitions = await provider.list_partitions("events")
-
-    # Assert
-    assert len(partitions) == 1
-    assert partitions[0].name == "public.events__2023_12"
-    assert partitions[0].is_attached is False
-    assert partitions[0].from_value is None
-
-
-async def test__metadata_provider__list_partitions__bare_parent__returns_schema_qualified_names() -> None:
-    # Arrange — even for a bare parent name, children are qualified with their own catalog schema:
-    # a partition may live in a different schema, and a bare child name could resolve elsewhere
-    row = MagicMock()
-    row.partition_schema = "archive"
-    row.partition_name = "events__2024_01"
-    row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
-    row.is_attached = True
-    engine = _make_engine(("r", "public.events"), [row], [])
+    rows = [
+        _root_row(),
+        _tree_row(
+            level=1,
+            name="events__2024_01",
+            oid=101,
+            schema="archive",
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+        ),
+    ]
+    engine = _make_engine(rows, [])
     provider = PostgresMetadataProvider(engine)
 
     # Act
@@ -277,206 +757,120 @@ async def test__metadata_provider__list_partitions__bare_parent__returns_schema_
 
     # Assert
     assert [p.name for p in partitions] == ["archive.events__2024_01"]
-
-
-async def test__metadata_provider__list_partitions__orphan_query__accepts_partitioned_relkind() -> None:
-    # Arrange — an orphan may itself be subpartitioned (relkind 'p'), not only a plain table ('r')
-    engine = _make_engine(("r", "public.events"), [], [])
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    await provider.list_partitions("events")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    orphan_sql = str(conn.execute.call_args_list[2].args[0])
-    assert "relkind IN ('r', 'p')" in orphan_sql
-
-
-# ── partition_exists / is_partition_attached ────────────────────────────────────
-
-
-@pytest.mark.parametrize("exists", [True, False])
-async def test__metadata_provider__partition_exists__returns_correct_bool(exists: bool) -> None:
-    # Arrange
-    engine = _make_engine(exists)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act / Assert
-    assert await provider.partition_exists("events__2024_01") is exists
-
-
-async def test__metadata_provider__partition_exists__uses_quoted_regclass_argument() -> None:
-    # Arrange
-    engine = _make_engine(True)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    await provider.partition_exists("events__2024_W12")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    params = conn.execute.call_args.args[1]
-    assert params["partition_name"] == '"events__2024_W12"'
-
-
-async def test__metadata_provider__partition_exists__accepts_partitioned_relkind() -> None:
-    # Arrange — a partition can itself be subpartitioned (relkind 'p'), not only a plain table ('r')
-    engine = _make_engine(True)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    await provider.partition_exists("events__2024_01")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    sql = str(conn.execute.call_args.args[0])
-    assert "relkind IN ('r', 'p')" in sql
-
-
-@pytest.mark.parametrize("attached", [True, False])
-async def test__metadata_provider__is_partition_attached__returns_correct_bool(attached: bool) -> None:
-    # Arrange
-    engine = _make_engine(attached)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act / Assert
-    assert await provider.is_partition_attached("events", "events__2024_01") is attached
-
-
-async def test__metadata_provider__is_partition_attached__uses_quoted_regclass_arguments() -> None:
-    # Arrange
-    engine = _make_engine(True)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    await provider.is_partition_attached("events", "events__2024_W12")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    params = conn.execute.call_args.args[1]
-    assert params["table_name"] == '"events"'
-    assert params["partition_name"] == '"events__2024_W12"'
-
-
-# ── is_partition_closed ─────────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("scalar,expected", [(True, True), (False, False)])
-async def test__metadata_provider__is_partition_closed__maps_scalar_to_bool(scalar: bool, expected: bool) -> None:
-    # Arrange -- the bound is read first, then compared against now() in SQL.
-    engine = _make_engine("2024-02-01 00:00:00+00", scalar)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act / Assert
-    assert await provider.is_partition_closed("events__2024_01") is expected
-
-
-async def test__metadata_provider__is_partition_closed__no_upper_bound__is_not_closed() -> None:
-    # Arrange -- DEFAULT, detached, non-RANGE, or a name that resolves to nothing.
-    engine = _make_engine(None)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act / Assert -- and no comparison is attempted for want of anything to compare.
-    assert await provider.is_partition_closed("events_default") is False
-
-
-async def test__metadata_provider__is_partition_closed__passes_settle_seconds_and_quoted_regclass_name() -> None:
-    # Arrange
-    engine = _make_engine("2024-04-01 00:00:00+00", True)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    await provider.is_partition_closed("events__2024_W12", settle_seconds=900)
-
-    # Assert -- the bound is looked up by regclass, then compared against the
-    # passed settle buffer with the clock staying server-side.
-    conn = engine.connect.return_value.__aenter__.return_value
-    lookup, compare = conn.execute.call_args_list
-    assert "to_regclass(:partition_name)" in str(lookup.args[0])
-    assert lookup.args[1]["partition_name"] == '"events__2024_W12"'
-    assert "make_interval(secs => :settle_seconds)" in str(compare.args[0])
-    assert compare.args[1] == {"upper_bound": "2024-04-01 00:00:00+00", "settle_seconds": 900}
-
-
-async def test__metadata_provider__is_partition_closed__defaults_to_zero_settle_seconds() -> None:
-    # Arrange
-    engine = _make_engine("2024-02-01 00:00:00+00", True)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    await provider.is_partition_closed("events__2024_01")
-
-    # Assert
-    conn = engine.connect.return_value.__aenter__.return_value
-    assert conn.execute.call_args.args[1]["settle_seconds"] == 0
-
-
-# ── get_partition_boundaries ────────────────────────────────────────────────────
-
-
-async def test__metadata_provider__get_partition_boundaries__found__parses_from_and_to() -> None:
-    # Arrange
-    engine = _make_engine("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')")
-    provider = PostgresMetadataProvider(engine)
-
-    # Act
-    result = await provider.get_partition_boundaries("events__2024_01")
-
-    # Assert
-    assert result == ("2024-01-01", "2024-02-01")
-
-
-async def test__metadata_provider__get_partition_boundaries__not_found__returns_none() -> None:
-    # Arrange
-    engine = _make_engine(None)
-    provider = PostgresMetadataProvider(engine)
-
-    # Act / Assert
-    assert await provider.get_partition_boundaries("events__2024_01") is None
-
-
-# ── _parse_boundaries ───────────────────────────────────────────────────────────
+    assert partitions[0].parent_table == "events"
 
 
 @pytest.mark.parametrize(
-    "expr,expected",
+    "boundaries,expected",
     [
-        ("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')", ("2024-01-01", "2024-02-01")),
-        ("FOR VALUES FROM (1) TO (5)", ("1", "5")),
-        ("FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)", ("2024-01-01", "2024-02-01")),
-        (None, (None, None)),
-        ("INVALID EXPR", (None, None)),
-        ("DEFAULT", (None, None)),
-        # LIST bound whose string value embeds ") TO (" must not be mis-parsed as a range
-        ("FOR VALUES IN ('a) TO (b')", (None, None)),
+        ("FOR VALUES WITH (modulus 4, remainder 1)", "FOR VALUES WITH (modulus 4, remainder 1)"),
+        ("FOR VALUES IN ('eu', 'u''s', NULL)", "FOR VALUES IN ('eu', 'u''s', NULL)"),
+        ("FOR VALUES IN ('NULL')", "FOR VALUES IN ('NULL')"),
     ],
 )
-def test__parse_boundaries__various_expressions__returns_correct_tuple(
-    expr: str | None, expected: tuple[str | None, str | None]
+async def test__list_partitions__hash_and_list_bounds__are_spelled_the_way_postgres_does(
+    boundaries: str, expected: str
 ) -> None:
     # Arrange
-    provider = PostgresMetadataProvider(MagicMock())
+    partstrat = "h" if "modulus" in boundaries else "l"
+    root = _tree_row(level=0, name="tasks", oid=1, relkind="p", partstrat=partstrat, columns=["k"], key_arity=1)
+    engine = _make_engine(
+        [root, _tree_row(level=1, name="tasks__x", oid=2, parent=("public", "tasks"), boundaries=boundaries)], []
+    )
+    provider = PostgresMetadataProvider(engine)
 
-    # Act / Assert
-    assert provider._parse_boundaries(expr) == expected
+    # Act
+    (partition,) = await provider.list_partitions("public.tasks")
+
+    # Assert
+    assert partition.boundaries_expr == expected
+    assert partition.from_value is None
+    assert partition.partition_type is PartitionType.from_partstrat(partstrat)
+
+
+async def test__list_partitions__list_bounds__are_structured() -> None:
+    # Arrange
+    root = _tree_row(level=0, name="tasks", oid=1, relkind="p", partstrat="l", columns=["k"], key_arity=1)
+    child = _tree_row(
+        level=1, name="tasks__eu", oid=2, parent=("public", "tasks"), boundaries="FOR VALUES IN ('de', NULL)"
+    )
+    engine = _make_engine([root, child], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    (partition,) = await provider.list_partitions("public.tasks")
+
+    # Assert
+    assert partition.bounds == ListBounds(values=("de",), includes_null=True)
+
+
+async def test__list_partitions__orphans__only_those_of_the_root_are_listed() -> None:
+    # Arrange
+    rows = [
+        _root_row(),
+        _tree_row(
+            level=1,
+            name="events__2024_02",
+            oid=102,
+            relkind="p",
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-02-01') TO ('2024-03-01')",
+            partstrat="h",
+            columns=["tenant_id"],
+            key_arity=1,
+        ),
+    ]
+    orphans = [
+        _orphan_row("events__2023_12", orphan_table_comment("public.events"), oid=500, relkind="p"),
+        _orphan_row("events__2024_02__h1", orphan_table_comment("public.events__2024_02"), oid=501),
+    ]
+    engine = _make_engine(rows, orphans)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    partitions = await provider.list_partitions("public.events")
+
+    # Assert
+    assert [p.name for p in partitions] == ["public.events__2024_02", "public.events__2023_12"]
+    orphan = partitions[1]
+    assert orphan.oid == 500
+    assert orphan.is_attached is False
+    assert orphan.from_value is None
+    assert orphan.bounds is None
+    assert orphan.relkind is RelationKind.PARTITIONED
+    assert orphan.parent_table == "public.events"
+
+
+async def test__list_partitions__unparseable_range_bound__still_lists_the_partition() -> None:
+    # Arrange
+    child = _tree_row(
+        level=1, name="events__weird", oid=101, parent=("public", "events"), boundaries="FOR VALUES FROM (weird) ???"
+    )
+    engine = _make_engine([_root_row(), child], [])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    partitions = await provider.list_partitions("public.events")
+
+    # Assert
+    assert [p.name for p in partitions] == ["public.events__weird"]
+    assert partitions[0].is_attached is True
 
 
 # ── get_default_partition ───────────────────────────────────────────────────────
 
 
-async def test__metadata_provider__get_default_partition__default_exists__returns_it() -> None:
+async def test__get_default_partition__default_exists__returns_it() -> None:
     # Arrange
-    row = MagicMock()
-    row.partition_schema = "public"
-    row.partition_name = "events_default"
-    row.boundaries = "DEFAULT"
-    row.is_attached = True
-    engine = _make_engine(("r", "public.events"), [row], [])
+    rows = [
+        _root_row(),
+        _tree_row(level=1, name="events_default", oid=102, parent=("public", "events"), boundaries="DEFAULT"),
+    ]
+    engine = _make_engine(rows, [])
     provider = PostgresMetadataProvider(engine)
 
     # Act
-    result = await provider.get_default_partition("events")
+    result = await provider.get_default_partition("public.events")
 
     # Assert
     assert result is not None
@@ -485,74 +879,160 @@ async def test__metadata_provider__get_default_partition__default_exists__return
     assert result.is_attached is True
 
 
-async def test__metadata_provider__get_default_partition__no_default__returns_none() -> None:
+async def test__get_default_partition__no_default__returns_none() -> None:
     # Arrange
-    row = MagicMock()
-    row.partition_schema = "public"
-    row.partition_name = "events__2024_01"
-    row.boundaries = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')"
-    row.is_attached = True
-    engine = _make_engine(("r", "public.events"), [row], [])
+    rows = [
+        _root_row(),
+        _tree_row(
+            level=1,
+            name="events__2024_01",
+            oid=101,
+            parent=("public", "events"),
+            boundaries="FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+        ),
+    ]
+    engine = _make_engine(rows, [])
     provider = PostgresMetadataProvider(engine)
 
     # Act / Assert
-    assert await provider.get_default_partition("events") is None
+    assert await provider.get_default_partition("public.events") is None
 
 
-async def test__metadata_provider__get_default_partition__orphaned_default__returns_none() -> None:
-    # Arrange — detached DEFAULT (orphan row) must be ignored
-    orphan_row = MagicMock()
-    orphan_row.partition_schema = "public"
-    orphan_row.partition_name = "events_default"
-    engine = _make_engine(("r", "public.events"), [], [orphan_row])
+async def test__get_default_partition__detached_default__is_not_reported() -> None:
+    # Arrange -- an orphan carries no bounds, so it cannot be the DEFAULT partition
+    engine = _make_engine([_root_row()], [_orphan_row("events_default", orphan_table_comment("public.events"))])
     provider = PostgresMetadataProvider(engine)
 
     # Act / Assert
-    assert await provider.get_default_partition("events") is None
+    assert await provider.get_default_partition("public.events") is None
 
 
-async def test__metadata_provider__is_partition_closed__codec_cannot_read_the_bound__warns() -> None:
-    # Arrange -- an encoded bound the configured codec does not recognise.
-    engine = _make_engine("not-an-encoded-boundary")
-    codec = MagicMock()
-    codec.decode.return_value = None
-    provider = PostgresMetadataProvider(engine, boundary_codec=codec)
-    logger = MagicMock()
-
-    # Act
-    with patch("pg_partsmith.aio.metadata.logger", logger):
-        result = await provider.is_partition_closed("events__2026_w35")
-
-    # Assert -- an export pipeline gated on this would otherwise wait forever
-    # with nothing in the log to say why.
-    assert result is False
-    logger.warning.assert_called_once()
-    assert "boundary_codec" in logger.warning.call_args.args[0]
+# ── single relations ────────────────────────────────────────────────────────────
 
 
-async def test__metadata_provider__is_partition_closed__bound_is_not_a_timestamp__warns_instead_of_raising() -> None:
-    # Arrange -- a sortable identifier with a date-shaped prefix gets past any
-    # regex worth writing and still fails the cast.
-    engine = _make_engine("2026-08-28-a1b2c3")
-    conn = engine.connect.return_value.__aenter__.return_value
-    bound = MagicMock()
-    bound.scalar.return_value = "2026-08-28-a1b2c3"
-    conn.execute.side_effect = [bound, DBAPIError("SELECT now() >= ...", {}, Exception("invalid input syntax"))]
+@pytest.mark.parametrize("exists", [True, False])
+async def test__partition_exists__returns_the_catalog_answer(exists: bool) -> None:
+    # Arrange
+    engine = _make_engine(exists)
     provider = PostgresMetadataProvider(engine)
-    logger = MagicMock()
+
+    # Act / Assert
+    assert await provider.partition_exists("events__2024_W12") is exists
+    assert _conn(engine).execute.call_args.args[1] == {"partition_name": '"events__2024_W12"'}
+    assert "relkind IN ('r', 'p', 'f')" in _statements(engine)[0]
+
+
+@pytest.mark.parametrize("attached", [True, False])
+async def test__is_partition_attached__returns_the_catalog_answer(attached: bool) -> None:
+    # Arrange
+    engine = _make_engine(attached)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.is_partition_attached("events", "events__2024_W12") is attached
+    assert _conn(engine).execute.call_args.args[1] == {"table_name": '"events"', "partition_name": '"events__2024_W12"'}
+
+
+@pytest.mark.parametrize("value,expected", [(4242, 4242), ("4242", 4242), (None, None)])
+async def test__get_relation_oid__returns_an_int_or_none(value: object, expected: int | None) -> None:
+    # Arrange
+    engine = _make_engine(value)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_relation_oid("public.events__2024_01") == expected
+    assert _conn(engine).execute.call_args.args[1] == {"name": '"public"."events__2024_01"'}
+
+
+async def test__get_key_high_water_mark__max__queries_the_quoted_table_and_column() -> None:
+    # Arrange
+    engine = _make_engine(12345)
+    provider = PostgresMetadataProvider(engine)
 
     # Act
-    with patch("pg_partsmith.aio.metadata.logger", logger):
-        result = await provider.is_partition_closed("events__2026_w35")
+    value = await provider.get_key_high_water_mark("public.queue", "msg_id")
 
-    # Assert -- "not closed" is the documented answer for a bound this provider
-    # cannot read; raising out of a predicate is not.
-    assert result is False
-    logger.warning.assert_called_once()
+    # Assert
+    assert value == 12345
+    assert _statements(engine) == ['SELECT max("msg_id") FROM "public"."queue"']
 
 
-async def test__metadata_provider__is_partition_closed__no_bound_at_all__stays_quiet() -> None:
-    # Arrange -- DEFAULT, detached or non-RANGE: nothing to explain.
+async def test__get_key_high_water_mark__sequence__reads_the_serial_sequence() -> None:
+    # Arrange
+    engine = _make_engine("77")
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    value = await provider.get_key_high_water_mark("public.queue", "msg_id", sequence=True)
+
+    # Assert
+    assert value == 77
+    call = _conn(engine).execute.call_args
+    assert "pg_sequence_last_value" in str(call.args[0])
+    assert call.args[1] == {"table_name": '"public"."queue"', "column": "msg_id"}
+
+
+async def test__get_key_high_water_mark__empty_table__returns_none() -> None:
+    # Arrange
+    engine = _make_engine(None)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_key_high_water_mark("queue", "msg_id") is None
+
+
+async def test__get_partition_boundaries__range_bound__returns_the_pair() -> None:
+    # Arrange
+    engine = _make_engine("FOR VALUES FROM ('2024-01-01'::date) TO ('2024-02-01'::date)")
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_partition_boundaries("events__2024_01") == ("2024-01-01", "2024-02-01")
+
+
+@pytest.mark.parametrize("expr", [None, "", "DEFAULT", "FOR VALUES WITH (modulus 2, remainder 0)"])
+async def test__get_partition_boundaries__not_a_range_bound__returns_none(expr: str | None) -> None:
+    # Arrange
+    engine = _make_engine(expr)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.get_partition_boundaries("events__x") is None
+
+
+async def test__get_unique_constraint_columns__returns_a_tuple_per_constraint() -> None:
+    # Arrange
+    rows = [
+        SimpleNamespace(constraint_name="events_pkey", columns=["id", "created_at"]),
+        SimpleNamespace(constraint_name="events_tenant_key", columns=("tenant_id",)),
+        SimpleNamespace(constraint_name="odd", columns=None),
+    ]
+    engine = _make_engine(rows)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    constraints = await provider.get_unique_constraint_columns("public.events")
+
+    # Assert
+    assert constraints == (("id", "created_at"), ("tenant_id",), ())
+    assert _conn(engine).execute.call_args.args[1] == {"table_name": '"public"."events"'}
+
+
+# ── is_partition_closed ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("scalar,expected", [(True, True), (False, False)])
+async def test__is_partition_closed__maps_scalar_to_bool(scalar: bool, expected: bool) -> None:
+    # Arrange -- the bound is read first, then compared against now() in SQL
+    engine = _make_engine("2024-02-01 00:00:00+00", scalar)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act / Assert
+    assert await provider.is_partition_closed("events__2024_01") is expected
+
+
+async def test__is_partition_closed__no_upper_bound__is_not_closed_and_stays_quiet() -> None:
+    # Arrange -- DEFAULT, detached, non-RANGE, or a name that resolves to nothing
     engine = _make_engine(None)
     provider = PostgresMetadataProvider(engine)
     logger = MagicMock()
@@ -563,39 +1043,247 @@ async def test__metadata_provider__is_partition_closed__no_bound_at_all__stays_q
 
     # Assert
     assert result is False
+    assert _conn(engine).execute.await_count == 1
     logger.warning.assert_not_called()
 
 
-# ── partition keys this library cannot address ──────────────────────────────────
-
-
-async def test__metadata_provider__get_partition_columns__expression_key__is_refused() -> None:
-    # Arrange -- an expression key is recorded as attnum 0, which matches no
-    # column, so the row comes back with a NULL name.
-    engine = _make_engine([("created_at",), (None,)])
-    provider = PostgresMetadataProvider(engine)
-
-    # Act / Assert -- dropping the position instead would report a one-column
-    # key for a two-column table, and every bound built from it would be the
-    # wrong arity.
-    with pytest.raises(InvalidPartitionConfigError, match="key position 2"):
-        await provider.get_partition_columns("public.events")
-
-
-async def test__metadata_provider__get_partition_column__expression_key__is_refused() -> None:
+async def test__is_partition_closed__passes_settle_seconds_and_quoted_regclass_name() -> None:
     # Arrange
-    engine = _make_engine([(None,)])
+    engine = _make_engine("2024-04-01 00:00:00+00", True)
     provider = PostgresMetadataProvider(engine)
+
+    # Act
+    await provider.is_partition_closed("events__2024_W12", settle_seconds=900)
+
+    # Assert -- the raw text form is cast in SQL so the session timezone decides how it is read
+    lookup, compare = _conn(engine).execute.call_args_list
+    assert "to_regclass(:partition_name)" in str(lookup.args[0])
+    assert lookup.args[1]["partition_name"] == '"events__2024_W12"'
+    assert "CAST(:upper_bound AS text)::timestamptz" in str(compare.args[0])
+    assert compare.args[1] == {"upper_bound": "2024-04-01 00:00:00+00", "settle_seconds": 900}
+
+
+async def test__is_partition_closed__defaults_to_zero_settle_seconds() -> None:
+    # Arrange
+    engine = _make_engine("2024-02-01 00:00:00+00", True)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    await provider.is_partition_closed("events__2024_01")
+
+    # Assert
+    assert _conn(engine).execute.call_args.args[1]["settle_seconds"] == 0
+
+
+async def test__is_partition_closed__ddl_timezone__is_applied_to_the_session_first() -> None:
+    # Arrange
+    engine = _make_engine(None, "2024-02-01", True)
+    provider = PostgresMetadataProvider(engine, ddl_timezone="Europe/Moscow")
+
+    # Act
+    result = await provider.is_partition_closed("events__2024_01")
+
+    # Assert
+    assert result is True
+    assert _statements(engine)[0] == "SET LOCAL TIME ZONE 'Europe/Moscow'"
+
+
+async def test__is_partition_closed__codec__decodes_the_bound_and_compares_the_instant() -> None:
+    # Arrange
+    instant = datetime(2024, 2, 1, tzinfo=UTC)
+    codec = MagicMock()
+    codec.decode.return_value = instant
+    engine = _make_engine("018d5d3c-2000-7000-8000-000000000000", True)
+    provider = PostgresMetadataProvider(engine, boundary_codec=codec)
+
+    # Act
+    result = await provider.is_partition_closed("events__2024_01", settle_seconds=5)
+
+    # Assert
+    assert result is True
+    codec.decode.assert_called_once_with("018d5d3c-2000-7000-8000-000000000000")
+    compare = _conn(engine).execute.call_args
+    assert "CAST(:upper_bound AS timestamptz)" in str(compare.args[0])
+    assert compare.args[1] == {"upper_bound": instant, "settle_seconds": 5}
+
+
+async def test__is_partition_closed__codec_cannot_read_the_bound__warns_and_is_not_closed() -> None:
+    # Arrange -- an encoded bound the configured codec does not recognise
+    engine = _make_engine("not-an-encoded-boundary")
+    codec = MagicMock()
+    codec.decode.return_value = None
+    provider = PostgresMetadataProvider(engine, boundary_codec=codec)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.aio.metadata.logger", logger):
+        result = await provider.is_partition_closed("events__2026_w35")
+
+    # Assert
+    assert result is False
+    logger.warning.assert_called_once()
+    assert "boundary_codec" in logger.warning.call_args.args[0]
+    assert logger.warning.call_args.kwargs["extra"] == {
+        "partition_name": "events__2026_w35",
+        "upper_bound": "not-an-encoded-boundary",
+    }
+
+
+async def test__is_partition_closed__bound_is_not_a_timestamp__warns_instead_of_raising() -> None:
+    # Arrange -- a sortable identifier with a date-shaped prefix fails the cast
+    engine = _make_engine("2026-08-28-a1b2c3", DBAPIError("SELECT now() >= ...", {}, Exception("invalid input syntax")))
+    provider = PostgresMetadataProvider(engine)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.aio.metadata.logger", logger):
+        result = await provider.is_partition_closed("events__2026_w35")
+
+    # Assert
+    assert result is False
+    logger.warning.assert_called_once()
+
+
+# ── constructor ─────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("prefix", ["", "   ", "bad prefix;"])
+def test__constructor__invalid_marker_prefix__raises_value_error(prefix: str) -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="marker_prefix"):
+        PostgresMetadataProvider(MagicMock(), marker_prefix=prefix)
+
+
+def test__constructor__non_string_marker_prefix__raises_type_error() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(TypeError, match="marker_prefix"):
+        PostgresMetadataProvider(MagicMock(), marker_prefix=42)  # type: ignore[arg-type]
+
+
+# ── the DEFAULT probe ───────────────────────────────────────────────────────────
+
+
+async def test__get_leading_key_minimum__single_key__min_over_non_null_rows() -> None:
+    # Arrange
+    engine = _make_engine(datetime(2026, 3, 3, tzinfo=UTC))
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    value = await provider.get_leading_key_minimum("public.events_default", ("created_at",))
+
+    # Assert
+    assert value == datetime(2026, 3, 3, tzinfo=UTC)
+    assert _statements(engine) == [
+        'SELECT min("created_at") FROM "public"."events_default" WHERE "created_at" IS NOT NULL'
+    ]
+
+
+async def test__get_leading_key_minimum__composite_key__leaves_out_rows_with_a_null_anywhere_in_the_key() -> None:
+    # Arrange
+    engine = _make_engine(None)
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    value = await provider.get_leading_key_minimum("d", ("created_at", "tenant_id"))
+
+    # Assert
+    assert value is None
+    assert _statements(engine) == [
+        'SELECT min("created_at") FROM "d" WHERE "created_at" IS NOT NULL AND "tenant_id" IS NOT NULL'
+    ]
+
+
+async def test__get_leading_key_minimum__no_key__refused() -> None:
+    # Arrange
+    provider = PostgresMetadataProvider(_make_engine(None))
 
     # Act / Assert
-    with pytest.raises(ValueError, match="expression"):
-        await provider.get_partition_column("public.events")
+    with pytest.raises(ValueError, match="partition key"):
+        await provider.get_leading_key_minimum("d", ())
 
 
-async def test__metadata_provider__get_partition_columns__plain_columns__reports_them_in_key_order() -> None:
+# ── measure: references ─────────────────────────────────────────────────────────
+
+
+def _fk_row(referenced_oid: int, referencing: str = '"public"."refs"') -> SimpleNamespace:
+    return SimpleNamespace(
+        constraint_name="refs_fk",
+        referenced_oid=referenced_oid,
+        referencing=referencing,
+        referencing_columns=["event_id", "created_at"],
+        referenced_columns=["id", "created_at"],
+    )
+
+
+async def test__measure__references_requested__joins_each_foreign_key_to_the_partition() -> None:
+    # Arrange -- one FK on the parent; January's rows are referenced, the orphan is checked against nothing
+    engine = _make_engine([_fk_row(100)], True)
+    provider = PostgresMetadataProvider(engine)
+    tree = _sample_tree()
+
+    # Act
+    measured = await provider.measure(
+        tree,
+        targets=("public.events__2024_01", "public.events__2023_12"),
+        facts=frozenset({FactKind.REFERENCES}),
+    )
+
+    # Assert
+    statements = _statements(engine)
+    assert "confrelid = ANY" in statements[0]
+    assert _conn(engine).execute.call_args_list[0].args[1] == {"oids": [101, 500, 100]}
+    assert statements[1] == (
+        'SELECT EXISTS (SELECT 1 FROM "public"."refs" r JOIN "public"."events__2024_01" p '
+        'ON r."event_id" = p."id" AND r."created_at" = p."created_at")'
+    )
+    assert len(statements) == 2
+    january = measured.root.children[0]
+    assert january.facts == PartitionFacts(referenced=True)
+    assert measured.orphans[0].facts == PartitionFacts(referenced=False)
+
+
+async def test__measure__references__foreign_key_on_the_orphan_itself_is_checked() -> None:
     # Arrange
-    engine = _make_engine([("created_at",), ("tenant_id",)])
+    engine = _make_engine([_fk_row(500)], False)
     provider = PostgresMetadataProvider(engine)
 
-    # Act / Assert
-    assert await provider.get_partition_columns("public.events") == ("created_at", "tenant_id")
+    # Act
+    measured = await provider.measure(
+        _sample_tree(), targets=("public.events__2023_12",), facts=frozenset({FactKind.REFERENCES})
+    )
+
+    # Assert
+    assert measured.orphans[0].facts == PartitionFacts(referenced=False)
+    assert 'JOIN "public"."events__2023_12" p' in _statements(engine)[1]
+
+
+async def test__measure__references__no_foreign_keys__no_join_is_run() -> None:
+    # Arrange
+    engine = _make_engine([])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = await provider.measure(
+        _sample_tree(), targets=("public.events__2024_01",), facts=frozenset({FactKind.REFERENCES})
+    )
+
+    # Assert
+    assert _conn(engine).execute.await_count == 1
+    assert measured.root.children[0].facts == PartitionFacts(referenced=False)
+
+
+async def test__measure__references_and_sizes__both_queries_run() -> None:
+    # Arrange
+    engine = _make_engine(
+        [_facts_row(101, 10, 1)],
+        [],
+    )
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = await provider.measure(
+        _sample_tree(), targets=("public.events__2024_01",), facts=frozenset({FactKind.SIZE, FactKind.REFERENCES})
+    )
+
+    # Assert
+    assert measured.root.children[0].facts == PartitionFacts(size_bytes=10, referenced=False)

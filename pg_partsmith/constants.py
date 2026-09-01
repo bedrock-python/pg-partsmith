@@ -11,8 +11,10 @@ MAX_IDENTIFIER_LENGTH = 63
 DEFAULT_HASH_NAME_SUFFIX = "__h{remainder}"
 DEFAULT_LIST_NAME_SUFFIX = "__{name}"
 DEFAULT_LIST_DEFAULT_NAME = "other"
-# Depth of a declared subpartition tree (levels below the root table).
-MAX_SUBPARTITION_DEPTH = 4
+DEFAULT_NUMERIC_NAME_SUFFIX = "__{start}"
+DEFAULT_SEQUENCE_NAME_SUFFIX = "__{value}"
+# Depth of a declared partition scheme, root level included.
+MAX_SCHEME_DEPTH = 5
 # Largest least-common-multiple of hash moduli we will enumerate when checking
 # whether a mixed-modulus hash set tiles the keyspace; beyond it coverage is
 # reported as unknown rather than guessed.
@@ -36,6 +38,9 @@ PG_CHECK_VIOLATION = "23514"
 # with another worker): duplicate_table, duplicate_object, and wrong_object_type
 # (42809 is what PostgreSQL raises for "X is already a partition").
 ATTACH_CONFLICT_SQLSTATES = frozenset({"42P07", "42710", "42809"})
+
+# Rows one batch of partition_data / unpartition moves.
+DEFAULT_MOVE_BATCH_ROWS = 10_000
 
 # Retries for ATTACH after DEFAULT-partition reconciliation.
 DEFAULT_CONFLICT_MAX_RETRIES = 2

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import ClassVar
 
-from pg_partsmith.entities import Period
+from pg_partsmith.periods import Period
 
 from .base import BasePeriodCalculator
 
@@ -19,9 +20,9 @@ class DayPeriodCalculator(BasePeriodCalculator):
 
     _NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^(.+)__(\d{4})_(\d{2})_(\d{2})$")
 
-    def current_period(self) -> Period:
-        """Get current day period."""
-        now = self._now()
+    def period_at(self, instant: datetime) -> Period:
+        """Return the day period holding ``instant``."""
+        now = self._local(instant)
         return Period(year=now.year, month=now.month, day=now.day)
 
     def format_partition_name(self, table_name: str, period: Period) -> str:

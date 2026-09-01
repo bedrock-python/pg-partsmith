@@ -1,229 +1,246 @@
+"""Unit tests for the sync ``PostgresPartitionRepository`` and its creator / remover helpers against a mocked engine."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.entities import (
-    DefaultBounds,
-    HashBounds,
-    HashSubpartitionSpec,
-    ListBounds,
-    PartitionGranularity,
-    PartitionStrategy,
-    PartitionType,
-    TablePartitionConfig,
-)
+from pg_partsmith.entities import DefaultBounds, HashBounds, ListBounds, PartitionType, RangeBounds
 from pg_partsmith.exceptions import (
     DropRetryExhaustedError,
     PartitionAlreadyExistsError,
     PartitionAttachedError,
     PartitionDetachInProgressError,
     PartitionNotFoundError,
+    PartitionReferencedError,
+    PlanStaleError,
+    RowMoveRefusedError,
     UnmanagedPartitionDropError,
 )
+from pg_partsmith.leaves import LocalLeaves
+from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.plan import PartitionBy
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.repositories.fk_manager import PartitionForeignKeyManager
-from pg_partsmith.utils import orphan_table_comment, pg_sqlstate
+from pg_partsmith.sync.repositories.resolver import PartitionRelationResolver
+from pg_partsmith.sync.repositories.timeouts import apply_local_statement_timeout, session_statement_timeout
+from pg_partsmith.utils import DETACHED_AT_MARKER, orphan_comment, orphan_table_comment
 
-# ── helpers ─────────────────────────────────────────────────────────────────────
+# ── a catalog the fake connection answers from ──────────────────────────────────
 
 
-def _columns_result(*names: str) -> MagicMock:
-    """A result standing in for the relation-columns lookup the move issues first."""
+@dataclass
+class _Catalog:
+    """What the mocked PostgreSQL knows; a list is consumed one value per read."""
+
+    exists: object = True
+    attached_to: object = None
+    comment: object = None
+    oid: object = 4242
+    fqn: str | None = "public.events"
+    detach_pending: bool = False
+    fk_constraints: list[str] = field(default_factory=list)
+    columns: list[str] = field(default_factory=lambda: ["created_at", "tenant_id", "data"])
+    column_defs: list[tuple[str, str, bool]] = field(
+        default_factory=lambda: [("ts", "timestamp with time zone", True), ("v", "double precision", False)]
+    )
+    privileges: list[tuple[str | None, str | None, str | None, bool]] = field(default_factory=list)
+    relkind: str = "r"
+    moved_rows: int | None = 0
+    identity_always: object = False
+    identity_columns: list[str] = field(default_factory=list)
+    # What ``pg_sequence`` and ``pg_sequence_last_value`` say about the
+    # identity column's sequence, and the extreme id the target holds.
+    sequence: dict[str, object] = field(
+        default_factory=lambda: {
+            "increment": 1,
+            "minimum": 1,
+            "maximum": 2**63 - 1,
+            "cycles": False,
+            "cache": 1,
+            "start_value": 1,
+            "last_value": None,
+        }
+    )
+    extreme_value: object = None
+    # Whether a row carries a value one of the sequence probes asks about
+    # (a cached block, or anything inside a cycling sequence's range).
+    holds_value: object = False
+    destructive_fks: list[tuple[str, str, str]] = field(default_factory=list)
+    failures: dict[str, object] = field(default_factory=dict)
+
+
+# A source that carries the destination's identity column: the move hands those
+# ids over, so the destination's sequence has something to decide about. One it
+# does not carry is filled by the sequence itself, like any ordinary insert.
+_IDENTITY_SOURCE_COLUMNS = ["id", "created_at", "tenant_id", "data"]
+# Where a move parks the identity values it brought in, and where every
+# sequence decision reads them back from.
+
+
+def _next(value: object) -> object:
+    if isinstance(value, list):
+        return value.pop(0) if value else None
+    return value
+
+
+def _scalar(value: object) -> MagicMock:
     result = MagicMock()
-    result.fetchall.return_value = [(name,) for name in (names or ("created_at", "tenant_id", "data"))]
+    result.scalar.return_value = value
+    result.fetchall.return_value = []
     return result
 
 
-def _ddl_engine() -> tuple[MagicMock, MagicMock]:
-    """An engine whose ``begin()`` yields a connection that records statements."""
-    engine = MagicMock()
+def _first(row: object) -> MagicMock:
+    result = MagicMock()
+    result.first.return_value = row
+    return result
+
+
+def _rows(values: list[tuple[object, ...]]) -> MagicMock:
+    result = MagicMock()
+    result.fetchall.return_value = values
+    return result
+
+
+def _answer(catalog: _Catalog, sql: str) -> MagicMock:
+    """Answer one statement from the catalog, raising a configured failure first."""
+    for needle, failure in catalog.failures.items():
+        if needle in sql:
+            error = _next(failure)
+            if error is not None:
+                raise error  # type: ignore[misc]
+    if "inhdetachpending" in sql:
+        return _scalar(catalog.detach_pending)
+    if "confdeltype IN" in sql:
+        return _rows(list(catalog.destructive_fks))
+    if "attidentity IN" in sql:
+        return _rows([(column,) for column in catalog.identity_columns])
+    if "attidentity" in sql:
+        return _scalar(_next(catalog.identity_always))
+    if "seqincrement" in sql:
+        # A list answers one identity column after another.
+        parameters = catalog.sequence
+        if isinstance(parameters, list):
+            parameters = parameters.pop(0)
+        return _first(SimpleNamespace(**parameters))
+    if sql.startswith("SELECT EXISTS (SELECT 1 FROM"):
+        return _scalar(catalog.holds_value)
+    if sql.startswith(("SELECT MAX(", "SELECT MIN(")):
+        return _scalar(catalog.extreme_value)
+    if "obj_description" in sql:
+        return _scalar(_next(catalog.comment))
+    if "relispartition = true" in sql:
+        return _scalar(_next(catalog.attached_to))
+    if "relkind IN ('r', 'p', 'f')" in sql:
+        return _scalar(_next(catalog.exists))
+    if "SELECT c.oid" in sql:
+        return _scalar(_next(catalog.oid))
+    if "ns.nspname || '.' || c.relname" in sql:
+        return _scalar(catalog.fqn)
+    if "contype = 'f'" in sql:
+        return _rows([(name,) for name in catalog.fk_constraints])
+    if "format_type(" in sql:
+        return _rows(list(catalog.column_defs))
+    if "pg_attribute a" in sql:
+        return _rows([(column,) for column in catalog.columns])
+    if "aclexplode" in sql:
+        return _rows(list(catalog.privileges))
+    if "SELECT c.relkind" in sql:
+        return _scalar(catalog.relkind)
+    if "WITH moved AS" in sql:
+        result = MagicMock()
+        result.rowcount = catalog.moved_rows
+        return result
+    return _scalar(None)
+
+
+def _engine(catalog: _Catalog | None = None) -> tuple[MagicMock, MagicMock]:
+    """An engine whose single connection answers from ``catalog`` and records every statement."""
+    catalog = catalog or _Catalog()
     conn = MagicMock()
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
+    conn.execute.side_effect = lambda stmt, params=None: _answer(catalog, str(stmt))
+    conn.execution_options = MagicMock(return_value=conn)
+
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=conn)
+    cm.__exit__ = MagicMock(return_value=False)
+    engine = MagicMock()
+    engine.connect.return_value = cm
+    engine.begin.return_value = cm
     return engine, conn
 
 
-def _sqlstate_error(sqlstate: str) -> SQLAlchemyError:
-    """A driver error carrying a PostgreSQL SQLSTATE."""
+def _all_statements(conn: MagicMock) -> list[str]:
+    return [str(call.args[0]) for call in conn.execute.call_args_list]
+
+
+def _is_timeout_bookkeeping(sql: str) -> bool:
+    return "statement_timeout" in sql
+
+
+def _statements(conn: MagicMock) -> list[str]:
+    """Every statement except the server-side ``statement_timeout`` bookkeeping the sync mirror adds."""
+    return [sql for sql in _all_statements(conn) if not _is_timeout_bookkeeping(sql)]
+
+
+def _locks(conn: MagicMock) -> list[str]:
+    return [s for s in _statements(conn) if s.startswith("LOCK TABLE")]
+
+
+def _attach_statement(conn: MagicMock) -> str:
+    return next(s for s in _statements(conn) if "ATTACH PARTITION" in s)
+
+
+def _parked_identity_of(conn: MagicMock) -> str:
+    """The relation one move parked its identity values in, as its probes name it."""
+    (created,) = [s for s in _statements(conn) if s.startswith("CREATE TEMP TABLE")]
+    return '"pg_temp".' + created.split()[3]
+
+
+def _move_statement_of(conn: MagicMock) -> str:
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    return statement
+
+
+# The comment read every attach ends with: a re-attached relation must not keep the marker.
+_MARKER_LOOKUP = "SELECT obj_description(to_regclass(:partition_name), 'pg_class')"
+
+
+def _creates(conn: object) -> list[str]:
+    """The create path's statements, without the created-OID lookup it now ends with."""
+    return [s for s in _statements(conn) if "SELECT c.oid" not in s]
+
+
+def _sqlstate_error(sqlstate: str, message: str = "pg error") -> SQLAlchemyError:
+    exc = SQLAlchemyError(message)
     orig = MagicMock()
     orig.sqlstate = sqlstate
-    error = SQLAlchemyError("boom")
-    error.orig = orig  # type: ignore[attr-defined]
-    return error
-
-
-#
-# Unlike the async repository, the sync repository enforces ``ddl_timeout_seconds``
-# server-side via extra ``set_config('statement_timeout', ...)`` executes:
-#   - every ``engine.begin()`` block and the drop pre-check connection start
-#     with one extra ``set_config`` execute;
-#   - the autocommit DETACH CONCURRENTLY path wraps in a session-level ``set_config``
-#     plus a trailing ``RESET statement_timeout`` execute;
-#   - every ``detach`` starts with a pending-detach pre-check on its own autocommit
-#     connection: ``set_config``, SELECT inhdetachpending, ``RESET`` (3 executes when
-#     not pending).
-# Result sequences and call-count assertions below account for those extra calls.
-
-
-@pytest.fixture
-def config() -> TablePartitionConfig:
-    return TablePartitionConfig(
-        table_name="events",
-        partition_type=PartitionType.RANGE,
-        partition_strategy=PartitionStrategy.TIME_BASED,
-        partition_column="created_at",
-        granularity=PartitionGranularity.MONTH,
-    )
-
-
-def _make_engine(sequence: list[object] | None = None) -> MagicMock:
-    """Build an engine mock consuming *sequence* values in order.
-
-    - A list value → result.fetchall.return_value
-    - Any other value → result.scalar.return_value
-    One conn mock is shared between engine.connect() and engine.begin().
-    """
-    engine = MagicMock()
-    conn = MagicMock()
-
-    results = []
-    for value in sequence or []:
-        r = MagicMock()
-        if isinstance(value, list):
-            r.fetchall.return_value = value
-        else:
-            r.scalar.return_value = value
-        results.append(r)
-
-    if results:
-        conn.execute.side_effect = results
-    else:
-        default_result = MagicMock()
-        default_result.scalar.return_value = None
-        default_result.fetchall.return_value = []
-        conn.execute.return_value = default_result
-
-    conn.execution_options = MagicMock(return_value=conn)
-
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=conn)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
-
-    return engine
-
-
-def _make_retryable_exc(sqlstate: str) -> SQLAlchemyError:
-    orig = MagicMock()
-    orig.sqlstate = sqlstate
-    exc = SQLAlchemyError("pg error")
     exc.orig = orig  # type: ignore[attr-defined]
     return exc
 
 
-def _make_retry_engine(fail_with: Exception, fail_attempts: int) -> MagicMock:
-    """Engine where connect() always reads OK, begin() fails *fail_attempts* times then succeeds."""
-    engine = MagicMock()
-    conn_read = MagicMock()
-
-    def _r(v: object) -> MagicMock:
-        r = MagicMock()
-        if isinstance(v, list):
-            r.fetchall.return_value = v
-        else:
-            r.scalar.return_value = v
-        return r
-
-    # read conn: set_config, exists, not attached, marker
-    conn_read.execute.side_effect = [
-        _r(None),
-        _r(True),
-        _r(None),
-        _r(orphan_table_comment("events")),
-    ]
-
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=conn_read)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
-
-    def _make_begin_cm(*, should_fail: bool) -> MagicMock:
-        ddl_conn = MagicMock()
-        if should_fail:
-            ddl_conn.execute.side_effect = fail_with
-        else:
-            # statement_timeout, lock_timeout, LOCK TABLE, revalidation (not attached, marker), FK list, DROP
-            ddl_conn.execute.side_effect = [
-                _r(None),
-                _r(None),
-                _r(None),
-                _r(None),
-                _r(orphan_table_comment("events")),
-                _r([]),
-                _r(None),
-            ]
-        begin_cm = MagicMock()
-        begin_cm.__enter__ = MagicMock(return_value=ddl_conn)
-        begin_cm.__exit__ = MagicMock(return_value=False)
-        return begin_cm
-
-    begin_cms = [_make_begin_cm(should_fail=True) for _ in range(fail_attempts)]
-    begin_cms.append(_make_begin_cm(should_fail=False))
-    engine.begin.side_effect = begin_cms
-
-    return engine
+def _comment_statement(conn: MagicMock) -> str:
+    (statement,) = [s for s in _statements(conn) if s.startswith("COMMENT ON TABLE")]
+    return statement
 
 
-def _make_drop_engine(read_values: list[object], ddl_values: list[object]) -> tuple[MagicMock, MagicMock]:
-    """Engine with separate connect() (pre-check) and begin() (DDL) connections for drop tests.
-
-    An Exception instance in a sequence is raised by that execute() call;
-    a list becomes result.fetchall(); anything else becomes result.scalar().
-    """
-
-    def _to_effect(value: object) -> object:
-        if isinstance(value, BaseException):
-            return value
-        r = MagicMock()
-        if isinstance(value, list):
-            r.fetchall.return_value = value
-        else:
-            r.scalar.return_value = value
-        return r
-
-    engine = MagicMock()
-
-    conn_read = MagicMock()
-    conn_read.execute.side_effect = [_to_effect(v) for v in read_values]
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=conn_read)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
-
-    ddl_conn = MagicMock()
-    ddl_conn.execute.side_effect = [_to_effect(v) for v in ddl_values]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=ddl_conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-
-    return engine, ddl_conn
-
-
-# ── constructor validation ──────────────────────────────────────────────────────
+# ── constructor ─────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
     "kwargs,exc_type,match",
     [
+        ({"ddl_timeout_seconds": 0}, ValueError, "ddl_timeout_seconds"),
+        ({"ddl_timeout_seconds": -1}, ValueError, "ddl_timeout_seconds"),
+        ({"ddl_timezone": ""}, ValueError, "ddl_timezone"),
+        ({"ddl_timezone": "Europe/Moscow; DROP"}, ValueError, "ddl_timezone"),
+        ({"marker_prefix": "bad prefix"}, ValueError, "marker_prefix"),
         ({"drop_lock_timeout_ms": -1}, ValueError, "drop_lock_timeout_ms"),
         ({"drop_lock_timeout_ms": "nope"}, TypeError, "drop_lock_timeout_ms"),
         ({"drop_lock_timeout_ms": True}, TypeError, "drop_lock_timeout_ms"),
@@ -232,703 +249,659 @@ def _make_drop_engine(read_values: list[object], ddl_values: list[object]) -> tu
         ({"drop_retry_delay": -0.1}, ValueError, "drop_retry_delay"),
         ({"drop_retry_delay": "slow"}, TypeError, "drop_retry_delay"),
         ({"drop_retry_delay": False}, TypeError, "drop_retry_delay"),
+        ({"drop_max_backoff": -1}, ValueError, "drop_max_backoff"),
     ],
 )
-def test__repository__invalid_constructor_argument__raises_correct_exception(
-    kwargs: dict, exc_type: type[Exception], match: str
+def test__constructor__invalid_argument__raises(
+    kwargs: dict[str, object], exc_type: type[Exception], match: str
 ) -> None:
     # Arrange / Act / Assert
     with pytest.raises(exc_type, match=match):
         PostgresPartitionRepository(MagicMock(), **kwargs)  # type: ignore[arg-type]
 
 
-# ── create_partition ────────────────────────────────────────────────────────────
+def test__ddl_timezone__defaults_to_utc() -> None:
+    # Arrange / Act / Assert
+    assert PostgresPartitionRepository(MagicMock()).ddl_timezone == "UTC"
 
 
-def test__repository__create_partition__new_partition__returns_partition_info(
-    config: TablePartitionConfig,
-) -> None:
-    # Arrange — set_config timeout; CREATE TABLE → success
-    engine = _make_engine([None, None])
+def test__ddl_timezone__is_stripped_and_kept() -> None:
+    # Arrange / Act / Assert
+    assert PostgresPartitionRepository(MagicMock(), ddl_timezone=" Europe/Moscow ").ddl_timezone == "Europe/Moscow"
+
+
+def test__ddl_timezone__none_trusts_the_session() -> None:
+    # Arrange / Act / Assert
+    assert PostgresPartitionRepository(MagicMock(), ddl_timezone=None).ddl_timezone is None
+
+
+# ── create_table_like ───────────────────────────────────────────────────────────
+
+
+def test__create_table_like__leaf__copies_the_template_without_its_identity() -> None:
+    # Arrange
+    engine, conn = _engine()
     repo = PostgresPartitionRepository(engine)
 
     # Act
-    info = repo.create_partition(config, "events__2024_01", "2024-01-01", "2024-02-01")
+    repo.create_table_like("public.events", "public.events__2024_01", None)
 
     # Assert
-    assert info.name == "events__2024_01"
-    assert info.from_value == "2024-01-01"
-    assert info.to_value == "2024-02-01"
-    assert info.is_attached is False
-    assert info.parent_table == "events"
+    assert _creates(conn) == [
+        'CREATE TABLE "public"."events__2024_01" (LIKE "public"."events" INCLUDING ALL EXCLUDING IDENTITY)'
+    ]
+    engine.begin.assert_called_once()
 
 
-def test__repository__create_partition__already_exists__raises_partition_already_exists(
-    config: TablePartitionConfig,
-) -> None:
-    # Arrange — set_config timeout succeeds; CREATE TABLE raises duplicate_table
-    engine = MagicMock()
-    conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), _make_retryable_exc("42P07")]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
+def test__create_table_like__branch__partitions_by_every_quoted_column() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+    partition_by = PartitionBy(method=PartitionType.HASH, columns=("tenant_id", "shard_id"))
+
+    # Act
+    repo.create_table_like("events__2026_w35", "events__2026_w35__h0", partition_by)
+
+    # Assert
+    assert _creates(conn) == [
+        'CREATE TABLE "events__2026_w35__h0" (LIKE "events__2026_w35" INCLUDING ALL EXCLUDING IDENTITY) '
+        'PARTITION BY HASH ("tenant_id", "shard_id")'
+    ]
+
+
+def test__create_table_like__range_branch__spells_the_method_in_upper_case() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_table_like("events", "events__h0", PartitionBy(method=PartitionType.RANGE, columns=("created_at",)))
+
+    # Assert
+    assert _creates(conn)[0].endswith('PARTITION BY RANGE ("created_at")')
+
+
+def test__create_table_like__name_taken__raises_already_exists() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"CREATE TABLE": _sqlstate_error("42P07")}))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
-    with pytest.raises(PartitionAlreadyExistsError):
-        repo.create_partition(config, "events__2024_01", "2024-01-01", "2024-02-01")
+    with pytest.raises(PartitionAlreadyExistsError) as excinfo:
+        repo.create_table_like("events", "events__2024_01", None)
+
+    assert excinfo.value.partition_name == "events__2024_01"
+
+
+def test__create_table_like__other_database_error__propagates() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"CREATE TABLE": _sqlstate_error("42501", "permission denied")}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="permission denied"):
+        repo.create_table_like("events", "events__2024_01", None)
+
+
+def test__create_table_like__transport_error__propagates() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"CREATE TABLE": OSError("connection reset")}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(OSError, match="connection reset"):
+        repo.create_table_like("events", "events__2024_01", None)
 
 
 # ── attach_partition ────────────────────────────────────────────────────────────
 
 
-def test__repository__attach_partition__sets_timeout_and_utc_timezone_then_attaches() -> None:
+def test__attach_partition__range_bounds__sets_the_ddl_timezone_then_attaches() -> None:
     # Arrange
-    engine = _make_engine([None, None, None])
+    engine, conn = _engine()
     repo = PostgresPartitionRepository(engine)
 
     # Act
-    repo.attach_partition("events", "events__2024_01", "2024-01-01", "2024-02-01")
+    repo.attach_partition("events", "events__2024_01", RangeBounds(from_value="2024-01-01", to_value="2024-02-01"))
 
     # Assert
-    conn = engine.begin.return_value.__enter__.return_value
-    assert conn.execute.call_count == 3
-    first_stmt = str(conn.execute.call_args_list[0].args[0])
-    assert "statement_timeout" in first_stmt
-    second_stmt = str(conn.execute.call_args_list[1].args[0])
-    assert "time zone" in second_stmt.lower() and "SET LOCAL" in second_stmt
-    assert "ATTACH PARTITION" in str(conn.execute.call_args_list[2].args[0])
+    assert _statements(conn) == [
+        "SET LOCAL TIME ZONE 'UTC'",
+        "ALTER TABLE \"events\" ATTACH PARTITION \"events__2024_01\" FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+        _MARKER_LOOKUP,
+    ]
+
+
+def test__attach_partition__custom_ddl_timezone__is_the_one_set() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine, ddl_timezone="Europe/Moscow")
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", RangeBounds(from_value="2024-01-01", to_value="2024-02-01"))
+
+    # Assert
+    assert _statements(conn)[0] == "SET LOCAL TIME ZONE 'Europe/Moscow'"
+
+
+def test__attach_partition__no_ddl_timezone__attaches_without_touching_the_session() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine, ddl_timezone=None)
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", RangeBounds(from_value="2024-01-01", to_value="2024-02-01"))
+
+    # Assert -- the attach, then the marker lookup; no session setting
+    assert _statements(conn)[0].startswith("ALTER TABLE")
+    assert not any("TIME ZONE" in s for s in _statements(conn))
+
+
+def test__attach_partition__composite_key__pads_every_trailing_column_with_minvalue() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition(
+        "events", "events__2026_w35", RangeBounds(from_value="2026-08-24", to_value="2026-08-31"), key_arity=3
+    )
+
+    # Assert -- one MINVALUE per trailing column, on both ends
+    stmt = _attach_statement(conn)
+    assert "FROM ('2026-08-24', MINVALUE, MINVALUE)" in stmt
+    assert "TO ('2026-08-31', MINVALUE, MINVALUE)" in stmt
+
+
+@pytest.mark.parametrize(
+    "bounds,expected",
+    [
+        (RangeBounds(from_value="MINVALUE", to_value="2024-02-01"), "FOR VALUES FROM (MINVALUE) TO ('2024-02-01')"),
+        (RangeBounds(from_value="2024-01-01", to_value="maxvalue"), "FOR VALUES FROM ('2024-01-01') TO (MAXVALUE)"),
+        (RangeBounds(from_value="o'clock", to_value="p'clock"), "FOR VALUES FROM ('o''clock') TO ('p''clock')"),
+        (RangeBounds(from_value="{a}", to_value="[b]"), "FOR VALUES FROM ('{a}') TO ('[b]')"),
+    ],
+)
+def test__attach_partition__range_literals__unbounded_ends_are_keywords_and_values_are_quoted(
+    bounds: RangeBounds, expected: str
+) -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events", "events__x", bounds)
+
+    # Assert
+    assert _attach_statement(conn).endswith(expected)
+
+
+def test__attach_partition__hash_bounds__renders_modulus_then_remainder_without_a_timezone() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events__2026_w35", "events__2026_w35__h1", HashBounds(modulus=4, remainder=1))
+
+    # Assert
+    assert _statements(conn) == [
+        'ALTER TABLE "events__2026_w35" ATTACH PARTITION "events__2026_w35__h1" '
+        "FOR VALUES WITH (MODULUS 4, REMAINDER 1)",
+        _MARKER_LOOKUP,
+    ]
+
+
+def test__attach_partition__list_bounds__quotes_values_and_keeps_null_a_keyword() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("regions", "regions__eu", ListBounds(values=("de", "l'x"), includes_null=True))
+
+    # Assert
+    assert _statements(conn) == [
+        "ALTER TABLE \"regions\" ATTACH PARTITION \"regions__eu\" FOR VALUES IN ('de', 'l''x', NULL)",
+        _MARKER_LOOKUP,
+    ]
+
+
+def test__attach_partition__list_bounds_with_the_string_null__quotes_it() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("regions", "regions__x", ListBounds(values=("NULL",)))
+
+    # Assert
+    assert _attach_statement(conn).endswith("FOR VALUES IN ('NULL')")
+
+
+def test__attach_partition__default_bounds__renders_default() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("regions", "regions__other", DefaultBounds())
+
+    # Assert
+    assert _statements(conn) == ['ALTER TABLE "regions" ATTACH PARTITION "regions__other" DEFAULT', _MARKER_LOOKUP]
+
+
+def test__attach_partition__database_error__propagates() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"ATTACH PARTITION": _sqlstate_error("42P07", "already a partition")}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="already a partition"):
+        repo.attach_partition("events", "events__x", HashBounds(modulus=2, remainder=0))
+
+
+# ── reconcile_default_rows ──────────────────────────────────────────────────────
+
+
+def test__reconcile_default_rows__names_the_columns_on_both_sides_and_returns_the_count() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=42))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        key_columns=("created_at",),
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert
+    assert moved == 42
+    statements = _statements(conn)
+    assert statements[0] == "SET LOCAL TIME ZONE 'UTC'"
+    assert _locks(conn) == [
+        'LOCK TABLE "events_default" IN SHARE ROW EXCLUSIVE MODE',
+        'LOCK TABLE "events__2024_04" IN SHARE ROW EXCLUSIVE MODE',
+    ]
+    assert _move_statement_of(conn) == (
+        'WITH moved AS (DELETE FROM "events_default" '
+        "WHERE \"created_at\" >= '2024-04-01' AND \"created_at\" < '2024-05-01' "
+        'RETURNING "created_at", "tenant_id", "data") '
+        'INSERT INTO "events__2024_04" ("created_at", "tenant_id", "data") '
+        'SELECT "created_at", "tenant_id", "data" FROM moved'
+    )
+    columns_lookup = next(c for c in conn.execute.call_args_list if "pg_attribute" in str(c.args[0]))
+    assert columns_lookup.args[1] == {"table_name": '"events_default"'}
+
+
+def test__reconcile_default_rows__composite_key__leaves_rows_with_a_null_trailing_key_in_default() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=3))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        key_columns=("created_at", "tenant_id", "shard_id"),
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert
+    move = _move_statement_of(conn)
+    assert 'AND "created_at" < \'2024-05-01\' AND "tenant_id" IS NOT NULL AND "shard_id" IS NOT NULL RETURNING' in move
+
+
+def test__reconcile_default_rows__single_column_key__adds_no_null_test() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        key_columns=("created_at",),
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert
+    assert "IS NOT NULL" not in _statements(conn)[-1]
+
+
+def test__reconcile_default_rows__empty_key__is_rejected_before_any_sql() -> None:
+    # Arrange
+    engine, _ = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="partition key"):
+        repo.reconcile_default_rows(
+            default_partition_name="events_default",
+            target_partition_name="events__2024_04",
+            key_columns=(),
+            from_value="2024-04-01",
+            to_value="2024-05-01",
+        )
+
+    engine.begin.assert_not_called()
+
+
+def test__reconcile_default_rows__relation_without_columns__is_reported_not_guessed() -> None:
+    # Arrange -- to_regclass resolved nothing, so the column lookup is empty
+    engine, conn = _engine(_Catalog(columns=[]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionNotFoundError, match="no readable columns"):
+        repo.reconcile_default_rows(
+            default_partition_name="events_default",
+            target_partition_name="events__2024_04",
+            key_columns=("created_at",),
+            from_value="2024-04-01",
+            to_value="2024-05-01",
+        )
+
+    assert not any("WITH moved AS" in s for s in _statements(conn))
+
+
+def test__reconcile_default_rows__no_ddl_timezone__skips_the_session_setting() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine, ddl_timezone=None)
+
+    # Act
+    repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        key_columns=("created_at",),
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert
+    assert not any("TIME ZONE" in s for s in _statements(conn))
+    assert _locks(conn)[0].startswith('LOCK TABLE "events_default"')
+
+
+def test__reconcile_default_rows__unknown_rowcount__reads_as_zero() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(moved_rows=None))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_04",
+        key_columns=("created_at",),
+        from_value="2024-04-01",
+        to_value="2024-05-01",
+    )
+
+    # Assert
+    assert moved == 0
 
 
 # ── detach_partition ────────────────────────────────────────────────────────────
 
 
-def test__repository__detach_partition__table_not_found__raises_partition_not_found() -> None:
-    # Arrange — pre-check: set_config, not pending, RESET; then set_config, marker query raises 42P01, RESET
-    engine = MagicMock()
-    conn = MagicMock()
-    not_pending = MagicMock()
-    not_pending.scalar.return_value = False
-    conn.execute.side_effect = [
-        MagicMock(),
-        not_pending,
-        MagicMock(),
-        MagicMock(),
-        _make_retryable_exc("42P01"),
-        MagicMock(),
-    ]
-    conn.execution_options = MagicMock(return_value=conn)
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=conn)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
+def test__detach_partition__auto__marks_the_orphan_then_detaches_concurrently() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01")
+
+    # Assert -- the pending pre-check and the concurrent detach each use an autocommit connection
+    statements = _statements(conn)
+    assert "inhdetachpending" in statements[0]
+    assert statements[-1] == 'ALTER TABLE "events" DETACH PARTITION "events__2024_01" CONCURRENTLY'
+    assert statements.index(_comment_statement(conn)) < len(statements) - 1
+    assert engine.connect.call_count == 2
+    engine.begin.assert_not_called()
+    assert conn.execution_options.call_count == 1
+    assert conn.execution_options.call_args.kwargs == {"isolation_level": "AUTOCOMMIT"}
+
+
+def test__detach_partition__marker__names_the_resolved_parent_and_the_detach_instant() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(fqn="public.events", comment="keep me"))
+    repo = PostgresPartitionRepository(engine)
+    before = datetime.now(UTC)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01")
+
+    # Assert -- line 1 is the ownership marker, line 2 the instant, the user's own comment below them
+    comment = _comment_statement(conn)
+    assert comment.startswith('COMMENT ON TABLE "events__2024_01" IS \'')
+    marker, stamped, rest = comment[len('COMMENT ON TABLE "events__2024_01" IS \'') : -1].split("\n")
+    assert marker == orphan_table_comment("public.events")
+    assert stamped.startswith(DETACHED_AT_MARKER)
+    assert before <= datetime.fromisoformat(stamped[len(DETACHED_AT_MARKER) :]) <= datetime.now(UTC)
+    assert rest == "keep me"
+
+
+def test__detach_partition__parent_cannot_be_resolved__marker_falls_back_to_the_given_name() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(fqn=None))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01")
+
+    # Assert
+    assert orphan_table_comment("events") in _comment_statement(conn)
+
+
+def test__detach_partition__already_marked_with_an_instant__keeps_it_and_writes_nothing() -> None:
+    # Arrange -- a repeated detach must not restart the grace period
+    existing = orphan_comment("public.events", detached_at=datetime(2024, 1, 1, tzinfo=UTC), existing_comment=None)
+    engine, conn = _engine(_Catalog(comment=existing))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01")
+
+    # Assert
+    assert not any(s.startswith("COMMENT ON TABLE") for s in _statements(conn))
+
+
+def test__detach_partition__custom_marker_prefix__is_used_in_the_comment() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine, marker_prefix="myapp:parent=")
+
+    # Act
+    repo.detach_partition("events", "events__2024_01")
+
+    # Assert
+    assert "'myapp:parent=public.events\n" in _comment_statement(conn)
+
+
+def test__detach_partition__non_ascii_existing_comment__does_not_raise() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment="существующий комментарий".encode()))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01")
+
+    # Assert
+    assert "существующий комментарий" in _comment_statement(conn)
+
+
+@pytest.mark.parametrize("sqlstate", ["0A000", "42601", "55000"])
+def test__detach_partition__auto_and_concurrent_refused__falls_back_to_the_blocking_form(sqlstate: str) -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(failures={"CONCURRENTLY": _sqlstate_error(sqlstate)}))
+    repo = PostgresPartitionRepository(engine)
+    logger = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.repositories.remover.logger", logger):
+        repo.detach_partition("events", "events__2024_01", mode=DetachMode.AUTO)
+
+    # Assert
+    assert _statements(conn)[-1] == 'ALTER TABLE "events" DETACH PARTITION "events__2024_01"'
+    assert engine.connect.call_count == 2
+    assert engine.begin.call_count == 1
+    logger.warning.assert_called_once()
+    assert logger.warning.call_args.kwargs["extra"]["sqlstate"] == sqlstate
+
+
+def test__detach_partition__auto_and_unrelated_error__propagates_without_a_fallback() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"CONCURRENTLY": _sqlstate_error("42501", "permission denied")}))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
-    with pytest.raises(PartitionNotFoundError):
+    with pytest.raises(SQLAlchemyError, match="permission denied"):
         repo.detach_partition("events", "events__2024_01")
 
-
-def test__repository__detach_partition_concurrent__uses_connect_not_begin() -> None:
-    # Arrange — pre-check: set_config, not pending, RESET;
-    # then set_config, resolve_fqn, comment_result, COMMENT, DETACH CONCURRENTLY, RESET
-    engine = _make_engine([None, False, None, None, "public.events", None, None, None, None])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.detach_partition("events", "events__2024_01", concurrent=True)
-
-    # Assert — one connect for the pending pre-check, one for the concurrent detach
-    assert engine.connect.call_count == 2
-    assert engine.begin.call_count == 0
+    engine.begin.assert_not_called()
 
 
-def test__repository__detach_partition_concurrent__non_ascii_comment__does_not_raise() -> None:
-    # Arrange — pre-check (3 executes), then concurrent detach flow
-    engine = _make_engine(
-        [None, False, None, None, "public.events", "существующий комментарий".encode(), None, None, None]
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert — must not raise
-    repo.detach_partition("events", "events__2024_01", concurrent=True)
-    assert engine.connect.call_count == 2
-
-
-def test__repository__detach_partition_concurrent__0a000_error__falls_back_to_non_concurrent() -> None:
+@pytest.mark.parametrize("sqlstate", ["0A000", "55000"])
+def test__detach_partition__concurrent_mode_refused__propagates_without_a_fallback(sqlstate: str) -> None:
     # Arrange
-    engine = MagicMock()
-    concurrent_exc = _make_retryable_exc("0A000")
-    concurrent_conn = MagicMock()
-    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
-    p0.scalar.return_value = False  # pending-detach pre-check → not pending
-    s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
-    c1.scalar.return_value = "public.events"
-    c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, concurrent_exc, c5]
-    concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
+    engine, _ = _engine(_Catalog(failures={"CONCURRENTLY": _sqlstate_error(sqlstate, "not possible")}))
+    repo = PostgresPartitionRepository(engine)
 
-    fallback_conn = MagicMock()
-    r0, r1, r2, r3, r4 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
-    r1.scalar.return_value = "public.events"
-    r2.scalar.return_value = None
-    fallback_conn.execute.side_effect = [r0, r1, r2, r3, r4]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=fallback_conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="not possible"):
+        repo.detach_partition("events", "events__2024_01", mode=DetachMode.CONCURRENT)
 
+    engine.begin.assert_not_called()
+
+
+def test__detach_partition__concurrent_mode__succeeds_with_the_concurrent_form() -> None:
+    # Arrange
+    engine, conn = _engine()
     repo = PostgresPartitionRepository(engine)
 
     # Act
-    repo.detach_partition("events", "events__2024_01", concurrent=True)
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.CONCURRENT)
 
-    # Assert — pre-check connect + concurrent connect, then non-concurrent begin
-    assert engine.connect.call_count == 2
+    # Assert
+    assert _statements(conn)[-1].endswith("CONCURRENTLY")
+    engine.begin.assert_not_called()
+
+
+def test__detach_partition__blocking_mode__runs_only_the_plain_form_in_a_transaction() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING)
+
+    # Assert
+    statements = _statements(conn)
+    assert statements[-1] == 'ALTER TABLE "events" DETACH PARTITION "events__2024_01"'
+    assert not any("CONCURRENTLY" in s for s in statements)
+    assert statements.index(_comment_statement(conn)) < len(statements) - 1
+    assert engine.connect.call_count == 1
     assert engine.begin.call_count == 1
 
 
-def test__repository__detach_partition_concurrent__55000_error__falls_back_to_non_concurrent() -> None:
-    # Arrange
-    engine = MagicMock()
-    concurrent_exc = _make_retryable_exc("55000")
-    concurrent_conn = MagicMock()
-    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
-    p0.scalar.return_value = False  # pending-detach pre-check → not pending
-    s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
-    c1.scalar.return_value = "public.events"
-    c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, concurrent_exc, c5]
-    concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
-
-    fallback_conn = MagicMock()
-    r0, r1, r2, r3, r4 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
-    r1.scalar.return_value = "public.events"
-    r2.scalar.return_value = None
-    fallback_conn.execute.side_effect = [r0, r1, r2, r3, r4]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=fallback_conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-
+@pytest.mark.parametrize("mode", [DetachMode.AUTO, DetachMode.BLOCKING])
+def test__detach_partition__table_missing__raises_partition_not_found(mode: DetachMode) -> None:
+    # Arrange -- the first marker query fails with undefined_table
+    engine, _ = _engine(_Catalog(failures={"obj_description": _sqlstate_error("42P01")}))
     repo = PostgresPartitionRepository(engine)
 
-    # Act
-    repo.detach_partition("events", "events__2024_01", concurrent=True)
+    # Act / Assert
+    with pytest.raises(PartitionNotFoundError) as excinfo:
+        repo.detach_partition("events", "events__2024_01", mode=mode)
 
-    # Assert — pre-check connect + concurrent connect, then non-concurrent begin
-    assert engine.connect.call_count == 2
-    assert engine.begin.call_count == 1
+    assert excinfo.value.partition_name == "events__2024_01"
 
 
-def test__repository__detach_partition_concurrent__55006_error__raises_detach_in_progress() -> None:
+@pytest.mark.parametrize("mode", [DetachMode.AUTO, DetachMode.CONCURRENT, DetachMode.BLOCKING])
+def test__detach_partition__another_detach_pending__raises_detach_in_progress(mode: DetachMode) -> None:
     # Arrange
-    engine = MagicMock()
-    in_progress_exc = _make_retryable_exc("55006")
-    concurrent_conn = MagicMock()
-    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
-    p0.scalar.return_value = False  # pending-detach pre-check → not pending
-    s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
-    c1.scalar.return_value = "public.events"
-    c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, in_progress_exc, c5]
-    concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
+    engine, _ = _engine(_Catalog(failures={"DETACH PARTITION": _sqlstate_error("55006")}))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
     with pytest.raises(PartitionDetachInProgressError):
-        repo.detach_partition("events", "events__2024_01", concurrent=True)
-
-    engine.begin.assert_not_called()
+        repo.detach_partition("events", "events__2024_01", mode=mode)
 
 
-def test__repository__detach_partition_concurrent__generic_error__propagates() -> None:
+def test__detach_partition__blocking_and_unrelated_error__propagates() -> None:
     # Arrange
-    engine = MagicMock()
-    concurrent_conn = MagicMock()
-    q0, p0, q1 = MagicMock(), MagicMock(), MagicMock()
-    p0.scalar.return_value = False  # pending-detach pre-check → not pending
-    s0, c1, c2, c3, c5 = MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
-    c1.scalar.return_value = "public.events"
-    c2.scalar.return_value = None
-    concurrent_conn.execute.side_effect = [q0, p0, q1, s0, c1, c2, c3, Exception("permission denied"), c5]
-    concurrent_conn.execution_options = MagicMock(return_value=concurrent_conn)
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=concurrent_conn)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
+    engine, _ = _engine(_Catalog(failures={"DETACH PARTITION": _sqlstate_error("42501", "permission denied")}))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
-    with pytest.raises(Exception, match="permission denied"):
-        repo.detach_partition("events", "events__2024_01", concurrent=True)
-
-    engine.begin.assert_not_called()
+    with pytest.raises(SQLAlchemyError, match="permission denied"):
+        repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING)
 
 
-def test__repository__detach_partition_non_concurrent__uses_begin() -> None:
-    # Arrange — pre-check: set_config, not pending, RESET; then set_config, resolve_fqn, comment_result, COMMENT, DETACH
-    engine = _make_engine([None, False, None, None, None, None, None, None])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.detach_partition("events", "events__2024_01", concurrent=False)
-
-    # Assert
-    engine.begin().__enter__.assert_called()
-
-
-def test__repository__detach_partition_concurrent__marker_write_fails__aborts_before_detach() -> None:
-    # Arrange — pre-check: set_config, not pending, RESET; then set_config, resolve_fqn and comment read
-    # succeed, COMMENT write fails; RESET timeout still runs
-    engine = MagicMock()
-    conn = MagicMock()
-    conn.execution_options = MagicMock(return_value=conn)
-    not_pending, resolve_result, comment_result = MagicMock(), MagicMock(), MagicMock()
-    not_pending.scalar.return_value = False
-    resolve_result.scalar.return_value = "public.events"
-    comment_result.scalar.return_value = None
-    conn.execute.side_effect = [
-        MagicMock(),
-        not_pending,
-        MagicMock(),
-        MagicMock(),
-        resolve_result,
-        comment_result,
-        Exception("cannot comment table"),
-        MagicMock(),
-    ]
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=conn)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
+def test__detach_partition__marker_write_fails__aborts_before_the_detach() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(failures={"COMMENT ON TABLE": RuntimeError("cannot comment table")}))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
-    with pytest.raises(Exception, match="cannot comment table"):
-        repo.detach_partition("events", "events__2024_01", concurrent=True)
+    with pytest.raises(RuntimeError, match="cannot comment table"):
+        repo.detach_partition("events", "events__2024_01")
 
-    # pre-check (3) + set_config + resolve + comment read + failed COMMENT + RESET — the DETACH itself never ran
-    assert conn.execute.call_count == 8
-    assert not any("DETACH" in str(call.args[0]) for call in conn.execute.call_args_list)
-    engine.begin.assert_not_called()
+    assert not any("DETACH" in s for s in _statements(conn))
 
 
-def test__repository__detach_partition__pending_detach__finalizes_without_plain_or_concurrent_detach() -> None:
-    # Arrange — pre-check: set_config, pending → True; then resolve_fqn, comment_result, COMMENT, FINALIZE, RESET
-    engine = _make_engine([None, True, "public.events", None, None, None, None])
+def test__detach_partition__pending_detach__is_finalized_instead() -> None:
+    # Arrange -- a interrupted DETACH CONCURRENTLY left the partition half detached
+    engine, conn = _engine(_Catalog(detach_pending=True))
     repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.detach_partition("events", "events__2024_01", concurrent=True)
-
-    # Assert — FINALIZE ran, the orphan marker was written, and no other detach was attempted
-    conn = engine.connect.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert any("DETACH PARTITION" in stmt and "FINALIZE" in stmt for stmt in statements)
-    assert any("COMMENT ON TABLE" in stmt for stmt in statements)
-    assert not any("CONCURRENTLY" in stmt for stmt in statements)
-    assert engine.connect.call_count == 1
-    engine.begin.assert_not_called()
-
-
-def test__repository__detach_partition__not_pending__proceeds_with_concurrent_detach() -> None:
-    # Arrange — pre-check: set_config, not pending, RESET;
-    # then set_config, resolve_fqn, comment_result, COMMENT, DETACH CONCURRENTLY, RESET
-    engine = _make_engine([None, False, None, None, "public.events", None, None, None, None])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.detach_partition("events", "events__2024_01", concurrent=True)
-
-    # Assert — normal concurrent flow runs; FINALIZE is never issued
-    conn = engine.connect.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert any("DETACH PARTITION" in stmt and "CONCURRENTLY" in stmt for stmt in statements)
-    assert not any("FINALIZE" in stmt for stmt in statements)
-
-
-# ── drop_partition — happy path ──────────────────────────────────────────────────
-
-
-def test__repository__drop_partition__not_exists__is_noop() -> None:
-    # Arrange — set_config, exists → False
-    engine = _make_engine([None, False])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    engine.begin.assert_not_called()
-
-
-def test__repository__drop_partition__detached_with_orphan_marker__drops_successfully() -> None:
-    # Arrange — pre-check: set_config, exists, not attached, has orphan marker;
-    # DDL txn: set_config, lock_timeout, LOCK, not attached, marker, no FKs, DROP
-    marker = orphan_table_comment("events")
-    engine = _make_engine([None, True, None, marker, None, None, None, None, marker, [], None])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    engine.begin.assert_called_once()
-
-
-def test__repository__drop_partition__still_attached__raises_partition_attached_error() -> None:
-    # Arrange — set_config, exists, is attached
-    engine = _make_engine([None, True, "events"])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    with pytest.raises(PartitionAttachedError):
-        repo.drop_partition("events__2024_01")
-
-    engine.begin.assert_not_called()
-
-
-def test__repository__drop_partition__no_orphan_marker__raises_unmanaged_drop_error() -> None:
-    # Arrange — set_config, exists, not attached, no marker, still exists (race check)
-    engine = _make_engine([None, True, None, None, True])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    with pytest.raises(UnmanagedPartitionDropError):
-        repo.drop_partition("events__2024_01")
-
-    engine.begin.assert_not_called()
-
-
-def test__repository__drop_partition__disappeared_between_checks__is_noop() -> None:
-    # Arrange — set_config, exists initially, no marker, gone by race check
-    engine = _make_engine([None, True, None, None, False])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    engine.begin.assert_not_called()
-
-
-def test__repository__drop_partition__unmanaged_with_opt_in__drops_successfully() -> None:
-    # Arrange — pre-check: set_config, exists, not attached;
-    # DDL txn: set_config, lock_timeout, LOCK, not attached, no FKs, DROP
-    engine = _make_engine([None, True, None, None, None, None, None, [], None])
-    repo = PostgresPartitionRepository(engine, drop_allow_unmanaged=True)
-
-    # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    engine.begin.assert_called_once()
-
-
-# ── drop_partition — FK cleanup ──────────────────────────────────────────────────
-
-
-def test__repository__drop_partition__single_fk__drops_fk_then_table() -> None:
-    # Arrange — pre-check: set_config, exists, not attached, marker;
-    # DDL txn: set_config, lock_timeout, LOCK, not attached, marker, FK list, DROP CONSTRAINT, DROP TABLE
-    engine = _make_engine(
-        [
-            None,
-            True,
-            None,
-            orphan_table_comment("events"),
-            None,
-            None,
-            None,
-            None,
-            orphan_table_comment("events"),
-            [("fk_events__2024_01_order_id",)],
-            None,
-            None,
-        ]
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    engine.begin.assert_called_once()
-    conn = engine.begin.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert any("DROP CONSTRAINT" in stmt and "fk_events__2024_01_order_id" in stmt for stmt in statements)
-    assert any("DROP TABLE" in stmt for stmt in statements)
-
-
-def test__repository__drop_partition__multiple_fks__drops_all_fks() -> None:
-    # Arrange
-    engine = _make_engine(
-        [
-            None,
-            True,
-            None,
-            orphan_table_comment("events"),
-            None,
-            None,
-            None,
-            None,
-            orphan_table_comment("events"),
-            [("fk_a",), ("fk_b",)],
-            None,
-            None,
-        ]
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    engine.begin.assert_called_once()
-    conn = engine.begin.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert any("fk_a" in stmt and "fk_b" in stmt and "DROP CONSTRAINT" in stmt for stmt in statements)
-
-
-# ── drop_partition — retry logic ─────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    "sqlstate",
-    ["40P01", "55P03", "57014"],
-)
-def test__repository__drop_partition__retryable_error__retries_and_succeeds(sqlstate: str) -> None:
-    # Arrange
-    exc = _make_retryable_exc(sqlstate)
-    engine = _make_retry_engine(exc, fail_attempts=1)
-    repo = PostgresPartitionRepository(engine, drop_retry_delay=0)
-
-    # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    assert engine.begin.call_count == 2
-
-
-def test__repository__drop_partition__all_retries_exhausted__raises_drop_retry_exhausted() -> None:
-    # Arrange
-    deadlock = _make_retryable_exc("40P01")
-    engine = MagicMock()
-    conn_read = MagicMock()
-
-    def _r(v: object) -> MagicMock:
-        r = MagicMock()
-        if isinstance(v, list):
-            r.fetchall.return_value = v
-        else:
-            r.scalar.return_value = v
-        return r
-
-    conn_read.execute.side_effect = [_r(None), _r(True), _r(None), _r(orphan_table_comment("events")), _r(None), _r([])]
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=conn_read)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
-
-    fail_conn = MagicMock()
-    fail_conn.execute.side_effect = deadlock
-    fail_cm = MagicMock()
-    fail_cm.__enter__ = MagicMock(return_value=fail_conn)
-    fail_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = fail_cm
-
-    repo = PostgresPartitionRepository(engine, drop_max_retries=3, drop_retry_delay=0)
-
-    # Act / Assert
-    with pytest.raises(DropRetryExhaustedError) as exc_info:
-        repo.drop_partition("events__2024_01")
-
-    assert exc_info.value.partition_name == "events__2024_01"
-    assert exc_info.value.attempts == 3
-    assert engine.begin.call_count == 3
-
-
-def test__repository__drop_partition__non_retryable_error__fails_without_retry() -> None:
-    # Arrange
-    engine = MagicMock()
-    conn_read = MagicMock()
-
-    def _r(v: object) -> MagicMock:
-        r = MagicMock()
-        if isinstance(v, list):
-            r.fetchall.return_value = v
-        else:
-            r.scalar.return_value = v
-        return r
-
-    conn_read.execute.side_effect = [_r(None), _r(True), _r(None), _r(orphan_table_comment("events")), _r(None), _r([])]
-    connect_cm = MagicMock()
-    connect_cm.__enter__ = MagicMock(return_value=conn_read)
-    connect_cm.__exit__ = MagicMock(return_value=False)
-    engine.connect.return_value = connect_cm
-
-    fail_conn = MagicMock()
-    fail_conn.execute.side_effect = Exception("syntax error")
-    fail_cm = MagicMock()
-    fail_cm.__enter__ = MagicMock(return_value=fail_conn)
-    fail_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = fail_cm
-
-    repo = PostgresPartitionRepository(engine, drop_max_retries=3, drop_retry_delay=0)
-
-    # Act / Assert
-    with pytest.raises(Exception, match="syntax error"):
-        repo.drop_partition("events__2024_01")
-
-    assert engine.begin.call_count == 1
-
-
-def test__repository__drop_partition__retry__logs_warning_with_attempt_number() -> None:
-    # Arrange
-    deadlock = _make_retryable_exc("40P01")
-    engine = _make_retry_engine(deadlock, fail_attempts=1)
-
     logger = MagicMock()
-    with patch("pg_partsmith.sync.repositories.remover.logger", logger):
-        repo = PostgresPartitionRepository(engine, drop_retry_delay=0)
-
-        # Act
-        repo.drop_partition("events__2024_01")
-
-        # Assert
-        logger.warning.assert_called_once()
-
-    call_kwargs = logger.warning.call_args
-    assert call_kwargs.kwargs.get("extra", {}).get("attempt") == 2
-
-
-# ── drop_partition — lock-then-revalidate transaction ────────────────────────────
-
-
-def test__repository__drop_partition__lock_precedes_revalidation_and_drop__single_transaction() -> None:
-    # Arrange — pre-check passes; DDL txn: set_config, lock_timeout, LOCK, not attached, marker, FK list, DROP
-    engine, ddl_conn = _make_drop_engine(
-        [None, True, None, orphan_table_comment("events")],
-        [None, None, None, None, orphan_table_comment("events"), [], None],
-    )
-    repo = PostgresPartitionRepository(engine)
 
     # Act
-    repo.drop_partition("events__2024_01")
-
-    # Assert — one transaction where LOCK TABLE runs before revalidation, which runs before DROP TABLE
-    engine.begin.assert_called_once()
-    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
-    lock_idx = next(i for i, s in enumerate(statements) if "LOCK TABLE" in s and "ACCESS EXCLUSIVE" in s)
-    revalidate_idx = next(i for i, s in enumerate(statements) if "pg_inherits" in s)
-    drop_idx = next(i for i, s in enumerate(statements) if "DROP TABLE" in s)
-    assert lock_idx < revalidate_idx < drop_idx
-
-
-def test__repository__drop_partition__lock_hits_42p01__returns_without_drop() -> None:
-    # Arrange — the table vanished between the pre-check and the LOCK TABLE statement
-    engine, ddl_conn = _make_drop_engine(
-        [None, True, None, orphan_table_comment("events")],
-        [None, None, _make_retryable_exc("42P01")],
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act — treated as already-done, not an error and not a retry
-    repo.drop_partition("events__2024_01")
+    with patch("pg_partsmith.sync.repositories.remover.logger", logger):
+        repo.detach_partition("events", "events__2024_01")
 
     # Assert
+    statements = _statements(conn)
+    assert statements[-1] == 'ALTER TABLE "events" DETACH PARTITION "events__2024_01" FINALIZE'
+    assert any(s.startswith("COMMENT ON TABLE") for s in statements)
+    assert not any("CONCURRENTLY" in s for s in statements)
+    assert engine.connect.call_count == 1
+    # The finalize itself runs in a transaction: lock, checks, marker and
+    # statement commit or roll back together.
     engine.begin.assert_called_once()
-    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
-    assert not any("DROP TABLE" in s for s in statements)
-
-
-def test__repository__drop_partition__reattached_after_lock__raises_attached_error_without_drop() -> None:
-    # Arrange — pre-check saw it detached, but under the lock it is attached again
-    engine, ddl_conn = _make_drop_engine(
-        [None, True, None, orphan_table_comment("events")],
-        [None, None, None, "public.events"],
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    with pytest.raises(PartitionAttachedError):
-        repo.drop_partition("events__2024_01")
-
-    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
-    assert not any("DROP TABLE" in s for s in statements)
-
-
-def test__repository__drop_partition__non_42p01_error_on_lock__propagates() -> None:
-    # Arrange — a non-retryable, non-42P01 error on the LOCK TABLE statement (e.g. permission denied)
-    engine, ddl_conn = _make_drop_engine(
-        [None, True, None, orphan_table_comment("events")],
-        [None, None, _make_retryable_exc("42501")],
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert — must propagate, not be swallowed like 42P01 and not be retried
-    with pytest.raises(SQLAlchemyError):
-        repo.drop_partition("events__2024_01")
-
-    engine.begin.assert_called_once()
-    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
-    assert not any("DROP TABLE" in s for s in statements)
-
-
-def test__repository__drop_partition__vanished_after_lock__returns_without_drop() -> None:
-    # Arrange — under the lock the marker is gone AND the table no longer exists (dropped concurrently)
-    engine, ddl_conn = _make_drop_engine(
-        [None, True, None, orphan_table_comment("events")],
-        [None, None, None, None, None, False],  # set_config, lock_timeout, LOCK, not attached, no marker, gone
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act — treated as already-done, no error
-    repo.drop_partition("events__2024_01")
-
-    # Assert
-    engine.begin.assert_called_once()
-    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
-    assert not any("DROP TABLE" in s for s in statements)
-
-
-def test__repository__drop_partition__marker_gone_after_lock__raises_unmanaged_error_without_drop() -> None:
-    # Arrange — pre-check saw the orphan marker, but under the lock the comment is gone (table replaced)
-    engine, ddl_conn = _make_drop_engine(
-        [None, True, None, orphan_table_comment("events")],
-        [None, None, None, None, None, True],  # set_config, lock_timeout, LOCK, not attached, no marker, exists
-    )
-    repo = PostgresPartitionRepository(engine)
-
-    # Act / Assert
-    with pytest.raises(UnmanagedPartitionDropError):
-        repo.drop_partition("events__2024_01")
-
-    statements = [str(call.args[0]) for call in ddl_conn.execute.call_args_list]
-    assert not any("DROP TABLE" in s for s in statements)
+    logger.warning.assert_called_once()
 
 
 # ── adopt_partition ─────────────────────────────────────────────────────────────
 
 
-def test__repository__adopt_partition__table_missing__returns_false_without_comment() -> None:
-    # Arrange — set_config, then the exists check inside the transaction comes back False
-    engine = _make_engine([None, False])
+def test__adopt_partition__detached_table__writes_the_marker_without_a_detach_instant() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment="legacy note"))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    adopted = repo.adopt_partition("events", "events__2023_01")
+
+    # Assert
+    assert adopted is True
+    engine.begin.assert_called_once()
+    engine.connect.assert_not_called()
+    comment = _comment_statement(conn)
+    assert comment == f"COMMENT ON TABLE \"events__2023_01\" IS '{orphan_table_comment('public.events')}\nlegacy note'"
+    assert DETACHED_AT_MARKER not in comment
+
+
+def test__adopt_partition__table_missing__returns_false_without_a_comment() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(exists=False))
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -936,47 +909,25 @@ def test__repository__adopt_partition__table_missing__returns_false_without_comm
 
     # Assert
     assert adopted is False
-    conn = engine.begin.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert not any("COMMENT ON TABLE" in stmt for stmt in statements)
+    assert not any(s.startswith("COMMENT ON TABLE") for s in _statements(conn))
 
 
-def test__repository__adopt_partition__still_attached__raises_attached_error_without_comment() -> None:
-    # Arrange — set_config, exists; the attachment check resolves a parent → the table is attached
-    engine = _make_engine([None, True, "public.events"])
+def test__adopt_partition__still_attached__raises_without_a_comment() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(attached_to="public.events"))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
-    with pytest.raises(PartitionAttachedError):
+    with pytest.raises(PartitionAttachedError) as excinfo:
         repo.adopt_partition("events", "events__2023_01")
 
-    conn = engine.begin.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert not any("COMMENT ON TABLE" in stmt for stmt in statements)
+    assert excinfo.value.table_name == "public.events"
+    assert not any(s.startswith("COMMENT ON TABLE") for s in _statements(conn))
 
 
-def test__repository__adopt_partition__detached_existing__writes_marker_in_transaction_and_returns_true() -> None:
-    # Arrange — set_config, exists, not attached, parent resolves to public.events, no existing comment, COMMENT
-    engine = _make_engine([None, True, None, "public.events", None, None])
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    adopted = repo.adopt_partition("events", "events__2023_01")
-
-    # Assert — the marker COMMENT ran inside a single begin() transaction
-    assert adopted is True
-    engine.begin.assert_called_once()
-    engine.connect.assert_not_called()
-    conn = engine.begin.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    comment_stmts = [s for s in statements if "COMMENT ON TABLE" in s]
-    assert len(comment_stmts) == 1
-    assert orphan_table_comment("public.events") in comment_stmts[0]
-
-
-def test__repository__adopt_partition__marker_already_present__returns_true_without_rewriting_comment() -> None:
-    # Arrange — set_config, then the table already carries the orphan marker (idempotent re-adopt)
-    engine = _make_engine([None, True, None, "public.events", orphan_table_comment("public.events")])
+def test__adopt_partition__marker_already_present__returns_true_without_rewriting() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment=orphan_table_comment("public.events")))
     repo = PostgresPartitionRepository(engine)
 
     # Act
@@ -984,16 +935,334 @@ def test__repository__adopt_partition__marker_already_present__returns_true_with
 
     # Assert
     assert adopted is True
-    conn = engine.begin.return_value.__enter__.return_value
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert not any("COMMENT ON TABLE" in stmt for stmt in statements)
+    assert not any(s.startswith("COMMENT ON TABLE") for s in _statements(conn))
 
 
-# ── fk_manager ──────────────────────────────────────────────────────────────────
+# ── drop_partition ──────────────────────────────────────────────────────────────
+
+
+def test__drop_partition__missing_table__is_a_no_op() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(exists=False))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    engine.begin.assert_not_called()
+
+
+def test__drop_partition__marked_orphan__is_dropped_under_an_exclusive_lock() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment=orphan_table_comment("public.events")))
+    repo = PostgresPartitionRepository(engine, drop_lock_timeout_ms=1500)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert -- the lock precedes the revalidation, which precedes the drop
+    engine.begin.assert_called_once()
+    statements = _statements(conn)
+    lock_timeout = next(i for i, s in enumerate(statements) if "set_config('lock_timeout'" in s)
+    lock = next(i for i, s in enumerate(statements) if s == 'LOCK TABLE "events__2024_01" IN ACCESS EXCLUSIVE MODE')
+    revalidate = next(i for i, s in enumerate(statements) if i > lock and "relispartition" in s)
+    marker = next(i for i, s in enumerate(statements) if i > lock and "obj_description" in s)
+    drop = statements.index('DROP TABLE IF EXISTS "events__2024_01"')
+    assert lock_timeout < lock < revalidate < marker < drop
+    lock_timeout_call = next(c for c in conn.execute.call_args_list if "set_config('lock_timeout'" in str(c.args[0]))
+    assert lock_timeout_call.args[1] == {"timeout": "1500"}
+
+
+def test__drop_partition__still_attached__raises_without_a_transaction() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(attached_to="public.events"))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionAttachedError):
+        repo.drop_partition("events__2024_01")
+
+    engine.begin.assert_not_called()
+
+
+def test__drop_partition__no_marker__refuses_an_unmanaged_table() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(comment=None))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(UnmanagedPartitionDropError, match="drop_allow_unmanaged"):
+        repo.drop_partition("events__2024_01")
+
+    engine.begin.assert_not_called()
+
+
+def test__drop_partition__foreign_comment__refuses_an_unmanaged_table() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(comment="somebody else's table"))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(UnmanagedPartitionDropError):
+        repo.drop_partition("events__2024_01")
+
+
+def test__drop_partition__unmanaged_with_opt_in__is_dropped_without_reading_the_comment() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment=None))
+    repo = PostgresPartitionRepository(engine, drop_allow_unmanaged=True)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    assert 'DROP TABLE IF EXISTS "events__2024_01"' in _statements(conn)
+    assert not any("obj_description" in s for s in _statements(conn))
+
+
+def test__drop_partition__vanished_between_checks__is_a_no_op() -> None:
+    # Arrange -- exists at first, no comment, gone by the race check
+    engine, _ = _engine(_Catalog(exists=[True, False], comment=None))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    engine.begin.assert_not_called()
+
+
+def test__drop_partition__expected_oid_matches__is_dropped() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=4242, comment=orphan_table_comment("public.events")))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01", expected_oid=4242)
+
+    # Assert
+    assert 'DROP TABLE IF EXISTS "events__2024_01"' in _statements(conn)
+    assert len([s for s in _statements(conn) if "SELECT c.oid" in s]) == 2
+
+
+def test__drop_partition__expected_oid_differs__is_stale_before_any_transaction() -> None:
+    # Arrange -- the name now belongs to a recreated relation
+    engine, _ = _engine(_Catalog(oid=9999, comment=orphan_table_comment("public.events")))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999") as excinfo:
+        repo.drop_partition("events__2024_01", expected_oid=4242)
+
+    assert excinfo.value.partition_name == "events__2024_01"
+    engine.begin.assert_not_called()
+
+
+def test__drop_partition__expected_oid_differs_under_the_lock__is_stale_without_a_drop() -> None:
+    # Arrange -- replaced between the pre-check and the lock
+    engine, conn = _engine(_Catalog(oid=[4242, 9999], comment=orphan_table_comment("public.events")))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError):
+        repo.drop_partition("events__2024_01", expected_oid=4242)
+
+    assert not any("DROP TABLE" in s for s in _statements(conn))
+
+
+def test__drop_partition__relation_gone_when_the_oid_is_read__proceeds() -> None:
+    # Arrange -- nothing holds the name, so nothing can be the wrong relation
+    engine, conn = _engine(_Catalog(oid=None, comment=orphan_table_comment("public.events")))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01", expected_oid=4242)
+
+    # Assert
+    assert 'DROP TABLE IF EXISTS "events__2024_01"' in _statements(conn)
+
+
+def test__drop_partition__no_expected_oid__never_reads_the_oid() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment=orphan_table_comment("public.events")))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    assert not any("SELECT c.oid" in s for s in _statements(conn))
+
+
+def test__drop_partition__foreign_keys__are_dropped_in_one_statement_before_the_table() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment=orphan_table_comment("public.events"), fk_constraints=["fk_a", "fk_b"]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    statements = _statements(conn)
+    constraint_drop = statements.index(
+        'ALTER TABLE "events__2024_01" DROP CONSTRAINT IF EXISTS "fk_a", DROP CONSTRAINT IF EXISTS "fk_b"'
+    )
+    assert constraint_drop < statements.index('DROP TABLE IF EXISTS "events__2024_01"')
+
+
+def test__drop_partition__lock_hits_undefined_table__returns_without_a_drop() -> None:
+    # Arrange -- the table vanished between the pre-check and the LOCK TABLE statement
+    engine, conn = _engine(
+        _Catalog(comment=orphan_table_comment("public.events"), failures={"LOCK TABLE": _sqlstate_error("42P01")})
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act -- treated as already done
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    engine.begin.assert_called_once()
+    assert not any("DROP TABLE" in s for s in _statements(conn))
+
+
+def test__drop_partition__reattached_after_the_lock__raises_without_a_drop() -> None:
+    # Arrange -- detached at the pre-check, attached again under the lock
+    engine, conn = _engine(_Catalog(attached_to=[None, "public.events"], comment=orphan_table_comment("public.events")))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionAttachedError):
+        repo.drop_partition("events__2024_01")
+
+    assert not any("DROP TABLE" in s for s in _statements(conn))
+
+
+def test__drop_partition__marker_gone_after_the_lock__raises_without_a_drop() -> None:
+    # Arrange -- the comment was removed (table replaced) between the pre-check and the lock
+    engine, conn = _engine(_Catalog(comment=[orphan_table_comment("public.events"), None], exists=[True, True]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(UnmanagedPartitionDropError):
+        repo.drop_partition("events__2024_01")
+
+    assert not any("DROP TABLE" in s for s in _statements(conn))
+
+
+def test__drop_partition__vanished_after_the_lock__returns_without_a_drop() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment=[orphan_table_comment("public.events"), None], exists=[True, False]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01")
+
+    # Assert
+    assert not any("DROP TABLE" in s for s in _statements(conn))
+
+
+@pytest.mark.parametrize("sqlstate", ["40P01", "55P03", "57014"])
+def test__drop_partition__transient_lock_error__is_retried_after_a_backoff(sqlstate: str) -> None:
+    # Arrange
+    engine, conn = _engine(
+        _Catalog(comment=orphan_table_comment("public.events"), failures={"LOCK TABLE": [_sqlstate_error(sqlstate)]})
+    )
+    repo = PostgresPartitionRepository(engine, drop_retry_delay=0.5)
+    sleep = MagicMock()
+    logger = MagicMock()
+
+    # Act
+    with (
+        patch("pg_partsmith.sync.repositories.remover.time.sleep", sleep),
+        patch("pg_partsmith.sync.repositories.remover.logger", logger),
+    ):
+        repo.drop_partition("events__2024_01")
+
+    # Assert
+    assert engine.begin.call_count == 2
+    assert 'DROP TABLE IF EXISTS "events__2024_01"' in _statements(conn)
+    sleep.assert_called_once_with(0.5)
+    logger.warning.assert_called_once()
+    assert logger.warning.call_args.kwargs["extra"]["attempt"] == 2
+
+
+def test__drop_partition__transport_error__is_retried_too() -> None:
+    # Arrange
+    engine, _ = _engine(
+        _Catalog(comment=orphan_table_comment("public.events"), failures={"LOCK TABLE": [OSError("reset")]})
+    )
+    repo = PostgresPartitionRepository(engine, drop_retry_delay=0)
+
+    # Act
+    with patch("pg_partsmith.sync.repositories.remover.time.sleep", MagicMock()):
+        repo.drop_partition("events__2024_01")
+
+    # Assert
+    assert engine.begin.call_count == 2
+
+
+def test__drop_partition__backoff__doubles_and_is_capped() -> None:
+    # Arrange
+    deadlock = _sqlstate_error("40P01")
+    engine, _ = _engine(
+        _Catalog(
+            comment=orphan_table_comment("public.events"),
+            failures={"LOCK TABLE": [deadlock, deadlock, deadlock]},
+        )
+    )
+    repo = PostgresPartitionRepository(engine, drop_max_retries=4, drop_retry_delay=1.0, drop_max_backoff=3.0)
+    sleep = MagicMock()
+
+    # Act
+    with patch("pg_partsmith.sync.repositories.remover.time.sleep", sleep):
+        repo.drop_partition("events__2024_01")
+
+    # Assert
+    assert [call.args[0] for call in sleep.call_args_list] == [1.0, 2.0, 3.0]
+
+
+def test__drop_partition__retries_exhausted__raises_with_the_last_cause() -> None:
+    # Arrange
+    deadlock = _sqlstate_error("40P01", "deadlock detected")
+    engine, _ = _engine(_Catalog(comment=orphan_table_comment("public.events"), failures={"LOCK TABLE": deadlock}))
+    repo = PostgresPartitionRepository(engine, drop_max_retries=3, drop_retry_delay=0)
+
+    # Act / Assert
+    with (
+        patch("pg_partsmith.sync.repositories.remover.time.sleep", MagicMock()),
+        pytest.raises(DropRetryExhaustedError, match="after 3 attempt") as excinfo,
+    ):
+        repo.drop_partition("events__2024_01")
+
+    assert excinfo.value.partition_name == "events__2024_01"
+    assert excinfo.value.attempts == 3
+    assert excinfo.value.cause is deadlock
+    assert excinfo.value.__cause__ is deadlock
+    assert engine.begin.call_count == 3
+
+
+def test__drop_partition__non_retryable_error__fails_at_once() -> None:
+    # Arrange
+    engine, _ = _engine(
+        _Catalog(
+            comment=orphan_table_comment("public.events"), failures={"DROP TABLE": _sqlstate_error("42501", "denied")}
+        )
+    )
+    repo = PostgresPartitionRepository(engine, drop_max_retries=3, drop_retry_delay=0)
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="denied"):
+        repo.drop_partition("events__2024_01")
+
+    assert engine.begin.call_count == 1
+
+
+# ── helpers: fk_manager and resolver ────────────────────────────────────────────
 
 
 def test__fk_manager__list_constraints_conn__returns_names() -> None:
-    # Arrange — a mocked connection returning two FK constraint rows
+    # Arrange
     conn = MagicMock()
     result = MagicMock()
     result.fetchall.return_value = [("fk_a",), ("fk_b",)]
@@ -1004,417 +1273,1085 @@ def test__fk_manager__list_constraints_conn__returns_names() -> None:
 
     # Assert
     assert names == ["fk_a", "fk_b"]
-    conn.execute.assert_called_once()
-    params = conn.execute.call_args.args[1]
-    assert params["partition_name"] == '"events__2024_01"'
+    assert conn.execute.call_args.args[1] == {"partition_name": '"events__2024_01"'}
 
 
-# ── pg_sqlstate helper ───────────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    "exc_builder,expected",
-    [
-        (
-            lambda: _set_attr(Exception("deadlock"), "orig", _set_attr(MagicMock(), "sqlstate", "40P01")),
-            "40P01",
-        ),
-    ],
-)
-def test__pg_sqlstate__asyncpg_style_exception__returns_sqlstate(exc_builder: object, expected: str) -> None:
+def test__fk_manager__drop_constraints__no_names__issues_nothing() -> None:
     # Arrange
-    orig = MagicMock()
-    orig.sqlstate = "40P01"
-    exc = Exception("deadlock")
-    exc.orig = orig  # type: ignore[attr-defined]
+    conn = MagicMock()
+
+    # Act
+    PartitionForeignKeyManager.drop_constraints(conn, "events__2024_01", [])
+
+    # Assert
+    conn.execute.assert_not_called()
+
+
+def test__resolver__exists_and_is_attached__open_their_own_connections() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(exists=True, attached_to="public.events"))
+    resolver = PartitionRelationResolver(engine)
+
+    # Act
+    exists = resolver.exists("events__2024_01")
+    attached = resolver.is_attached("events", "events__2024_01")
+
+    # Assert
+    assert exists is True
+    assert attached is True
+    assert engine.connect.call_count == 2
+
+
+def test__resolver__resolve_fqn_conn__returns_none_for_an_unknown_relation() -> None:
+    # Arrange
+    _, conn = _engine(_Catalog(fqn=None))
 
     # Act / Assert
-    assert pg_sqlstate(exc) == "40P01"
+    assert PartitionRelationResolver.resolve_fqn_conn(conn, "nothing") is None
 
 
-def test__pg_sqlstate__psycopg2_style_exception__returns_pgcode() -> None:
+# ── server-side statement timeouts (sync only) ──────────────────────────────────
+
+
+def test__create_table_like__transaction__starts_with_a_local_statement_timeout() -> None:
+    # Arrange -- the sync mirror has no client-side wait bound, so the budget is enforced by the server
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine, ddl_timeout_seconds=12.5)
+
+    # Act
+    repo.create_table_like("events", "events__2024_01", None)
+
+    # Assert
+    first = conn.execute.call_args_list[0]
+    assert str(first.args[0]) == "SELECT set_config('statement_timeout', :timeout, true)"
+    assert first.args[1] == {"timeout": "12500"}
+    assert _all_statements(conn)[1].startswith("CREATE TABLE")
+
+
+@pytest.mark.parametrize("mode", [DetachMode.AUTO, DetachMode.CONCURRENT])
+def test__detach_partition__autocommit_connections__set_and_reset_a_session_timeout(mode: DetachMode) -> None:
+    # Arrange -- SET LOCAL has no effect on an autocommit connection, so the timeout is a session setting
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=mode)
+
+    # Assert -- the pending probe now runs a plain transaction; only the
+    # concurrent statement's autocommit connection sets and resets the session timeout
+    statements = _all_statements(conn)
+    session_sets = [
+        call
+        for call in conn.execute.call_args_list
+        if str(call.args[0]) == "SELECT set_config('statement_timeout', :timeout, false)"
+    ]
+    assert len(session_sets) == 1
+    assert all(call.args[1] == {"timeout": "30000"} for call in session_sets)
+    assert statements.count("RESET statement_timeout") == 1
+    assert statements[-1] == "RESET statement_timeout"
+
+
+def test__detach_partition__concurrent_form_fails__session_timeout_is_still_reset() -> None:
     # Arrange
-    orig = MagicMock()
-    orig.sqlstate = None
-    orig.pgcode = "55P03"
-    exc = Exception("lock")
-    exc.orig = orig  # type: ignore[attr-defined]
+    engine, conn = _engine(_Catalog(failures={"CONCURRENTLY": _sqlstate_error("42501", "denied")}))
+    repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
-    assert pg_sqlstate(exc) == "55P03"
+    with pytest.raises(SQLAlchemyError, match="denied"):
+        repo.detach_partition("events", "events__2024_01")
+
+    assert _all_statements(conn)[-1] == "RESET statement_timeout"
 
 
-def test__pg_sqlstate__plain_exception__returns_none() -> None:
-    # Arrange / Act / Assert
-    assert pg_sqlstate(ValueError("nope")) is None
-
-
-# ── reconcile_default_rows ───────────────────────────────────────────────────────
-
-
-def test__repository__reconcile_default_rows__matching_rows__returns_row_count() -> None:
+def test__drop_partition__pre_check_connection__is_bounded_too() -> None:
     # Arrange
-    move_result = MagicMock()
-    move_result.rowcount = 42
-    engine = MagicMock()
-    conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
+    engine, conn = _engine(_Catalog(comment=orphan_table_comment("public.events")))
     repo = PostgresPartitionRepository(engine)
 
     # Act
-    count = repo.reconcile_default_rows(
-        default_partition_name="events_default",
-        target_partition_name="events__2024_04",
-        partition_column="created_at",
-        from_value="2024-04-01",
-        to_value="2024-05-01",
-    )
+    repo.drop_partition("events__2024_01")
+
+    # Assert -- one local timeout for the pre-check connection, one for the drop transaction
+    timeouts = [sql for sql in _all_statements(conn) if "set_config('statement_timeout'" in sql]
+    assert len(timeouts) == 2
+
+
+def test__apply_local_statement_timeout__rounds_down_to_milliseconds_with_a_floor_of_one() -> None:
+    # Arrange
+    conn = MagicMock()
+
+    # Act
+    apply_local_statement_timeout(conn, 0.0004)
+    apply_local_statement_timeout(conn, 1.9999)
 
     # Assert
-    assert count == 42
-    assert conn.execute.call_count == 6  # set_config + SET TIME ZONE + 2 LOCK TABLE + column lookup + move
+    assert [call.args[1] for call in conn.execute.call_args_list] == [{"timeout": "1"}, {"timeout": "1999"}]
 
 
-def test__repository__reconcile_default_rows__acquires_locks_on_both_tables() -> None:
+def test__session_statement_timeout__resets_on_exit_even_when_the_body_fails() -> None:
     # Arrange
-    move_result = MagicMock()
-    move_result.rowcount = 5
-    engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-    repo = PostgresPartitionRepository(engine)
 
-    # Act
-    repo.reconcile_default_rows(
-        default_partition_name="events_default",
-        target_partition_name="events__2024_04",
-        partition_column="created_at",
-        from_value="2024-04-01",
-        to_value="2024-05-01",
-    )
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="body"), session_statement_timeout(conn, 2.0):
+        raise RuntimeError("body")
 
-    # Assert
-    calls = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert any("LOCK TABLE" in call and "events_default" in call for call in calls)
-    assert any("LOCK TABLE" in call and "events__2024_04" in call for call in calls)
-
-
-def test__repository__reconcile_default_rows__no_matching_rows__returns_zero() -> None:
-    # Arrange
-    move_result = MagicMock()
-    move_result.rowcount = 0
-    engine = MagicMock()
-    conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    count = repo.reconcile_default_rows(
-        default_partition_name="events_default",
-        target_partition_name="events__2024_04",
-        partition_column="created_at",
-        from_value="2024-04-01",
-        to_value="2024-05-01",
-    )
-
-    # Assert
-    assert count == 0
-
-
-def test__repository__reconcile_default_rows__sets_timezone_before_locks() -> None:
-    # Arrange — default ddl_timezone is 'UTC'
-    move_result = MagicMock()
-    move_result.rowcount = 1
-    engine = MagicMock()
-    conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.reconcile_default_rows(
-        default_partition_name="events_default",
-        target_partition_name="events__2024_04",
-        partition_column="created_at",
-        from_value="2024-04-01",
-        to_value="2024-05-01",
-    )
-
-    # Assert — SET LOCAL TIME ZONE runs right after set_config, before either LOCK TABLE
     statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert "statement_timeout" in statements[0]
-    assert "time zone" in statements[1].lower() and "SET LOCAL" in statements[1]
-    assert all("LOCK TABLE" in stmt for stmt in statements[2:4])
+    assert statements == ["SELECT set_config('statement_timeout', :timeout, false)", "RESET statement_timeout"]
+    conn.invalidate.assert_not_called()
 
 
-def test__repository__reconcile_default_rows__no_ddl_timezone__skips_set_time_zone() -> None:
-    # Arrange
-    move_result = MagicMock()
-    move_result.rowcount = 1
-    engine = MagicMock()
+def test__session_statement_timeout__reset_fails__connection_is_invalidated_not_returned_to_the_pool() -> None:
+    # Arrange -- a stale timeout must never leak into another checkout
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-    repo = PostgresPartitionRepository(engine, ddl_timezone=None)
+    conn.execute.side_effect = [MagicMock(), SQLAlchemyError("connection lost")]
 
-    # Act
-    repo.reconcile_default_rows(
-        default_partition_name="events_default",
-        target_partition_name="events__2024_04",
-        partition_column="created_at",
-        from_value="2024-04-01",
-        to_value="2024-05-01",
-    )
-
-    # Assert — only set_config + 2 LOCK TABLE + column lookup + move; no timezone statement
-    assert conn.execute.call_count == 5
-    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-    assert not any("time zone" in stmt.lower() for stmt in statements)
-
-
-# ── ddl_timezone property ───────────────────────────────────────────────────────
-
-
-def test__repository__ddl_timezone_property__returns_constructor_value() -> None:
-    # Arrange / Act
-    repo = PostgresPartitionRepository(MagicMock(), ddl_timezone="Europe/Moscow")
+    # Act -- the reset failure is swallowed
+    with session_statement_timeout(conn, 2.0):
+        pass
 
     # Assert
-    assert repo.ddl_timezone == "Europe/Moscow"
+    conn.invalidate.assert_called_once()
 
 
-def test__repository__ddl_timezone_property__defaults_to_utc() -> None:
-    # Arrange / Act
-    repo = PostgresPartitionRepository(MagicMock())
-
-    # Assert
-    assert repo.ddl_timezone == "UTC"
-
-
-def test__repository__ddl_timezone_property__none_when_disabled() -> None:
-    # Arrange / Act
-    repo = PostgresPartitionRepository(MagicMock(), ddl_timezone=None)
-
-    # Assert
-    assert repo.ddl_timezone is None
-
-
-# ── helper used by parametrize ──────────────────────────────────────────────────
-
-
-def _set_attr(obj: object, attr: str, value: object) -> object:
-    setattr(obj, attr, value)
-    return obj
-
-
-def test__repository__reconcile_default_rows__composite_key__leaves_null_trailing_rows_in_default() -> None:
+def test__session_statement_timeout__reset_and_invalidate_both_fail__nothing_escapes() -> None:
     # Arrange
-    move_result = MagicMock()
-    move_result.rowcount = 3
-    engine = MagicMock()
     conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
-    repo = PostgresPartitionRepository(engine)
+    conn.execute.side_effect = [MagicMock(), SQLAlchemyError("connection lost")]
+    conn.invalidate.side_effect = RuntimeError("already gone")
 
-    # Act
-    repo.reconcile_default_rows(
-        default_partition_name="events_default",
-        target_partition_name="events__2024_04",
-        partition_column="created_at",
-        trailing_columns=("tenant_id",),
-        from_value="2024-04-01",
-        to_value="2024-05-01",
-    )
-
-    # Assert -- PostgreSQL adds an IS NOT NULL test for every key column, so a
-    # row with a NULL tenant belongs in DEFAULT and moving it would be rejected
-    # with the very error this call exists to clear.
-    move = str(conn.execute.call_args_list[-1].args[0])
-    assert '"tenant_id" IS NOT NULL' in move
+    # Act / Assert -- must not raise
+    with session_statement_timeout(conn, 2.0):
+        pass
 
 
-def test__repository__reconcile_default_rows__single_column_key__adds_no_null_test() -> None:
+# ── leaf backends: local physical settings ──────────────────────────────────────
+
+
+def test__create_table_like__storage_parameters_and_tablespace__spelled_as_literals() -> None:
     # Arrange
-    move_result = MagicMock()
-    move_result.rowcount = 3
-    engine = MagicMock()
-    conn = MagicMock()
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), _columns_result(), move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
+    engine, conn = _engine()
     repo = PostgresPartitionRepository(engine)
+    physical = LocalLeaves(tablespace="fast_ssd", storage_parameters={"fillfactor": 70, "autovacuum_enabled": False})
 
     # Act
-    repo.reconcile_default_rows(
-        default_partition_name="events_default",
-        target_partition_name="events__2024_04",
-        partition_column="created_at",
-        from_value="2024-04-01",
-        to_value="2024-05-01",
-    )
-
-    # Assert -- the leading column already carries its own NOT NULL implicitly
-    # through the range test, so the statement stays what it always was.
-    assert "IS NOT NULL" not in str(conn.execute.call_args_list[-1].args[0])
-
-
-# ── rendered DDL for keys and bounds ────────────────────────────────────────────
-
-
-def test__repository__attach_composite_partition__pads_every_trailing_column_with_minvalue() -> None:
-    # Arrange
-    engine, conn = _ddl_engine()
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.attach_composite_partition("events", "events__2026_w35", "2026-08-24", "2026-08-31", key_arity=3)
-
-    # Assert -- one MINVALUE per trailing column, on both ends. Getting the
-    # count wrong makes PostgreSQL reject the bound outright.
-    stmt = str(conn.execute.call_args.args[0])
-    assert "FROM ('2026-08-24', MINVALUE, MINVALUE)" in stmt
-    assert "TO ('2026-08-31', MINVALUE, MINVALUE)" in stmt
-
-
-def test__repository__attach_composite_partition__single_column_key__pads_nothing() -> None:
-    # Arrange
-    engine, conn = _ddl_engine()
-    repo = PostgresPartitionRepository(engine)
-
-    # Act
-    repo.attach_composite_partition("events", "events__2026_w35", "2026-08-24", "2026-08-31", key_arity=1)
+    repo.create_table_like("events", "events__2024_01", None, physical=physical)
 
     # Assert
-    stmt = str(conn.execute.call_args.args[0])
-    assert "FROM ('2026-08-24') TO ('2026-08-31')" in stmt
+    assert _creates(conn) == [
+        'CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY) '
+        "WITH (fillfactor = '70', autovacuum_enabled = 'false') TABLESPACE \"fast_ssd\""
+    ]
 
 
-def test__repository__attach_subpartition__list_bounds_with_null__renders_null_as_a_keyword() -> None:
+def test__create_table_like__branch__takes_the_tablespace_but_no_storage_parameters() -> None:
     # Arrange
-    engine, conn = _ddl_engine()
+    engine, conn = _engine()
     repo = PostgresPartitionRepository(engine)
+    physical = LocalLeaves(tablespace="fast_ssd", storage_parameters={"fillfactor": 70})
 
     # Act
-    repo.attach_subpartition(
-        "events__2026_w35",
-        "events__2026_w35__unknown",
-        ListBounds(values=("eu",), includes_null=True),
+    repo.create_table_like(
+        "events", "events__2024_01", PartitionBy(method=PartitionType.HASH, columns=("tenant_id",)), physical=physical
     )
 
-    # Assert -- quoting NULL would create a partition for the three-character
-    # string, which is a different partition.
-    assert "FOR VALUES IN ('eu', NULL)" in str(conn.execute.call_args.args[0])
+    # Assert
+    assert _creates(conn) == [
+        'CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY) '
+        'PARTITION BY HASH ("tenant_id") TABLESPACE "fast_ssd"'
+    ]
 
 
-def test__repository__attach_subpartition__default_bounds__renders_default() -> None:
+def test__create_table_like__plain_physical__adds_nothing() -> None:
     # Arrange
-    engine, conn = _ddl_engine()
+    engine, conn = _engine()
     repo = PostgresPartitionRepository(engine)
 
     # Act
-    repo.attach_subpartition("events__2026_w35", "events__2026_w35__rest", DefaultBounds())
+    repo.create_table_like("events", "events__2024_01", None, physical=LocalLeaves())
 
     # Assert
-    assert str(conn.execute.call_args.args[0]).rstrip().endswith("DEFAULT")
+    assert _creates(conn) == ['CREATE TABLE "events__2024_01" (LIKE "events" INCLUDING ALL EXCLUDING IDENTITY)']
 
 
-def test__repository__create_subpartition_table__composite_spec__partitions_by_every_column() -> None:
+def test__create_table_like__inherit_privileges__replays_owner_and_grants_in_the_same_transaction() -> None:
     # Arrange
-    engine, conn = _ddl_engine()
+    privileges = [
+        ("app", "app", "SELECT", False),
+        ("app", "app", "INSERT", False),
+        ("app", "reader", "SELECT", False),
+        ("app", "PUBLIC", "SELECT", False),
+        ("app", '"odd role"', "UPDATE", True),
+    ]
+    engine, conn = _engine(_Catalog(privileges=privileges))
     repo = PostgresPartitionRepository(engine)
-    spec = HashSubpartitionSpec(column="tenant_id", trailing_columns=("shard_id",), modulus=4)
 
     # Act
-    repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", spec)
+    repo.create_table_like(
+        "public.events", "public.events__2024_01", None, physical=LocalLeaves(inherit_privileges=True)
+    )
 
-    # Assert -- key order is the spec's order, and both columns are quoted.
-    stmt = str(conn.execute.call_args.args[0])
-    assert 'PARTITION BY HASH ("tenant_id", "shard_id")' in stmt
+    # Assert
+    statements = _statements(conn)
+    assert statements[0].startswith('CREATE TABLE "public"."events__2024_01"')
+    assert 'ALTER TABLE "public"."events__2024_01" OWNER TO "app"' in statements
+    assert 'GRANT SELECT, INSERT ON TABLE "public"."events__2024_01" TO app' in statements
+    assert 'GRANT SELECT ON TABLE "public"."events__2024_01" TO reader' in statements
+    assert 'GRANT SELECT ON TABLE "public"."events__2024_01" TO PUBLIC' in statements
+    assert 'GRANT UPDATE ON TABLE "public"."events__2024_01" TO "odd role" WITH GRANT OPTION' in statements
+    engine.begin.assert_called_once()
 
 
-def test__repository__create_subpartition_table__name_already_taken__raises_already_exists() -> None:
+def test__create_table_like__inherit_privileges__empty_acl__sets_the_owner_only() -> None:
     # Arrange
-    engine, conn = _ddl_engine()
-    conn.execute.side_effect = [MagicMock(), _sqlstate_error("42P07")]
+    engine, conn = _engine(_Catalog(privileges=[("app", None, None, False)]))
     repo = PostgresPartitionRepository(engine)
 
-    # Act / Assert -- the planner reads this as a lost race rather than a fault.
+    # Act
+    repo.create_table_like("events", "events__2024_01", None, physical=LocalLeaves(inherit_privileges=True))
+
+    # Assert
+    assert [s for s in _statements(conn) if s.startswith(("GRANT", "ALTER"))] == [
+        'ALTER TABLE "events__2024_01" OWNER TO "app"'
+    ]
+
+
+def test__create_table_like__inherit_privileges__unknown_privilege_word__is_not_spliced() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(privileges=[("app", "reader", "SELECT; DROP", False)]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_table_like("events", "events__2024_01", None, physical=LocalLeaves(inherit_privileges=True))
+
+    # Assert
+    assert not [s for s in _statements(conn) if s.startswith("GRANT")]
+
+
+# ── leaf backends: foreign tables ───────────────────────────────────────────────
+
+
+def test__create_foreign_table_like__spells_columns_server_and_options() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_foreign_table_like(
+        "public.metrics",
+        "public.metrics__2026_01",
+        server="archive",
+        options={"table_name": "metrics__2026_01", "schema_name": "cold"},
+    )
+
+    # Assert
+    assert _creates(conn)[-1] == (
+        'CREATE FOREIGN TABLE "public"."metrics__2026_01" '
+        '("ts" timestamp with time zone NOT NULL, "v" double precision) '
+        "SERVER \"archive\" OPTIONS (table_name 'metrics__2026_01', schema_name 'cold')"
+    )
+    engine.begin.assert_called_once()
+
+
+def test__create_foreign_table_like__no_options__omits_the_clause() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={})
+
+    # Assert
+    assert _creates(conn)[-1].endswith('SERVER "archive"')
+
+
+def test__create_foreign_table_like__option_value_is_a_literal__quotes_are_escaped() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={"table_name": "it's"})
+
+    # Assert
+    assert "OPTIONS (table_name 'it''s')" in _creates(conn)[-1]
+
+
+def test__create_foreign_table_like__template_without_columns__raises_not_found() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(column_defs=[]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionNotFoundError, match="no readable columns"):
+        repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={})
+
+
+def test__create_foreign_table_like__name_taken__raises_already_exists() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"CREATE FOREIGN TABLE": _sqlstate_error("42P07")}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
     with pytest.raises(PartitionAlreadyExistsError):
-        repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", None)
+        repo.create_foreign_table_like("metrics", "metrics__2026_01", server="archive", options={})
 
 
-def test__repository__attach_subpartition__hash_bounds__renders_modulus_then_remainder() -> None:
+def test__detach_partition__foreign_table__marker_is_written_with_comment_on_foreign_table() -> None:
     # Arrange
-    engine, conn = _ddl_engine()
+    engine, conn = _engine(_Catalog(relkind="f"))
     repo = PostgresPartitionRepository(engine)
 
     # Act
-    repo.attach_subpartition("events__2026_w35", "events__2026_w35__h1", HashBounds(modulus=4, remainder=1))
+    repo.detach_partition("public.metrics", "public.metrics__2026_01", mode=DetachMode.BLOCKING)
 
-    # Assert -- swapping the two is accepted by PostgreSQL whenever remainder
-    # < modulus, so it produces a differently-shaped tree rather than an error.
-    assert "FOR VALUES WITH (MODULUS 4, REMAINDER 1)" in str(conn.execute.call_args.args[0])
+    # Assert
+    (comment,) = [s for s in _statements(conn) if s.startswith("COMMENT ON")]
+    assert comment.startswith('COMMENT ON FOREIGN TABLE "public"."metrics__2026_01" IS')
 
 
-def test__repository__create_subpartition_table__copies_the_parent_but_not_its_identity() -> None:
+def test__drop_partition__foreign_table__uses_drop_foreign_table_and_skips_constraints() -> None:
     # Arrange
-    engine, conn = _ddl_engine()
+    engine, conn = _engine(_Catalog(comment=orphan_table_comment("public.metrics"), relkind="f", fk_constraints=["fk"]))
     repo = PostgresPartitionRepository(engine)
 
     # Act
-    repo.create_subpartition_table("events__2026_w35", "events__2026_w35__h0", None)
+    repo.drop_partition("metrics__2026_01")
 
-    # Assert -- INCLUDING ALL copies an identity column, and PostgreSQL then
-    # refuses to attach the result; the parent's identity propagates on ATTACH.
-    stmt = str(conn.execute.call_args.args[0])
-    assert "INCLUDING ALL EXCLUDING IDENTITY" in stmt
+    # Assert
+    statements = _statements(conn)
+    assert 'DROP FOREIGN TABLE IF EXISTS "metrics__2026_01"' in statements
+    assert not [s for s in statements if s.startswith("DROP TABLE") or "DROP CONSTRAINT" in s]
 
 
-def test__repository__reconcile_default_rows__relation_has_no_columns__is_reported_not_guessed() -> None:
-    # Arrange -- to_regclass resolved nothing, so the column lookup is empty.
-    move_result = MagicMock()
-    move_result.rowcount = 0
-    engine = MagicMock()
-    conn = MagicMock()
-    empty = MagicMock()
-    empty.fetchall.return_value = []
-    conn.execute.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), empty, move_result]
-    begin_cm = MagicMock()
-    begin_cm.__enter__ = MagicMock(return_value=conn)
-    begin_cm.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_cm
+# ── batched moves ───────────────────────────────────────────────────────────────
+
+
+def test__reconcile_default_rows__with_a_limit__picks_a_batch_by_tableoid_and_ctid() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=10))
     repo = PostgresPartitionRepository(engine)
 
-    # Act / Assert -- moving rows into a shape we cannot name would be a guess.
+    # Act
+    moved = repo.reconcile_default_rows(
+        default_partition_name="events_default",
+        target_partition_name="events__2024_01",
+        key_columns=("created_at",),
+        from_value="2024-01-01",
+        to_value="2024-02-01",
+        limit=10,
+    )
+
+    # Assert
+    assert moved == 10
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    assert statement == (
+        'WITH moved AS (DELETE FROM "events_default" WHERE (tableoid, ctid) IN ('
+        'SELECT tableoid, ctid FROM "events_default" '
+        "WHERE \"created_at\" >= '2024-01-01' AND \"created_at\" < '2024-02-01' LIMIT 10) "
+        'RETURNING "created_at", "tenant_id", "data") '
+        'INSERT INTO "events__2024_01" ("created_at", "tenant_id", "data") '
+        'SELECT "created_at", "tenant_id", "data" FROM moved'
+    )
+
+
+def test__reconcile_default_rows__without_a_limit__moves_the_whole_window_as_before() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.reconcile_default_rows(
+        default_partition_name="d", target_partition_name="t", key_columns=("k",), from_value="1", to_value="2"
+    )
+
+    # Assert
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    assert "LIMIT" not in statement
+    assert statement.startswith('WITH moved AS (DELETE FROM "d" WHERE "k" >= \'1\' AND "k" < \'2\' RETURNING')
+
+
+def test__move_rows__locks_both_sides_and_moves_a_batch_of_any_rows() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=4))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("public.events__2024_01", "public.events_flat", limit=4)
+
+    # Assert
+    assert moved == 4
+    assert _locks(conn) == [
+        'LOCK TABLE "public"."events__2024_01" IN SHARE ROW EXCLUSIVE MODE',
+        'LOCK TABLE "public"."events_flat" IN SHARE ROW EXCLUSIVE MODE',
+    ]
+    assert _move_statement_of(conn) == (
+        'WITH moved AS (DELETE FROM "public"."events__2024_01" WHERE (tableoid, ctid) IN ('
+        'SELECT tableoid, ctid FROM "public"."events__2024_01" LIMIT 4) '
+        'RETURNING "created_at", "tenant_id", "data") '
+        'INSERT INTO "public"."events_flat" ("created_at", "tenant_id", "data") '
+        'SELECT "created_at", "tenant_id", "data" FROM moved'
+    )
+    engine.begin.assert_called_once()
+
+
+def test__move_rows__no_limit__moves_everything() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=99))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert
+    assert moved == 99
+    assert _move_statement_of(conn).startswith('WITH moved AS (DELETE FROM "a" RETURNING')
+
+
+def test__move_rows__source_without_columns__raises_not_found() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(columns=[]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
     with pytest.raises(PartitionNotFoundError):
+        repo.move_rows("gone", "b")
+
+
+# ── detach refused by a foreign key ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", [DetachMode.BLOCKING, DetachMode.CONCURRENT, DetachMode.AUTO])
+def test__detach_partition__rows_still_referenced__raises_partition_referenced(mode: DetachMode) -> None:
+    # Arrange
+    message = 'removing partition "events__2024_01" violates foreign key constraint "refs_fk1"'
+    engine, _ = _engine(_Catalog(failures={"DETACH PARTITION": _sqlstate_error("23503", message)}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PartitionReferencedError) as excinfo:
+        repo.detach_partition("events", "events__2024_01", mode=mode)
+
+    assert excinfo.value.partition_name == "events__2024_01"
+    assert "violates foreign key constraint" in excinfo.value.detail
+
+
+# ── review follow-ups: markers, identities, refused moves, guarded detaches ─────
+
+
+def test__attach_partition__marked_orphan__loses_the_marker_and_keeps_the_user_comment() -> None:
+    # Arrange
+    marked = orphan_comment("public.events", detached_at=datetime(2026, 6, 1, tzinfo=UTC), existing_comment="keep me")
+    engine, conn = _engine(_Catalog(comment=marked))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", HashBounds(modulus=2, remainder=0))
+
+    # Assert -- ATTACH and the comment rewrite share the transaction
+    assert _statements(conn)[-1] == "COMMENT ON TABLE \"events__2024_01\" IS 'keep me'"
+    engine.begin.assert_called_once()
+
+
+def test__attach_partition__marker_only_comment__is_removed_entirely() -> None:
+    # Arrange
+    marked = orphan_comment("public.events", detached_at=None, existing_comment=None)
+    engine, conn = _engine(_Catalog(comment=marked))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", HashBounds(modulus=2, remainder=0))
+
+    # Assert
+    assert _statements(conn)[-1] == 'COMMENT ON TABLE "events__2024_01" IS NULL'
+
+
+def test__attach_partition__no_marker__writes_no_comment() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(comment="just a note"))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.attach_partition("events", "events__2024_01", HashBounds(modulus=2, remainder=0))
+
+    # Assert
+    assert not any(s.startswith("COMMENT ON") for s in _statements(conn))
+
+
+def test__move_rows__cascading_foreign_key__is_refused_before_any_row_moves() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(destructive_fks=[("fk_orders_event", '"public"."orders"', "c")]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="ON DELETE CASCADE"):
+        repo.move_rows("public.events__2024_01", "public.events_flat")
+    assert not any("WITH moved AS" in s for s in _statements(conn))
+
+
+def test__reconcile_default_rows__set_null_foreign_key__is_refused() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(destructive_fks=[("fk_ref", '"public"."refs"', "n")]))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="ON DELETE SET NULL"):
         repo.reconcile_default_rows(
             default_partition_name="events_default",
             target_partition_name="events__2024_04",
-            partition_column="created_at",
+            key_columns=("created_at",),
             from_value="2024-04-01",
             to_value="2024-05-01",
         )
+
+
+def test__move_rows__identity_always_on_the_target__overrides_the_system_value() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(identity_always=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert -- moved rows keep their identity values
+    (statement,) = [s for s in _statements(conn) if s.startswith("WITH moved AS")]
+    assert ') OVERRIDING SYSTEM VALUE SELECT "created_at"' in statement
+
+
+def test__detach_partition__expected_oid_differs__is_stale_and_nothing_is_marked() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=9999, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING, expected_oid=4242)
+    statements = _statements(conn)
+    assert not any("COMMENT ON" in s for s in statements)
+    assert not any("DETACH PARTITION" in s for s in statements)
+
+
+def test__detach_partition__expected_oid_matches__locks_checks_marks_and_detaches_in_one_transaction() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=4242, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING, expected_oid=4242)
+
+    # Assert -- lock, identity, marker, statement, identity again: one transaction
+    statements = _statements(conn)
+    lock_at = statements.index('LOCK TABLE "events__2024_01" IN ACCESS EXCLUSIVE MODE')
+    oid_at = next(i for i, s in enumerate(statements) if "SELECT c.oid" in s)
+    comment_at = next(i for i, s in enumerate(statements) if s.startswith("COMMENT ON TABLE"))
+    detach_at = statements.index('ALTER TABLE "events" DETACH PARTITION "events__2024_01"')
+    recheck_at = max(i for i, s in enumerate(statements) if "SELECT c.oid" in s)
+    assert lock_at < oid_at < comment_at < detach_at < recheck_at
+    engine.begin.assert_called_once()
+
+
+def test__detach_partition__concurrent_form_with_an_oid__pins_verifies_and_detaches() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=4242, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.CONCURRENT, expected_oid=4242)
+
+    # Assert -- the pin comes first; the statement runs while the relation was verified under it
+    statements = _statements(conn)
+    pin_at = statements.index('LOCK TABLE ONLY "events__2024_01" IN ACCESS SHARE MODE')
+    oid_at = next(i for i, s in enumerate(statements) if "SELECT c.oid" in s)
+    comment_at = next(i for i, s in enumerate(statements) if s.startswith("COMMENT ON TABLE"))
+    detach_at = next(i for i, s in enumerate(statements) if "DETACH PARTITION" in s and "CONCURRENTLY" in s)
+    assert pin_at < oid_at < comment_at < detach_at
+
+
+def test__detach_partition__concurrent_form__swapped_before_the_pin__is_stale_and_nothing_is_marked() -> None:
+    # Arrange -- the name resolves to another relation by the time the pin verifies it
+    engine, conn = _engine(_Catalog(oid=9999, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.detach_partition("events", "events__2024_01", mode=DetachMode.CONCURRENT, expected_oid=4242)
+    statements = _statements(conn)
+    assert not any("COMMENT ON" in s for s in statements)
+    assert not any("DETACH PARTITION" in s for s in statements)
+
+
+def test__detach_partition__no_expected_oid__skips_the_identity_checks() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING)
+
+    # Assert
+    assert not any("SELECT c.oid" in s for s in _statements(conn))
+
+
+def test__drop_partition__drain_into__moves_the_tail_in_the_drop_transaction() -> None:
+    # Arrange
+    marked = orphan_table_comment("public.events")
+    engine, conn = _engine(_Catalog(comment=[marked, marked], moved_rows=3))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.drop_partition("events__2024_01", drain_into="public.events_flat")
+
+    # Assert -- the move precedes the drop, under the same lock
+    statements = _statements(conn)
+    move_at = next(i for i, s in enumerate(statements) if s.startswith("WITH moved AS"))
+    drop_at = next(i for i, s in enumerate(statements) if s.startswith("DROP TABLE"))
+    lock_at = next(i for i, s in enumerate(statements) if "ACCESS EXCLUSIVE" in s)
+    assert lock_at < move_at < drop_at
+    assert '"public"."events_flat"' in statements[move_at]
+
+
+# ── verification round: referenced rows, identity sequences, pinned identities ──
+
+
+def test__move_rows__referenced_rows__refused_atomically_with_guidance() -> None:
+    # Arrange -- even ON DELETE NO ACTION refuses: the moved row is outside the tree
+    error = _sqlstate_error("23503", 'update or delete on table "events__2024_01" violates foreign key constraint')
+    engine, _ = _engine(_Catalog(failures={"WITH moved AS": error}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="still referenced"):
+        repo.move_rows("public.events__2024_01", "public.events_flat")
+
+
+def test__reconcile_default_rows__target_swapped_under_the_lock__is_stale_before_any_row_moves() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(oid=9999))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.reconcile_default_rows(
+            default_partition_name="d",
+            target_partition_name="t",
+            key_columns=("k",),
+            from_value="1",
+            to_value="2",
+            expected_target_oid=4242,
+        )
+    assert not any(s.startswith("WITH moved AS") for s in _statements(conn))
+
+
+def test__attach_partition__expected_oid_mismatch__fails_inside_the_attach_transaction() -> None:
+    # Arrange -- the check runs after the ATTACH, under its lock; the raise rolls it all back
+    engine, conn = _engine(_Catalog(oid=9999))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.attach_partition("events", "events__x", HashBounds(modulus=2, remainder=0), expected_oid=4242)
+    statements = _statements(conn)
+    assert any("ATTACH PARTITION" in s for s in statements)
+    assert not any("obj_description" in s for s in statements)
+    engine.begin.assert_called_once()
+
+
+def test__drop_partition__drain_into__returns_the_rows_it_moved() -> None:
+    # Arrange
+    marked = orphan_table_comment("public.events")
+    engine, _ = _engine(_Catalog(comment=[marked, marked], moved_rows=3))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    assert repo.drop_partition("events__2024_01", drain_into="public.events_flat") == 3
+
+
+def test__detach_partition__blocking_foreign_with_a_swap__rolls_back_on_the_recheck() -> None:
+    # Arrange -- a foreign relation cannot be locked; the transactional re-check covers it
+    engine, conn = _engine(_Catalog(relkind="f", oid=[4242, 9999], attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError, match="OID 9999"):
+        repo.detach_partition("metrics", "metrics__2026_01", mode=DetachMode.BLOCKING, expected_oid=4242)
+    assert any("DETACH PARTITION" in s for s in _statements(conn))
+    engine.begin.assert_called_once()
+
+
+def test__detach_partition__foreign_with_an_oid__uses_the_transactional_blocking_form() -> None:
+    # Arrange -- the pin cannot hold a foreign relation, so AUTO goes blocking
+    engine, conn = _engine(_Catalog(relkind="f", oid=4242, attached_to=True))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.detach_partition("metrics", "metrics__2026_01", mode=DetachMode.AUTO, expected_oid=4242)
+
+    # Assert
+    detaches = [s for s in _statements(conn) if "DETACH PARTITION" in s]
+    assert detaches
+    assert all("CONCURRENTLY" not in s for s in detaches)
+
+
+def test__move_rows__identity_target__sets_the_sequence_past_the_ids_it_could_reissue() -> None:
+    # Arrange -- a fresh ascending sequence and rows carrying 1..11
+    engine, conn = _engine(
+        _Catalog(moved_rows=4, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, extreme_value=11)
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert -- the reachable extreme is found, then the sequence is set to it
+    assert moved == 4
+    statements = _statements(conn)
+    move_at = statements.index(_move_statement_of(conn))
+    parked = _parked_identity_of(conn)
+    reach_at = next(i for i, s in enumerate(statements) if s.startswith("SELECT MAX(") and parked in s)
+    setval_at = next(i for i, s in enumerate(statements) if "setval(" in s)
+    assert move_at < reach_at < setval_at
+    engine.begin.assert_called_once()
+
+
+def test__move_rows__descending_identity_target__chases_the_low_water_mark() -> None:
+    # Arrange -- INCREMENT -1 means the reachable extreme is the minimum
+    sequence = {
+        "increment": -1,
+        "minimum": -(2**63),
+        "maximum": 0,
+        "cycles": False,
+        "cache": 1,
+        "start_value": 0,
+        "last_value": None,
+    }
+    engine, conn = _engine(
+        _Catalog(
+            moved_rows=3, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, sequence=sequence, extreme_value=-2
+        )
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert
+    statements = _statements(conn)
+    parked = _parked_identity_of(conn)
+    assert any(s.startswith("SELECT MIN(") and parked in s for s in statements)
+    assert any("setval(" in s for s in statements)
+
+
+def test__move_rows__identity_sequence_out_of_reach__is_left_alone() -> None:
+    # Arrange -- no row carries a value the sequence can still issue
+    engine, conn = _engine(
+        _Catalog(moved_rows=4, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, extreme_value=None)
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert -- an id off the sequence's path or outside its range cannot collide
+    assert not any("setval(" in s for s in _statements(conn))
+
+
+def test__move_rows__nothing_moved__leaves_identity_sequences_alone() -> None:
+    # Arrange
+    engine, conn = _engine(
+        _Catalog(moved_rows=0, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, extreme_value=11)
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert
+    assert not any("setval(" in s for s in _statements(conn))
+
+
+def test__move_rows__cycling_identity_sequence__refuses_the_move() -> None:
+    # Arrange -- a cycling sequence comes back around onto the moved ids
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 5,
+        "cycles": True,
+        "cache": 1,
+        "start_value": 1,
+        "last_value": None,
+    }
+    engine, _ = _engine(
+        _Catalog(
+            moved_rows=3,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=5,
+            holds_value=True,
+        )
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="cycles"):
+        repo.move_rows("a", "b")
+
+
+def test__move_rows__identity_sequence_would_be_exhausted__refuses_the_move() -> None:
+    # Arrange -- every value the sequence can still reach is already carried
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 5,
+        "cycles": False,
+        "cache": 1,
+        "start_value": 1,
+        "last_value": None,
+    }
+    engine, _ = _engine(
+        _Catalog(
+            moved_rows=3, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS, sequence=sequence, extreme_value=5
+        )
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="nothing left to issue"):
+        repo.move_rows("a", "b")
+
+
+def test__move_rows__identity_sequence_with_a_cache__refuses_what_a_session_may_hold() -> None:
+    # Arrange -- CACHE 5 was drawn: 1..5 live in that session, the catalog says 5
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 1,
+        "last_value": 5,
+    }
+    catalog = _Catalog(
+        moved_rows=2,
+        identity_columns=["id"],
+        columns=_IDENTITY_SOURCE_COLUMNS,
+        sequence=sequence,
+        extreme_value=2,
+        holds_value=True,
+    )
+    engine, _ = _engine(catalog)
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- no setval can take a cached value back
+    with pytest.raises(RowMoveRefusedError, match="caches 5 values"):
+        repo.move_rows("a", "b")
+
+
+def test__move_rows__identity_sequence_with_a_cache_nobody_holds__moves() -> None:
+    # Arrange -- the same cache, but no row carries a value from the drawn block
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 1,
+        "last_value": 5,
+    }
+    engine, conn = _engine(
+        _Catalog(
+            moved_rows=2,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=None,
+        )
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert
+    assert moved == 2
+    assert not any("setval(" in s for s in _statements(conn))
+
+
+def test__move_rows__identity_cache_block_below_the_newest__still_refuses() -> None:
+    # Arrange -- one session drew 1..5 and another 6..10, so the catalog says 10
+    # while 2 is still sitting in the first session's cache.
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 1,
+        "last_value": 10,
+    }
+    catalog = _Catalog(
+        moved_rows=1,
+        identity_columns=["id"],
+        columns=_IDENTITY_SOURCE_COLUMNS,
+        sequence=sequence,
+        extreme_value=None,
+        holds_value=True,
+    )
+    engine, conn = _engine(catalog)
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert -- the whole allocated region counts, not just the newest block
+    with pytest.raises(RowMoveRefusedError, match="already handed out"):
+        repo.move_rows("a", "b")
+    (probe,) = [s for s in _statements(conn) if s.startswith("SELECT EXISTS (SELECT 1 FROM")]
+    assert "BETWEEN 1 AND 10" in probe
+
+
+def test__move_rows__cached_identity__values_before_its_start_are_not_refused() -> None:
+    # Arrange -- the sequence began at 100; 50 was never handed out by anyone
+    sequence = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2**63 - 1,
+        "cycles": False,
+        "cache": 5,
+        "start_value": 100,
+        "last_value": 109,
+    }
+    engine, conn = _engine(
+        _Catalog(
+            moved_rows=1,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=None,
+            holds_value=False,
+        )
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert -- the allocated region runs from the start, not from the declared minimum
+    assert moved == 1
+    (probe,) = [s for s in _statements(conn) if s.startswith("SELECT EXISTS (SELECT 1 FROM")]
+    assert "BETWEEN 100 AND 109" in probe
+
+
+def test__move_rows__cycling_identity__asks_about_the_whole_range_not_one_residue() -> None:
+    # Arrange -- a wraparound restarts the sequence at the far end of its range,
+    # which can put it on values its increments skipped before
+    sequence = {
+        "increment": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "cycles": True,
+        "cache": 2,
+        "start_value": 2,
+        "last_value": 4,
+    }
+    engine, _ = _engine(
+        _Catalog(
+            moved_rows=1,
+            identity_columns=["id"],
+            columns=_IDENTITY_SOURCE_COLUMNS,
+            sequence=sequence,
+            extreme_value=None,
+            holds_value=True,
+        )
+    )
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="skipped before"):
+        repo.move_rows("a", "b")
+
+
+def test__move_rows__identity_target__keeps_the_ids_it_moved_and_asks_about_those() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+
+    # Assert -- one statement moves the rows and hands over what it placed,
+    # and the relation it parked them in is opened before and released after
+    statements = _statements(conn)
+    move = _move_statement_of(conn)
+    parked = _parked_identity_of(conn)
+    assert 'placed AS (INSERT INTO "b" ("id", "created_at", "tenant_id", "data") ' in move
+    assert 'RETURNING "id") ' in move
+    assert parked in move
+    assert move.endswith('("id") SELECT "id" FROM placed')
+    opened = next(i for i, s in enumerate(statements) if s.startswith("CREATE TEMP TABLE"))
+    released = next(i for i, s in enumerate(statements) if s.startswith("DROP TABLE"))
+    assert opened < statements.index(move) < released
+    assert all(parked in s for s in statements if s.startswith(("SELECT MAX(", "SELECT MIN(")))
+
+
+def test__move_rows__identity_column_the_source_does_not_carry__is_left_to_its_sequence() -> None:
+    # Arrange -- the move inserts no id, so the destination's sequence issues
+    # them itself and has nothing the move could have taken from it
+    engine, conn = _engine(_Catalog(moved_rows=4, identity_columns=["id"], extreme_value=11))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.move_rows("a", "b")
+
+    # Assert
+    assert moved == 4
+    statements = _statements(conn)
+    assert "placed AS" not in _move_statement_of(conn)
+    assert not any(s.startswith("CREATE TEMP TABLE") for s in statements)
+    assert not any("setval(" in s for s in statements)
+
+
+def test__move_rows__two_moves__park_their_ids_in_relations_of_their_own() -> None:
+    # Arrange -- the temporary schema is the session's, and a caller may be
+    # holding names in it; nothing the library opens may be a name it guessed
+    engine, conn = _engine(_Catalog(moved_rows=1, identity_columns=["id"], columns=_IDENTITY_SOURCE_COLUMNS))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.move_rows("a", "b")
+    repo.move_rows("a", "b")
+
+    # Assert -- each move opens its own relation and gives that one back
+    opened = [s.split()[3] for s in _statements(conn) if s.startswith("CREATE TEMP TABLE")]
+    released = [s.split()[2] for s in _statements(conn) if s.startswith("DROP TABLE")]
+    assert len(opened) == 2
+    assert opened[0] != opened[1]
+    assert opened == released
+
+
+def test__move_rows__a_later_identity_column_refuses__no_sequence_was_moved() -> None:
+    # Arrange -- the first column would be set to 4, the second cycles onto the
+    # ids the move carries. A sequence does not roll back with the transaction,
+    # so the first must not have been touched.
+    reachable = {
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 5,
+        "cycles": False,
+        "cache": 1,
+        "start_value": 1,
+        "last_value": None,
+    }
+    cycling = {**reachable, "maximum": 10, "cycles": True}
+    catalog = _Catalog(
+        moved_rows=1,
+        identity_columns=["id", "ref"],
+        columns=["id", "ref", "created_at"],
+        sequence=[reachable, cycling],
+        extreme_value=4,
+        holds_value=True,
+    )
+    engine, conn = _engine(catalog)
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(RowMoveRefusedError, match="cycles"):
+        repo.move_rows("a", "b")
+    assert not any("setval(" in s for s in _statements(conn))

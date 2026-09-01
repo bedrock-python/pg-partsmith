@@ -1,23 +1,19 @@
-# Configuration
+# Configure a table
 
-`TablePartitionConfig` controls how pg-partsmith manages a single table's partitions.
+`TablePartitionConfig` describes one partitioned table. This guide shows the two ways to
+write one, how to load it from the environment or JSON, and what is checked when.
 
-## Full example
+## The flat spelling
+
+For the ordinary time-partitioned table — a `RANGE` root over a timestamp, one partition
+per period:
 
 ```python
-from pg_partsmith import (
-    MonthPeriodCalculator,
-    PartitionGranularity,
-    PartitionStrategy,
-    PartitionType,
-    TablePartitionConfig,
-)
+from pg_partsmith import PartitionGranularity, TablePartitionConfig
 
 config = TablePartitionConfig(
     schema="public",
     table_name="events",
-    partition_type=PartitionType.RANGE,
-    partition_strategy=PartitionStrategy.TIME_BASED,
     partition_column="created_at",
     granularity=PartitionGranularity.MONTH,
     create_ahead_count=3,
@@ -25,115 +21,157 @@ config = TablePartitionConfig(
 )
 ```
 
-## Fields
+| Field | Meaning |
+|---|---|
+| `schema` | Schema of the parent table. Optional but recommended: everything is then schema-qualified and independent of `search_path`. |
+| `table_name` | The parent table, lowercase. |
+| `partition_column` | Leading column of the partition key — the time dimension. |
+| `trailing_partition_columns` | The rest of a composite key, in key order. |
+| `granularity` | `HOUR`, `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`. |
+| `tz` | Timezone the calendar is computed in (IANA name or `ZoneInfo`); `UTC` by default. |
+| `boundary_codec` | Physical encoding of the key: `"uuidv7"`, `"epoch_seconds"`, `"epoch_milliseconds"`, or a codec instance. |
+| `subpartition` | A level below the root: `HashPartitioning(...)` or `ListPartitioning(...)`. |
+| `create_ahead_count` | Periods that must exist, the current one included. |
+| `retention_count` | Newest periods kept, the current one included — a count, not a distance. |
+| `partition_type`, `partition_strategy` | Optional; checked against the scheme. |
 
-### `table_name`
+## The composed spelling
 
-The name of the parent (partitioned) table. Must match the PostgreSQL table name exactly.
-
-### `schema`
-
-The PostgreSQL schema that contains the table. Optional, but **strongly recommended** in
-multi-schema databases. When set, all catalog queries and DDL are schema-qualified and
-independent of `search_path`.
-
-```python
-schema="public"      # default schema
-schema="analytics"   # custom schema
-schema=None          # relies on search_path (not recommended)
-```
-
-### `partition_type`
-
-```python
-class PartitionType(StrEnum):
-    RANGE = "range"
-    LIST  = "list"
-    HASH  = "hash"
-```
-
-Use `RANGE` for time-based partitioning.
-
-### `partition_strategy`
+Everything else — an integer axis, a hash or list root, a sliding list, a policy beyond
+"N ahead, M kept", leaves that are not plain tables — is spelled out:
 
 ```python
-class PartitionStrategy(StrEnum):
-    TIME_BASED  = "time_based"
-    VALUE_BASED = "value_based"
-    HASH_BASED  = "hash_based"
+from datetime import timedelta
+
+from pg_partsmith import (
+    CreateAhead,
+    DropAfter,
+    HashPartitioning,
+    KeepNewest,
+    LifecyclePolicy,
+    LocalLeaves,
+    PartitionGranularity,
+    RangePartitioning,
+    TablePartitionConfig,
+    TimeBoundaries,
+)
+
+config = TablePartitionConfig(
+    schema="public",
+    table_name="events",
+    scheme=RangePartitioning(
+        key="created_at",
+        boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH, tz="Europe/Helsinki"),
+        child=HashPartitioning(key="tenant_id", modulus=4),
+    ),
+    lifecycle=LifecyclePolicy(
+        creation=CreateAhead(count=3),
+        retention=KeepNewest(count=12),
+        drop=DropAfter(grace=timedelta(days=7)),
+    ),
+    leaves=LocalLeaves(storage_parameters={"fillfactor": 90}),
+)
 ```
 
-The values matter when the config comes from the environment: a
-`PartitionTableSettings` subclass reads `…_PARTITION_STRATEGY=time_based`, not
-the member name.
+| Field | See |
+|---|---|
+| `scheme` | [Partition schemes](../concepts/schemes.md) |
+| `lifecycle` | [Lifecycle policies](../concepts/lifecycle.md) |
+| `leaves` | [Leaf backends](../concepts/leaves.md) |
 
-Use `TIME_BASED` for automatic period calculation via a `PeriodCalculator`.
+Passing `scheme` together with the flat scheme fields, or `lifecycle` together with
+`create_ahead_count` / `retention_count`, is an error: one spelling per config.
 
-### `partition_column`
-
-Column used as the partition key. For `TIME_BASED` this is typically a `TIMESTAMP` or
-`TIMESTAMPTZ` column.
+Whichever spelling you used, both views are there:
 
 ```python
-partition_column="created_at"
-partition_column="event_date"
+config.scheme                 # the root level
+config.lifecycle              # the policy
+config.leaves                 # what kind of relation the leaves are
+config.partition_type         # PartitionType.RANGE / LIST / HASH — the root's method
+config.partition_strategy     # TIME_BASED / NUMERIC_BASED / VALUE_BASED / HASH_BASED
+config.partition_columns      # the root's whole key
+config.levels                 # every level, root first
+config.qualified_name         # "public.events"
 ```
 
-### `trailing_partition_columns`
+## From the environment
 
-The rest of a composite partition key, in key order, when the table partitions on
-more than one column. Empty by default, which is the single-column case.
+`PartitionTableSettings` (`pip install "pg-partsmith[pydantic-settings]"`) reads the flat
+fields from environment variables, and `SCHEME` / `LIFECYCLE` / `LEAVES` as JSON for the
+composed form:
 
 ```python
-partition_column="created_at"
-trailing_partition_columns=("tenant_id",)   # PARTITION BY RANGE (created_at, tenant_id)
+from pydantic_settings import SettingsConfigDict
+
+from pg_partsmith.settings import PartitionTableSettings
+
+
+class EventsSettings(PartitionTableSettings):
+    model_config = SettingsConfigDict(env_prefix="EVENTS_")
+
+
+config = EventsSettings().to_config()
 ```
 
-Only the leading column carries the period; the trailing ones are bounded with
-`MINVALUE`. Read the whole key back with `config.partition_columns` and its length
-with `config.key_arity`. See [Composite partition keys](subpartitioning.md#composite-partition-keys)
-for what a nullable trailing column does to row routing.
+```bash
+EVENTS_TABLE_NAME=events
+EVENTS_SCHEMA_NAME=public
+EVENTS_PARTITION_COLUMN=created_at
+EVENTS_GRANULARITY=month
+EVENTS_CREATE_AHEAD_COUNT=3
+EVENTS_RETENTION_COUNT=12
+```
 
-### `granularity`
+Every variable is listed in [Environment settings](../reference/settings.md).
 
-Controls which built-in period calculator to use when one is not passed explicitly.
+## From JSON
+
+Configs are frozen Pydantic models. `model_dump(mode="json")` produces a document —
+timezones as IANA names, built-in codecs by name, policies discriminated on `kind` — and
+`model_validate` reads it back, nested schemes, numeric boundaries and combinator
+policies included:
 
 ```python
-class PartitionGranularity(StrEnum):
-    HOUR    = "hour"
-    DAY     = "day"
-    WEEK    = "week"
-    MONTH   = "month"
-    QUARTER = "quarter"
-    YEAR    = "year"
+payload = config.model_dump(mode="json", by_alias=True)
+same = TablePartitionConfig.model_validate(payload)
 ```
 
-See [Period strategies](strategies.md) for details.
+Custom calculators, custom codecs and `Callback` predicates are Python objects and are
+left out of the dump; a config using them is built in code.
 
-### `create_ahead_count`
+## Several tables
 
-Number of partitions to ensure exist, counting from the current period inclusive.
-
-| Value | Effect (MONTH granularity, current = 2024-06) |
-|-------|-----------------------------------------------|
-| `1`   | Only `events__2024_06` |
-| `3`   | `events__2024_06`, `events__2024_07`, `events__2024_08` |
-
-### `retention_count`
-
-Number of **most recent** periods to keep attached. Partitions older than this are detached.
+One config per table; the service is stateless across them:
 
 ```python
-retention_count=12   # keep 12 months; detach everything older
-retention_count=90   # keep 90 days (with DAY granularity)
+CONFIGS = [events_config, audit_config, outbox_config]
+
+for table_config in CONFIGS:
+    result = await maintainer.run_maintenance_safe(table_config)
 ```
 
-Detached partitions are tagged with a marker comment and become orphans eligible for dropping.
+Tables are locked and maintained independently — a problem with one never blocks
+another.
 
-## Enums reference
+## What is checked, and when
 
-```python
-from pg_partsmith import PartitionType, PartitionGranularity, PartitionStrategy
+**At construction** — no database involved: an unknown or misspelled field is refused
+rather than silently dropped (a `retention_cout` typo must not shrink retention to its
+default), identifiers are lowercased and checked, a LIST key is one column, every level
+partitions on a fresh column, a sliding list has no `CreateAhead`, a retention age is
+never negative, every generated name fits 63 bytes at every level:
+
+```text
+table_name 'a_very_long_table_name_for_an_events_store_that_goes_on_and_on' is too long for
+this scheme: table_name (62) + the longest generated suffix (9) = 71 > 63 bytes. PostgreSQL
+truncates identifiers silently, which would collapse two partitions onto one name.
 ```
 
-All three enums are `str` subclasses and serialise cleanly to/from JSON.
+**At plan time** — against the catalog: the table exists and is partitioned by the root's
+method on the root's key (composite keys compared in key order; mixed-case and expression
+keys refused); the calendar's timezone and the repository's `ddl_timezone` agree; every
+nested level's key columns appear in every `UNIQUE` / `PRIMARY KEY` constraint; foreign
+leaves are not asked of a parent with a unique index. Each failure is an
+`InvalidPartitionConfigError` naming the fix — the timezone mismatch a `ValueError` —
+raised before any DDL.

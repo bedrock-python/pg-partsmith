@@ -31,6 +31,7 @@ docs-serve:
 docs-build:
 	python -c "import shutil; shutil.copy('CHANGELOG.md', 'docs/changelog.md')"
 	uv run --no-dev --group docs zensical build --clean
+	python scripts/emit_markdown.py
 
 clean:
 	python -c "import shutil, os, pathlib; [shutil.rmtree(p, ignore_errors=True) for p in ['.pytest_cache', '.mypy_cache', '.ruff_cache', 'dist', 'build', 'site'] if os.path.exists(p)]; [os.remove(p) for p in ['.coverage', 'coverage.xml'] if os.path.exists(p)]; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('.').rglob('__pycache__')]"

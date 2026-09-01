@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
-from pg_partsmith.catalog_queries import PARTITION_IS_ATTACHED_SQL, RELATION_EXISTS_SQL
+from pg_partsmith.catalog_queries import PARTITION_IS_ATTACHED_SQL, RELATION_EXISTS_SQL, RELATION_KIND_SQL
 from pg_partsmith.utils import coerce_str, to_regclass_argument
 
 if TYPE_CHECKING:
@@ -69,3 +69,9 @@ class PartitionRelationResolver:
             {"name": to_regclass_argument(name)},
         )
         return coerce_str(result.scalar())
+
+
+def relation_kind(conn: Connection, name: str) -> str | None:
+    """``pg_class.relkind`` of the relation holding ``name``, or None when there is none."""
+    result = conn.execute(text(RELATION_KIND_SQL), {"name": to_regclass_argument(name)})
+    return coerce_str(result.scalar(), encoding="ascii")

@@ -7,8 +7,8 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING, ClassVar
 
-from pg_partsmith.entities import Period
 from pg_partsmith.partition_bounds import parse_boundary_literal
+from pg_partsmith.periods import Period
 from pg_partsmith.utils import timezone_name
 
 if TYPE_CHECKING:
@@ -117,10 +117,25 @@ class BasePeriodCalculator(ABC):
         """Current time in the calculator's timezone."""
         return datetime.now(self._tz)
 
+    def _local(self, instant: datetime) -> datetime:
+        """Express an instant in the calculator's timezone (naive values are read as UTC)."""
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=UTC)
+        return instant.astimezone(self._tz)
+
     @abstractmethod
+    def period_at(self, instant: datetime) -> Period:
+        """Return the period holding ``instant``, computed in :attr:`tz`.
+
+        Every position-dependent question -- which period is current, which
+        period a horizon falls in, which period an existing bound starts --
+        is answered through this one method.
+        """
+        ...
+
     def current_period(self) -> Period:
         """Return the current period based on the current time in :attr:`tz`."""
-        ...
+        return self.period_at(self._now())
 
     @abstractmethod
     def format_partition_name(self, table_name: str, period: Period) -> str:

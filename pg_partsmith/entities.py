@@ -2,58 +2,45 @@
 
 from __future__ import annotations
 
-import functools
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from .constants import (
-    DEFAULT_CREATE_AHEAD_COUNT,
-    DEFAULT_RETENTION_COUNT,
-    MAX_HOUR,
-    MAX_IDENTIFIER_LENGTH,
-    MAX_ISO_WEEK,
-    MAX_MONTH,
-    MAX_QUARTER,
-    MIN_HOUR,
-    MIN_ISO_WEEK,
-    MIN_MONTH,
-    MIN_QUARTER,
-)
+from .boundaries import Axis, CursorSource, TimeBoundaries
+from .leaves import LeafBackend, LocalLeaves
+from .lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
+from .periods import PartitionGranularity, Period
+from .scheme import HashPartitioning, ListPartitioning, PartitionScheme, RangePartitioning, SchemeBase, name_fits
 from .topology import (
     DefaultBounds,
     HashBounds,
-    HashSubpartitionSpec,
     ListBounds,
-    ListGroup,
-    ListSubpartitionSpec,
     PartitionBounds,
     PartitionNode,
     PartitionType,
     RangeBounds,
-    SubpartitionBounds,
-    SubpartitionSpec,
-    SubpartitionSpecBase,
+    RelationKind,
     validate_pg_identifier,
 )
-from .types import NonNegativeInt, PositiveInt, StrippedNonEmptyStr
+from .types import NonNegativeInt, StrippedNonEmptyStr
+from .utils import qualify
 
-# ``PartitionType`` and the partition-tree models live in ``topology`` so that
-# module can stay IO-free and importable from anywhere; they are re-exported
-# here because ``pg_partsmith.entities`` has always been their public home.
+if TYPE_CHECKING:
+    from .plan import MaintenancePlan
+
+# ``PartitionType`` and the partition-tree models live in ``topology``, the
+# calendar in ``periods``, so those modules stay IO-free and importable from
+# anywhere; they are re-exported here because ``pg_partsmith.entities`` has
+# always been their public home.
 __all__ = [
     "DefaultBounds",
     "HashBounds",
-    "HashSubpartitionSpec",
     "ListBounds",
-    "ListGroup",
-    "ListSubpartitionSpec",
     "MaintenanceIssue",
     "MaintenanceIssueStep",
     "MaintenanceResult",
+    "MigrationResult",
     "PartitionBounds",
     "PartitionGranularity",
     "PartitionInfo",
@@ -62,417 +49,35 @@ __all__ = [
     "PartitionType",
     "Period",
     "RangeBounds",
-    "SubpartitionBounds",
-    "SubpartitionSpec",
-    "SubpartitionSpecBase",
     "TablePartitionConfig",
 ]
 
 
-class PartitionGranularity(StrEnum):
-    """Time-based partition granularity.
-
-    Attributes:
-        HOUR: Hourly partitions.
-        DAY: Daily partitions.
-        WEEK: Weekly partitions.
-        MONTH: Monthly partitions.
-        QUARTER: Quarterly partitions.
-        YEAR: Yearly partitions.
-    """
-
-    HOUR = "hour"
-    DAY = "day"
-    WEEK = "week"
-    MONTH = "month"
-    QUARTER = "quarter"
-    YEAR = "year"
-
-
 class PartitionStrategy(StrEnum):
-    """Partition strategy type.
+    """What drives a root table's partitions.
+
+    Derived from the scheme; accepted as input only to be checked against it.
 
     Attributes:
-        TIME_BASED: Time-based partitioning using granularity.
-        VALUE_BASED: Value-based partitioning (LIST).
-        HASH_BASED: Hash-based partitioning.
+        TIME_BASED: RANGE over a time axis.
+        NUMERIC_BASED: RANGE over an integer axis.
+        VALUE_BASED: LIST.
+        HASH_BASED: HASH.
     """
 
     TIME_BASED = "time_based"
+    NUMERIC_BASED = "numeric_based"
     VALUE_BASED = "value_based"
     HASH_BASED = "hash_based"
 
 
-@dataclass(frozen=True)
-@functools.total_ordering
-class Period:
-    """Represents a time period for partition boundaries.
-
-    Every period has exactly one granularity kind (a
-    :class:`PartitionGranularity` member), decided once by
-    ``_granularity_key``. All kind-specific behaviour (validation,
-    arithmetic, ordering, formatting) lives in the ``_SPECS`` table below,
-    so supporting a new kind means adding one ``_GranularitySpec`` entry.
-
-    Attributes:
-        year: Year component.
-        month: Month component (1-12), optional.
-        day: Day component (1-31), optional.
-        week: ISO week number (1-53), optional.
-        hour: Hour component (0-23), optional; requires day.
-        quarter: Quarter component (1-4), optional.
-    """
-
-    year: int
-    month: int | None = None
-    day: int | None = None
-    week: int | None = None
-    hour: int | None = None
-    quarter: int | None = None
-
-    def __post_init__(self) -> None:
-        """Validate period components for this period's granularity kind."""
-        self._spec.validate(self)
-
-    @property
-    def _spec(self) -> _GranularitySpec:
-        """Per-kind behaviour for this period."""
-        return _SPECS[_granularity_key(self)]
-
-    def to_date(self) -> date:
-        """Return the period's start date.
-
-        Weekly periods return the Monday of the ISO week; hourly periods
-        return the calendar date (use :meth:`to_datetime` to preserve the
-        hour component).
-        """
-        return self._spec.start_date(self)
-
-    def to_datetime(self) -> datetime:
-        """Convert period start to a timezone-aware UTC datetime.
-
-        Unlike :meth:`to_date`, preserves the hour component, so hourly
-        periods within one day map to distinct instants.
-        """
-        base = datetime.combine(self.to_date(), datetime.min.time(), tzinfo=UTC)
-        if self.hour is not None:
-            base = base.replace(hour=self.hour)
-        return base
-
-    def __add__(self, offset: int) -> Period:
-        """Add offset to period (implementation depends on granularity).
-
-        Args:
-            offset: Number of periods to add.
-
-        Returns:
-            New Period object.
-        """
-        return self._spec.add(self, offset)
-
-    def __sub__(self, offset: int) -> Period:
-        """Subtract offset from period.
-
-        Args:
-            offset: Number of periods to subtract.
-
-        Returns:
-            New Period object.
-        """
-        return self.__add__(-offset)
-
-    def __lt__(self, other: object) -> bool:
-        """Compare periods of the same granularity kind."""
-        if not isinstance(other, Period):
-            return NotImplemented
-
-        kind = _granularity_key(self)
-        if kind != _granularity_key(other):
-            return NotImplemented
-
-        spec = _SPECS[kind]
-        return spec.sort_key(self) < spec.sort_key(other)
-
-    def __str__(self) -> str:
-        """String representation."""
-        return self._spec.fmt(self)
-
-
-# ── Per-granularity dispatch for Period ─────────────────────────────────────────
-#
-# Each granularity kind is described by one _GranularitySpec entry in _SPECS.
-# Period methods dispatch on the kind exactly once; adding a new kind means
-# adding one group of handlers plus one _SPECS entry (and teaching
-# _granularity_key below to recognise it).
-#
-# The handlers may assume the invariants enforced by their kind's `validate`
-# (e.g. an "hour" period always has month, day and hour set).
-
-
-@dataclass(frozen=True)
-class _GranularitySpec:
-    """Kind-specific behaviour of :class:`Period`.
-
-    Attributes:
-        validate: Check field consistency and ranges; raise ``ValueError``.
-        start_date: Return the period's start date.
-        add: Return the period shifted by an offset of whole periods.
-        sort_key: Tuple used to order periods of the same kind.
-        fmt: Canonical string form (used in partition names).
-    """
-
-    validate: Callable[[Period], None]
-    start_date: Callable[[Period], date]
-    add: Callable[[Period, int], Period]
-    sort_key: Callable[[Period], tuple[int | None, ...]]
-    fmt: Callable[[Period], str]
-
-
-def _check_month_range(p: Period) -> None:
-    if p.month is None:
-        return
-    if not MIN_MONTH <= p.month <= MAX_MONTH:
-        msg = f"Month must be between {MIN_MONTH} and {MAX_MONTH}, got {p.month}"
-        raise ValueError(msg)
-
-
-def _check_day_resolves_to_real_date(p: Period) -> None:
-    if p.day is None:
-        return
-    if p.month is None:
-        msg = "Month is required when day is specified"
-        raise ValueError(msg)
-    try:
-        date(p.year, p.month, p.day)
-    except ValueError as exc:
-        msg = f"Invalid date: {p.year}-{p.month}-{p.day}"
-        raise ValueError(msg) from exc
-
-
-def _check_hour_requires_day_and_range(p: Period) -> None:
-    if p.hour is None:
-        return
-    if p.day is None:
-        msg = "Day is required when hour is specified"
-        raise ValueError(msg)
-    if not MIN_HOUR <= p.hour <= MAX_HOUR:
-        msg = f"Hour must be between {MIN_HOUR} and {MAX_HOUR}, got {p.hour}"
-        raise ValueError(msg)
-
-
-# ── year ──
-
-
-def _year_validate(p: Period) -> None:
-    """A year-only period has no extra components to validate."""
-
-
-def _year_start(p: Period) -> date:
-    return date(p.year, 1, 1)
-
-
-def _year_add(p: Period, offset: int) -> Period:
-    return Period(year=p.year + offset)
-
-
-def _year_sort(p: Period) -> tuple[int | None, ...]:
-    return (p.year,)
-
-
-def _year_fmt(p: Period) -> str:
-    return f"{p.year:04d}"
-
-
-# ── month ──
-
-
-def _month_validate(p: Period) -> None:
-    _check_month_range(p)
-
-
-def _month_start(p: Period) -> date:
-    month = p.month if p.month is not None else 1
-    return date(p.year, month, 1)
-
-
-def _month_add(p: Period, offset: int) -> Period:
-    month = p.month if p.month is not None else 1
-    total_months = p.year * 12 + month - 1 + offset
-    return Period(year=total_months // 12, month=(total_months % 12) + 1)
-
-
-def _month_sort(p: Period) -> tuple[int | None, ...]:
-    return (p.year, p.month)
-
-
-def _month_fmt(p: Period) -> str:
-    return f"{p.year:04d}_{p.month:02d}"
-
-
-# ── day ──
-
-
-def _day_validate(p: Period) -> None:
-    _check_month_range(p)
-    _check_day_resolves_to_real_date(p)
-
-
-def _day_start(p: Period) -> date:
-    return _day_date(p)
-
-
-def _day_add(p: Period, offset: int) -> Period:
-    d = _day_date(p) + timedelta(days=offset)
-    return Period(year=d.year, month=d.month, day=d.day)
-
-
-def _day_sort(p: Period) -> tuple[int | None, ...]:
-    return (p.year, p.month, p.day)
-
-
-def _day_fmt(p: Period) -> str:
-    return f"{p.year:04d}_{p.month:02d}_{p.day:02d}"
-
-
-def _day_date(p: Period) -> date:
-    """Calendar date of a day- or hour-kind period (fields guaranteed set)."""
-    month = p.month if p.month is not None else 1
-    day = p.day if p.day is not None else 1
-    return date(p.year, month, day)
-
-
-# ── week ──
-
-
-def _week_validate(p: Period) -> None:
-    if p.month is not None or p.day is not None or p.hour is not None:
-        msg = "Period cannot have both week and month/day/hour"
-        raise ValueError(msg)
-    if p.quarter is not None:
-        msg = "Period cannot have both quarter and month/day/week/hour"
-        raise ValueError(msg)
-    week = p.week if p.week is not None else 1
-    if not MIN_ISO_WEEK <= week <= MAX_ISO_WEEK:
-        msg = f"Week must be between {MIN_ISO_WEEK} and {MAX_ISO_WEEK}, got {week}"
-        raise ValueError(msg)
-    try:
-        date.fromisocalendar(p.year, week, 1)
-    except ValueError as exc:
-        msg = f"Invalid ISO week: {p.year:04d}-W{week:02d}"
-        raise ValueError(msg) from exc
-
-
-def _week_start(p: Period) -> date:
-    week = p.week if p.week is not None else 1
-    return date.fromisocalendar(p.year, week, 1)
-
-
-def _week_add(p: Period, offset: int) -> Period:
-    new_date = _week_start(p) + timedelta(weeks=offset)
-    iso_year, iso_week, _ = new_date.isocalendar()
-    return Period(year=iso_year, week=iso_week)
-
-
-def _week_sort(p: Period) -> tuple[int | None, ...]:
-    return (p.year, p.week)
-
-
-def _week_fmt(p: Period) -> str:
-    return f"{p.year:04d}_w{p.week:02d}"
-
-
-# ── hour ──
-
-
-def _hour_validate(p: Period) -> None:
-    _check_month_range(p)
-    _check_day_resolves_to_real_date(p)
-    _check_hour_requires_day_and_range(p)
-
-
-def _hour_start(p: Period) -> date:
-    return _day_date(p)
-
-
-def _hour_add(p: Period, offset: int) -> Period:
-    hour = p.hour if p.hour is not None else 0
-    start = datetime.combine(_day_date(p), datetime.min.time(), tzinfo=UTC).replace(hour=hour)
-    dt = start + timedelta(hours=offset)
-    return Period(year=dt.year, month=dt.month, day=dt.day, hour=dt.hour)
-
-
-def _hour_sort(p: Period) -> tuple[int | None, ...]:
-    return (p.year, p.month, p.day, p.hour)
-
-
-def _hour_fmt(p: Period) -> str:
-    return f"{p.year:04d}_{p.month:02d}_{p.day:02d}_{p.hour:02d}"
-
-
-# ── quarter ──
-
-
-def _quarter_validate(p: Period) -> None:
-    if p.month is not None or p.day is not None or p.hour is not None:
-        msg = "Period cannot have both quarter and month/day/week/hour"
-        raise ValueError(msg)
-    quarter = p.quarter if p.quarter is not None else 1
-    if not MIN_QUARTER <= quarter <= MAX_QUARTER:
-        msg = f"Quarter must be between {MIN_QUARTER} and {MAX_QUARTER}, got {quarter}"
-        raise ValueError(msg)
-
-
-def _quarter_start(p: Period) -> date:
-    quarter = p.quarter if p.quarter is not None else 1
-    return date(p.year, (quarter - 1) * 3 + 1, 1)
-
-
-def _quarter_add(p: Period, offset: int) -> Period:
-    quarter = p.quarter if p.quarter is not None else 1
-    total_quarters = p.year * 4 + quarter - 1 + offset
-    return Period(year=total_quarters // 4, quarter=(total_quarters % 4) + 1)
-
-
-def _quarter_sort(p: Period) -> tuple[int | None, ...]:
-    return (p.year, p.quarter)
-
-
-def _quarter_fmt(p: Period) -> str:
-    return f"{p.year:04d}_q{p.quarter}"
-
-
-_SPECS: dict[PartitionGranularity, _GranularitySpec] = {
-    PartitionGranularity.YEAR: _GranularitySpec(_year_validate, _year_start, _year_add, _year_sort, _year_fmt),
-    PartitionGranularity.MONTH: _GranularitySpec(_month_validate, _month_start, _month_add, _month_sort, _month_fmt),
-    PartitionGranularity.DAY: _GranularitySpec(_day_validate, _day_start, _day_add, _day_sort, _day_fmt),
-    PartitionGranularity.WEEK: _GranularitySpec(_week_validate, _week_start, _week_add, _week_sort, _week_fmt),
-    PartitionGranularity.HOUR: _GranularitySpec(_hour_validate, _hour_start, _hour_add, _hour_sort, _hour_fmt),
-    PartitionGranularity.QUARTER: _GranularitySpec(
-        _quarter_validate, _quarter_start, _quarter_add, _quarter_sort, _quarter_fmt
-    ),
-}
-
-
-def _granularity_key(p: Period) -> PartitionGranularity:
-    if p.week is not None:
-        return PartitionGranularity.WEEK
-    if p.quarter is not None:
-        return PartitionGranularity.QUARTER
-    if p.hour is not None:
-        return PartitionGranularity.HOUR
-    if p.day is not None:
-        return PartitionGranularity.DAY
-    if p.month is not None:
-        return PartitionGranularity.MONTH
-    return PartitionGranularity.YEAR
-
-
 class PartitionInfo(BaseModel):
-    """Metadata about a partition.
+    """Metadata about a partition, as ``list_partitions`` reports it.
 
     Attributes:
-        name: Partition table name.
-        partition_type: Type of partition (RANGE, LIST, HASH).
+        name: Schema-qualified partition table name.
+        oid: ``pg_class.oid``, when read from the catalog.
+        partition_type: How the *parent* partitions this relation (RANGE, LIST, HASH).
         from_value: Start boundary value (for RANGE).
         to_value: End boundary value (for RANGE).
         boundaries_expr: Raw boundary expression as reported by PostgreSQL
@@ -483,6 +88,7 @@ class PartitionInfo(BaseModel):
             partitions when not supplied, so the two views never disagree.
         is_attached: Whether partition is currently attached to parent table.
         is_default: Whether this is the DEFAULT partition (no explicit boundaries).
+        relkind: What the relation physically is.
         subpartition_type: How this partition partitions its own children, when
             it is itself a partitioned table. ``None`` for a leaf — which is
             what distinguishes a legacy leaf from a subpartitioned branch.
@@ -492,6 +98,7 @@ class PartitionInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: StrippedNonEmptyStr
+    oid: int | None = None
     partition_type: PartitionType
     from_value: str | None = None
     to_value: str | None = None
@@ -499,6 +106,7 @@ class PartitionInfo(BaseModel):
     bounds: PartitionBounds | None = None
     is_attached: bool = True
     is_default: bool = False
+    relkind: RelationKind = RelationKind.TABLE
     subpartition_type: PartitionType | None = None
     parent_table: StrippedNonEmptyStr | None = None
 
@@ -600,285 +208,309 @@ def _split_name(name: str) -> tuple[str | None, str]:
     return None, name
 
 
+# Flat fields accepted as sugar for the composed ``scheme`` / ``lifecycle``.
+_FLAT_SCHEME_FIELDS = frozenset(
+    {"partition_column", "trailing_partition_columns", "granularity", "tz", "boundary_codec", "subpartition"}
+)
+_FLAT_LIFECYCLE_FIELDS = frozenset({"create_ahead_count", "retention_count"})
+_FLAT_CHECK_FIELDS = frozenset({"partition_type", "partition_strategy"})
+
+
 class TablePartitionConfig(BaseModel):
-    """Configuration for table partitioning maintenance.
+    """Configuration for one partitioned table.
 
-    A root is either **time-based** — RANGE over a date/time dimension, with a
-    create-ahead window and a retention window — or **static**: HASH_BASED or
-    VALUE_BASED, divided into a fixed set of partitions described by
-    :attr:`root_layout`, which neither grows with the clock nor ages out.
+    A configuration is a **scheme** — which levels exist, by which method, on
+    which key, with which boundaries — and a **lifecycle policy** — when the
+    partitions of the progression level are created, detached and dropped.
+    Everything else the library does follows from those two.
 
-    Either kind can be subpartitioned further.
+    The composed form spells both out::
+
+        TablePartitionConfig(
+            table_name="events",
+            scheme=RangePartitioning(
+                key="created_at",
+                boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH),
+                child=HashPartitioning(key="tenant_id", modulus=4),
+            ),
+            lifecycle=LifecyclePolicy(creation=CreateAhead(3), retention=KeepNewest(12)),
+        )
+
+    The ordinary time-partitioned table keeps its flat spelling, which is sugar
+    for exactly that::
+
+        TablePartitionConfig(
+            table_name="events",
+            partition_column="created_at",
+            granularity=PartitionGranularity.MONTH,
+            create_ahead_count=3,
+            retention_count=12,
+        )
 
     Attributes:
         schema: Optional schema name for the partitioned table. When set, all
             DDL and catalogue queries are schema-qualified, making behaviour
             deterministic in databases with multiple schemas.
-        table_name: Name of the partitioned table (lowercase, max 63 chars minus
+        table_name: Name of the partitioned table (lowercase, max 63 bytes minus
             the longest generated partition suffix).
-        partition_type: Type of partitioning (RANGE, LIST, HASH).
-        partition_strategy: Strategy for partitioning.
-        partition_column: The leading column of the table's partition key. For
-            a time-based table this is the time dimension.
-        trailing_partition_columns: The rest of a composite partition key, in
-            key order; empty for the usual single-column case. Trailing columns
-            are bounded with MINVALUE at both ends, so each partition covers
-            exactly one period -- but only for rows whose trailing columns are
-            all non-NULL. PostgreSQL adds an IS NOT NULL test for every key
-            column, so a NULL in any of them routes the row to DEFAULT whatever
-            its period, and DEFAULT is never pruned. Declare them NOT NULL
-            unless you want that.
-        granularity: Time granularity (for TIME_BASED strategy).
-        create_ahead_count: Number of periods to ensure exist, including the current period.
-        retention_count: Number of partitions to retain. Counted in top-level
-            time periods, never in subpartitions - the time dimension is the
-            lifecycle dimension.
-        auto_attach_after_create: Whether to attach immediately after creation.
-        root_layout: For a HASH_BASED or VALUE_BASED root, the fixed set of
-            partitions the table itself is divided into. Such a table has no
-            time dimension, so it has no create-ahead window and nothing ages
-            out of it — maintenance only converges the set. Must be ``None``
-            for a TIME_BASED root, whose partitions come from its periods.
-        subpartition: Optional subpartitioning applied inside each partition,
-            making it a partitioned table in its own right (for example
-            ``RANGE(created_at)`` weekly -> ``HASH(tenant_id)``). Leave ``None``
-            for the classic one-leaf-per-partition layout.
+        scheme: The root level of the partition tree and everything below it.
+        lifecycle: When partitions of the progression level are created,
+            detached and dropped. Meaningless — and ignored — for a scheme
+            with no progression level, whose partition set is fixed.
+        leaves: What kind of relation the leaves are: ordinary tables
+            (:class:`~pg_partsmith.leaves.LocalLeaves`, the default, optionally
+            with a tablespace, storage parameters and inherited privileges) or
+            foreign tables (:class:`~pg_partsmith.leaves.ForeignLeaves`).
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True, populate_by_name=True, extra="forbid")
 
     # NOTE: We store the value under a different field name to avoid Pydantic's
     # warning about shadowing BaseModel.schema(). Externally, the public API is
     # still `schema=...` and `config.db_schema`.
     schema_name: StrippedNonEmptyStr | None = Field(default=None, alias="schema")
     table_name: StrippedNonEmptyStr
-    partition_type: PartitionType
-    partition_strategy: PartitionStrategy
-    partition_column: StrippedNonEmptyStr
-    trailing_partition_columns: tuple[StrippedNonEmptyStr, ...] = ()
-    granularity: PartitionGranularity | None = None
-    create_ahead_count: PositiveInt = Field(
-        default=DEFAULT_CREATE_AHEAD_COUNT,
-        description="Number of periods to ensure exist, including the current period",
-    )
-    retention_count: PositiveInt = Field(default=DEFAULT_RETENTION_COUNT, description="Number of partitions to retain")
-    auto_attach_after_create: bool = True
-    root_layout: SubpartitionSpec | None = None
-    subpartition: SubpartitionSpec | None = None
+    scheme: PartitionScheme
+    lifecycle: LifecyclePolicy = Field(default_factory=LifecyclePolicy)
+    leaves: LeafBackend = Field(default_factory=LocalLeaves)
 
-    @property
-    def db_schema(self) -> StrippedNonEmptyStr | None:
-        """PostgreSQL schema name."""
-        return self.schema_name
+    @model_validator(mode="before")
+    @classmethod
+    def compose_flat_fields(cls, data: object) -> object:
+        """Turn the flat time-based spelling into a scheme and a lifecycle.
 
-    @property
-    def partition_columns(self) -> tuple[str, ...]:
-        """The table's whole partition key, in key order.
-
-        For a time-based table the leading column is the time dimension;
-        trailing columns are bounded with MINVALUE at both ends.
+        The flat fields are accepted only for a RANGE root over time; every
+        other topology is spelled with ``scheme``. ``partition_type`` and
+        ``partition_strategy`` are accepted with either spelling and checked
+        against the result.
         """
-        return (self.partition_column, *self.trailing_partition_columns)
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
 
-    @property
-    def key_arity(self) -> int:
-        """Number of columns in the table's partition key."""
-        return 1 + len(self.trailing_partition_columns)
+        scheme_fields = {k: data.pop(k) for k in tuple(data) if k in _FLAT_SCHEME_FIELDS}
+        lifecycle_fields = {k: data.pop(k) for k in tuple(data) if k in _FLAT_LIFECYCLE_FIELDS}
+        checks = {k: data.pop(k) for k in tuple(data) if k in _FLAT_CHECK_FIELDS}
 
-    @field_validator("table_name", "partition_column")
+        if "scheme" in data:
+            if scheme_fields:
+                msg = f"Pass either scheme or the flat fields {sorted(scheme_fields)!r}, not both"
+                raise ValueError(msg)
+        else:
+            data["scheme"] = _scheme_from_flat(scheme_fields, checks)
+
+        if lifecycle_fields:
+            if "lifecycle" in data:
+                msg = f"Pass either lifecycle or the flat fields {sorted(lifecycle_fields)!r}, not both"
+                raise ValueError(msg)
+            data["lifecycle"] = LifecyclePolicy(
+                creation=CreateAhead(count=lifecycle_fields.get("create_ahead_count", CreateAhead().count)),
+                retention=KeepNewest(count=lifecycle_fields.get("retention_count", KeepNewest().count)),
+            )
+
+        # Kept for the after-validator, which sees the scheme fully built.
+        if checks:
+            data["_checks"] = checks
+        return data
+
+    # Populated only during validation; see ``compose_flat_fields``.
+    checks_: dict[str, Any] | None = Field(default=None, alias="_checks", exclude=True, repr=False)
+
+    @field_validator("table_name")
     @classmethod
     def validate_identifier(cls, v: str) -> str:
-        """Validate and normalise SQL identifiers."""
-        result = _validate_pg_identifier(v)
-        if result is None:
-            msg = "SQL identifier cannot be empty"
-            raise ValueError(msg)
-        return result
-
-    @field_validator("trailing_partition_columns")
-    @classmethod
-    def validate_trailing_partition_columns(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        """Validate and normalise the rest of the partition key."""
-        return tuple(_require_pg_identifier(column) for column in v)
+        """Validate and normalise the table name."""
+        return validate_pg_identifier(v)
 
     @field_validator("schema_name")
     @classmethod
     def validate_schema(cls, v: str | None) -> str | None:
         """Validate and normalise schema name."""
-        return _validate_pg_identifier(v)
+        return None if v is None else validate_pg_identifier(v)
 
     @model_validator(mode="after")
-    def validate_strategy_requirements(self) -> TablePartitionConfig:
-        """Validate strategy-specific requirements."""
-        if self.partition_strategy == PartitionStrategy.TIME_BASED:
-            self._validate_time_based()
-        else:
-            self._validate_static_root()
+    def validate_scheme(self) -> TablePartitionConfig:
+        """Check the declared type/strategy against the scheme, and the name budget."""
+        checks = self.checks_ or {}
+        object.__setattr__(self, "checks_", None)
 
+        declared_type = checks.get("partition_type")
+        if declared_type is not None and PartitionType(declared_type) != self.partition_type:
+            msg = (
+                f"partition_type={PartitionType(declared_type).value!r} does not match the scheme's root, which is "
+                f"{self.partition_type.value.upper()}"
+            )
+            raise ValueError(msg)
+
+        declared_strategy = checks.get("partition_strategy")
+        if declared_strategy is not None and PartitionStrategy(declared_strategy) != self.partition_strategy:
+            msg = (
+                f"partition_strategy={PartitionStrategy(declared_strategy).value!r} does not match the scheme, "
+                f"which is {self.partition_strategy.value!r}"
+            )
+            raise ValueError(msg)
+
+        fits, total = name_fits(self.table_name, self.scheme)
+        if not fits:
+            msg = (
+                f"table_name {self.table_name!r} is too long for this scheme: table_name ({len(self.table_name)}) + "
+                f"the longest generated suffix ({self.scheme.name_length_budget()}) = {total} > 63 bytes. "
+                "PostgreSQL truncates identifiers silently, which would collapse two partitions onto one name."
+            )
+            raise ValueError(msg)
+
+        if isinstance(self.lifecycle.creation, CreateAhead):
+            for level in self.levels:
+                progression = level.progression
+                if progression is not None and progression.cursor_source is CursorSource.NEWEST_MEMBER:
+                    msg = (
+                        f"{level.describe()} is a sliding list whose cursor is its newest partition, so "
+                        "CreateAhead would open another partition on every run; rotate it with "
+                        "CreateNextIf(...) or bound it with CreateUntil(...)"
+                    )
+                    raise ValueError(msg)
         return self
+
+    # ── Derived views ───────────────────────────────────────────────────────────
+
+    @property
+    def db_schema(self) -> str | None:
+        """PostgreSQL schema name."""
+        return self.schema_name
+
+    @property
+    def qualified_name(self) -> str:
+        """``schema.table`` when a schema is set, else the bare table name."""
+        return qualify(self.schema_name, self.table_name)
+
+    @property
+    def root(self) -> SchemeBase:
+        """The root level of the scheme."""
+        return self.scheme
+
+    @property
+    def partition_type(self) -> PartitionType:
+        """How the root table partitions its children."""
+        return self.scheme.method
+
+    @property
+    def partition_strategy(self) -> PartitionStrategy:
+        """What drives the root's partitions."""
+        scheme = self.scheme
+        if isinstance(scheme, HashPartitioning):
+            return PartitionStrategy.HASH_BASED
+        if isinstance(scheme, ListPartitioning):
+            return PartitionStrategy.VALUE_BASED
+        assert isinstance(scheme, RangePartitioning)
+        return (
+            PartitionStrategy.TIME_BASED
+            if scheme.range_boundaries.axis is Axis.TIME
+            else PartitionStrategy.NUMERIC_BASED
+        )
+
+    @property
+    def partition_column(self) -> str:
+        """The leading column of the root's partition key."""
+        return self.scheme.leading_column
+
+    @property
+    def trailing_partition_columns(self) -> tuple[str, ...]:
+        """The rest of the root's partition key, in key order."""
+        return self.scheme.key[1:]
+
+    @property
+    def partition_columns(self) -> tuple[str, ...]:
+        """The root's whole partition key, in key order."""
+        return self.scheme.key
+
+    @property
+    def key_arity(self) -> int:
+        """Number of columns in the root's partition key."""
+        return len(self.scheme.key)
+
+    @property
+    def granularity(self) -> PartitionGranularity | None:
+        """The built-in period size of a time-based root, when it uses one."""
+        boundaries = self.time_boundaries
+        return None if boundaries is None else boundaries.granularity
+
+    @property
+    def time_boundaries(self) -> TimeBoundaries | None:
+        """The root's time boundaries, when the root is a RANGE over time."""
+        scheme = self.scheme
+        return scheme.time_boundaries if isinstance(scheme, RangePartitioning) else None
+
+    @property
+    def subpartition(self) -> SchemeBase | None:
+        """The level below the root, if any."""
+        return self.scheme.child
+
+    @property
+    def create_ahead_count(self) -> int | None:
+        """Windows kept ahead of the cursor, when the creation policy is ``CreateAhead``."""
+        creation = self.lifecycle.creation
+        return creation.count if isinstance(creation, CreateAhead) else None
+
+    @property
+    def retention_count(self) -> int | None:
+        """Newest windows kept, when the retention policy is ``KeepNewest``."""
+        retention = self.lifecycle.retention
+        return retention.count if isinstance(retention, KeepNewest) else None
+
+    @property
+    def is_progression_root(self) -> bool:
+        """True when the root is a progression level: a RANGE, or a sliding LIST."""
+        return self.scheme.progression is not None
 
     @property
     def is_time_based(self) -> bool:
-        """True when this table's partitions come from a calendar period.
-
-        A time-based table has a create-ahead window and a retention window; a
-        static one — HASH or LIST at the root — has a fixed set of partitions
-        that neither grows with the clock nor ages out.
-        """
-        return self.partition_strategy == PartitionStrategy.TIME_BASED
-
-    def _validate_time_based(self) -> None:
-        """Check a TIME_BASED root and the names its periods will generate."""
-        if self.granularity is None:
-            msg = "TIME_BASED strategy requires granularity"
-            raise ValueError(msg)
-        if self.partition_type != PartitionType.RANGE:
-            msg = "TIME_BASED strategy requires RANGE partition type"
-            raise ValueError(msg)
-        if self.root_layout is not None:
-            msg = (
-                "root_layout is only for HASH_BASED / VALUE_BASED roots; a TIME_BASED table's "
-                "partitions come from its periods. Use `subpartition` to divide each period."
-            )
-            raise ValueError(msg)
-
-        # Validate that generated partition names will not exceed PostgreSQL's
-        # 63-byte identifier limit (max_identifier_length default). PostgreSQL
-        # truncates silently, so two hash buckets could otherwise collapse
-        # onto a single name.
-        suffix_len = _NAME_SUFFIX_LEN[self.granularity]
-        subpartition_len = self.subpartition.name_length_budget() if self.subpartition is not None else 0
-        total = len(self.table_name) + suffix_len + subpartition_len
-        if total > MAX_IDENTIFIER_LENGTH:
-            subpartition_part = f" + subpartition suffix ({subpartition_len})" if subpartition_len else ""
-            msg = (
-                f"table_name {self.table_name!r} is too long for "
-                f"{self.granularity.value} granularity: "
-                f"table_name ({len(self.table_name)}) + suffix ({suffix_len})"
-                f"{subpartition_part} = {total} > {MAX_IDENTIFIER_LENGTH} bytes."
-            )
-            raise ValueError(msg)
-
-    def _validate_static_root(self) -> None:
-        """Check a HASH_BASED or VALUE_BASED root and its generated names."""
-        expected_type = _STATIC_ROOT_TYPES[self.partition_strategy]
-
-        if self.root_layout is None:
-            msg = (
-                f"{self.partition_strategy.value!r} strategy requires root_layout, describing the "
-                f"{expected_type.value.upper()} partitions the table is divided into"
-            )
-            raise ValueError(msg)
-        if self.partition_type != expected_type:
-            msg = (
-                f"{self.partition_strategy.value!r} strategy requires "
-                f"{expected_type.value.upper()} partition type, got {self.partition_type.value.upper()}"
-            )
-            raise ValueError(msg)
-        if self.partition_type == PartitionType.LIST and self.trailing_partition_columns:
-            msg = (
-                f"LIST partitioning takes exactly one column, got {self.partition_columns!r}. "
-                "PostgreSQL rejects a composite LIST key."
-            )
-            raise ValueError(msg)
-        if self.root_layout.partition_type != expected_type:
-            msg = (
-                f"root_layout describes {self.root_layout.partition_type.value.upper()} partitions but "
-                f"{self.partition_strategy.value!r} needs {expected_type.value.upper()}"
-            )
-            raise ValueError(msg)
-        if self.root_layout.columns != self.partition_columns:
-            msg = (
-                f"root_layout columns {self.root_layout.columns!r} must be the table's own partition "
-                f"key {self.partition_columns!r}"
-            )
-            raise ValueError(msg)
-        if self.granularity is not None:
-            msg = f"{self.partition_strategy.value!r} strategy has no periods, so granularity must be unset"
-            raise ValueError(msg)
-        if self.subpartition is not None:
-            msg = "Nest deeper levels inside root_layout's own `subpartition` rather than alongside it"
-            raise ValueError(msg)
-
-        total = len(self.table_name) + self.root_layout.name_length_budget()
-        if total > MAX_IDENTIFIER_LENGTH:
-            msg = (
-                f"table_name {self.table_name!r} is too long for this layout: table_name "
-                f"({len(self.table_name)}) + partition suffix ({self.root_layout.name_length_budget()}) "
-                f"= {total} > {MAX_IDENTIFIER_LENGTH} bytes."
-            )
-            raise ValueError(msg)
-
-    @model_validator(mode="after")
-    def validate_subpartitioning(self) -> TablePartitionConfig:
-        """Reject subpartitioning the library cannot manage on this root.
-
-        Defence in depth rather than a reachable path today: a static root
-        rejects ``subpartition`` earlier and points at ``root_layout``, and a
-        TIME_BASED root already has to be RANGE. Kept so that adding a strategy
-        cannot open the case silently.
-        """
-        if self.subpartition is not None and self.partition_type != PartitionType.RANGE:
-            msg = "Subpartitioning is only supported under a RANGE-partitioned root table"
-            raise ValueError(msg)
-
-        # Every level must divide on a fresh dimension: reusing a column would
-        # leave the lower level with nothing left to separate. The root counts,
-        # and for a static root it is already the first declared spec.
-        columns = list(self.partition_columns)
-        if self.root_layout is not None:
-            for spec in self.root_layout.walk()[1:]:
-                columns.extend(spec.columns)
-        elif self.subpartition is not None:
-            for spec in self.subpartition.walk():
-                columns.extend(spec.columns)
-
-        duplicates = sorted({column for column in columns if columns.count(column) > 1})
-        if duplicates:
-            msg = f"Partition columns must be distinct across levels; {duplicates!r} appears more than once"
-            raise ValueError(msg)
-
-        return self
+        """True when the root is a RANGE over time."""
+        return self.time_boundaries is not None
 
     @property
-    def subpartition_levels(self) -> list[SubpartitionSpec]:
-        """Every declared level, outermost first.
+    def has_progression_level(self) -> bool:
+        """True when any level of the scheme is a progression."""
+        return any(level.progression is not None for level in self.scheme.walk())
 
-        For a static root that starts with :attr:`root_layout` itself; for a
-        time-based one the root is the period dimension, which is not a spec, so
-        the list starts below it.
-        """
-        if self.root_layout is not None:
-            return self.root_layout.walk()
-        return self.subpartition.walk() if self.subpartition is not None else []
+    @property
+    def levels(self) -> list[SchemeBase]:
+        """Every level of the scheme, root first."""
+        return list(self.scheme.walk())
 
-
-# Root partition type each non-time strategy describes.
-_STATIC_ROOT_TYPES: dict[PartitionStrategy, PartitionType] = {
-    PartitionStrategy.HASH_BASED: PartitionType.HASH,
-    PartitionStrategy.VALUE_BASED: PartitionType.LIST,
-}
-
-# Partition-name suffix lengths per granularity; must track the _SPECS fmt
-# handlers and the calculators' _NAME_PATTERNs.
-_NAME_SUFFIX_LEN: dict[PartitionGranularity, int] = {
-    PartitionGranularity.HOUR: len("__0000_00_00_00"),
-    PartitionGranularity.DAY: len("__0000_00_00"),
-    PartitionGranularity.WEEK: len("__0000_w00"),
-    PartitionGranularity.MONTH: len("__0000_00"),
-    PartitionGranularity.QUARTER: len("__0000_q0"),
-    PartitionGranularity.YEAR: len("__0000"),
-}
+    @property
+    def manages_foreign_leaves(self) -> bool:
+        """True when the leaves are foreign tables the lifecycle creates and drops."""
+        return self.leaves.kind == "foreign"
 
 
-def _validate_pg_identifier(v: str | None) -> str | None:
-    """Validate and normalise an optional PostgreSQL identifier to lowercase."""
-    return None if v is None else validate_pg_identifier(v)
+def _scheme_from_flat(fields: dict[str, Any], checks: dict[str, Any]) -> SchemeBase:
+    """Build the scheme the flat spelling describes."""
+    column = fields.get("partition_column")
+    if column is None:
+        msg = "TablePartitionConfig needs either scheme or partition_column"
+        raise ValueError(msg)
 
+    strategy = checks.get("partition_strategy")
+    if strategy is not None and PartitionStrategy(strategy) is not PartitionStrategy.TIME_BASED:
+        msg = (
+            f"The flat fields describe a time-partitioned RANGE root; a {PartitionStrategy(strategy).value!r} table "
+            "is spelled with scheme=HashPartitioning(...) / ListPartitioning(...) / RangePartitioning(...)"
+        )
+        raise ValueError(msg)
 
-def _require_pg_identifier(v: str) -> str:
-    """Validate and normalise a required PostgreSQL identifier to lowercase."""
-    return validate_pg_identifier(v)
+    granularity = fields.get("granularity")
+    if granularity is None:
+        msg = "A time-partitioned table requires granularity"
+        raise ValueError(msg)
+
+    boundaries: dict[str, Any] = {"granularity": granularity}
+    if "tz" in fields:
+        boundaries["tz"] = fields["tz"]
+    if "boundary_codec" in fields:
+        boundaries["codec"] = fields["boundary_codec"]
+
+    key = (column, *tuple(fields.get("trailing_partition_columns") or ()))
+    return RangePartitioning(key=key, boundaries=TimeBoundaries(**boundaries), child=fields.get("subpartition"))
 
 
 class MaintenanceIssueStep(StrEnum):
@@ -886,8 +518,10 @@ class MaintenanceIssueStep(StrEnum):
 
     CREATE = "create"
     RECONCILE = "reconcile"
+    ATTACH = "attach"
     DETACH = "detach"
     DROP = "drop"
+    MOVE = "move"
 
 
 class MaintenanceIssue(BaseModel):
@@ -897,7 +531,7 @@ class MaintenanceIssue(BaseModel):
         step: Lifecycle step the problem occurred in.
         error: Error message (``TypeName: message``).
         partition_name: Partition the problem concerns, when it is specific to
-            one - subpartition reconciliation always sets it.
+            one - reconciliation findings always set it.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -911,35 +545,69 @@ class MaintenanceResult(BaseModel):
     """Result of partition maintenance operation.
 
     Attributes:
-        created_count: Number of top-level partitions created. A subpartitioned
-            branch counts once, however many leaves it contains - the branch is
-            the lifecycle unit.
-        repaired_count: Number of subpartitions created inside *pre-existing*
-            branches to close gaps in their child sets.
-        detached_count: Number of partitions detached in this run.
-        dropped_count: Number of partitions dropped.
+        created_count: Partitions created directly under the root. A branch
+            counts once, however many leaves it contains - the branch is the
+            lifecycle unit.
+        repaired_count: Partitions created inside *pre-existing* branches to
+            close gaps in their child sets.
+        attached_count: Detached partitions re-attached because their window
+            was wanted again.
+        detached_count: Partitions detached in this run.
+        dropped_count: Partitions dropped.
         duration_ms: Duration of maintenance in milliseconds.
         error: Fatal error message (set when the whole maintenance run fails).
         issues: Non-fatal problems. Step failures land here when the run was
-            started with ``continue_on_error=True``; topology divergences that
-            reconciliation deliberately refused to repair are always recorded,
-            since leaving them unreported would hide rejected writes.
+            started with ``continue_on_error=True``; findings the planner
+            deliberately refused to act on are always recorded, since leaving
+            them unreported would hide rejected writes.
+        plan: The plan this run executed, when one was made.
     """
 
     model_config = ConfigDict(frozen=True)
 
     created_count: NonNegativeInt = 0
     repaired_count: NonNegativeInt = 0
+    attached_count: NonNegativeInt = 0
     detached_count: NonNegativeInt = 0
     dropped_count: NonNegativeInt = 0
     duration_ms: NonNegativeInt = 0
     error: str | None = None
     issues: tuple[MaintenanceIssue, ...] = ()
+    plan: Any = Field(default=None, exclude=True, repr=False)
 
     @property
     def success(self) -> bool:
         """True only when there is no fatal error (non-fatal ``issues`` may exist)."""
         return self.error is None
+
+    @property
+    def maintenance_plan(self) -> MaintenancePlan | None:
+        """:attr:`plan`, typed."""
+        return self.plan  # type: ignore[no-any-return]
+
+
+class MigrationResult(BaseModel):
+    """Result of a batched row move (``partition_data`` / ``unpartition``).
+
+    Attributes:
+        rows_moved: Rows moved by this call.
+        batches: Statements it took.
+        partitions: Partitions created and filled (``partition_data``) or
+            emptied (``unpartition``), in the order they were handled.
+        complete: True when nothing is left to move; False when the batch
+            budget ran out or a window could not be given a partition -- call
+            again, or read ``issues``.
+        issues: Windows that could not be handled, and findings the planner
+            reported on the way.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    rows_moved: NonNegativeInt = 0
+    batches: NonNegativeInt = 0
+    partitions: tuple[str, ...] = ()
+    complete: bool = True
+    issues: tuple[MaintenanceIssue, ...] = ()
 
 
 def _as_range_bounds(bounds: object) -> RangeBounds | None:

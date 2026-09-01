@@ -1,3 +1,8 @@
-"""Internal partition lifecycle services. Not part of the public API."""
+"""Component services behind :class:`~pg_partsmith.aio.PartitionLifecycleService`."""
 
-__all__: list[str] = []
+from .execution import PlanExecutor
+from .inspection import PartitionInspector
+from .migration import DataMover
+from .validation import PartitionValidationService
+
+__all__ = ["DataMover", "PartitionInspector", "PartitionValidationService", "PlanExecutor"]

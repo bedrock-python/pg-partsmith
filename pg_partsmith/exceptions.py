@@ -38,6 +38,47 @@ class PartitionDetachInProgressError(PartitionError):
         self.partition_name = partition_name
 
 
+class PartitionReferencedError(PartitionError):
+    """Raised when PostgreSQL refuses to detach a partition whose rows are still referenced.
+
+    A foreign key on another table points at the parent, and rows of that
+    table reference rows of this partition; detaching it would orphan them,
+    so the statement fails (``23503``). The partition stays attached until
+    the referencing rows are gone -- see
+    :class:`~pg_partsmith.lifecycle.Unreferenced` for keeping it out of the
+    plan until then.
+    """
+
+    def __init__(self, partition_name: str, detail: str) -> None:
+        super().__init__(f"Partition {partition_name} is still referenced by rows of another table: {detail}")
+        self.partition_name = partition_name
+        self.detail = detail
+
+
+class RowMoveRefusedError(PartitionError):
+    """Raised when rows are not moved because the move would not be safe.
+
+    Two kinds of refusal, both fail-closed -- the move's transaction rolls
+    back with every row where it was:
+
+    * A foreign key referencing the source with ``ON DELETE CASCADE``,
+      ``SET NULL`` or ``SET DEFAULT``. A move is a ``DELETE`` and an
+      ``INSERT`` in one statement, and such an action fires on the ``DELETE``
+      alone: the referencing rows would be deleted or rewritten while the
+      moved row lives on in its new partition. Re-create the key without the
+      action, or after the move.
+    * A destination whose identity sequence cannot be made consistent with
+      the ids the rows carry -- it cycles back onto them, or its declared
+      range leaves it nothing to issue afterwards. Widen the range, or take
+      the identity off the column for the migration.
+    """
+
+    def __init__(self, relation_name: str, detail: str) -> None:
+        super().__init__(f"Rows of {relation_name} were not moved: {detail}")
+        self.relation_name = relation_name
+        self.detail = detail
+
+
 class PartitionTopologyError(PartitionError):
     """Raised when an existing partition tree diverges from the configured one.
 
@@ -53,26 +94,6 @@ class PartitionTopologyError(PartitionError):
         self.partition_name = partition_name
         self.reason = reason
         self.detail = detail
-
-
-class UnsupportedCapabilityError(PartitionError):
-    """Raised when a config is wired to components that cannot serve it.
-
-    Custom repositories and metadata providers written against the flat
-    protocols keep working for flat configs; they are only refused when a
-    config actually asks for something they do not implement. The capability is
-    named rather than assumed, because more than one of them is optional.
-    """
-
-    def __init__(self, component: str, capability: str, expected: str) -> None:
-        msg = (
-            f"{component} does not support {capability}: it must implement {expected}. "
-            "Use the bundled PostgreSQL implementation, or extend yours with the missing methods."
-        )
-        super().__init__(msg)
-        self.component = component
-        self.capability = capability
-        self.expected = expected
 
 
 class InvalidPartitionConfigError(PartitionError):
@@ -113,6 +134,21 @@ class DropRetryExhaustedError(PartitionError):
         self.partition_name = partition_name
         self.attempts = attempts
         self.cause = cause
+
+
+class PlanStaleError(PartitionError):
+    """Raised when a plan's assumption about a relation no longer holds at apply time.
+
+    A relation may be dropped and recreated under the same name between the
+    plan and its application; its OID then differs from the one the plan
+    recorded, and a destructive operation must not proceed against the
+    replacement.
+    """
+
+    def __init__(self, partition_name: str, detail: str) -> None:
+        super().__init__(f"Plan is stale for {partition_name!r}: {detail}")
+        self.partition_name = partition_name
+        self.detail = detail
 
 
 class UnmanagedPartitionDropError(PartitionError):

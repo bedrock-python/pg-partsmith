@@ -3,135 +3,346 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.catalog_queries import RELATION_COLUMNS_SQL
-from pg_partsmith.entities import HashBounds, ListBounds, PartitionInfo
-from pg_partsmith.exceptions import PartitionAlreadyExistsError, PartitionNotFoundError
+from pg_partsmith.catalog_queries import (
+    DESTRUCTIVE_INCOMING_FOREIGN_KEYS_SQL,
+    RELATION_COLUMN_DEFINITIONS_SQL,
+    RELATION_COLUMNS_SQL,
+    RELATION_HAS_IDENTITY_ALWAYS_SQL,
+    RELATION_IDENTITY_COLUMNS_SQL,
+    RELATION_PRIVILEGES_SQL,
+    SEQUENCE_PARAMETERS_SQL,
+)
+from pg_partsmith.exceptions import (
+    PartitionAlreadyExistsError,
+    PartitionNotFoundError,
+    PlanStaleError,
+    RowMoveRefusedError,
+)
+from pg_partsmith.topology import HashBounds, ListBounds, RangeBounds
 from pg_partsmith.utils import (
     _as_text,
     build_ddl_statement,
     coerce_str,
+    comment_without_markers,
+    parse_orphan_comment,
     pg_sqlstate,
-    qualify,
     quote_identifier,
     quote_literal,
     to_regclass_argument,
 )
 
+from .resolver import relation_kind
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-    from pg_partsmith.entities import SubpartitionBounds, SubpartitionSpec, TablePartitionConfig
+    from pg_partsmith.leaves import LocalLeaves
+    from pg_partsmith.plan import PartitionBy
+    from pg_partsmith.topology import PartitionBounds
+
+# Privilege names ``aclexplode`` reports; anything else is not spliced into a GRANT.
+_PRIVILEGE_PATTERN = re.compile(r"^[A-Z]+$")
+
+# ``pg_constraint.confdeltype`` codes of the actions a row move must not trigger.
+_ON_DELETE_ACTIONS = {"c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
+# What a move names the relation it parks its identity values in. The rest of
+# the name is drawn per move: the temporary schema belongs to the session, and
+# a caller may be holding names in it of its own.
+_MOVED_IDENTITY_PREFIX = "pg_partsmith_moved_"
 
 
 class PartitionCreator:
-    """Helper for partition creation and attachment."""
+    """Helper for partition creation, attachment and row movement."""
 
-    def __init__(self, *, engine: AsyncEngine, ddl_timeout: float, ddl_timezone: str | None) -> None:
+    def __init__(
+        self, *, engine: AsyncEngine, ddl_timeout: float, ddl_timezone: str | None, marker_prefix: str | None = None
+    ) -> None:
         self._engine = engine
         self._ddl_timeout = ddl_timeout
         self._ddl_timezone = ddl_timezone
+        self._marker_prefix = marker_prefix
 
-    async def create(
-        self, config: TablePartitionConfig, partition_name: str, from_value: str, to_value: str
-    ) -> PartitionInfo:
-        """Create a new partition table."""
+    async def create_table_like(
+        self,
+        template_name: str,
+        table_name: str,
+        partition_by: PartitionBy | None,
+        *,
+        physical: LocalLeaves | None = None,
+    ) -> int:
+        """Create a detached table shaped like ``template_name``.
+
+        Standalone — ``LIKE`` the template, not ``PARTITION OF`` it — so this
+        takes only an ACCESS SHARE lock on the live template. The table becomes
+        reachable for row routing only when it is attached, which the caller
+        does last, once its own subtree is complete.
+
+        Args:
+            template_name: Relation whose shape is copied.
+            table_name: Schema-qualified name for the new table.
+            partition_by: How the new table partitions its own children, or
+                None for a plain leaf.
+            physical: Tablespace, storage parameters and privileges to give
+                the new table. Storage parameters apply to leaves only:
+                PostgreSQL refuses them on a partitioned table.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+        """
         # EXCLUDING IDENTITY: PostgreSQL refuses to attach a partition that
         # carries an identity column ("The new partition may not contain an
         # identity column"), and propagates the parent's own identity on ATTACH
         # instead. Tables without one are unaffected.
-        stmt = build_ddl_statement(
-            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY)",
-            partition=partition_name,
-            parent=qualify(config.db_schema, config.table_name),
-        )
+        template = "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY)"
+        params = {"partition": table_name, "parent": template_name}
+        if partition_by is not None:
+            clause, columns = _partition_by_clause(partition_by)
+            template = f"{template} {clause}"
+            params.update(columns)
+        if physical is not None:
+            if partition_by is None and physical.storage_parameters:
+                clause, values = _storage_parameters_clause(physical)
+                template = f"{template} {clause}"
+                params.update(values)
+            if physical.tablespace is not None:
+                template = f"{template} TABLESPACE {{tablespace}}"
+                params["tablespace"] = physical.tablespace
+
+        stmt = build_ddl_statement(template, **params)
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             try:
                 await conn.execute(stmt)
             except (SQLAlchemyError, OSError, TimeoutError) as exc:
                 if pg_sqlstate(exc) == "42P07":  # duplicate_table
-                    raise PartitionAlreadyExistsError(partition_name) from exc
+                    raise PartitionAlreadyExistsError(table_name) from exc
                 raise
+            if physical is not None and physical.inherit_privileges:
+                await self._inherit_privileges(conn, template_name, table_name)
+            return await self._created_oid(conn, table_name)
 
-        return PartitionInfo(
-            name=partition_name,
-            partition_type=config.partition_type,
-            from_value=from_value,
-            to_value=to_value,
-            is_attached=False,
-            parent_table=qualify(config.db_schema, config.table_name),
-        )
-
-    async def attach(self, table_name: str, partition_name: str, from_value: str, to_value: str) -> None:
-        """Attach partition to parent table."""
-        stmt = build_ddl_statement(
-            "ALTER TABLE {parent} ATTACH PARTITION {partition} FOR VALUES FROM ([from_val]) TO ([to_val])",
-            parent=table_name,
-            partition=partition_name,
-            from_val=from_value,
-            to_val=to_value,
-        )
-        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
-            if self._ddl_timezone is not None:
-                await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
-            await conn.execute(stmt)
-
-    async def attach_composite_partition(
+    async def create_foreign_table_like(
         self,
+        template_name: str,
         table_name: str,
-        partition_name: str,
-        from_value: str,
-        to_value: str,
         *,
-        key_arity: int,
-    ) -> None:
-        """Attach a partition to a parent whose partition key has several columns.
+        server: str,
+        options: dict[str, str],
+    ) -> int:
+        """Create a detached foreign table with ``template_name``'s columns.
 
-        Only the leading column carries the period; the trailing ones are
-        bounded with MINVALUE at both ends, so the partition holds the rows
-        whose leading column falls in ``[from_value, to_value)``.
-
-        Not *all* of them: PostgreSQL adds an IS NOT NULL test for every key
-        column to the constraint it derives from this bound, so a row with a
-        NULL in any trailing column goes to DEFAULT regardless of its leading
-        value. Declare the trailing columns NOT NULL if you need every row of a
-        period in that period's partition.
+        ``CREATE FOREIGN TABLE`` has no ``LIKE``, so the columns are read from
+        the catalog and spelled out: name, type as ``format_type`` renders it,
+        and ``NOT NULL`` where the template has it -- ATTACH requires the
+        partition to match the parent's ``NOT NULL`` constraints.
 
         Args:
-            table_name: Parent table name.
-            partition_name: Partition table name.
-            from_value: Start boundary for the leading column.
-            to_value: End boundary for the leading column.
-            key_arity: Number of columns in the parent's partition key.
+            template_name: Relation whose columns are copied.
+            table_name: Schema-qualified name for the new foreign table.
+            server: The foreign server.
+            options: Foreign table options, already rendered.
+
+        Raises:
+            PartitionAlreadyExistsError: If a relation of that name exists.
+            PartitionNotFoundError: If the template has no readable columns.
         """
-        padding = ", MINVALUE" * (key_arity - 1)
+        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            definitions = await self._column_definitions(conn, template_name)
+            params: dict[str, str] = {"partition": table_name, "server": server}
+            columns: list[str] = []
+            for index, (name, type_name, not_null) in enumerate(definitions):
+                params[f"col_{index}"] = name
+                columns.append(f"{{col_{index}}} {type_name}{' NOT NULL' if not_null else ''}")
+            template = f"CREATE FOREIGN TABLE {{partition}} ({', '.join(columns)}) SERVER {{server}}"
+            if options:
+                rendered: list[str] = []
+                for index, (name, value) in enumerate(options.items()):
+                    params[f"opt_{index}"] = value
+                    rendered.append(f"{name} [opt_{index}]")
+                template = f"{template} OPTIONS ({', '.join(rendered)})"
+            try:
+                await conn.execute(build_ddl_statement(template, **params))
+            except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                if pg_sqlstate(exc) == "42P07":  # duplicate_table
+                    raise PartitionAlreadyExistsError(table_name) from exc
+                raise
+            return await self._created_oid(conn, table_name)
+
+    async def _column_definitions(self, conn: AsyncConnection, table_name: str) -> list[tuple[str, str, bool]]:
+        """Read ``(name, type, not_null)`` for every live column of a relation."""
+        result = await conn.execute(
+            text(RELATION_COLUMN_DEFINITIONS_SQL),
+            {"table_name": to_regclass_argument(table_name)},
+        )
+        definitions = [(coerce_str(row[0]) or "", coerce_str(row[1]) or "", bool(row[2])) for row in result.fetchall()]
+        if not definitions:
+            msg = f"Relation {table_name!r} has no readable columns, so nothing can be shaped like it."
+            raise PartitionNotFoundError(msg)
+        return definitions
+
+    async def _inherit_privileges(self, conn: AsyncConnection, template_name: str, table_name: str) -> None:
+        """Give the new relation the template's owner and grants.
+
+        Runs in the transaction that created the relation, so a grant the
+        current role may not make rolls the creation back with it rather than
+        leaving a half-configured table behind.
+        """
+        result = await conn.execute(
+            text(RELATION_PRIVILEGES_SQL),
+            {"table_name": to_regclass_argument(template_name)},
+        )
+        rows = result.fetchall()
+        if not rows:
+            return
+        owner = coerce_str(rows[0][0])
+        if owner:
+            await conn.execute(
+                build_ddl_statement("ALTER TABLE {partition} OWNER TO {owner}", partition=table_name, owner=owner)
+            )
+
+        grants: dict[tuple[str, bool], list[str]] = {}
+        for row in rows:
+            grantee, privilege, grantable = coerce_str(row[1]), coerce_str(row[2]), bool(row[3])
+            if not grantee or not privilege or not _PRIVILEGE_PATTERN.match(privilege):
+                continue
+            grants.setdefault((grantee, grantable), []).append(privilege)
+        for (grantee, grantable), privileges in grants.items():
+            # The grantee is catalog output (``regrole::text`` quotes what needs
+            # quoting; PUBLIC is a keyword) and the privileges are keywords, so
+            # neither goes through identifier quoting.
+            statement = f"GRANT {', '.join(privileges)} ON TABLE {quote_identifier(table_name)} TO {grantee}"
+            if grantable:
+                statement = f"{statement} WITH GRANT OPTION"
+            await conn.execute(_as_text(statement))
+
+    async def attach(
+        self,
+        parent_name: str,
+        partition_name: str,
+        bounds: PartitionBounds,
+        *,
+        key_arity: int = 1,
+        expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
+    ) -> None:
+        """Attach a table to a partitioned parent.
+
+        ATTACH rather than ``CREATE … PARTITION OF`` on purpose: attaching takes
+        SHARE UPDATE EXCLUSIVE on the parent, so filling a gap in a live parent
+        does not block reads or writes, where creating in place would take
+        ACCESS EXCLUSIVE and stall every writer routing through it.
+
+        The parent's DEFAULT partition, if it has one, is the exception: ATTACH
+        takes ACCESS EXCLUSIVE on that one while scanning it for rows the new
+        partition would claim. A fully tiled parent has no DEFAULT partition and
+        pays nothing for it.
+
+        A RANGE bound is written under ``SET LOCAL TIME ZONE`` so a naive
+        timestamp literal means the same instant every time. Under a composite
+        key only the leading column carries the window; the trailing ones are
+        bounded with ``MINVALUE`` at both ends.
+
+        A table that carries the orphan marker -- one this library detached
+        and is now bringing back -- loses it in the same transaction: an
+        attached partition is nobody's orphan, and a marker left on it would
+        hand its old detach instant to the next detach, cutting that grace
+        period short. The rest of the comment is kept.
+
+        Args:
+            parent_name: Partitioned relation to attach to.
+            partition_name: Table to attach.
+            bounds: What the partition owns.
+            key_arity: Number of columns in the parent's partition key.
+            expected_oid: The identity the decision to attach was made about.
+                Checked after the ATTACH, under the ACCESS EXCLUSIVE lock it
+                took, in the same transaction -- a relation swapped in under
+                the name rolls the whole attach back (``PlanStaleError``)
+                instead of going live in the planned one's stead.
+            expected_parent_oid: The identity of the relation this partition
+                should go into, checked the same way under the SHARE UPDATE
+                EXCLUSIVE lock ATTACH takes on it -- so a branch this library
+                created and then had replaced never gains children in the
+                planned one's stead.
+
+        Raises:
+            PlanStaleError: If either name is not held by the relation the
+                caller decided about; nothing stays attached.
+        """
+        clause, values = _values_clause(bounds, key_arity)
         stmt = build_ddl_statement(
-            "ALTER TABLE {parent} ATTACH PARTITION {partition} "
-            f"FOR VALUES FROM ([from_val]{padding}) TO ([to_val]{padding})",
-            parent=table_name,
+            "ALTER TABLE {parent} ATTACH PARTITION {partition} " + clause,
+            parent=parent_name,
             partition=partition_name,
-            from_val=from_value,
-            to_val=to_value,
+            **values,
         )
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
-            if self._ddl_timezone is not None:
+            if isinstance(bounds, RangeBounds) and self._ddl_timezone is not None:
                 await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
+            await self._require_oid(conn, parent_name, expected_parent_oid)
             await conn.execute(stmt)
+            # Under ATTACH's own locks now: what these see is what went live.
+            await self._require_oid(conn, partition_name, expected_oid)
+            await self._require_oid(conn, parent_name, expected_parent_oid)
+            await self._clear_orphan_marker(conn, partition_name)
+
+    async def _created_oid(self, conn: AsyncConnection, table_name: str) -> int:
+        """The OID of the relation just created, read in the creating transaction.
+
+        Callers hold it through fills and the final ATTACH, so nothing that
+        takes over the name later can receive the rows or go live in the
+        created relation's stead.
+        """
+        result = await conn.execute(
+            text("SELECT c.oid FROM pg_class c WHERE c.oid = to_regclass(:name)"),
+            {"name": to_regclass_argument(table_name)},
+        )
+        value = result.scalar()
+        if value is None:  # pragma: no cover - the relation was created one statement ago
+            raise PartitionNotFoundError(table_name)
+        return int(value)
+
+    async def _require_oid(self, conn: AsyncConnection, partition_name: str, expected_oid: int | None) -> None:
+        """The relation holding the name is the one the caller decided about."""
+        if expected_oid is None:
+            return
+        result = await conn.execute(
+            text("SELECT c.oid FROM pg_class c WHERE c.oid = to_regclass(:name)"),
+            {"name": to_regclass_argument(partition_name)},
+        )
+        actual = result.scalar()
+        if actual is None or int(actual) != expected_oid:
+            held = "nothing" if actual is None else f"OID {int(actual)}"
+            raise PlanStaleError(
+                partition_name, f"the name now resolves to {held}, the plan decided about OID {expected_oid}"
+            )
+
+    async def _clear_orphan_marker(self, conn: AsyncConnection, partition_name: str) -> None:
+        """Take this library's marker lines off a relation that is attached again."""
+        result = await conn.execute(
+            text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
+            {"partition_name": to_regclass_argument(partition_name)},
+        )
+        existing = coerce_str(result.scalar())
+        if parse_orphan_comment(existing, marker_prefix=self._marker_prefix) is None:
+            return
+        rest = comment_without_markers(existing, marker_prefix=self._marker_prefix)
+        relation = "FOREIGN TABLE" if await relation_kind(conn, partition_name) == "f" else "TABLE"
+        if rest:
+            stmt = build_ddl_statement(
+                f"COMMENT ON {relation} {{partition}} IS [comment]", partition=partition_name, comment=rest
+            )
+        else:
+            stmt = build_ddl_statement(f"COMMENT ON {relation} {{partition}} IS NULL", partition=partition_name)
+        await conn.execute(stmt)
 
     async def _relation_columns(self, conn: AsyncConnection, table_name: str) -> tuple[str, ...]:
         """Read a relation's live column names, in its own physical order.
-
-        Args:
-            conn: Connection already inside the caller's transaction, so the
-                shape read here is the shape the move will run against.
-            table_name: Relation to inspect, schema-qualified.
-
-        Returns:
-            The column names, dropped columns excluded.
 
         Raises:
             PartitionNotFoundError: If the relation has no readable columns,
@@ -152,27 +363,39 @@ class PartitionCreator:
         *,
         default_partition_name: str,
         target_partition_name: str,
-        partition_column: str,
-        trailing_columns: tuple[str, ...] = (),
+        key_columns: tuple[str, ...],
         from_value: str,
         to_value: str,
+        limit: int | None = None,
+        expected_source_oid: int | None = None,
+        expected_target_oid: int | None = None,
     ) -> int:
         """Move conflicting rows from DEFAULT partition to target partition.
 
         Args:
             default_partition_name: Qualified name of DEFAULT partition.
             target_partition_name: Qualified name of target partition.
-            partition_column: Leading column of the partition key.
-            trailing_columns: The remaining key columns, for a composite key.
+            key_columns: The parent's partition key, leading column first.
             from_value: Range start boundary (inclusive).
             to_value: Range end boundary (exclusive).
+            limit: Move at most this many rows; None moves every row of the
+                window in one statement.
+            expected_source_oid: The identity of the relation the rows should
+                come from, checked the same way -- what a compensating move
+                back into DEFAULT needs, where both names matter.
+            expected_target_oid: The identity of the relation the rows should
+                land in, checked under the target's lock in the move's own
+                transaction -- a target swapped at its name refuses the batch
+                (``PlanStaleError``) before a single row leaves DEFAULT.
 
         Returns:
             Number of rows moved.
         """
-        default_quoted = quote_identifier(default_partition_name)
-        target_quoted = quote_identifier(target_partition_name)
-        column_quoted = quote_identifier(partition_column)
+        if not key_columns:
+            msg = "reconcile_default_rows needs the parent's partition key"
+            raise ValueError(msg)
+
+        column_quoted = quote_identifier(key_columns[0])
         from_quoted = quote_literal(from_value)
         to_quoted = quote_literal(to_value)
 
@@ -181,186 +404,446 @@ class PartitionCreator:
         # belongs in DEFAULT whatever its leading value is. Moving it out would
         # be rejected -- and the rejection would look exactly like the DEFAULT
         # conflict this call exists to clear, so the retry would never converge.
-        not_null = "".join(f" AND {quote_identifier(column)} IS NOT NULL" for column in trailing_columns)
+        not_null = "".join(f" AND {quote_identifier(column)} IS NOT NULL" for column in key_columns[1:])
 
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             # Boundary literals must be interpreted in the same timezone ATTACH uses,
             # otherwise a non-UTC server timezone moves the wrong row range.
             if self._ddl_timezone is not None:
                 await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
-            # Lock both tables to minimize race conditions
-            await conn.execute(text(f"LOCK TABLE {default_quoted} IN SHARE ROW EXCLUSIVE MODE"))
-            await conn.execute(text(f"LOCK TABLE {target_quoted} IN SHARE ROW EXCLUSIVE MODE"))
-
-            columns = await self._relation_columns(conn, default_partition_name)
-            column_list = ", ".join(quote_identifier(column) for column in columns)
-
-            # Both sides name their columns. ``RETURNING *`` emits the DEFAULT
-            # partition's own physical order, and an unqualified INSERT binds
-            # that order positionally to the target's -- silently transposing
-            # values whenever the two differ. They can differ: ATTACH PARTITION
-            # matches columns by name, so a DEFAULT partition created
-            # independently and attached need not share the order of one
-            # created with LIKE.
-            #
+            await self._lock_for_move(conn, default_partition_name, target_partition_name)
+            # Deferred foreign-key checks would otherwise escape to COMMIT,
+            # outside the per-statement translation below.
+            await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
             # All identifiers and literals are properly quoted, S608 is a false positive
-            move_sql = _as_text(
-                f"WITH moved AS ("  # noqa: S608
-                f"DELETE FROM {default_quoted} "
-                f"WHERE {column_quoted} >= {from_quoted} "
-                f"AND {column_quoted} < {to_quoted}"
-                f"{not_null} "
-                f"RETURNING {column_list}"
-                f") "
-                f"INSERT INTO {target_quoted} ({column_list}) "
-                f"SELECT {column_list} FROM moved"
+            condition = f"{column_quoted} >= {from_quoted} AND {column_quoted} < {to_quoted}{not_null}"
+            return await self._move(
+                conn,
+                default_partition_name,
+                target_partition_name,
+                condition=condition,
+                limit=limit,
+                expected_source_oid=expected_source_oid,
+                expected_target_oid=expected_target_oid,
             )
 
-            result = await conn.execute(move_sql)
-            moved_count = result.rowcount or 0
-
-        return moved_count
-
-    async def create_branch(
-        self,
-        config: TablePartitionConfig,
-        branch_name: str,
-        from_value: str,
-        to_value: str,
-        spec: SubpartitionSpec,
-    ) -> PartitionInfo:
-        """Create a time partition that is itself a partitioned table.
-
-        The branch is created standalone — ``LIKE`` the parent, not
-        ``PARTITION OF`` it — so this takes only an ACCESS SHARE lock on the
-        live root table. Its buckets are built while it is still detached, and
-        only the final ATTACH makes the completed subtree reachable for row
-        routing. A branch is therefore never visible to writers in a state
-        where part of its keyspace has nowhere to go.
+    async def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:
+        """Move rows from one relation into another, whatever their keys.
 
         Args:
-            config: Table partition configuration.
-            branch_name: Name for the new branch table.
-            from_value: Start boundary value.
-            to_value: End boundary value.
-            spec: Subpartitioning the branch itself applies to its children.
+            source_name: Qualified name of the relation to take rows from; a
+                partitioned table works, its leaves are addressed through it.
+            target_name: Qualified name of the relation to put them in.
+            limit: Move at most this many rows; None moves every row.
 
         Returns:
-            Info about the created (still detached) branch.
+            Number of rows moved.
 
         Raises:
-            PartitionAlreadyExistsError: If a relation of that name exists.
+            RowMoveRefusedError: If a foreign key's ``ON DELETE`` action would
+                fire on the rows as they leave ``source_name``.
         """
-        clause, columns = _partition_by_clause(spec)
-        stmt = build_ddl_statement(
-            "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY) " + clause,
-            partition=branch_name,
-            parent=qualify(config.db_schema, config.table_name),
-            **columns,
-        )
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
-            try:
-                await conn.execute(stmt)
-            except (SQLAlchemyError, OSError, TimeoutError) as exc:
-                if pg_sqlstate(exc) == "42P07":  # duplicate_table
-                    raise PartitionAlreadyExistsError(branch_name) from exc
+            await self._lock_for_move(conn, source_name, target_name)
+            await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+            return await self._move(conn, source_name, target_name, condition=None, limit=limit)
+
+    async def move_rows_conn(self, conn: AsyncConnection, source_name: str, target_name: str) -> int:
+        """Move every row of ``source_name`` into ``target_name`` on an open transaction.
+
+        For callers that need the move and what follows it -- a drop, say --
+        to commit together. Locks are the caller's; deferred foreign-key
+        checks are forced to statement time so a refusal surfaces here, not
+        at the caller's commit.
+        """
+        await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        return await self._move(conn, source_name, target_name, condition=None, limit=None)
+
+    async def _lock_for_move(self, conn: AsyncConnection, *names: str) -> None:
+        """Take SHARE ROW EXCLUSIVE on every local relation involved in a move.
+
+        A foreign table cannot be locked (``LOCK TABLE is not supported for
+        foreign tables``); it is written through its wrapper like any other
+        INSERT, and a detached one is reachable by nobody else anyway.
+        """
+        for name in names:
+            if await relation_kind(conn, name) != "f":
+                await conn.execute(text(f"LOCK TABLE {quote_identifier(name)} IN SHARE ROW EXCLUSIVE MODE"))
+
+    async def _move(
+        self,
+        conn: AsyncConnection,
+        source_name: str,
+        target_name: str,
+        *,
+        condition: str | None,
+        limit: int | None,
+        expected_source_oid: int | None = None,
+        expected_target_oid: int | None = None,
+    ) -> int:
+        """Run one move statement once it is known to be safe.
+
+        Both identities are checked before *and after* the statement: the
+        pre-checks run under whatever locks the caller took, and the
+        post-checks cover a relation that cannot be locked -- a foreign table
+        -- by rolling the whole transaction back when a name changed hands, so
+        rows are never taken from, or handed to, a replacement.
+        """
+        await self._require_oid(conn, source_name, expected_source_oid)
+        await self._require_oid(conn, target_name, expected_target_oid)
+        await self._refuse_referential_actions(conn, source_name)
+        columns = await self._relation_columns(conn, source_name)
+        # Both sides name their columns. ``RETURNING *`` emits the source's
+        # own physical order, and an unqualified INSERT binds that order
+        # positionally to the target's -- silently transposing values whenever
+        # the two differ. They can differ: ATTACH PARTITION matches columns by
+        # name, so a DEFAULT partition created independently and attached need
+        # not share the order of one created with LIKE.
+        column_list = ", ".join(quote_identifier(column) for column in columns)
+        overriding = await self._has_identity_always(conn, target_name)
+        # Which ids the destination's sequences must not reissue is a question
+        # about the rows this move brings in, not about the rows the destination
+        # already held -- those its own sequence handed out, and it does not hand
+        # a value out twice. The statement therefore keeps the identity values it
+        # inserts, and the decisions below read them back from there.
+        # An identity column the source does not carry is filled by the sequence
+        # itself, exactly as an ordinary insert would: the move brings it no
+        # values, so there is nothing to decide about it.
+        identity_columns = tuple(
+            column for column in await self._identity_columns(conn, target_name) if column in columns
+        )
+        capture = ", ".join(quote_identifier(column) for column in identity_columns)
+        parked = f"{_MOVED_IDENTITY_PREFIX}{uuid4().hex}"
+        quoted_parked = quote_identifier(f"pg_temp.{parked}")
+        if identity_columns:
+            await self._open_moved_identity(conn, target_name, parked, capture)
+        statement = _move_statement(
+            quote_identifier(source_name),
+            quote_identifier(target_name),
+            column_list,
+            condition,
+            limit,
+            overriding=overriding,
+            capture=(quoted_parked, capture) if identity_columns else None,
+        )
+        try:
+            result = await conn.execute(_as_text(statement))
+        except (SQLAlchemyError, OSError, TimeoutError) as exc:
+            if pg_sqlstate(exc) != "23503":
                 raise
+            # Even ON DELETE NO ACTION refuses here: its end-of-statement check
+            # looks for the key through the referenced tree, and a row being
+            # moved sits in a table that is not attached (or not attached any
+            # more), so a *referenced* row cannot be moved at all. The failure
+            # is atomic -- the statement rolls back with every row in place.
+            first_line = str(exc).strip().splitlines()[0]
+            raise RowMoveRefusedError(
+                source_name,
+                f"rows are still referenced through a foreign key and a referenced row cannot leave the "
+                f"partition tree it is referenced in ({first_line}); delete or repoint the referencing rows "
+                "first, or drop the foreign key for the migration and re-create it afterwards",
+            ) from exc
+        moved = result.rowcount or 0
+        await self._require_oid(conn, source_name, expected_source_oid)
+        await self._require_oid(conn, target_name, expected_target_oid)
+        if identity_columns:
+            if moved:
+                await self._advance_identity_sequences(conn, target_name, identity_columns, quoted_parked)
+            # A refusal takes the whole transaction, and the relation with it;
+            # a move that gets this far gives it back here.
+            await conn.execute(text(f"DROP TABLE {quote_identifier(parked)}"))
+        return moved
 
-        return PartitionInfo(
-            name=branch_name,
-            partition_type=config.partition_type,
-            from_value=from_value,
-            to_value=to_value,
-            is_attached=False,
-            subpartition_type=spec.partition_type,
-            parent_table=qualify(config.db_schema, config.table_name),
+    async def _identity_columns(self, conn: AsyncConnection, table_name: str) -> tuple[str, ...]:
+        """The relation's identity columns, in its own attribute order."""
+        result = await conn.execute(
+            text(RELATION_IDENTITY_COLUMNS_SQL), {"table_name": to_regclass_argument(table_name)}
+        )
+        return tuple(coerce_str(row[0]) or "" for row in result.fetchall())
+
+    async def _open_moved_identity(self, conn: AsyncConnection, target_name: str, parked: str, capture: str) -> None:
+        """Open the temporary relation a move parks its identity values in.
+
+        Shaped from the target's own columns, so every value keeps the type it
+        will be compared against, and dropped with the transaction whatever
+        becomes of the move.
+        """
+        await conn.execute(
+            _as_text(
+                f"CREATE TEMP TABLE {quote_identifier(parked)} ON COMMIT DROP AS "  # noqa: S608
+                f"SELECT {capture} FROM {quote_identifier(target_name)} WITH NO DATA"
+            )
         )
 
-    async def create_subpartition_table(self, parent_name: str, child_name: str, spec: SubpartitionSpec | None) -> None:
-        """Create a detached table shaped like ``parent_name``.
+    async def _advance_identity_sequences(
+        self, conn: AsyncConnection, target_name: str, columns: tuple[str, ...], parked: str
+    ) -> None:
+        """Keep the target's identity sequences from reissuing the values a move brought in.
 
-        Args:
-            parent_name: Relation the table will later be attached to.
-            child_name: Name for the new table.
-            spec: Subpartitioning this table applies to its own children, or
-                None to create a leaf.
+        ``OVERRIDING SYSTEM VALUE`` preserves the moved ids but leaves the
+        backing sequence where it was, so the sequence may still be about to
+        issue an id a moved row already owns. Only values the sequence can
+        actually still reach matter: on its own path (``next + k *
+        increment``), on the side it advances towards, and inside its declared
+        range. When such a value exists the sequence is set past the furthest
+        one; when none does, the sequence is left alone -- an id off its path
+        or outside its range can never collide.
 
-        Raises:
-            PartitionAlreadyExistsError: If a relation of that name exists.
+        A configuration where that is not enough refuses the move instead of
+        leaving a destination that cannot take its next ordinary insert: a
+        cycling sequence comes back around to the moved values, a sequence
+        whose remaining path is entirely consumed by them has nothing left to
+        issue, and a sequence with a cache has already handed a block of
+        values to some session, where no ``setval`` can reach them. Runs in
+        the move's transaction, so a refusal rolls the move back with it.
+
+        Every question is asked of the values this move carried in, which the
+        statement parked in a temporary relation. A row the destination already
+        held is none of the move's business: its id came from this very
+        sequence, and whatever the sequence does next it does the same with the
+        move or without it.
+
+        Every column is decided before any sequence moves. PostgreSQL does not
+        roll a sequence back with the transaction, so a second identity column
+        refusing after the first had been advanced would leave that first
+        sequence past ids that went back where they came from -- and a bounded
+        one could be spent by a move that never happened.
         """
-        template = "CREATE TABLE {partition} (LIKE {parent} INCLUDING ALL EXCLUDING IDENTITY)"
-        params = {"partition": child_name, "parent": parent_name}
-        if spec is not None:
-            clause, columns = _partition_by_clause(spec)
-            template = f"{template} {clause}"
-            params.update(columns)
+        advances = []
+        for column in columns:
+            value = await self._identity_advance(conn, target_name, column, parked)
+            if value is not None:
+                advances.append((column, value))
+        for column, value in advances:
+            await conn.execute(
+                text(
+                    "SELECT setval(CAST(pg_get_serial_sequence(:table_name, :column) AS regclass), "
+                    "CAST(:value AS bigint))"
+                ),
+                {"table_name": to_regclass_argument(target_name), "column": column, "value": value},
+            )
 
-        stmt = build_ddl_statement(template, **params)
-        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
-            try:
-                await conn.execute(stmt)
-            except (SQLAlchemyError, OSError, TimeoutError) as exc:
-                if pg_sqlstate(exc) == "42P07":  # duplicate_table
-                    raise PartitionAlreadyExistsError(child_name) from exc
-                raise
+    async def _identity_advance(self, conn: AsyncConnection, target_name: str, column: str, parked: str) -> int | None:
+        """Where one identity column's sequence has to be set, or None; or refuse the move."""
+        parameters = (
+            await conn.execute(
+                text(SEQUENCE_PARAMETERS_SQL),
+                {"table_name": to_regclass_argument(target_name), "column": column},
+            )
+        ).first()
+        if parameters is None:  # pragma: no cover - an identity column always owns a sequence
+            return None
 
-    async def attach_subpartition(self, parent_name: str, child_name: str, bounds: SubpartitionBounds) -> None:
-        """Attach a hash bucket to its parent.
+        increment = int(parameters.increment)
+        minimum, maximum = int(parameters.minimum), int(parameters.maximum)
+        cache, start_value = int(parameters.cache), int(parameters.start_value)
+        last = parameters.last_value
+        # The next value the sequence would issue: its start until it has been
+        # read once, one increment past the last value afterwards.
+        upcoming = start_value if last is None else int(last) + increment
+        ascending = increment > 0
+        sequence_name = f"the identity sequence of {target_name}.{column}"
+        # Every identifier is quoted and every number is a catalog integer
+        # rendered with ``:d``; ``_as_text`` escapes the colons an identifier
+        # may carry, which is why the numbers are formatted rather than bound.
+        quoted_column = quote_identifier(column)
+        in_range = f"{quoted_column} BETWEEN {minimum:d} AND {maximum:d}"
+        on_path = f"({quoted_column} - {upcoming:d}) % {increment:d} = 0"
 
-        ATTACH rather than ``CREATE … PARTITION OF`` on purpose: attaching takes
-        SHARE UPDATE EXCLUSIVE on the parent, so filling a gap in a live branch
-        does not block reads or writes, where creating in place would take
-        ACCESS EXCLUSIVE and stall every writer routing through it.
+        if parameters.cycles:
+            # A cycling sequence comes back around, and the wrap restarts it at
+            # the far end of its range -- which can land it on values its
+            # pre-wrap increments never touched. Anything inside the range is
+            # therefore something it may hand out again, whatever its residue.
+            if await self._holds(conn, parked, in_range):
+                raise RowMoveRefusedError(
+                    target_name,
+                    f"{sequence_name} cycles, so it comes back around to the ids these rows carry and hands one "
+                    "out again -- a wraparound can even move it onto values its increments skipped before; move "
+                    "into a destination whose identity does not cycle, or take the identity off the column for "
+                    "the migration",
+                )
+            return None
 
-        The parent's DEFAULT partition, if it has one, is the exception: ATTACH
-        takes ACCESS EXCLUSIVE on that one while scanning it for rows the new
-        partition would claim. A fully tiled parent has no DEFAULT partition and
-        pays nothing for it.
+        if last is not None and cache > 1:
+            # A cache hands whole blocks to sessions, and a session keeps its
+            # block in memory until it is used up. PostgreSQL publishes only
+            # the newest allocation (``last_value``); an older block, drawn
+            # before another session moved the catalog on, is invisible and
+            # still live. So everything the sequence has issued since it
+            # started -- its path from ``seqstart`` to ``last_value`` -- counts
+            # as possibly held, and no ``setval`` can take any of it back.
+            low, high = sorted((start_value, int(last)))
+            allocated = f"{quoted_column} BETWEEN {low:d} AND {high:d} AND {on_path}"
+            if await self._holds(conn, parked, allocated):
+                raise RowMoveRefusedError(
+                    target_name,
+                    f"{sequence_name} caches {cache} values, so values it has already handed out may still be "
+                    "sitting in a session's cache, where no setval reaches them -- and PostgreSQL does not say "
+                    "which; stop the writers and reset the sequence yourself, or take the identity off the "
+                    "column for the migration",
+                )
 
-        Args:
-            parent_name: Partitioned relation to attach to.
-            child_name: Table to attach.
-            bounds: What the child owns — a hash bucket, a set of LIST values,
-                or DEFAULT.
-        """
-        clause, values = _values_clause(bounds)
-        stmt = build_ddl_statement(
-            "ALTER TABLE {parent} ATTACH PARTITION {partition} " + clause,
-            parent=parent_name,
-            partition=child_name,
-            **values,
+        # The furthest value the sequence could still reach that a moved row
+        # owns: inside the declared range, ahead of where it stands, and on the
+        # values it actually lands on.
+        aggregate = "MAX" if ascending else "MIN"
+        ahead = ">=" if ascending else "<="
+        collision = (
+            await conn.execute(
+                _as_text(
+                    f"SELECT {aggregate}({quoted_column}) FROM {parked} "  # noqa: S608
+                    f"WHERE {in_range} AND {quoted_column} {ahead} {upcoming:d} AND {on_path}"
+                )
+            )
+        ).scalar()
+        if collision is None:
+            return None
+
+        beyond = int(collision) + increment
+        if beyond > maximum or beyond < minimum:
+            raise RowMoveRefusedError(
+                target_name,
+                f"{sequence_name} would have nothing left to issue: every value it can still reach is already "
+                f"carried by a moved row (its range is {minimum}..{maximum}); give the destination a wider "
+                "range, or take the identity off the column for the migration",
+            )
+        return int(collision)
+
+    @staticmethod
+    async def _holds(conn: AsyncConnection, quoted_relation: str, condition: str) -> bool:
+        """Whether any row of the relation carries a value the condition describes."""
+        result = await conn.execute(
+            _as_text(f"SELECT EXISTS (SELECT 1 FROM {quoted_relation} WHERE {condition})")  # noqa: S608
         )
-        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
-            await conn.execute(stmt)
+        return bool(result.scalar())
+
+    async def _refuse_referential_actions(self, conn: AsyncConnection, source_name: str) -> None:
+        """Refuse a move that a foreign key's ``ON DELETE`` action would turn into data loss.
+
+        The move is one statement: ``DELETE ... RETURNING`` into ``INSERT``.
+        CASCADE, SET NULL and SET DEFAULT act on the DELETE alone and would
+        delete or rewrite the referencing rows while the moved row lives on,
+        so they are refused up front. NO ACTION and RESTRICT stay allowed:
+        unreferenced rows move freely, and a *referenced* row fails the
+        statement atomically (the moved row is outside the referenced tree
+        when the check runs -- see ``_move``), which the caller receives as
+        :class:`RowMoveRefusedError`. Verified on PostgreSQL 15, 16 and 17.
+        """
+        result = await conn.execute(
+            text(DESTRUCTIVE_INCOMING_FOREIGN_KEYS_SQL), {"table_name": to_regclass_argument(source_name)}
+        )
+        rows = result.fetchall()
+        if not rows:
+            return
+        described = ", ".join(
+            f"{coerce_str(row[0])} on {coerce_str(row[1])} (ON DELETE "
+            f"{_ON_DELETE_ACTIONS.get(coerce_str(row[2], encoding='ascii') or '', '?')})"
+            for row in rows
+        )
+        raise RowMoveRefusedError(
+            source_name,
+            f"foreign key {described} would act on the rows as they are deleted from their old partition, "
+            "deleting or rewriting the rows that reference them; re-create it ON DELETE NO ACTION "
+            "(referenced rows are then refused row-safe instead) or drop it for the migration and "
+            "re-create it afterwards",
+        )
+
+    async def _has_identity_always(self, conn: AsyncConnection, table_name: str) -> bool:
+        result = await conn.execute(
+            text(RELATION_HAS_IDENTITY_ALWAYS_SQL), {"table_name": to_regclass_argument(table_name)}
+        )
+        return bool(result.scalar())
 
 
-def _partition_by_clause(spec: SubpartitionSpec) -> tuple[str, dict[str, str]]:
-    """Render the ``PARTITION BY`` clause for a spec, plus the identifiers it needs.
+def _move_statement(
+    source: str,
+    target: str,
+    column_list: str,
+    condition: str | None,
+    limit: int | None,
+    *,
+    overriding: bool = False,
+    capture: tuple[str, str] | None = None,
+) -> str:
+    """One ``DELETE ... RETURNING`` / ``INSERT`` statement moving rows from ``source`` to ``target``.
 
-    The strategy comes from a closed enum and each column is substituted by
+    Both sides name their columns: ``RETURNING *`` would emit the source's
+    physical order, and an unqualified INSERT binds it positionally -- silently
+    transposing values whenever the two relations were created independently.
+    A batch is bounded through ``(tableoid, ctid)`` rather than ``ctid`` alone
+    so a partitioned source, whose leaves each number their own tuples, is
+    addressed unambiguously. ``overriding`` keeps the values of a
+    ``GENERATED ALWAYS AS IDENTITY`` column on the target. ``capture`` is the
+    relation the inserted identity values are parked in and the columns to park,
+    for the sequence decisions that follow -- one statement, so what it hands
+    over is exactly what it placed. Every identifier and literal is already
+    quoted.
+    """
+    where = f" WHERE {condition}" if condition else ""
+    if limit is not None:
+        picked = f"SELECT tableoid, ctid FROM {source}{where} LIMIT {int(limit):d}"  # noqa: S608
+        where = f" WHERE (tableoid, ctid) IN ({picked})"
+    override = " OVERRIDING SYSTEM VALUE" if overriding else ""
+    taking = f"DELETE FROM {source}{where} RETURNING {column_list}"  # noqa: S608
+    placing = f"INSERT INTO {target} ({column_list}){override} SELECT {column_list} FROM moved"  # noqa: S608
+    if capture is None:
+        return f"WITH moved AS ({taking}) {placing}"
+    parked, kept = capture
+    return (
+        f"WITH moved AS ({taking}), placed AS ({placing} RETURNING {kept}) "  # noqa: S608
+        f"INSERT INTO {parked} ({kept}) SELECT {kept} FROM placed"
+    )
+
+
+def _storage_parameters_clause(physical: LocalLeaves) -> tuple[str, dict[str, str]]:
+    """Render ``WITH (...)``, every value as a literal placeholder.
+
+    PostgreSQL accepts a quoted literal for every storage parameter type, so
+    numbers and booleans are spelled as strings and quoted like the rest; the
+    names were validated by the model and are spliced as they are.
+    """
+    values: dict[str, str] = {}
+    rendered: list[str] = []
+    for index, (name, value) in enumerate(physical.rendered_storage_parameters().items()):
+        values[f"with_{index}"] = value
+        rendered.append(f"{name} = [with_{index}]")
+    return f"WITH ({', '.join(rendered)})", values
+
+
+def _partition_by_clause(partition_by: PartitionBy) -> tuple[str, dict[str, str]]:
+    """Render the ``PARTITION BY`` clause, plus the identifiers it needs.
+
+    The method comes from a closed enum and each column is substituted by
     :func:`~pg_partsmith.utils.build_ddl_statement` as a quoted identifier, so
     no part of the clause is unescaped caller text.
-
-    Returns:
-        The clause and the identifier parameters it references.
     """
-    columns = {f"key_{index}": column for index, column in enumerate(spec.columns)}
+    columns = {f"key_{index}": column for index, column in enumerate(partition_by.columns)}
     rendered = ", ".join(f"{{{name}}}" for name in columns)
-    return f"PARTITION BY {spec.partition_type.value.upper()} ({rendered})", columns
+    return f"PARTITION BY {partition_by.method.value.upper()} ({rendered})", columns
 
 
-def _values_clause(bounds: SubpartitionBounds) -> tuple[str, dict[str, str]]:
-    """Render the bound clause for a subpartition, plus the literals it needs.
+def _values_clause(bounds: PartitionBounds, key_arity: int) -> tuple[str, dict[str, str]]:
+    """Render the bound clause for a partition, plus the literals it needs.
 
     Hash moduli are validated integers on a frozen model, so formatting them in
-    cannot inject anything — and PostgreSQL requires literals there anyway. LIST
-    values are caller data, so they go back through ``build_ddl_statement`` as
-    ``[placeholder]`` literals rather than into the template: a value containing
-    a brace would otherwise be re-interpreted when the template is formatted.
-
-    Returns:
-        The clause and the literal parameters it references.
+    cannot inject anything — and PostgreSQL requires literals there anyway.
+    RANGE and LIST values are caller data, so they go back through
+    ``build_ddl_statement`` as ``[placeholder]`` literals rather than into the
+    template: a value containing a brace would otherwise be re-interpreted when
+    the template is formatted.
     """
+    if isinstance(bounds, RangeBounds):
+        padding = ", MINVALUE" * max(0, key_arity - 1)
+        from_part = "MINVALUE" if bounds.from_value.upper() == "MINVALUE" else "[from_val]"
+        to_part = "MAXVALUE" if bounds.to_value.upper() == "MAXVALUE" else "[to_val]"
+        values = {}
+        if from_part != "MINVALUE":
+            values["from_val"] = bounds.from_value
+        if to_part != "MAXVALUE":
+            values["to_val"] = bounds.to_value
+        return f"FOR VALUES FROM ({from_part}{padding}) TO ({to_part}{padding})", values
+
     if isinstance(bounds, HashBounds):
         return f"FOR VALUES WITH (MODULUS {bounds.modulus:d}, REMAINDER {bounds.remainder:d})", {}
 

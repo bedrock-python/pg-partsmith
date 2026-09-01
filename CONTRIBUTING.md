@@ -61,14 +61,26 @@ PostgreSQL instance automatically. Docker must be running:
 
 ```bash
 make test-integration
+PG_PARTSMITH_TEST_PG_IMAGE=postgres:15-alpine make test-integration   # another server version
 ```
+
+CI runs the integration suite on PostgreSQL 15, 16 and 17; the default image is
+`postgres:17-alpine`.
 
 ## Adding a period strategy
 
 1. Create `pg_partsmith/strategies/your_strategy.py`, subclassing `BasePeriodCalculator`
 2. Export it from `pg_partsmith/strategies/__init__.py` and `pg_partsmith/__init__.py`
 3. Add unit tests in `tests/unit/test_strategies.py`
-4. Document it in `docs/guide/strategies.md`
+4. Document it in `docs/guide/calendars-and-codecs.md`
+
+## Adding a boundary codec
+
+1. Implement the `RangeBoundaryCodec` protocol from `pg_partsmith.boundaries`
+   (`encode` an instant into the column's literal, `decode` a literal back)
+2. Register its name in `_CODECS_BY_NAME` in `pg_partsmith/boundaries.py`, next to `uuidv7` and `epoch_*`
+3. Add unit tests in `tests/unit/test_boundaries.py`
+4. Document it in `docs/guide/calendars-and-codecs.md` and `docs/concepts/boundaries.md`
 
 ## Adding a lock manager
 
@@ -76,25 +88,47 @@ make test-integration
    and/or `pg_partsmith.sync.protocols` (sync)
 2. Add it to `pg_partsmith/aio/__init__.py` / `pg_partsmith/sync/__init__.py` exports
    (optional extra if it has deps)
-3. Document it in `docs/guide/locks.md`
+3. Document it in `docs/guide/scheduling.md` and `docs/guide/extending.md`
 
 ## Keeping aio and sync in sync
 
-`pg_partsmith/sync` is a hand-maintained mirror of `pg_partsmith/aio` (same files, same
-class names, plain methods instead of coroutines). Any behavioural change to one package
-must be applied to the other, along with the mirrored tests in `tests/unit/sync/` and
-`tests/integration/sync/`.
+`pg_partsmith/sync` is a mirror of `pg_partsmith/aio` (same files, same class names, plain
+methods instead of coroutines, server-side statement timeouts instead of `asyncio.timeout`).
+Edit the aio package, then regenerate the mirror and review the diff:
+
+```bash
+uv run python scripts/sync_mirror.py
+uv run ruff check --fix pg_partsmith/sync && uv run ruff format pg_partsmith/sync
+```
+
+The lock managers, `maintainer.py`, `repositories/{resolver,fk_manager,timeouts}.py` are
+maintained by hand.
+
+The tests follow the same rule. `tests/integration/sync/` is generated from
+`tests/integration/aio/`:
+
+```bash
+uv run python scripts/sync_tests_mirror.py
+uv run ruff check --fix tests/integration/sync && uv run ruff format tests/integration/sync
+```
+
+A test that drives two coroutines at once cannot be mirrored mechanically: put a
+`# sync-mirror: skip` line right above it and write its thread-based twin in
+`tests/integration/sync/test_concurrency.py`, the one hand-written module of that suite.
+`tests/unit/sync/` mirrors `tests/unit/` by hand — only the modules touching the aio package
+have a sync twin.
 
 ## Releasing (maintainers only)
 
-1. Move `[Unreleased]` section in `CHANGELOG.md` to `[x.y.z] - YYYY-MM-DD`
-2. Update `pg_partsmith/__version__.py`
-3. Commit: `chore(release): v0.x.y`
-4. Tag and push:
+Releases are cut by [release-please](https://github.com/googleapis/release-please) from the
+Conventional Commits on `master`: it keeps a release pull request open with the next version
+and the generated changelog section; merging that PR tags the release, and the publish
+workflow builds the package and uploads it to PyPI.
 
-```bash
-git tag v0.x.y
-git push origin master --tags
-```
-
-The CI pipeline handles PyPI publishing and GitHub Release creation automatically.
+- `feat:` bumps the minor version, `fix:` the patch version, `feat!:` / a `BREAKING CHANGE:`
+  footer bumps the major version (before 1.0 a breaking change bumps the minor version —
+  `bump-minor-pre-major` is on).
+- To force a specific version, add a `Release-As: x.y.z` footer to a commit — this is how
+  1.0.0 is cut.
+- Keep the hand-written `[Unreleased]` notes in `CHANGELOG.md` for the parts release-please
+  cannot write (upgrade notes, behaviour changes); they are folded into the release section.

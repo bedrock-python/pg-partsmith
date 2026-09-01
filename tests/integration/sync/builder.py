@@ -1,4 +1,4 @@
-"""Builder pattern for partitioning integration tests (sync API)."""
+"""Builder pattern for partitioning integration tests."""
 
 from __future__ import annotations
 
@@ -9,25 +9,20 @@ from typing import TYPE_CHECKING
 import freezegun
 from sqlalchemy import text
 
-from pg_partsmith.entities import (
-    PartitionGranularity,
-    PartitionStrategy,
-    PartitionType,
-    Period,
-    TablePartitionConfig,
-)
-from pg_partsmith.protocols import PeriodCalculator
-from pg_partsmith.strategies.selector import get_period_calculator
+from pg_partsmith.entities import PartitionGranularity, Period, TablePartitionConfig
+from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
+from pg_partsmith.topology import RangeBounds
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
     from pg_partsmith.entities import MaintenanceResult
+    from pg_partsmith.protocols import PeriodCalculator
     from pg_partsmith.sync.hooks import PartitionLifecycleHooks
 
 
@@ -76,6 +71,12 @@ class PartitioningScenarioBuilder:
         return self
 
     def with_detached_partition(self, name: str, from_val: str, to_val: str) -> PartitioningScenarioBuilder:
+        """Add a partition the library detached when its window closed.
+
+        The orphan marker records the detach instant, so the detach runs with
+        the clock frozen at the partition's upper bound: any maintenance run
+        frozen after the window then sees the (zero) grace elapsed.
+        """
         self._partitions.append(PreCreatedPartition(name, from_val, to_val, attached=False))
         return self
 
@@ -98,17 +99,16 @@ class PartitioningScenarioBuilder:
         metadata = PostgresMetadataProvider(self._engine)
         locks = PostgresAdvisoryLockManager(self._engine)
 
-        calc = get_period_calculator(self._granularity)
-
         config = TablePartitionConfig(
             table_name=self._table_name,
-            partition_type=PartitionType.RANGE,
-            partition_strategy=PartitionStrategy.TIME_BASED,
             partition_column="created_at",
             granularity=self._granularity,
             create_ahead_count=self._create_ahead,
             retention_count=self._retention,
         )
+        boundaries = config.time_boundaries
+        assert boundaries is not None  # the builder always describes a time-partitioned root
+        calc = boundaries.period_calculator
 
         # Create DEFAULT partition if requested
         if self._create_default:
@@ -117,18 +117,13 @@ class PartitioningScenarioBuilder:
                     text(f'CREATE TABLE "{self._table_name}_default" PARTITION OF "{self._table_name}" DEFAULT')
                 )
 
-        # Setup pre-created partitions
+        # Setup pre-created partitions through the library's own DDL path.
         for p in self._partitions:
-            repo.create_partition(config, p.name, p.from_value, p.to_value)
-            if p.attached:
-                repo.attach_partition(self._table_name, p.name, p.from_value, p.to_value)
-            else:
-                # To make it an orphan, we need to add the comment marker if detach_partition does it
-                # Actually repo.create_partition + repo.attach_partition + repo.detach_partition is better
-                # but if it's already detached we just need the marker.
-                # Let's use the repo methods to be sure.
-                repo.attach_partition(self._table_name, p.name, p.from_value, p.to_value)
-                repo.detach_partition(self._table_name, p.name, concurrent=False)
+            repo.create_table_like(self._table_name, p.name, None)
+            repo.attach_partition(self._table_name, p.name, RangeBounds(from_value=p.from_value, to_value=p.to_value))
+            if not p.attached:
+                with freezegun.freeze_time(p.to_value):
+                    repo.detach_partition(self._table_name, p.name, mode=DetachMode.BLOCKING)
 
         # Setup FKs
         with self._engine.begin() as conn:
@@ -141,7 +136,7 @@ class PartitioningScenarioBuilder:
                     )
                 )
 
-        service = PartitionLifecycleService(repo, metadata, locks, calc, hooks=self._hooks)
+        service = PartitionLifecycleService(repo, metadata, locks, hooks=self._hooks)
         maintainer = PartitionMaintainer(service)
 
         return PartitioningTestContext(
@@ -176,16 +171,26 @@ class PartitioningTestContext:
         at_time: str | datetime | None = None,
         *,
         skip_create: bool = False,
+        skip_detach: bool = False,
+        skip_drop: bool = False,
         continue_on_error: bool = False,
     ) -> MaintenanceResult:
         """Runs maintenance, optionally at a specific time."""
         if at_time:
             with freezegun.freeze_time(at_time):
                 return self.maintainer.run_maintenance(
-                    self.config, skip_create=skip_create, continue_on_error=continue_on_error
+                    self.config,
+                    skip_create=skip_create,
+                    skip_detach=skip_detach,
+                    skip_drop=skip_drop,
+                    continue_on_error=continue_on_error,
                 )
         return self.maintainer.run_maintenance(
-            self.config, skip_create=skip_create, continue_on_error=continue_on_error
+            self.config,
+            skip_create=skip_create,
+            skip_detach=skip_detach,
+            skip_drop=skip_drop,
+            continue_on_error=continue_on_error,
         )
 
     def assert_partition_exists(self, name: str) -> None:

@@ -7,7 +7,7 @@ import hashlib
 import logging
 import re
 import time
-from datetime import UTC, tzinfo
+from datetime import UTC, datetime, tzinfo
 
 from sqlalchemy import TextClause, text
 
@@ -215,6 +215,95 @@ def orphan_table_comment(parent_table: str, *, marker_prefix: str | None = None)
 def orphan_comment_prefix(*, marker_prefix: str | None = None) -> str:
     """Return the COMMENT marker prefix used for orphaned partitions."""
     return _resolve_marker_prefix(marker_prefix)
+
+
+# Second marker line, recording when the table was detached. Namespaced by the
+# library name rather than by ``marker_prefix`` so it is unambiguous whatever
+# prefix a deployment chose for the first line.
+DETACHED_AT_MARKER = "pg-partsmith:detached-at="
+
+
+def orphan_comment(
+    parent_table: str,
+    *,
+    detached_at: datetime | None,
+    existing_comment: str | None,
+    marker_prefix: str | None = None,
+) -> str:
+    """Compose the whole COMMENT for a table this library detached.
+
+    Line one is the ownership marker :func:`orphan_table_comment` has always
+    written; line two records the detach instant; whatever comment the table
+    carried before is kept below them. Re-marking an already marked table keeps
+    the instant it already carries, so a repeated detach does not restart a
+    grace period.
+    """
+    marker = orphan_table_comment(parent_table, marker_prefix=marker_prefix)
+    lines = [marker]
+
+    parsed = parse_orphan_comment(existing_comment, marker_prefix=marker_prefix)
+    if parsed is not None and parsed[1] is not None:
+        detached_at = parsed[1]
+    if detached_at is not None:
+        lines.append(f"{DETACHED_AT_MARKER}{detached_at.astimezone(UTC).isoformat()}")
+
+    rest = comment_without_markers(existing_comment, marker_prefix=marker_prefix)
+    if rest:
+        lines.append(rest)
+    return "\n".join(lines)
+
+
+def parse_orphan_comment(
+    comment: str | None,
+    *,
+    marker_prefix: str | None = None,
+) -> tuple[str, datetime | None] | None:
+    """Read the parent and the detach instant out of an orphan marker.
+
+    Returns:
+        ``(parent_table, detached_at)`` when the comment carries the marker;
+        ``detached_at`` is None for a marker written by an older version or
+        by :meth:`~pg_partsmith.aio.PostgresPartitionRepository.adopt_partition`.
+        None when the comment carries no marker at all.
+    """
+    if not comment:
+        return None
+    prefix = _resolve_marker_prefix(marker_prefix)
+    first, _, rest = comment.partition("\n")
+    if not first.startswith(prefix) or len(first) <= len(prefix):
+        return None
+    parent = first[len(prefix) :]
+
+    detached_at: datetime | None = None
+    for line in rest.splitlines():
+        if line.startswith(DETACHED_AT_MARKER):
+            try:
+                detached_at = datetime.fromisoformat(line[len(DETACHED_AT_MARKER) :])
+            except ValueError:
+                detached_at = None
+            else:
+                if detached_at.tzinfo is None:
+                    detached_at = detached_at.replace(tzinfo=UTC)
+            break
+    return parent, detached_at
+
+
+def comment_without_markers(comment: str | None, *, marker_prefix: str | None = None) -> str:
+    """The user's own comment, with this library's marker lines removed.
+
+    What a relation's comment goes back to when it is attached again: an
+    attached partition is nobody's orphan, and a marker left on it would hand
+    its old detach instant to the next detach.
+    """
+    if not comment:
+        return ""
+    prefix = _resolve_marker_prefix(marker_prefix)
+    kept = [
+        line
+        for line in comment.splitlines()
+        if not (line.startswith(prefix) and len(line) > len(prefix)) and not line.startswith(DETACHED_AT_MARKER)
+    ]
+    return "\n".join(kept).strip("\n")
 
 
 def pg_sqlstate(exc: BaseException) -> str | None:
