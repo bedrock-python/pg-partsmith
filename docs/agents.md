@@ -15,6 +15,12 @@
 
 ## How to read this page
 
+Every page of this site is also served as raw Markdown at its own URL with `.md` in
+place of the trailing slash — this page is `/agents.md`, the foreign-key guide is
+`/guide/foreign-keys.md` — so anything the map below points at can be fetched as plain
+text rather than scraped out of HTML. The **Copy page** control at the top of every page
+does the same thing for a human with a chat window open.
+
 Top to bottom before writing code. [Rules that hold or break the code](#rules-that-hold-or-break-the-code)
 is the section correctness lives in — those are the things the library will not save you
 from. Every name used below is in the public API; if you need something not listed here,
