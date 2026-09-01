@@ -7,18 +7,30 @@ at all. This guide combines the three tools for that — hooks, the grace period
 
 ## The hooks
 
-Six hooks fire around create, detach and drop, once per **lifecycle unit** — the partition
+Six phases fire around create, detach and drop, once per **lifecycle unit** — the partition
 directly under the root, never once per leaf of its subtree — and once per member of a
 root `HASH` or `LIST`:
 
 | Hook | When |
 |---|---|
-| `before_create(config, partition)` | before the partition (name, bounds, `subpartition_type`) is created |
-| `after_create(config, partition)` | after it is created, its subtree built, and attached |
-| `before_detach(table_name, partition)` | before detaching — the data is still reachable through the parent |
-| `after_detach(table_name, partition_name)` | after a successful detach — the table exists, standalone |
-| `before_drop(table_name, partition_name)` | before the table is dropped — the last chance to read it |
-| `after_drop(table_name, partition_name)` | after the table is gone |
+| `before_create(event)` | before the partition is created |
+| `after_create(event)` | after it is created, its subtree built, and attached |
+| `before_detach(event)` | before detaching — the data is still reachable through the parent |
+| `after_detach(event)` | after a successful detach — the table exists, standalone |
+| `before_drop(event)` | before the table is dropped — the last chance to read it |
+| `after_drop(event)` | after the table is gone |
+| `on_event(event)` | all of the above, in addition to the method named for the phase |
+
+Every one of them takes the same `PartitionEvent`:
+
+| Field | What it is |
+|---|---|
+| `phase` | which of the six moments this is |
+| `config` | the table's configuration — the calendar, the codec, the policy in force |
+| `partition` | the partition itself: `name`, `bounds`, `oid`, `subpartition_type` |
+| `window` | the period it covers; `None` for a member of a root `HASH` or `LIST` |
+| `operation` | the planned operation: `reason`, `detail`, `oid`, `size_bytes`, `row_estimate`, `detached_at` |
+| `table_name` | the root table, derived from the config |
 
 A `before_*` hook that raises **aborts that operation**: the partition stays as it was and
 comes back on the next tick. With `continue_on_error` the error lands in
@@ -34,12 +46,12 @@ class ArchiveHooks(BasePartitionLifecycleHooks):
     def __init__(self, archive: Archive) -> None:
         self._archive = archive
 
-    async def after_detach(self, table_name: str, partition_name: str) -> None:
-        await self._archive.export(partition_name)          # the whole week, buckets included
+    async def after_detach(self, event: PartitionEvent) -> None:
+        await self._archive.export(event.partition.name, covering=event.window)   # the whole week
 
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        if not await self._archive.verified(partition_name):
-            raise RuntimeError(f"{partition_name} is not verified yet")   # dropped on a later tick
+    async def before_drop(self, event: PartitionEvent) -> None:
+        if not await self._archive.verified(event.partition.name):
+            raise RuntimeError(f"{event.partition.name} is not verified yet")   # dropped on a later tick
 
 
 service = PartitionLifecycleService(repo, metadata, locks, hooks=[ArchiveHooks(archive)])
@@ -48,37 +60,43 @@ service = PartitionLifecycleService(repo, metadata, locks, hooks=[ArchiveHooks(a
 Hooks are called in the order given; pass several for notifications, metrics and audit
 logs.
 
-### What a drop hook can know
+### One method for every phase
 
-`before_detach` is handed the whole `PartitionInfo`, bounds included, because the
-partition is still attached and the catalog still describes it. `DETACH` clears
-`relpartbound`, so by drop time — usually a later run, after the grace — the database no
-longer records where the partition sat; its name is what is left. Two ways to get the
-window back, neither of them a catalog query:
+An audit trail or a metrics counter wants all six moments and treats them alike. That is
+`on_event`, which fires for every phase in addition to the method named after it — so a
+hook implementing both is called twice, on purpose:
 
 ```python
-class ExportHooks(BasePartitionLifecycleHooks):
-    def __init__(self, config: TablePartitionConfig) -> None:
-        self._boundaries = config.time_boundaries          # the object that made the bounds
-
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        _, relname = split_qualified_name(partition_name)
-        window = self._boundaries.parse_child_name(relname)   # None if the name is not ours
-        await self._archive.finalize(partition_name, covering=window)
+class AuditHooks(BasePartitionLifecycleHooks):
+    async def on_event(self, event: PartitionEvent) -> None:
+        await audit.record(
+            phase=event.phase,
+            table=event.table_name,
+            partition=event.partition.name,
+            why=event.operation.reason,
+            bytes=event.operation.size_bytes,
+        )
 ```
 
-Or take the plan apart before applying it — every `DropPartition` carries the bounds it
-was planned with, plus `detached_at`, the OID and any size the policy measured:
+A phase added in a later version arrives here as a new `phase` value rather than as a
+method you have to write.
+
+### What a drop hook knows
+
+`DETACH` clears `relpartbound`, so by drop time — usually a later run, after the grace —
+the database no longer records where the partition sat; its name is the only evidence
+left. The event carries the reading the planner itself decided the drop on, so a hook does
+not have to repeat it:
 
 ```python
-plan = await service.plan(config)
-for drop in plan.drops:
-    await archive.finalize(drop.target, covering=drop.bounds, size=drop.size_bytes)
-await service.apply(config, plan)
+async def before_drop(self, event: PartitionEvent) -> None:
+    await self._archive.finalize(event.partition.name, covering=event.window)
 ```
 
-This is the same reading the planner itself used to decide the drop, so the two cannot
-disagree.
+`event.window` and `event.partition.bounds` are `None` when the name does not decode — an
+adopted table under a name of someone else's making. The same reading is on the plan
+(`drop.bounds`) for callers that export between `plan()` and `apply()` rather than from a
+hook.
 
 ## The grace period
 

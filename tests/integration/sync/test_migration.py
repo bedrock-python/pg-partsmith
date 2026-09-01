@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, text
 from testcontainers.postgres import PostgresContainer
 
 from pg_partsmith.entities import MaintenanceIssueStep, Period
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.sync.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
@@ -335,7 +336,7 @@ class _LateWriter(BasePartitionLifecycleHooks):
         self._table = table
         self._when = when
 
-    def before_detach(self, table_name: str, partition: object) -> None:
+    def before_detach(self, event: PartitionEvent) -> None:
         exec_sql(
             self._engine,
             f"INSERT INTO \"{self._table}\" (created_at, payload) VALUES (:ts, 'late')",  # noqa: S608
@@ -452,8 +453,8 @@ class _DetachedWriter(BasePartitionLifecycleHooks):
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
-    def before_drop(self, table_name: str, partition_name: str) -> None:
-        quoted = ".".join(f'"{part}"' for part in partition_name.split("."))
+    def before_drop(self, event: PartitionEvent) -> None:
+        quoted = ".".join(f'"{part}"' for part in event.partition.name.split("."))
         exec_sql(
             self._engine,
             f"INSERT INTO {quoted} (created_at, payload) VALUES ('2026-03-20T12:00:00+00:00', 'dropwrite')",  # noqa: S608

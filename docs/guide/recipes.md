@@ -130,11 +130,11 @@ ColdFront's `detach` strategy plus an archival pipeline:
 
 ```python
 class ArchiveHooks(BasePartitionLifecycleHooks):
-    async def after_detach(self, table_name: str, partition_name: str) -> None:
-        await export_to_iceberg(partition_name)
+    async def after_detach(self, event: PartitionEvent) -> None:
+        await export_to_iceberg(event.partition.name, covering=event.window)
 
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        if not await archive_verified(partition_name):
+    async def before_drop(self, event: PartitionEvent) -> None:
+        if not await archive_verified(event.partition.name):
             raise RuntimeError("archive not verified yet")   # the drop is retried next tick
 
 

@@ -113,7 +113,8 @@ its advisory lock on a dedicated autocommit connection for that reason.
 ## Hooks
 
 Subclass `BasePartitionLifecycleHooks` and override what you need; the base does nothing.
-See [Archive before dropping](archiving.md) for the six hook points and their semantics.
+See [Archive before dropping](archiving.md) for the hook points, the event they are
+handed, and their semantics.
 
 ## The pieces under the service
 
@@ -123,7 +124,7 @@ The service is a thin façade over three components you can use directly:
 |---|---|
 | `PartitionInspector(metadata)` | `inspect(config, measure=…)` reads the `ActualTree` and gathers facts; `context(config, now=…, mode=…)` resolves the cursors into a `PlanningContext` |
 | `plan_maintenance(config, tree, context)` | the pure planner — no I/O, testable with hand-built trees |
-| `PlanExecutor(repo, metadata, hooks)` | `apply(config, plan)`; `create_partition(config, plan, op, issues=…, fill=…)` to load rows before a partition goes live; `detach_single_partition`, `drop_single_partition` for one-at-a-time control |
+| `PlanExecutor(repo, metadata, hooks)` | `apply(config, plan)`; `create_partition(config, plan, op, issues=…, fill=…)` to load rows before a partition goes live; `detach_single_partition(config, op)`, `drop_single_partition(config, op)` for one-at-a-time control |
 | `DataMover(repo, metadata, executor)` | the batched movers behind `partition_data` / `unpartition` |
 
 A custom orchestration — plan on one connection, review, apply elsewhere — is a few

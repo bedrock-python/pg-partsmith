@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pg_partsmith.boundaries import Window
 from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
 from pg_partsmith.entities import MaintenanceResult, MigrationResult, PartitionInfo, Period, TablePartitionConfig
+from pg_partsmith.events import validate_hook_signatures
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.plan import CreatePartition, DetachPartition, DropPartition, MaintenancePlan, OperationKind, Reason
 from pg_partsmith.planner import PlanMode, plan_maintenance
@@ -61,9 +62,11 @@ class PartitionLifecycleService:
 
         Raises:
             ValueError: If the repository and the metadata provider disagree
-                about the orphan marker prefix.
+                about the orphan marker prefix, or a hook still takes the
+                arguments hooks took before 1.1.
         """
         validate_marker_alignment(repo, metadata)
+        validate_hook_signatures(hooks or ())
         self._repo = repo
         self._metadata = metadata
         self._locks = locks
@@ -433,13 +436,14 @@ class PartitionLifecycleService:
                 )
         return infos
 
-    async def detach_old_partitions(self, table_name: str, partitions: list[PartitionInfo]) -> list[str]:
+    async def detach_old_partitions(self, config: TablePartitionConfig, partitions: list[PartitionInfo]) -> list[str]:
         """Detach attached partitions from their parent table.
 
         Takes no lock of its own.
 
         Args:
-            table_name: Qualified parent table name.
+            config: The table's configuration -- the parent, and what hooks are
+                told about the table they are firing for.
             partitions: Attached partitions to detach. Inputs that are already
                 detached are counted without any DDL.
 
@@ -454,23 +458,23 @@ class PartitionLifecycleService:
             op = DetachPartition(
                 target=partition.name,
                 oid=partition.oid,
-                parent_name=partition.parent_table or table_name,
+                parent_name=partition.parent_table or config.qualified_name,
                 bounds=partition.bounds,
                 reason=Reason.RETENTION_EXPIRED,
                 detail="requested explicitly",
             )
-            await self._executor.detach_single_partition(table_name, op)
+            await self._executor.detach_single_partition(config, op)
             detached.append(partition.name)
         return detached
 
-    async def drop_detached_partitions(self, table_name: str, partition_names: list[str]) -> int:
+    async def drop_detached_partitions(self, config: TablePartitionConfig, partition_names: list[str]) -> int:
         """Drop previously detached, marker-tagged partitions.
 
         Attached partitions are skipped with a warning. Unmanaged tables are
         refused unless the underlying repository is configured otherwise.
 
         Args:
-            table_name: Qualified parent table name (used for hook context).
+            config: The table's configuration, as hooks are given it.
             partition_names: Names of partitions to drop.
 
         Returns:
@@ -479,7 +483,7 @@ class PartitionLifecycleService:
         dropped = 0
         for name in partition_names:
             op = DropPartition(target=name, reason=Reason.GRACE_ELAPSED, detail="requested explicitly")
-            if await self._executor.drop_single_partition(table_name, op) is not None:
+            if await self._executor.drop_single_partition(config, op) is not None:
                 dropped += 1
         return dropped
 

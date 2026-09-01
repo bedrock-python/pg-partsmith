@@ -22,6 +22,7 @@ from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import MaintenanceIssueStep, Period
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
 from tests.integration.aio.support import (
     child_count,
@@ -346,7 +347,7 @@ class _LateWriter(BasePartitionLifecycleHooks):
         self._table = table
         self._when = when
 
-    async def before_detach(self, table_name: str, partition: object) -> None:
+    async def before_detach(self, event: PartitionEvent) -> None:
         await exec_sql(
             self._engine,
             f"INSERT INTO \"{self._table}\" (created_at, payload) VALUES (:ts, 'late')",  # noqa: S608
@@ -467,8 +468,8 @@ class _DetachedWriter(BasePartitionLifecycleHooks):
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
 
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        quoted = ".".join(f'"{part}"' for part in partition_name.split("."))
+    async def before_drop(self, event: PartitionEvent) -> None:
+        quoted = ".".join(f'"{part}"' for part in event.partition.name.split("."))
         await exec_sql(
             self._engine,
             f"INSERT INTO {quoted} (created_at, payload) VALUES ('2026-03-20T12:00:00+00:00', 'dropwrite')",  # noqa: S608

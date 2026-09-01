@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from pg_partsmith.boundaries import Window
 from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, DEFAULT_CONFLICT_MAX_RETRIES
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult, PartitionInfo
+from pg_partsmith.events import HookPhase, PartitionEvent
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionAttachedError,
@@ -120,7 +121,7 @@ class PlanExecutor:
                 elif isinstance(op, AttachPartition):
                     await self._attach_detached(config, plan, op, tally=tally, issues=issues)
                 elif isinstance(op, DetachPartition):
-                    await self.detach_single_partition(config.qualified_name, op)
+                    await self.detach_single_partition(config, op)
                     detached.add(op.target)
                     tally.detached += 1
                 elif isinstance(op, DropPartition):
@@ -130,7 +131,7 @@ class PlanExecutor:
                             extra={"partition_name": op.target},
                         )
                         continue
-                    if await self.drop_single_partition(config.qualified_name, op) is not None:
+                    if await self.drop_single_partition(config, op) is not None:
                         tally.dropped += 1
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
@@ -226,7 +227,7 @@ class PlanExecutor:
         fires_hooks = op.counts_as == "created"
         info = _partition_info(config, op)
         if fires_hooks:
-            await self._run_hooks(lambda h: h.before_create(config, info), "before_create", partition_name=op.target)
+            await self._fire(HookPhase.BEFORE_CREATE, config, info, op)
 
         try:
             target_oid = _created_identity(op.target, await self._materialize(config, op))
@@ -287,8 +288,7 @@ class PlanExecutor:
             tally.repaired += 1
 
         if fires_hooks:
-            attached = info.model_copy(update={"is_attached": True})
-            await self._run_hooks(lambda h: h.after_create(config, attached), "after_create", partition_name=op.target)
+            await self._fire(HookPhase.AFTER_CREATE, config, info.model_copy(update={"is_attached": True}), op)
         return True
 
     async def _materialize(self, config: TablePartitionConfig, op: CreatePartition) -> int | None:
@@ -632,7 +632,7 @@ class PlanExecutor:
 
     # ── Removal ─────────────────────────────────────────────────────────────────
 
-    async def detach_single_partition(self, table_name: str, op: DetachPartition) -> None:
+    async def detach_single_partition(self, config: TablePartitionConfig, op: DetachPartition) -> None:
         """Detach one partition, running the detach hooks around it.
 
         Extension point for callers that manage partitions one at a time.
@@ -650,12 +650,12 @@ class PlanExecutor:
             raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
 
         info = _detach_info(op)
-        await self._run_hooks(lambda h: h.before_detach(table_name, info), "before_detach", partition_name=op.target)
+        await self._fire(HookPhase.BEFORE_DETACH, config, info, op)
         await self._repo.detach_partition(op.parent_name, op.target, mode=op.mode, expected_oid=op.oid)
-        await self._run_hooks(lambda h: h.after_detach(table_name, op.target), "after_detach", partition_name=op.target)
+        await self._fire(HookPhase.AFTER_DETACH, config, info.model_copy(update={"is_attached": False}), op)
 
     async def drop_single_partition(
-        self, table_name: str, op: DropPartition, *, drain_into: str | None = None
+        self, config: TablePartitionConfig, op: DropPartition, *, drain_into: str | None = None
     ) -> int | None:
         """Drop one detached partition, running the drop hooks around it.
 
@@ -670,13 +670,14 @@ class PlanExecutor:
             without a drain) when the partition was dropped; None when it is
             still attached (logged and skipped).
         """
-        await self._run_hooks(lambda h: h.before_drop(table_name, op.target), "before_drop", partition_name=op.target)
+        info = _drop_info(op)
+        await self._fire(HookPhase.BEFORE_DROP, config, info, op)
         try:
             drained = await self._repo.drop_partition(op.target, expected_oid=op.oid, drain_into=drain_into)
         except PartitionAttachedError:
             logger.warning("Refusing to drop attached partition", extra={"partition_name": op.target})
             return None
-        await self._run_hooks(lambda h: h.after_drop(table_name, op.target), "after_drop", partition_name=op.target)
+        await self._fire(HookPhase.AFTER_DROP, config, info, op)
         return drained
 
     async def _require_same_relation(self, name: str, expected_oid: int | None) -> None:
@@ -692,6 +693,25 @@ class PlanExecutor:
             )
 
     # ── Hooks ───────────────────────────────────────────────────────────────────
+
+    async def _fire(
+        self,
+        phase: HookPhase,
+        config: TablePartitionConfig,
+        partition: PartitionInfo,
+        operation: Operation,
+    ) -> None:
+        """Hand one event to the method named after its phase, and to ``on_event``.
+
+        Both, always: the named method is where a hook does something to one
+        moment, ``on_event`` is where it watches all of them. A hook that
+        implements both is called twice on purpose.
+        """
+        if not self._hooks:
+            return
+        event = PartitionEvent.build(phase, config, partition, operation)
+        await self._run_hooks(lambda h: getattr(h, phase.value)(event), phase.value, partition_name=partition.name)
+        await self._run_hooks(lambda h: h.on_event(event), "on_event", partition_name=partition.name)
 
     async def _run_hooks(
         self,
@@ -777,6 +797,33 @@ def _detach_info(op: DetachPartition) -> PartitionInfo:
         relkind=RelationKind.TABLE,
         subpartition_type=None,
         parent_table=op.parent_name,
+    )
+
+
+def _drop_info(op: DropPartition) -> PartitionInfo:
+    """What hooks see of a partition about to be dropped.
+
+    Detached by definition, and by then the catalog no longer records where it
+    sat -- ``DETACH`` clears ``relpartbound`` -- so its bounds are the ones the
+    plan decided the drop on, which may be nothing at all.
+    """
+    bounds = op.bounds
+    from_value = to_value = None
+    if isinstance(bounds, RangeBounds):
+        from_value, to_value = bounds.from_value, bounds.to_value
+    return PartitionInfo.model_construct(
+        name=op.target,
+        oid=op.oid,
+        partition_type=_parent_method(bounds),
+        from_value=from_value,
+        to_value=to_value,
+        boundaries_expr=None if bounds is None else bounds.kind,
+        bounds=bounds,
+        is_attached=False,
+        is_default=bounds is not None and bounds.kind == "default",
+        relkind=RelationKind.TABLE,
+        subpartition_type=None,
+        parent_table=None,
     )
 
 

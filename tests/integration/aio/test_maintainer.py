@@ -22,11 +22,11 @@ from pg_partsmith.aio.service import PartitionLifecycleService
 from pg_partsmith.entities import (
     MaintenanceResult,
     PartitionGranularity,
-    PartitionInfo,
     PartitionStrategy,
     PartitionType,
     TablePartitionConfig,
 )
+from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import LockAcquisitionError, PlanStaleError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import Reason
@@ -208,14 +208,14 @@ async def test__maintainer__hooks_called_at_lifecycle_points(db_engine: AsyncEng
     hook_events: list[str] = []
 
     class AuditHooks(BasePartitionLifecycleHooks):
-        async def after_create(self, config: TablePartitionConfig, partition: PartitionInfo) -> None:
-            hook_events.append(f"created:{partition.name}")
+        async def after_create(self, event: PartitionEvent) -> None:
+            hook_events.append(f"created:{event.partition.name}")
 
-        async def before_drop(self, table_name: str, partition_name: str) -> None:
-            hook_events.append(f"before_drop:{partition_name}")
+        async def before_drop(self, event: PartitionEvent) -> None:
+            hook_events.append(f"before_drop:{event.partition.name}")
 
-        async def after_drop(self, table_name: str, partition_name: str) -> None:
-            hook_events.append(f"dropped:{partition_name}")
+        async def after_drop(self, event: PartitionEvent) -> None:
+            hook_events.append(f"dropped:{event.partition.name}")
 
     service = PartitionLifecycleService(repo, metadata, locks, hooks=[AuditHooks()])
     maintainer = PartitionMaintainer(service)
@@ -436,9 +436,9 @@ class _SwapHooks(BasePartitionLifecycleHooks):
         self._engine = engine
         self._parent = parent
 
-    async def before_detach(self, table_name: str, partition: object) -> None:
-        name = partition.relname  # type: ignore[attr-defined]
-        lower, upper = partition.from_value, partition.to_value  # type: ignore[attr-defined]
+    async def before_detach(self, event: PartitionEvent) -> None:
+        name = event.partition.relname  # type: ignore[attr-defined]
+        lower, upper = event.partition.from_value, event.partition.to_value  # type: ignore[attr-defined]
         async with self._engine.begin() as conn:
             await conn.execute(text(f'ALTER TABLE "{self._parent}" DETACH PARTITION "{name}"'))
             await conn.execute(text(f'DROP TABLE "{name}"'))

@@ -227,18 +227,24 @@ from pg_partsmith.aio import BasePartitionLifecycleHooks
 
 
 class ColdStorageHooks(BasePartitionLifecycleHooks):
-    async def before_drop(self, table_name: str, partition_name: str) -> None:
-        await export_to_object_storage(partition_name)   # raising aborts the drop; retried next tick
+    async def before_drop(self, event: PartitionEvent) -> None:
+        await export_to_object_storage(event.partition.name, covering=event.window)
+        # raising aborts the drop; retried next tick
 
 
 service = PartitionLifecycleService(repo, metadata, locks, hooks=[ColdStorageHooks()])
 ```
 
+Every method takes one `PartitionEvent`: the `phase`, the `config`, the `partition`, the
+`window` it covers, and the `operation` being carried out — with the `reason` it was
+planned and the size the policy measured, when it asked for one.
+
 | Method | When |
 |--------|------|
-| `before_create(config, partition)` / `after_create(config, partition)` | around the creation of a partition directly under the root (its subtree included) |
-| `before_detach(table_name, partition)` / `after_detach(table_name, partition_name)` | around a detach |
-| `before_drop(table_name, partition_name)` / `after_drop(table_name, partition_name)` | around a drop — `before_drop` is the last chance to read the data |
+| `before_create` / `after_create` | around the creation of a partition directly under the root (its subtree included) |
+| `before_detach` / `after_detach` | around a detach |
+| `before_drop` / `after_drop` | around a drop — `before_drop` is the last chance to read the data |
+| `on_event` | every one of the above, for an audit trail or metrics in one method |
 
 `before_*` exceptions abort that operation; `after_*` exceptions are logged.
 
