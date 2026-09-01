@@ -16,6 +16,14 @@ tree that actually exists from the catalog, and turns the difference into a
 **maintenance plan** — typed operations with a reason on each — that you can inspect,
 serialize, filter and apply. No extension, no superuser, no scheduler of its own.
 
+> [!TIP]
+> **Building this with an AI assistant?** Hand it
+> **[one page](https://bedrock-python.github.io/pg-partsmith/agents/)** instead of the
+> whole site: the complete API surface, the rules that break code when they are broken,
+> the mistakes models actually make, and a map of which page to fetch for the rest. Every
+> docs page is also served as raw Markdown at its own URL, and a **Copy page** button at
+> the top of each one hands it straight to a chat window.
+
 ## Features
 
 - **Any topology** — `RANGE(time)`, `RANGE(id)`, root `HASH`, root `LIST`, a sliding

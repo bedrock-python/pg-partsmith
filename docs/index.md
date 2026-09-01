@@ -7,6 +7,15 @@ what the tree should look like — monthly partitions, twelve of them kept, thre
 ahead, each split by tenant — and it reads what actually exists, works out the difference,
 shows you the plan, and applies it. No extension, no superuser, no scheduler of its own.
 
+!!! agents "Building this with an AI assistant?"
+
+    Hand it **[one page](agents.md)** instead of this site. It carries the whole API
+    surface, the rules that break code when they are broken, the mistakes models actually
+    make, and a map of which page to fetch for everything it leaves out. Every page here
+    is also served as raw Markdown at its own URL — `/agents.md`,
+    `/guide/foreign-keys.md` — and the **Copy page** button at the top of each one hands
+    it straight to a chat window.
+
 ```python
 config = TablePartitionConfig(
     schema="public",
