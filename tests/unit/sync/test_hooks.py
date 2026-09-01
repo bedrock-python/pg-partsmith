@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -183,6 +184,16 @@ def test__validate_hook_signatures__pre_1_1_shape__is_refused_at_wiring_time(hoo
     # Arrange / Act / Assert -- otherwise it is accepted here and fails mid-run
     with pytest.raises(ValueError, match="takes one PartitionEvent"):
         validate_hook_signatures([hook])
+
+
+def test__validate_hook_signatures__signature_that_cannot_be_read__is_left_alone() -> None:
+    # Arrange -- a C callable or a decorator that hides its parameters is not ours to judge
+    class Opaque(BasePartitionLifecycleHooks):
+        def before_drop(self, event: PartitionEvent) -> None: ...
+
+    # Act / Assert
+    with patch("pg_partsmith.events.inspect.signature", side_effect=ValueError("no signature")):
+        validate_hook_signatures([Opaque()])
 
 
 def test__validate_hook_signatures__unreadable_or_variadic__is_left_alone() -> None:

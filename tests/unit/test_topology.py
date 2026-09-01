@@ -2,6 +2,7 @@
 
 import logging
 from datetime import UTC, datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -283,6 +284,16 @@ def test__parse_range_boundaries__non_range_expression__returns_nones(expression
 def test__is_naive_timestamp_literal__reports_whether_a_zone_is_missing(literal: str | None, expected: bool) -> None:
     # Arrange / Act / Assert -- only a timestamp that carries no offset leaves the zone open
     assert is_naive_timestamp_literal(literal) is expected
+
+
+def test__is_naive_timestamp_literal__interrupted__propagates() -> None:
+    # Arrange -- the parse is guarded against bad input, never against a stop signal
+    with (
+        patch("pg_partsmith.partition_bounds.isoparse", side_effect=KeyboardInterrupt),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        # Act / Assert
+        is_naive_timestamp_literal("2026-02-01 00:00:00")
 
 
 # -- parse_boundary_literal ------------------------------------------------------------------
