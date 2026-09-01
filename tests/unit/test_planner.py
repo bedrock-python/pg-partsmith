@@ -1292,6 +1292,7 @@ def test__plan_maintenance__drop_after_zero_grace__drop_follows_each_detach() ->
         DropPartition(
             target=f"{ROOT}__2026_05",
             oid=5,
+            bounds=RangeBounds(from_value="2026-05-01", to_value="2026-06-01"),
             reason=Reason.FOLLOWS_DETACH,
             detail="dropped in the same run as its detach ('drop immediately')",
             follows_detach=True,
@@ -1299,6 +1300,7 @@ def test__plan_maintenance__drop_after_zero_grace__drop_follows_each_detach() ->
         DropPartition(
             target=f"{ROOT}__2026_06",
             oid=6,
+            bounds=RangeBounds(from_value="2026-06-01", to_value="2026-07-01"),
             reason=Reason.FOLLOWS_DETACH,
             detail="dropped in the same run as its detach ('drop immediately')",
             follows_detach=True,
@@ -1867,6 +1869,7 @@ def test__plan_maintenance__orphan_past_its_grace__dropped_with_its_detach_insta
         DropPartition(
             target=f"{ROOT}__2025_01",
             oid=11,
+            bounds=RangeBounds(from_value="2025-01-01", to_value="2025-02-01"),
             reason=Reason.GRACE_ELAPSED,
             detail=f"detached at {detached_at.isoformat()}; grace of 7 days, 0:00:00 elapsed",
             detached_at=detached_at,
@@ -1876,6 +1879,19 @@ def test__plan_maintenance__orphan_past_its_grace__dropped_with_its_detach_insta
         ),
     )
     assert plan.findings == ()
+
+
+def test__plan_maintenance__orphan_whose_name_does_not_decode__dropped_without_bounds() -> None:
+    # Arrange -- an adopted table under a name of someone else's making
+    config = _config(lifecycle=_policy(drop=DropAfter(grace=timedelta(days=7))))
+    orphan = _orphan("events_archive_2024", oid=13, detached_at=NOW - timedelta(days=30))
+
+    # Act
+    plan = _plan(config, _root(_month(2026, 8, oid=8)), orphans=(orphan,))
+
+    # Assert -- the drop still happens; nothing is invented about where it sat
+    assert [op.target for op in plan.drops] == [f"{SCHEMA}.events_archive_2024"]
+    assert plan.drops[0].bounds is None
 
 
 def test__plan_maintenance__orphan_within_its_grace__reported_pending_not_dropped() -> None:

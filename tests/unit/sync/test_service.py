@@ -217,6 +217,27 @@ def test__plan__column_mismatch__raises_invalid_config(
         service.plan(config)
 
 
+def test__service__marker_prefixes_disagree__refused_at_wiring_time(
+    repo: MagicMock, metadata: MagicMock, locks: MagicMock
+) -> None:
+    # Arrange -- passing marker_prefix to one collaborator only: the repository would
+    # stamp a prefix orphan discovery never looks for, so nothing detached is seen again
+    repo.marker_prefix = "app:orphan-parent="
+    metadata.marker_prefix = "pg-partsmith:orphan-parent="
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="Orphan marker mismatch"):
+        PartitionLifecycleService(repo, metadata, locks)
+
+
+def test__service__marker_prefixes_agree__constructs(repo: MagicMock, metadata: MagicMock, locks: MagicMock) -> None:
+    # Arrange
+    repo.marker_prefix = metadata.marker_prefix = "app:orphan-parent="
+
+    # Act / Assert
+    assert PartitionLifecycleService(repo, metadata, locks) is not None
+
+
 def test__plan__calendar_and_ddl_timezones_disagree__refused_before_touching_the_catalog(
     repo: MagicMock, metadata: MagicMock, locks: MagicMock, config: TablePartitionConfig
 ) -> None:

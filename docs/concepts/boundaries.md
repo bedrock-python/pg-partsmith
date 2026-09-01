@@ -143,7 +143,10 @@ bound against the cutoff, and ownership compares it against the grid; a codec th
 only encode would create partitions the library could never recognise again.
 
 `PostgresMetadataProvider(engine, boundary_codec=…)` needs the codec only for
-`is_partition_closed`; planning decodes through the configuration.
+`is_partition_closed`; planning decodes through the configuration. That one call also
+accepts the boundaries directly — `is_partition_closed(name, boundaries=config.time_boundaries)`
+— which is the way to be sure the reader and the writer agree about both the codec and the
+timezone.
 
 ## Cursors, in one place
 

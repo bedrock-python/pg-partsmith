@@ -54,7 +54,7 @@ class PostgresPartitionRepository:
         drop_retry_delay: float = DEFAULT_DROP_RETRY_DELAY,
         drop_max_backoff: float = DEFAULT_DROP_MAX_BACKOFF,
     ) -> None:
-        marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
+        marker_prefix = self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
         ddl_timeout_seconds = validate_ddl_timeout(ddl_timeout_seconds)
         self._ddl_timezone = validate_timezone(ddl_timezone)
         drop_lock_timeout_ms = validate_int(drop_lock_timeout_ms, "drop_lock_timeout_ms", min_val=0)
@@ -83,6 +83,11 @@ class PostgresPartitionRepository:
             creator=self._creator,
             allow_unmanaged=bool(drop_allow_unmanaged),
         )
+
+    @property
+    def marker_prefix(self) -> str:
+        """Prefix of the COMMENT marker stamped on detach and verified before a drop."""
+        return self._marker_prefix
 
     @property
     def ddl_timezone(self) -> str | None:

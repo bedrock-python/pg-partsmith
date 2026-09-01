@@ -448,11 +448,17 @@ class DropPartition(OperationBase):
         detached_at: When it was detached, when known.
         follows_detach: True when the detach happens in the same plan; the
             drop is skipped if that detach did not go through.
+        bounds: How the partition was bound in its parent, when that is known.
+            ``DETACH`` clears ``relpartbound``, so an orphan detached by an
+            earlier run has no bounds left in the catalog; what is reported
+            then is the window its name decodes to, which is the same reading
+            the drop policy was decided on. None when the name does not decode.
     """
 
     kind_name: Literal["drop"] = Field(default="drop", alias="kind")
     detached_at: datetime | None = None
     follows_detach: bool = False
+    bounds: PartitionBounds | None = None
 
     model_config = ConfigDict(frozen=True, populate_by_name=True)
 

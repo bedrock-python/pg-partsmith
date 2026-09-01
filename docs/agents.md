@@ -117,6 +117,12 @@ Constructor options worth knowing:
 * `RedisDistributedLockManager(redis_client, prefix=…, ttl_seconds=300, acquire_min_interval_seconds=0.0)`
   — needs the `redis-locks` extra; renews itself while long DDL runs.
 
+`marker_prefix` must be the same on the repository and the provider — the first writes the
+ownership marker, the second finds it — and `PartitionLifecycleService` refuses a pair that
+disagrees. The provider's `boundary_codec` and `ddl_timezone` are used by
+`is_partition_closed` alone, which also takes `boundaries=config.time_boundaries` and reads
+both from there instead.
+
 ## Configuration
 
 `TablePartitionConfig` is a frozen Pydantic model with `extra="forbid"`: an unknown keyword

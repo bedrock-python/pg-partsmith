@@ -30,7 +30,7 @@ Operations are typed, ordered as they must execute, and nested where order matte
 | `CreatePartition` | create a partition, build its subtree, attach it | `parent_name`, `bounds`, `partition_by` (for a branch), `children`, `counts_as` |
 | `AttachPartition` | re-attach a detached orphan whose window is wanted again | `parent_name`, `bounds` |
 | `DetachPartition` | detach an expired partition, subtree included | `parent_name`, `mode`, `oid` |
-| `DropPartition` | drop a detached, marker-tagged orphan | `oid`, `detached_at`, `follows_detach` |
+| `DropPartition` | drop a detached, marker-tagged orphan | `oid`, `detached_at`, `follows_detach`, `bounds` |
 
 Creations come first (each with its subtree inside it), then re-attachments, then
 detaches, then drops. Every operation records:

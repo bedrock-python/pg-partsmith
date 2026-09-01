@@ -144,6 +144,12 @@ drop_max_retries=3, drop_retry_delay=0.5, drop_max_backoff=300)`.
 `PostgresMetadataProvider(engine, *, marker_prefix=None, boundary_codec=None,
 ddl_timezone=None)`.
 
+`marker_prefix` must be the same on the repository and the provider — the first writes the
+ownership marker, the second finds it — and `PartitionLifecycleService` refuses a pair that
+disagrees. The provider's `boundary_codec` and `ddl_timezone` are used by
+`is_partition_closed` alone, which also takes `boundaries=config.time_boundaries` and reads
+both from there instead.
+
 `PostgresAdvisoryLockManager(engine, prefix="partitioner", acquire_min_interval_seconds=0)`;
 `RedisDistributedLockManager(redis_client, prefix="partitioner:lock", ttl_seconds=300,
 acquire_min_interval_seconds=0)`.

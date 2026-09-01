@@ -31,6 +31,7 @@ from pg_partsmith.utils import (
     validate_ddl_timeout,
     validate_float,
     validate_int,
+    validate_marker_alignment,
     validate_timezone,
     validate_timezone_alignment,
 )
@@ -57,6 +58,13 @@ class _Repository:
 
     def __init__(self, ddl_timezone: object) -> None:
         self.ddl_timezone = ddl_timezone
+
+
+class _Marked:
+    """A repository or metadata provider declaring the prefix it marks orphans with."""
+
+    def __init__(self, marker_prefix: object) -> None:
+        self.marker_prefix = marker_prefix
 
 
 class _AsyncpgError:
@@ -695,6 +703,31 @@ def test__timezone_name__keyless_tzinfo_like_object__raises_value_error() -> Non
     # Arrange / Act / Assert
     with pytest.raises(ValueError, match="Unsupported timezone"):
         timezone_name(_KeylessTz())
+
+
+# -- validate_marker_alignment --------------------------------------------------------------
+
+
+def test__validate_marker_alignment__same_prefix__passes() -> None:
+    # Arrange / Act / Assert
+    validate_marker_alignment(_Marked("app:orphan-parent="), _Marked("app:orphan-parent="))
+
+
+def test__validate_marker_alignment__different_prefixes__raises_value_error() -> None:
+    # Arrange / Act / Assert -- partitions detached under one are invisible to the other
+    with pytest.raises(ValueError, match="Orphan marker mismatch"):
+        validate_marker_alignment(_Marked("app:orphan-parent="), _Marked("pg-partsmith:orphan-parent="))
+
+
+def test__validate_marker_alignment__components_without_a_prefix__not_checked() -> None:
+    # Arrange / Act / Assert -- a custom repository or a stub is trusted
+    validate_marker_alignment(object(), _Marked("app:"))
+    validate_marker_alignment(_Marked("app:"), object())
+
+
+def test__validate_marker_alignment__prefix_that_is_not_a_string__not_checked() -> None:
+    # Arrange / Act / Assert -- runtime protocols only verify attribute presence
+    validate_marker_alignment(_Marked(123), _Marked("app:"))
 
 
 # -- validate_timezone_alignment ------------------------------------------------------------

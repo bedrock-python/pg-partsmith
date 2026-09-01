@@ -48,6 +48,38 @@ service = PartitionLifecycleService(repo, metadata, locks, hooks=[ArchiveHooks(a
 Hooks are called in the order given; pass several for notifications, metrics and audit
 logs.
 
+### What a drop hook can know
+
+`before_detach` is handed the whole `PartitionInfo`, bounds included, because the
+partition is still attached and the catalog still describes it. `DETACH` clears
+`relpartbound`, so by drop time — usually a later run, after the grace — the database no
+longer records where the partition sat; its name is what is left. Two ways to get the
+window back, neither of them a catalog query:
+
+```python
+class ExportHooks(BasePartitionLifecycleHooks):
+    def __init__(self, config: TablePartitionConfig) -> None:
+        self._boundaries = config.time_boundaries          # the object that made the bounds
+
+    async def before_drop(self, table_name: str, partition_name: str) -> None:
+        _, relname = split_qualified_name(partition_name)
+        window = self._boundaries.parse_child_name(relname)   # None if the name is not ours
+        await self._archive.finalize(partition_name, covering=window)
+```
+
+Or take the plan apart before applying it — every `DropPartition` carries the bounds it
+was planned with, plus `detached_at`, the OID and any size the policy measured:
+
+```python
+plan = await service.plan(config)
+for drop in plan.drops:
+    await archive.finalize(drop.target, covering=drop.bounds, size=drop.size_bytes)
+await service.apply(config, plan)
+```
+
+This is the same reading the planner itself used to decide the drop, so the two cannot
+disagree.
+
 ## The grace period
 
 ```python
@@ -112,8 +144,15 @@ if await metadata.is_partition_closed(partition_name, settle_seconds=900):
 ```
 
 The check runs `now()` on the server, so replica lag and application clock skew do not
-skew it. With an encoded key (UUIDv7, epoch) pass the codec to
-`PostgresMetadataProvider(boundary_codec=…)`.
+skew it. Reading a bound back needs the same timezone and codec that wrote it, so hand it
+the table's own boundaries and the question cannot be asked with the wrong ones:
+
+```python
+await metadata.is_partition_closed(name, settle_seconds=900, boundaries=config.time_boundaries)
+```
+
+Without that argument the provider's own `ddl_timezone` and `boundary_codec` decide, which
+is only safe if they were constructed to match the table.
 
 ## Cold tiering instead of dropping
 

@@ -93,6 +93,7 @@ from .planner import PlanMode, PlanningContext, plan_maintenance
 from .protocols import (
     BoundaryDecoder,
     DdlTimezoneAware,
+    OrphanMarkerAware,
     PeriodCalculator,
     PositionedCalculator,
     TimezoneAwareCalculator,
@@ -171,6 +172,7 @@ __all__ = [
     "Operation",
     "OperationCapabilities",
     "OperationKind",
+    "OrphanMarkerAware",
     "PartitionAlreadyExistsError",
     "PartitionAttachedError",
     "PartitionBounds",

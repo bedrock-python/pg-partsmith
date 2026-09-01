@@ -13,7 +13,7 @@ from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.plan import CreatePartition, DetachPartition, DropPartition, MaintenancePlan, OperationKind, Reason
 from pg_partsmith.planner import PlanMode, plan_maintenance
 from pg_partsmith.scheme import RangePartitioning
-from pg_partsmith.utils import validate_timezone_alignment
+from pg_partsmith.utils import validate_marker_alignment, validate_timezone_alignment
 
 from .services.execution import PlanExecutor
 from .services.inspection import PartitionInspector
@@ -58,7 +58,12 @@ class PartitionLifecycleService:
             metadata: Read-only access to PostgreSQL catalog data.
             locks: Distributed lock manager preventing concurrent maintenance runs.
             hooks: Optional list of lifecycle hooks called around each step.
+
+        Raises:
+            ValueError: If the repository and the metadata provider disagree
+                about the orphan marker prefix.
         """
+        validate_marker_alignment(repo, metadata)
         self._repo = repo
         self._metadata = metadata
         self._locks = locks

@@ -70,8 +70,11 @@ class ReplicaMetadata(PostgresMetadataProvider):
         super().__init__(replica_engine, **kwargs)
 ```
 
-Constructor knobs: `marker_prefix` (pass the repository's), `boundary_codec` (only for
-`is_partition_closed`), `ddl_timezone` (for reading naive bounds).
+Constructor knobs: `marker_prefix` (pass the repository's — the service refuses a pair
+that disagrees), `boundary_codec` (only for `is_partition_closed`), `ddl_timezone` (for
+reading naive bounds). Rather than keeping the last two in step with each table by hand,
+pass the table's boundaries to the one method that uses them:
+`is_partition_closed(name, boundaries=config.time_boundaries)`.
 
 The protocol's reads: `get_partition_type`, `get_partition_columns`, `get_actual_tree`,
 `measure`, `get_partition_tree`, `get_default_partition`, `partition_exists`,
