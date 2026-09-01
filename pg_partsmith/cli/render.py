@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from pg_partsmith.plan import MaintenancePlan
     from pg_partsmith.topology import ActualTree, PartitionNode
 
-__all__ = ["OUTPUT_VERSION", "describe_tree", "envelope", "plan_entry", "to_json", "tree_entry"]
+__all__ = ["OUTPUT_VERSION", "describe_locks", "describe_tree", "envelope", "plan_entry", "to_json", "tree_entry"]
 
 OUTPUT_VERSION = 1
 """Schema version of the JSON envelope, so a reader can tell what it is holding."""
@@ -57,6 +57,24 @@ def tree_entry(table_name: str, tree: ActualTree | None) -> dict[str, Any]:
         "table": table_name,
         "tree": None if tree is None else tree.model_dump(mode="json", by_alias=True),
     }
+
+
+def describe_locks(plan: MaintenancePlan) -> str:
+    """What each operation will lock, which is what a window is scheduled around.
+
+    One line per top-level operation. A subtree is built detached and attached
+    once, so its children take nothing the parent's line does not already say.
+    An operation that cannot run in a transaction block says so: it is the one
+    a crash leaves half-done, and the next run completes.
+    """
+    if plan.is_noop:
+        return "locks: none, nothing to do"
+    lines = ["locks:"]
+    for op in plan.operations:
+        transactional = "" if op.capabilities.transactional else " (outside a transaction block)"
+        lines.append(f"  {op.kind.value.upper()} {op.target}{transactional}")
+        lines.append(f"    {op.capabilities.lock}")
+    return "\n".join(lines)
 
 
 def describe_tree(tree: ActualTree) -> str:

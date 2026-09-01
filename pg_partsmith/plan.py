@@ -18,7 +18,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from .exceptions import PlanConfigMismatchError
 from .lifecycle import DetachMode
@@ -294,11 +294,17 @@ class OperationBase(BaseModel):
         """The DDL family."""
         raise NotImplementedError
 
+    # Serialized, not only computed: the lock an operation takes is what an
+    # operator reads before scheduling a window, and a plan written to a file
+    # is exactly the plan they read it off. Each subclass overrides the
+    # property; the dump takes the override.
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def capabilities(self) -> OperationCapabilities:
         """How the operation may be executed."""
         raise NotImplementedError
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def is_destructive(self) -> bool:
         """True for operations that remove a partition from service."""

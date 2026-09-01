@@ -24,13 +24,15 @@ from pg_partsmith.cli.loader import (
     select_configs,
 )
 from pg_partsmith.cli.main import _hooks as _cli_hooks
-from pg_partsmith.cli.render import envelope, plan_entry
+from pg_partsmith.cli.render import describe_locks, envelope, plan_entry
 from pg_partsmith.document import PartitionsDocument
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult
 from pg_partsmith.events import HookPhase
 from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import (
     CreatePartition,
+    DetachPartition,
     DropPartition,
     Finding,
     FindingReason,
@@ -501,3 +503,59 @@ def test__hooks__allowed__are_built_from_the_document(tmp_path: Path) -> None:
     # Assert
     assert hooks is not None
     assert hooks[0].phases == (HookPhase.BEFORE_DROP,)
+
+
+# ── What a plan will lock ───────────────────────────────────────────────────────
+
+
+def test__describe_locks__names_the_heaviest_lock_of_every_top_level_operation() -> None:
+    # Arrange
+    plan = _destructive_plan()
+
+    # Act
+    lines = describe_locks(plan).splitlines()
+
+    # Assert: one header line per operation, its lock on the next
+    assert lines[0] == "locks:"
+    assert lines[1].startswith("  CREATE public.events__2026_09")
+    assert "SHARE UPDATE EXCLUSIVE on the parent" in lines[2]
+    assert lines[3].startswith("  DROP public.events__2025_08")
+    assert "ACCESS EXCLUSIVE on the dropped table only" in lines[4]
+
+
+def test__describe_locks__an_operation_that_cannot_run_in_a_transaction__says_so() -> None:
+    # The one a crash leaves half-done, which is worth knowing before a window.
+    plan = MaintenancePlan(
+        table_name="public.events",
+        generated_at=NOW,
+        operations=(
+            DetachPartition(
+                target="public.events__2025_08",
+                parent_name="public.events",
+                reason=Reason.RETENTION_EXPIRED,
+                mode=DetachMode.CONCURRENT,
+            ),
+        ),
+    )
+
+    # Act / Assert
+    assert "(outside a transaction block)" in describe_locks(plan).splitlines()[1]
+
+
+def test__describe_locks__a_converged_table__has_nothing_to_lock() -> None:
+    # Arrange / Act / Assert
+    assert describe_locks(_plan(noop=True)) == "locks: none, nothing to do"
+
+
+async def test__plan__locks__are_printed_after_the_operations_only_when_asked() -> None:
+    # Arrange
+    kit = _kit(_plan())
+
+    # Act
+    without = (await run_plan(kit, _configs(), check=False)).render(output="human")
+    with_locks = (await run_plan(kit, _configs(), check=False, locks=True)).render(output="human")
+
+    # Assert
+    assert "locks:" not in without
+    assert "locks:" in with_locks
+    assert "SHARE UPDATE EXCLUSIVE" in with_locks

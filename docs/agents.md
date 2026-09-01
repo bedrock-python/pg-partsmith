@@ -63,7 +63,8 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
   5 connection, 6 lock held, 1 unexpected. `--output json` is the model dump under a
   versioned envelope; `--output metrics` is Prometheus text exposition for a node_exporter
-  textfile, all gauges, prefixed `pg_partsmith_`. See `guide/cli.md`.
+  textfile, all gauges, prefixed `pg_partsmith_`; `plan --locks` prints the heaviest lock
+  each operation takes. There is deliberately no `--sql`. See `guide/cli.md`.
 * `CommandHooks` (both mirrors) runs a configured command per phase with the
   `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. In a document
   it is the `hooks` section, honoured only under `apply --allow-hooks`. Hooks never fire
@@ -277,6 +278,10 @@ On a `MaintenancePlan`: `.operations`, `.findings`, `.cursors`, `.generated_at`,
 `.config_fingerprint`, `.creates` / `.attaches` / `.detaches` / `.drops`, `.is_noop`,
 `.only(*kinds)`, `.without(*kinds)`, `.describe()`. Filtering a plan and applying the rest
 is supported and is how you split creation from pruning across schedules.
+
+Every operation dumps its `capabilities` (the heaviest lock it takes, and whether it can
+run in a transaction block) and `is_destructive` beside its fields; both are computed on the
+way out and ignored on the way in, so the round trip holds.
 
 Serialize a plan with `model_dump_json(by_alias=True)` — the same vocabulary a
 configuration uses (`kind`, `method`, `schema`) — and read it back with

@@ -102,6 +102,41 @@ versioned envelope, in the vocabulary a configuration file is written in:
 It is the dump, never a shape assembled by the CLI — a hand-rolled one drifts from the
 library the first time a field is added. Logs go to stderr, so stdout stays parseable.
 
+## What will it lock
+
+```bash
+pg-partsmith plan -c partitions.yaml --locks
+```
+
+```
+plan for public.events at 2026-09-01T02:15:00+00:00
+  CREATE public.events__2026_10 (create_ahead)
+  DETACH public.events__2025_08 (retention_expired) size=1073741824 rows~4021553
+  DROP public.events__2025_08 (follows_detach)
+locks:
+  CREATE public.events__2026_10
+    ACCESS SHARE on the template during CREATE; SHARE UPDATE EXCLUSIVE on the parent and ACCESS EXCLUSIVE on the new partition (and on a DEFAULT sibling) during ATTACH; SHARE ROW EXCLUSIVE on every table referencing the parent through a foreign key
+  DETACH public.events__2025_08 (outside a transaction block)
+    SHARE UPDATE EXCLUSIVE on the parent (CONCURRENTLY), ACCESS EXCLUSIVE on the partition and, in the second transaction, on every table referencing the parent through a foreign key; ...
+  DROP public.events__2025_08
+    ACCESS EXCLUSIVE on the dropped table only
+```
+
+The heaviest lock each operation takes, and on what, as measured on PostgreSQL 15 and 17
+— the thing a DBA reads before agreeing to a window. An operation that cannot run inside a
+transaction block is marked, because it is the one a crash leaves half-done and the next
+run completes. The JSON carries the same under each operation's `capabilities`, and
+`is_destructive` beside it, whether or not `--locks` was asked for; a saved plan is
+therefore reviewable for its locks without the CLI.
+
+**Why there is no `--sql`.** Printing the statements would be the obvious next thing, and
+it is deliberately not offered. The DDL is built at execution time from decisions that are
+only made then — whether a `DETACH CONCURRENTLY` has to fall back to the blocking form
+because a DEFAULT sibling exists, how rows a DEFAULT partition holds for a new window get
+moved, which orphan marker gets cleared — and a rendering that left those out would be
+read as a transcript in exactly the cases a review exists to catch. The plan is the
+contract: what, why, how big, what it locks.
+
 ## Monitoring, for free
 
 `--output metrics` renders the same run as Prometheus text exposition, for a node_exporter

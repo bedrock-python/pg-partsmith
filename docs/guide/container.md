@@ -101,8 +101,8 @@ Two things worth knowing before you point it at production:
   while planning. It is read-only, but it is your statement running with these
   credentials.
 - **`apply` takes locks.** Every operation in a plan reports the heaviest lock it takes;
-  `plan --output json` carries that per operation, which is the thing to read before
-  scheduling a window.
+  `plan --locks` prints it and `plan --output json` carries it per operation under
+  `capabilities`, which is the thing to read before scheduling a window.
 
 ## Tags
 

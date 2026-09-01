@@ -699,3 +699,23 @@ def test__validate_plan_for_config__plan_without_a_fingerprint__is_checked_for_i
     validate_plan_for_config(_config(), plan)
     with pytest.raises(PlanConfigMismatchError):
         validate_plan_for_config(_config(schema="archive"), plan)
+
+
+def test__model_dump__carries_the_lock_each_operation_takes() -> None:
+    # A plan written to a file is what an operator reads before agreeing to a
+    # window, so what each operation locks is in the dump, not only on the object.
+    dumped = json.loads(FULL_PLAN.model_dump_json(by_alias=True))
+
+    # Assert
+    by_kind = {op["kind"]: op for op in dumped["operations"]}
+    assert "ACCESS EXCLUSIVE on the dropped table only" in by_kind["drop"]["capabilities"]["lock"]
+    assert by_kind["detach"]["capabilities"]["transactional"] is False
+    assert by_kind["drop"]["is_destructive"] is True
+    assert by_kind["create"]["is_destructive"] is False
+    # and a subtree member says so as well
+    assert "capabilities" in by_kind["create"]["children"][0]
+
+
+def test__model_validate__a_dump_carrying_capabilities__reads_back_as_the_same_plan() -> None:
+    # Computed on the way out, ignored on the way in: the round trip holds.
+    assert MaintenancePlan.model_validate_json(FULL_PLAN.model_dump_json(by_alias=True)) == FULL_PLAN

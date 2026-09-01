@@ -165,6 +165,20 @@ Both mirrors run the command through one implementation, so it does not depend o
 event loop being able to spawn processes — a hook that works in production works on a
 developer's machine too.
 
+### What a plan will lock
+
+Every operation now serializes its `capabilities` — the heaviest lock it takes and on
+what, and whether it can run inside a transaction block — and `is_destructive` beside its
+fields. They were on the object before and not in the dump, which meant a plan written to
+a file lost the one thing a DBA reads before agreeing to a window. Both are computed on
+the way out and ignored on the way in, so the round trip holds. `plan --locks` prints the
+same for a person.
+
+There is deliberately no `--sql`. The DDL is built at execution time from decisions only
+made then — a concurrent detach falling back to the blocking form, rows moved out of a
+DEFAULT partition, an orphan marker cleared — and a rendering without them would be
+read as a transcript in exactly the cases a review exists to catch.
+
 ### Monitoring, for free
 
 `--output metrics` renders any command as Prometheus text exposition for a node_exporter

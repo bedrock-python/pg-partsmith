@@ -82,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="write the plan to FILE, for review and for `apply --plan FILE`",
             )
+            sub.add_argument(
+                "--locks",
+                action="store_true",
+                help="after each operation, the heaviest lock it takes and on what",
+            )
         if name == "apply":
             _add_apply_arguments(sub)
 
@@ -138,7 +143,7 @@ async def _run(args: argparse.Namespace) -> CommandResult:
         if args.command == "inspect":
             return await run_inspect(kit, configs)
         if args.command == "plan":
-            result = await run_plan(kit, configs, check=args.check)
+            result = await run_plan(kit, configs, check=args.check, locks=args.locks)
             if args.save:
                 _save_plan(Path(args.save), result)
             return result

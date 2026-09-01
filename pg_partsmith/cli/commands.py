@@ -19,7 +19,7 @@ from pg_partsmith.plan import MaintenancePlan, OperationKind
 from .exit_codes import ExitCode
 from .loader import ConfigError
 from .metrics import render_metrics
-from .render import describe_tree, envelope, plan_entry, to_json, tree_entry
+from .render import describe_locks, describe_tree, envelope, plan_entry, to_json, tree_entry
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -80,12 +80,18 @@ async def run_inspect(kit: PartitionToolkit, configs: Sequence[TablePartitionCon
     return CommandResult(code=code, lines=blocks, payload=envelope("inspect", entries))
 
 
-async def run_plan(kit: PartitionToolkit, configs: Sequence[TablePartitionConfig], *, check: bool) -> CommandResult:
+async def run_plan(
+    kit: PartitionToolkit, configs: Sequence[TablePartitionConfig], *, check: bool, locks: bool = False
+) -> CommandResult:
     """Plan every selected table, and issue no DDL doing it.
 
     With ``check``, pending operations are drift and are exited on, which is
     what lets an alert say "maintenance has not been running". A finding
     outranks that: drift is what a run fixes, a finding is what it cannot.
+
+    With ``locks``, each operation is followed by the heaviest lock it takes
+    and on what -- the thing a DBA reads before agreeing to a window. The JSON
+    carries the same under ``capabilities`` whether or not it was asked for.
     """
     blocks: list[str] = []
     entries: list[dict[str, Any]] = []
@@ -94,7 +100,7 @@ async def run_plan(kit: PartitionToolkit, configs: Sequence[TablePartitionConfig
     for config in configs:
         plan = await kit.service.plan(config)
         entries.append(plan_entry(plan))
-        blocks.append(plan.describe())
+        blocks.append(plan.describe() + ("\n" + describe_locks(plan) if locks else ""))
         drift = drift or not plan.is_noop
         findings = findings or bool(plan.actionable_findings)
 
