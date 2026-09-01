@@ -55,10 +55,14 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
 * `PartitionToolkit.from_engine(engine, ...)` builds the repository, the metadata provider,
   the locks, the service and the maintainer around one engine, giving each setting that
   belongs to two of them (`marker_prefix`, `ddl_timezone`, `boundary_codec`) exactly once.
-* `pg-partsmith` (extra `cli`) runs `inspect` / `plan` / `validate` over a document and a
-  DSN, read-only. Exit codes: 0 nothing pending, 2 drift under `plan --check`, 3 findings,
-  4 configuration, 5 connection, 6 lock held, 1 unexpected. `--output json` is the model
-  dump under a versioned envelope. See `guide/cli.md`.
+* `pg-partsmith` (extra `cli`) runs `inspect` / `plan` / `validate` / `apply` over a
+  document and a DSN. The first three issue no DDL; `apply` withholds detaches and drops
+  unless `--allow-destructive`. `plan --save FILE` writes the artifact `apply --plan FILE`
+  reads back, and applying it is refused if it was made for another table or under a
+  configuration that has since changed (`--allow-config-drift` overrides). Exit codes: 0
+  nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
+  5 connection, 6 lock held, 1 unexpected. `--output json` is the model dump under a
+  versioned envelope. See `guide/cli.md`.
 * `PartitionsDocument` is several tables and their wiring as one validated model — what a
   YAML or JSON file parses into. `document.configs()` gives every `TablePartitionConfig`,
   `document.config_for(name)` one of them, and

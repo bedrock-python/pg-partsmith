@@ -13,12 +13,29 @@ import pytest
 
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.cli import ExitCode, main
-from pg_partsmith.cli.commands import run_plan, run_validate
-from pg_partsmith.cli.loader import DSN_ENV_VAR, ConfigError, async_url, load_document, resolve_dsn, select_configs
+from pg_partsmith.cli.commands import run_apply, run_plan, run_validate
+from pg_partsmith.cli.loader import (
+    DSN_ENV_VAR,
+    ConfigError,
+    async_url,
+    load_document,
+    load_plans,
+    resolve_dsn,
+    select_configs,
+)
 from pg_partsmith.cli.render import envelope, plan_entry
 from pg_partsmith.document import PartitionsDocument
+from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult
 from pg_partsmith.exceptions import InvalidPartitionConfigError
-from pg_partsmith.plan import CreatePartition, Finding, FindingReason, MaintenancePlan, Reason, Severity
+from pg_partsmith.plan import (
+    CreatePartition,
+    DropPartition,
+    Finding,
+    FindingReason,
+    MaintenancePlan,
+    Reason,
+    Severity,
+)
 from pg_partsmith.topology import RangeBounds
 
 if TYPE_CHECKING:
@@ -193,7 +210,7 @@ def test__select_configs__a_name_the_document_does_not_have__lists_the_ones_it_d
 
 async def test__plan__a_converged_table__exits_ok_even_under_check() -> None:
     # Arrange / Act
-    result = await run_plan(_kit(_plan(noop=True)), _configs(), as_json=False, check=True)
+    result = await run_plan(_kit(_plan(noop=True)), _configs(), check=True)
 
     # Assert
     assert result.code is ExitCode.OK
@@ -204,8 +221,8 @@ async def test__plan__pending_operations__are_drift_only_when_asked_to_check() -
     kit = _kit(_plan())
 
     # Act / Assert: a plan is a report by default; --check is what alerts
-    assert (await run_plan(kit, _configs(), as_json=False, check=False)).code is ExitCode.OK
-    assert (await run_plan(kit, _configs(), as_json=False, check=True)).code is ExitCode.DRIFT
+    assert (await run_plan(kit, _configs(), check=False)).code is ExitCode.OK
+    assert (await run_plan(kit, _configs(), check=True)).code is ExitCode.DRIFT
 
 
 async def test__plan__an_actionable_finding__outranks_drift() -> None:
@@ -218,7 +235,7 @@ async def test__plan__an_actionable_finding__outranks_drift() -> None:
     )
 
     # Act
-    result = await run_plan(_kit(_plan(findings=(finding,))), _configs(), as_json=False, check=True)
+    result = await run_plan(_kit(_plan(findings=(finding,))), _configs(), check=True)
 
     # Assert
     assert result.code is ExitCode.FINDINGS
@@ -226,7 +243,7 @@ async def test__plan__an_actionable_finding__outranks_drift() -> None:
 
 async def test__plan__json__is_the_model_dump_under_a_versioned_envelope() -> None:
     # Arrange / Act
-    result = await run_plan(_kit(_plan()), _configs(), as_json=True, check=False)
+    result = await run_plan(_kit(_plan()), _configs(), check=False)
     payload = json.loads(result.render(as_json=True))
 
     # Assert: the vocabulary a configuration file is written in, not one of ours
@@ -247,7 +264,7 @@ async def test__validate__a_table_the_catalog_disagrees_with__exits_config(monke
     _validation(monkeypatch, error=InvalidPartitionConfigError("Table 'public.events' is not partitioned"))
 
     # Act
-    result = await run_validate(MagicMock(), _configs(), as_json=True)
+    result = await run_validate(MagicMock(), _configs())
 
     # Assert
     assert result.code is ExitCode.CONFIG
@@ -259,7 +276,7 @@ async def test__validate__a_table_the_catalog_agrees_with__exits_ok(monkeypatch:
     _validation(monkeypatch)
 
     # Act
-    result = await run_validate(MagicMock(), _configs(), as_json=True)
+    result = await run_validate(MagicMock(), _configs())
 
     # Assert
     assert result.code is ExitCode.OK
@@ -303,3 +320,140 @@ def test__plan_entry__names_the_table_beside_the_plan() -> None:
     # Assert
     assert entry["table"] == "public.events"
     assert entry["plan"]["table_name"] == "public.events"
+
+
+# ── Applying ────────────────────────────────────────────────────────────────────
+
+
+def _applying_kit(result: MaintenanceResult | None = None) -> MagicMock:
+    kit = MagicMock()
+    answer = result if result is not None else MaintenanceResult(created_count=1)
+    kit.service.apply = AsyncMock(return_value=answer)
+    kit.service.maintain = AsyncMock(return_value=answer)
+    return kit
+
+
+def _destructive_plan() -> MaintenancePlan:
+    return MaintenancePlan(
+        table_name="public.events",
+        generated_at=NOW,
+        operations=(
+            CreatePartition(
+                target="public.events__2026_09",
+                parent_name="public.events",
+                bounds=RangeBounds(from_value="2026-09-01", to_value="2026-10-01"),
+                reason=Reason.CREATE_AHEAD,
+            ),
+            DropPartition(target="public.events__2025_08", reason=Reason.GRACE_ELAPSED, oid=7),
+        ),
+    )
+
+
+async def test__apply__by_default__withholds_every_destructive_operation() -> None:
+    # Arrange: the safe mode is the default one, not a second mode to remember
+    kit = _applying_kit()
+
+    # Act
+    result = await run_apply(kit, _configs(), plans={"public.events": _destructive_plan()})
+
+    # Assert
+    applied = kit.service.apply.await_args.args[1]
+    assert [op.kind.value for op in applied.operations] == ["create"]
+    assert "--allow-destructive" in result.render(as_json=False)
+
+
+async def test__apply__allow_destructive__carries_the_drop_out_too() -> None:
+    # Arrange
+    kit = _applying_kit()
+
+    # Act
+    await run_apply(kit, _configs(), plans={"public.events": _destructive_plan()}, allow_destructive=True)
+
+    # Assert
+    applied = kit.service.apply.await_args.args[1]
+    assert [op.kind.value for op in applied.operations] == ["create", "drop"]
+
+
+async def test__apply__without_a_plan_file__plans_and_applies_under_one_lock() -> None:
+    # Arrange: that is what maintain() is for, and it finalizes a detach that
+    # was interrupted before deciding the rest of the run.
+    kit = _applying_kit()
+
+    # Act
+    await run_apply(kit, _configs())
+
+    # Assert
+    kit.service.apply.assert_not_awaited()
+    assert kit.service.maintain.await_args.kwargs == {
+        "skip_detach": True,
+        "skip_drop": True,
+        "continue_on_error": False,
+    }
+
+
+async def test__apply__a_plan_file_with_nothing_for_the_table__says_what_it_holds() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ConfigError, match=re.escape("public.audit")):
+        await run_apply(_applying_kit(), _configs(), plans={"public.audit": _plan()})
+
+
+async def test__apply__issues_reported_by_the_run__exit_findings() -> None:
+    # Arrange
+    issue = MaintenanceIssue(step=MaintenanceIssueStep.DROP, partition_name="public.events__2025_08", error="refused")
+    kit = _applying_kit(MaintenanceResult(created_count=1, issues=(issue,)))
+
+    # Act
+    result = await run_apply(kit, _configs())
+
+    # Assert
+    assert result.code is ExitCode.FINDINGS
+    assert "refused" in result.render(as_json=False)
+
+
+async def test__apply__json__carries_the_plan_beside_the_result() -> None:
+    # The result excludes its plan from serialization, so an audit log would
+    # otherwise get counters with nothing saying what they counted.
+    kit = _applying_kit()
+
+    # Act
+    result = await run_apply(kit, _configs(), plans={"public.events": _plan()})
+    payload = json.loads(result.render(as_json=True))
+
+    # Assert
+    entry = payload["tables"][0]
+    assert entry["result"]["created_count"] == 1
+    assert entry["plan"]["operations"][0]["kind"] == "create"
+
+
+def test__load_plans__a_file_plan_save_wrote__reads_back_as_the_plan(tmp_path: Path) -> None:
+    # Arrange
+    saved = envelope("plan", [plan_entry(_plan())])
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+
+    # Act
+    plans = load_plans(path)
+
+    # Assert
+    assert plans["public.events"] == _plan()
+
+
+def test__load_plans__a_version_this_does_not_read__is_refused(tmp_path: Path) -> None:
+    # Arrange
+    saved = {**envelope("plan", [plan_entry(_plan())]), "version": 99}
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+
+    # Act / Assert: half-reading a future format is worse than refusing it
+    with pytest.raises(ConfigError, match="version 99"):
+        load_plans(path)
+
+
+def test__load_plans__something_that_is_not_a_saved_plan__is_refused(tmp_path: Path) -> None:
+    # Arrange
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps({"version": 1, "command": "plan"}), encoding="utf-8")
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match="no 'tables'"):
+        load_plans(path)

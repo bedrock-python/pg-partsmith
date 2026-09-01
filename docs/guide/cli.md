@@ -4,7 +4,7 @@
 pip install "pg-partsmith[cli]"
 ```
 
-`pg-partsmith` runs the library's read-only half over a
+`pg-partsmith` runs partition maintenance over a
 [configuration document](../reference/document.md) and a DSN — no Python in your
 application, no import, no dependency on this library at all.
 
@@ -12,9 +12,11 @@ application, no import, no dependency on this library at all.
 pg-partsmith validate -c partitions.yaml     # does the document match the database?
 pg-partsmith inspect  -c partitions.yaml     # what tree actually exists?
 pg-partsmith plan     -c partitions.yaml     # what would maintenance do, and why?
+pg-partsmith apply    -c partitions.yaml     # do it — creations only, by default
 ```
 
-None of the three issues DDL, takes a lock, or fires a hook.
+The first three issue no DDL, take no lock and fire no hook. `apply` is the one that
+acts.
 
 ## Where the connection comes from
 
@@ -106,9 +108,55 @@ library the first time a field is added. Logs go to stderr, so stdout stays pars
 document answers to is an error naming the ones that do, rather than a silent run over
 nothing.
 
+## Applying
+
+```bash
+pg-partsmith apply -c partitions.yaml                        # create what is missing
+pg-partsmith apply -c partitions.yaml --allow-destructive    # …and retire what expired
+```
+
+**Destructive operations are withheld unless you ask for them.** Without
+`--allow-destructive`, `apply` creates and re-attaches, and detaches and drops nothing.
+That is deliberate: the safe behaviour is the default one rather than a second mode
+somebody has to remember to select, and it is exactly what an init container wants —
+create the partitions the application is about to write into, retire nothing at startup.
+
+With no `--plan`, planning and applying happen under one lock, which is also what
+completes an interrupted `DETACH … CONCURRENTLY` before the rest of the run is decided.
+
+`--continue-on-error` isolates a failed operation into the run's issues instead of
+aborting: a failed create still lets pruning run, a failed detach still lets existing
+orphans be dropped. Any issue makes the command exit `3`.
+
+## The plan as an artifact
+
+The reason to trust an external tool with `DROP` is that you can read what it will do
+first:
+
+```bash
+pg-partsmith plan  -c partitions.yaml --save plan.json     # zero DDL
+# read it, diff it, gate it on a human or a CI approval
+pg-partsmith apply -c partitions.yaml --plan plan.json --allow-destructive
+```
+
+`--save` writes the same JSON envelope `--output json` prints, whatever format the
+terminal was given. `apply --plan` reads it back and applies exactly that.
+
+Two things are checked before anything runs, by the library rather than by the CLI:
+
+- **The plan must be for this table.** A plan for `public.events` applied under the
+  configuration of `public.audit` is refused.
+- **The configuration must not have moved.** The plan records a fingerprint of the
+  configuration it was made under; if the document has been edited since, applying it is
+  refused with exit `4`. `--allow-config-drift` applies it as it stands.
+
+That second one is not the same as the OID revalidation every destructive operation
+already does. Revalidation asks whether the relation is still the same relation. The
+fingerprint asks whether the plan is still the same intent: a plan made under
+`retention_count: 12` names exactly the right partitions to expire, for a reason that
+stopped being true the moment someone wrote `120`.
+
 ## What is not here yet
 
-`apply`. `plan` and `apply` stay separable — the plan is the artifact between them, and
-the library already refuses a plan the configuration did not produce — but the applying
-half is not in this release. Until it is, run maintenance from Python and use these three
-to see it.
+`partition_data` and `unpartition` — the batched row-movement verbs — are library-only for
+now, because both want a progress story a one-shot command does not have yet.

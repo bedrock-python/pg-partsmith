@@ -1,8 +1,9 @@
 """The command line: argument parsing, the engine, and what the process exits with.
 
-Three read-only commands so far -- ``inspect``, ``plan`` and ``validate`` --
-none of which issues DDL. Logging goes to stderr so stdout stays parseable;
-``--output json`` is the models' own dump, so it cannot drift from the library.
+``inspect``, ``plan`` and ``validate`` issue no DDL; ``apply`` is the one that
+acts, and withholds every destructive operation unless it is asked for them.
+Logging goes to stderr so stdout stays parseable; ``--output json`` is the
+models' own dump, so it cannot drift from the library.
 
 The argument parser is the standard library's. The image this ships in is
 measured, and a dependency is a poor trade for a nicer ``--help``.
@@ -22,11 +23,20 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.aio import PartitionToolkit
-from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError
+from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError, PlanConfigMismatchError
 
-from .commands import CommandResult, run_inspect, run_plan, run_validate
+from .commands import CommandResult, run_apply, run_inspect, run_plan, run_validate
 from .exit_codes import ExitCode
-from .loader import DSN_ENV_VAR, ConfigError, async_url, load_document, resolve_dsn, select_configs
+from .loader import (
+    DSN_ENV_VAR,
+    ConfigError,
+    async_url,
+    load_document,
+    load_plans,
+    resolve_dsn,
+    select_configs,
+)
+from .render import to_json
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     """The whole command surface, as a parser."""
     parser = argparse.ArgumentParser(
         prog="pg-partsmith",
-        description="Plan and inspect PostgreSQL partition maintenance from a configuration document.",
+        description="Inspect, plan and run PostgreSQL partition maintenance from a configuration document.",
         epilog=(
             "Exit codes: 0 nothing pending, 2 drift found (plan --check), 3 findings need a human, "
             "4 configuration, 5 connection, 6 another maintainer holds the lock, 1 unexpected."
@@ -53,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("inspect", "read the partition tree that exists and print it"),
         ("plan", "show what maintenance would do, and why; issues no DDL"),
         ("validate", "check the document against the catalog; exits non-zero on a problem"),
+        ("apply", "carry out maintenance; creations only unless --allow-destructive"),
     ):
         sub = subcommands.add_parser(name, help=help_text, description=help_text)
         _add_common_arguments(sub)
@@ -62,6 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="exit 2 when any operation is pending, for alerting on maintenance that has stopped running",
             )
+            sub.add_argument(
+                "--save",
+                metavar="FILE",
+                default=None,
+                help="write the plan to FILE, for review and for `apply --plan FILE`",
+            )
+        if name == "apply":
+            _add_apply_arguments(sub)
 
     return parser
 
@@ -84,6 +103,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = asyncio.run(_run(args))
     except (ConfigError, InvalidPartitionConfigError) as exc:
+        return _failed(str(exc), ExitCode.CONFIG)
+    except PlanConfigMismatchError as exc:
         return _failed(str(exc), ExitCode.CONFIG)
     except LockAcquisitionError as exc:
         # An overlapping run is ordinary operation, not a failure to page on.
@@ -111,14 +132,62 @@ async def _run(args: argparse.Namespace) -> CommandResult:
     engine = create_async_engine(url)
     try:
         kit = PartitionToolkit.from_options(engine, document.runtime)
-        as_json = args.output == "json"
         if args.command == "inspect":
-            return await run_inspect(kit, configs, as_json=as_json)
+            return await run_inspect(kit, configs)
         if args.command == "plan":
-            return await run_plan(kit, configs, as_json=as_json, check=args.check)
-        return await run_validate(kit, configs, as_json=as_json)
+            result = await run_plan(kit, configs, check=args.check)
+            if args.save:
+                _save_plan(Path(args.save), result)
+            return result
+        if args.command == "apply":
+            return await run_apply(
+                kit,
+                configs,
+                plans=load_plans(Path(args.plan)) if args.plan else None,
+                allow_destructive=args.allow_destructive,
+                continue_on_error=args.continue_on_error,
+                allow_config_drift=args.allow_config_drift,
+            )
+        return await run_validate(kit, configs)
     finally:
         await engine.dispose()
+
+
+def _add_apply_arguments(parser: argparse.ArgumentParser) -> None:
+    """What only ``apply`` takes, including the two that decide how much it may do."""
+    parser.add_argument(
+        "--plan",
+        metavar="FILE",
+        default=None,
+        help="apply the plan saved in FILE instead of planning now; refused if it was not made from this document",
+    )
+    parser.add_argument(
+        "--allow-destructive",
+        action="store_true",
+        help="carry out detaches and drops as well; without it, only partitions are created",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="isolate a failed operation into the issues instead of aborting the run",
+    )
+    parser.add_argument(
+        "--allow-config-drift",
+        action="store_true",
+        help="apply a saved plan whose configuration has changed since it was made",
+    )
+
+
+def _save_plan(path: Path, result: CommandResult) -> None:
+    """Write the plan envelope where ``apply --plan`` can read it back.
+
+    Written whatever ``--output`` says: the file is the artifact between plan
+    and apply, and what a person reads on the terminal is a separate question.
+    """
+    if result.payload is None:  # pragma: no cover - every command builds one
+        msg = "the command produced no plan to save"
+        raise ConfigError(msg)
+    path.write_text(to_json(result.payload) + "\n", encoding="utf-8")
 
 
 def _failed(message: str, code: ExitCode) -> ExitCode:

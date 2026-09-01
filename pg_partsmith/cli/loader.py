@@ -15,13 +15,24 @@ from typing import Any
 
 from pg_partsmith.document import PartitionsDocument
 from pg_partsmith.entities import TablePartitionConfig
+from pg_partsmith.plan import MaintenancePlan
+
+from .render import OUTPUT_VERSION
 
 try:
     import yaml
 except ImportError:  # pragma: no cover - PyYAML is an extra; JSON documents work without it
     yaml = None  # type: ignore[assignment]
 
-__all__ = ["DSN_ENV_VAR", "ConfigError", "async_url", "load_document", "resolve_dsn", "select_configs"]
+__all__ = [
+    "DSN_ENV_VAR",
+    "ConfigError",
+    "async_url",
+    "load_document",
+    "load_plans",
+    "resolve_dsn",
+    "select_configs",
+]
 
 DSN_ENV_VAR = "PG_PARTSMITH_DSN"
 """Environment variable read when neither ``--dsn`` nor the document carries one."""
@@ -165,3 +176,53 @@ def _parse_yaml(text: str, path: Path) -> Any:
     except yaml.YAMLError as exc:
         msg = f"{path} is not valid YAML: {exc}"
         raise ConfigError(msg) from exc
+
+
+def load_plans(path: Path) -> dict[str, MaintenancePlan]:
+    """Read plans written by ``plan --save``, keyed by the table each is for.
+
+    The envelope carries its own version so a reader can tell what it is
+    holding; a file from a future format is refused rather than half-read.
+
+    Args:
+        path: The file ``plan --save`` wrote.
+
+    Returns:
+        One plan per table named in the file.
+
+    Raises:
+        ConfigError: If the file cannot be read, is not that envelope, or holds
+            a plan this version cannot validate.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        msg = f"Cannot read {path}: {exc.strerror or exc}"
+        raise ConfigError(msg) from exc
+    except json.JSONDecodeError as exc:
+        msg = f"{path} is not valid JSON: {exc}"
+        raise ConfigError(msg) from exc
+
+    if not isinstance(payload, dict) or "tables" not in payload:
+        msg = f"{path} is not a saved plan: it has no 'tables'"
+        raise ConfigError(msg)
+    version = payload.get("version")
+    if version != OUTPUT_VERSION:
+        msg = f"{path} is version {version!r}; this reads version {OUTPUT_VERSION}"
+        raise ConfigError(msg)
+
+    plans: dict[str, MaintenancePlan] = {}
+    for entry in payload["tables"]:
+        if not isinstance(entry, dict) or "plan" not in entry:
+            msg = f"{path} holds an entry with no plan in it"
+            raise ConfigError(msg)
+        try:
+            plan = MaintenancePlan.model_validate(entry["plan"])
+        except ValueError as exc:
+            msg = f"{path} holds a plan this version cannot read:\n{exc}"
+            raise ConfigError(msg) from exc
+        plans[plan.table_name] = plan
+    if not plans:
+        msg = f"{path} names no table"
+        raise ConfigError(msg)
+    return plans

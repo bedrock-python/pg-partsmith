@@ -135,9 +135,15 @@ what comes out of `plan` and what goes into a document are one vocabulary; logs 
 stderr. The connection comes from `--dsn`, then `$PG_PARTSMITH_DSN`, then the document.
 `--version` reads `pg_partsmith.__version__`: one number for the library and the CLI.
 
-`apply` is deliberately not in this release. The plan/apply split is what makes an
-external tool trustworthy with `DROP`, and the applying half ships once the artifact
-between them has been used in anger.
+`apply` carries maintenance out, and withholds every destructive operation unless
+`--allow-destructive` is given — the safe behaviour is the default one rather than a second
+mode to remember, and it is what an init container wants. With no `--plan` it plans and
+applies under one lock, which is also what finalizes an interrupted `DETACH CONCURRENTLY`.
+
+`plan --save FILE` writes the artifact between the two halves, and `apply --plan FILE`
+reads it back. Both guards from earlier in this release apply to it: a plan made for
+another table, or under a configuration that has since been edited, is refused with exit
+`4` unless `--allow-config-drift` is passed.
 
 ## [1.0.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...pg-partsmith-v1.0.0) (2026-09-01)
 

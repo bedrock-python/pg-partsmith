@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 
 from pg_partsmith.cli import ExitCode, main
-from tests.integration.aio.support import make_service, make_table
+from tests.integration.aio.support import exec_sql, make_service, make_table
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
 
 if TYPE_CHECKING:
@@ -49,6 +50,7 @@ def _document(tmp_path: Path, table: str, dsn: str, *, retention: int = 12) -> s
             }
         ],
     }
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "partitions.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return str(path)
@@ -56,6 +58,15 @@ def _document(tmp_path: Path, table: str, dsn: str, *, retention: int = 12) -> s
 
 def _dsn(db_engine: AsyncEngine) -> str:
     return db_engine.url.render_as_string(hide_password=False)
+
+
+async def _with_an_expired_partition(db_engine: AsyncEngine, table: str) -> None:
+    """Two live windows, and one long past any retention."""
+    await make_service(db_engine).maintain(monthly_config(table, create_ahead=2, retention=12))
+    await exec_sql(
+        db_engine,
+        f"CREATE TABLE \"{table}__2020_01\" PARTITION OF \"{table}\" FOR VALUES FROM ('2020-01-01') TO ('2020-02-01')",
+    )
 
 
 async def test__validate__a_table_the_document_matches__exits_ok(
@@ -156,3 +167,73 @@ async def test__dsn__a_database_that_is_not_there__exits_connection(tmp_path: Pa
 
     # Act / Assert: a connection failure is its own code, not a generic failure
     assert await _run_cli("validate", "-c", config) == ExitCode.CONNECTION
+
+
+async def test__apply__by_default__creates_and_retires_nothing(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: two live windows and one that retention has long expired
+    await _with_an_expired_partition(db_engine, table)
+    config = _document(tmp_path, table, _dsn(db_engine), retention=1)
+
+    # Act: the safe mode is the default one
+    code = await _run_cli("apply", "-c", config)
+
+    # Assert: the expired partition is still attached
+    assert code == ExitCode.OK
+    async with db_engine.begin() as conn:
+        attached = await conn.execute(
+            text("SELECT count(*) FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent WHERE p.relname = :table"),
+            {"table": table},
+        )
+    assert attached.scalar_one() == 3
+
+
+async def test__apply__allow_destructive__retires_what_retention_expired(
+    db_engine: AsyncEngine, table: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange
+    await _with_an_expired_partition(db_engine, table)
+    config = _document(tmp_path, table, _dsn(db_engine), retention=1)
+
+    # Act
+    code = await _run_cli("apply", "-c", config, "--allow-destructive", "--output", "json")
+    payload = json.loads(capsys.readouterr().out)
+
+    # Assert
+    assert code == ExitCode.OK
+    assert payload["tables"][0]["result"]["detached_count"] == 1
+
+
+async def test__plan_save__then_apply__is_the_artifact_between_the_two(
+    db_engine: AsyncEngine, table: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange
+    config = _document(tmp_path, table, _dsn(db_engine))
+    saved = tmp_path / "plan.json"
+
+    # Act: plan it, read it, then apply exactly that
+    assert await _run_cli("plan", "-c", config, "--save", str(saved)) == ExitCode.OK
+    written = json.loads(saved.read_text(encoding="utf-8"))
+    capsys.readouterr()
+    code = await _run_cli("apply", "-c", config, "--plan", str(saved))
+
+    # Assert
+    assert written["tables"][0]["plan"]["config_fingerprint"]
+    assert code == ExitCode.OK
+    assert "created 2" in capsys.readouterr().out
+
+
+async def test__apply__a_plan_made_under_another_configuration__is_refused(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: plan under one retention, then edit the document
+    planned_under = _document(tmp_path, table, _dsn(db_engine), retention=12)
+    saved = tmp_path / "plan.json"
+    assert await _run_cli("plan", "-c", planned_under, "--save", str(saved)) == ExitCode.OK
+    edited = _document(tmp_path / "edited", table, _dsn(db_engine), retention=3)
+
+    # Act / Assert: the operations still name the right relations, for reasons
+    # that stopped being true
+    assert await _run_cli("apply", "-c", edited, "--plan", str(saved)) == ExitCode.CONFIG
+    assert await _run_cli("apply", "-c", edited, "--plan", str(saved), "--allow-config-drift") == ExitCode.OK
