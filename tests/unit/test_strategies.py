@@ -21,6 +21,7 @@ from pg_partsmith.strategies import (
 )
 
 _MOSCOW = ZoneInfo("Europe/Moscow")
+_BERLIN = ZoneInfo("Europe/Berlin")  # a zone that changes its clocks twice a year
 _ALL_CALCULATORS = [
     HourPeriodCalculator,
     DayPeriodCalculator,
@@ -977,6 +978,57 @@ def test__calculator__period_start__is_local_midnight_in_the_calculators_zone() 
     assert start == datetime(2024, 4, 1, tzinfo=_MOSCOW)
     assert start.tzinfo is _MOSCOW
     assert start == datetime(2024, 3, 31, 21, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("period", "start", "next_start"),
+    [
+        # Berlin skips 02:00 on 29 March 2026 and repeats it on 25 October.
+        (
+            Period(year=2026, month=3, day=29),
+            datetime(2026, 3, 28, 23, tzinfo=UTC),
+            datetime(2026, 3, 29, 22, tzinfo=UTC),
+        ),
+        (
+            Period(year=2026, month=10, day=25),
+            datetime(2026, 10, 24, 22, tzinfo=UTC),
+            datetime(2026, 10, 25, 23, tzinfo=UTC),
+        ),
+    ],
+)
+def test__day_calculator__period_start_across_a_clock_change__takes_the_offset_of_that_day(
+    period: Period, start: datetime, next_start: datetime
+) -> None:
+    # Arrange
+    calc = DayPeriodCalculator(tz=_BERLIN)
+
+    # Act / Assert -- the two ends of one day carry different UTC offsets
+    assert calc.period_start(period) == start
+    assert calc.period_start(period + 1) == next_start
+
+    # and the literals PostgreSQL will read under SET LOCAL TIME ZONE decode back to them
+    lower, upper = calc.get_boundaries(period)
+    assert calc.decode_boundary(lower) == start
+    assert calc.decode_boundary(upper) == next_start
+
+
+@pytest.mark.parametrize(
+    ("instant", "expected"),
+    [
+        (datetime(2026, 3, 29, 21, 30, tzinfo=UTC), Period(year=2026, month=3, day=29)),  # 23:30, summer time
+        (datetime(2026, 3, 29, 22, 30, tzinfo=UTC), Period(year=2026, month=3, day=30)),  # 00:30 the next day
+        (datetime(2026, 10, 25, 22, 30, tzinfo=UTC), Period(year=2026, month=10, day=25)),  # 23:30, winter time
+        (datetime(2026, 10, 25, 23, 30, tzinfo=UTC), Period(year=2026, month=10, day=26)),
+    ],
+)
+def test__day_calculator__period_at_around_a_clock_change__follows_the_local_clock(
+    instant: datetime, expected: Period
+) -> None:
+    # Arrange
+    calc = DayPeriodCalculator(tz=_BERLIN)
+
+    # Act / Assert
+    assert calc.period_at(instant) == expected
 
 
 def test__calculator__period_start_in_utc__matches_period_to_datetime() -> None:

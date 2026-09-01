@@ -26,6 +26,7 @@ from pg_partsmith.periods import PartitionGranularity, Period
 from pg_partsmith.strategies import DayPeriodCalculator, MonthPeriodCalculator, WeekPeriodCalculator
 
 _MOSCOW = ZoneInfo("Europe/Moscow")
+_BERLIN = ZoneInfo("Europe/Berlin")  # a zone that changes its clocks twice a year
 
 
 class _LegacyCalculator:
@@ -743,6 +744,76 @@ def test__time_boundaries__literals_with_codec_in_a_business_timezone__encode_th
 
     # Assert
     assert codec.decode(lower) == datetime(2026, 8, 24, tzinfo=berlin).astimezone(UTC)
+
+
+@pytest.mark.parametrize(
+    ("period", "start", "end", "real_hours"),
+    [
+        # Berlin skips 02:00 on 29 March 2026: that local day lasts 23 hours.
+        (
+            Period(year=2026, month=3, day=29),
+            datetime(2026, 3, 28, 23, tzinfo=UTC),
+            datetime(2026, 3, 29, 22, tzinfo=UTC),
+            23,
+        ),
+        # It repeats 02:00 on 25 October 2026: that one lasts 25.
+        (
+            Period(year=2026, month=10, day=25),
+            datetime(2026, 10, 24, 22, tzinfo=UTC),
+            datetime(2026, 10, 25, 23, tzinfo=UTC),
+            25,
+        ),
+    ],
+)
+def test__time_boundaries__window_over_a_clock_change__keeps_local_midnights(
+    period: Period, start: datetime, end: datetime, real_hours: int
+) -> None:
+    # Arrange
+    boundaries = TimeBoundaries(granularity=PartitionGranularity.DAY, tz=_BERLIN)
+
+    # Act
+    window = boundaries.window_for(period)
+
+    # Assert -- both ends are local midnight; only their instants show the day is not 24 hours.
+    # Subtracting two datetimes that share one tzinfo compares wall clocks, so convert first.
+    assert window.start.astimezone(UTC) == start
+    assert window.end.astimezone(UTC) == end
+    assert window.end.astimezone(UTC) - window.start.astimezone(UTC) == timedelta(hours=real_hours)
+
+
+@pytest.mark.parametrize(
+    ("instant", "expected"),
+    [
+        (datetime(2026, 3, 29, 21, 30, tzinfo=UTC), Period(year=2026, month=3, day=29)),  # 23:30, summer time
+        (datetime(2026, 3, 29, 22, 30, tzinfo=UTC), Period(year=2026, month=3, day=30)),  # 00:30 the next day
+        (datetime(2026, 10, 25, 22, 30, tzinfo=UTC), Period(year=2026, month=10, day=25)),  # 23:30, winter time
+        (datetime(2026, 10, 25, 23, 30, tzinfo=UTC), Period(year=2026, month=10, day=26)),
+    ],
+)
+def test__time_boundaries__window_at_around_a_clock_change__is_the_local_day(
+    instant: datetime, expected: Period
+) -> None:
+    # Arrange -- the last hour of a Berlin day is a different UTC hour in summer and in winter
+    boundaries = TimeBoundaries(granularity=PartitionGranularity.DAY, tz=_BERLIN)
+
+    # Act / Assert
+    assert boundaries.window_at(instant).token == expected
+
+
+def test__time_boundaries__codec_over_a_clock_change__encodes_the_shifted_instants_contiguously() -> None:
+    # Arrange -- an encoded key must follow the same local calendar the bounds do, or the rows
+    # written in the hour the clocks moved land outside the partition meant for them
+    codec = UUIDv7BoundaryCodec()
+    boundaries = TimeBoundaries(granularity=PartitionGranularity.DAY, tz=_BERLIN, codec=codec)
+
+    # Act
+    before = boundaries.literals(boundaries.window_for(Period(year=2026, month=3, day=28)))
+    across = boundaries.literals(boundaries.window_for(Period(year=2026, month=3, day=29)))
+
+    # Assert -- no gap over the transition, and both ends are the local midnights in UTC
+    assert before[1] == across[0]
+    assert codec.decode(across[0]) == datetime(2026, 3, 28, 23, tzinfo=UTC)
+    assert codec.decode(across[1]) == datetime(2026, 3, 29, 22, tzinfo=UTC)
 
 
 def test__time_boundaries__adjacent_windows__literals_are_contiguous() -> None:
