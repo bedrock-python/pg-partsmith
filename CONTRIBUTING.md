@@ -155,7 +155,10 @@ have a sync twin.
 Releases are cut by [release-please](https://github.com/googleapis/release-please) from the
 Conventional Commits on `master`: it keeps a release pull request open with the next version
 and the generated changelog section; merging that PR tags the release, and the publish
-workflow builds the package and uploads it to PyPI.
+workflow builds the package and uploads it to PyPI, then builds, scans, pushes and signs
+the image, then pulls it back on both architectures and runs the end-to-end suite against
+what was published. A failure in that last job is a red release run to read, not an
+unpublished image.
 
 - `feat:` bumps the minor version, `fix:` the patch version, `feat!:` / a `BREAKING CHANGE:`
   footer bumps the major version (before 1.0 a breaking change bumps the minor version —

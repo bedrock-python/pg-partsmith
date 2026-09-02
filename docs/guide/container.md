@@ -155,6 +155,10 @@ did: Python 3.14, nothing to byte-compile, and less of everything to load.
 
 - **Both architectures.** The release publishes amd64 and arm64; CI builds and runs both,
   natively, with the same size budget and the same scan.
+- **Verified after publishing.** The release workflow pulls the image it just pushed, on
+  both architectures, and checks it the way this page tells you to: the signature, the
+  SBOM and the provenance, `--version` and the label against the tag, the minor tag
+  against the exact one — and then runs the end-to-end suite against it.
 - **Scanned**, on every pull request and every release, with `HIGH` and `CRITICAL` failing
   the build. The runtime image holds nothing that is not needed to run one command, which
   is most of what keeps that list empty.
