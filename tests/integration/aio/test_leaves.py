@@ -7,7 +7,7 @@ expired and dropped by the lifecycle.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 from uuid import uuid4
@@ -247,7 +247,7 @@ async def test__foreign_leaves__converged_tree__costs_no_ddl(
     await run_maintenance(db_engine, config, at_time=NOW)
 
     # Act
-    plan = await make_service(db_engine).plan(config, now=None)
+    plan = await make_service(db_engine).plan(config, now=datetime.fromisoformat(NOW).replace(tzinfo=UTC))
 
     # Assert
     assert plan.findings == ()
@@ -295,7 +295,7 @@ async def test__foreign_leaves__grace_period__foreign_orphan_waits_with_a_commen
     comment = await table_comment(db_engine, may)
     kind_in_grace = await relkind(db_engine, may)
     attached_in_grace = await is_attached(db_engine, may)
-    plan_in_grace = await make_service(db_engine).plan(config, now=None)
+    plan_in_grace = await make_service(db_engine).plan(config, now=datetime(2026, 8, 30, tzinfo=UTC))
     dropped = await run_maintenance(db_engine, config, at_time="2026-09-10")
 
     # Assert
