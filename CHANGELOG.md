@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.0.0...pg-partsmith-v1.1.0) (2026-09-02)
+
+
+### Features
+
+* hooks see a detached partition coming back ([783f265](https://github.com/bedrock-python/pg-partsmith/commit/783f265601e3c39009e77c56185c2df2ce065b0d))
+* one event for every lifecycle hook ([826c217](https://github.com/bedrock-python/pg-partsmith/commit/826c217e84a5ef3985d1feb7140516ebf5c0c4d9))
+
+
+### Bug Fixes
+
+* close the review findings on the hook event ([38d8c23](https://github.com/bedrock-python/pg-partsmith/commit/38d8c233521bc568a4c80dcf0245e1ac20bfc838))
+* recognise an attach failure by its SQLSTATE, not by SQLAlchemy's type ([5f9185a](https://github.com/bedrock-python/pg-partsmith/commit/5f9185a3d545835b250459e3ee4539e1bdc9566b))
+* refuse a mismatched orphan marker, and let the boundaries answer for themselves ([1245fd9](https://github.com/bedrock-python/pg-partsmith/commit/1245fd9f7e9f5bae4274d777bf1cc5cbd94e686d))
+* say when a partition's closed-ness rests on the session timezone ([7c44a09](https://github.com/bedrock-python/pg-partsmith/commit/7c44a0904dccd9aac3ed55cacb8f18a2a679716a))
+
+
+### Documentation
+
+* how to query a partitioned table, what a plan costs, and the final report ([a82264b](https://github.com/bedrock-python/pg-partsmith/commit/a82264b79a1cc5779b099a9f870dbaefa5e37b7c))
+* mark the two cheat-sheet entries 1.1 superseded ([0ddff78](https://github.com/bedrock-python/pg-partsmith/commit/0ddff780736773c421ebebdebf671d1847dbb689))
+
 ## 1.1.0 — one event for every hook
 
 **This breaks every hook written against 1.0.** It is shipped in a minor version on
