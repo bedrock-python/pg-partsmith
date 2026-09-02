@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.1.0...pg-partsmith-v1.2.0) (2026-09-02)
+
+
+### Features
+
+* a CLI, an image, and hooks reachable from a config file ([#32](https://github.com/bedrock-python/pg-partsmith/issues/32)) ([34fb9ba](https://github.com/bedrock-python/pg-partsmith/commit/34fb9bacab49865f4a5df87ce07f6391e420a587))
+
+
+### Bug Fixes
+
+* name the path when --write or --save cannot write it ([ec7290b](https://github.com/bedrock-python/pg-partsmith/commit/ec7290be18e22ce057b6b1da4fdb64b7de881208))
+* what the review found in the command line and the document ([8e5333b](https://github.com/bedrock-python/pg-partsmith/commit/8e5333b6205ca24cddcb00f82dcd92a581e1f7c1))
+
+
+### Documentation
+
+* file the notes under 1.2.0, which is where they ship ([648f0f9](https://github.com/bedrock-python/pg-partsmith/commit/648f0f9c496f69b3bf291bc353d621e6dba7ad8e))
+* the image as it is, the counts as they are, and a reference page for what 1.2.0 adds ([5009656](https://github.com/bedrock-python/pg-partsmith/commit/5009656f1847f55a05582827c1d6b81d657d0893))
+
 ## 1.2.0 — a command line, an image, and hooks from a config file
 
 Everything here is reachable without writing Python: `pg-partsmith` on the command line
