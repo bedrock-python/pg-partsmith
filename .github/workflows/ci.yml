@@ -94,7 +94,7 @@ jobs:
           docker run --rm pg-partsmith:ci --version
           test "$(docker run --rm --entrypoint id pg-partsmith:ci -u)" = "65532"
       - name: Scan
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: pg-partsmith:ci
           severity: CRITICAL,HIGH

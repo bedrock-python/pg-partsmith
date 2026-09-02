@@ -105,7 +105,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
 
       - name: Scan
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: pg-partsmith:release
           severity: CRITICAL,HIGH
