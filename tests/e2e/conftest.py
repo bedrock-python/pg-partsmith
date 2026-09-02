@@ -9,6 +9,7 @@ commands the tests run are the ones the guides show.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import TYPE_CHECKING
 
@@ -26,13 +27,17 @@ IMAGE_ENV_VAR = "PG_PARTSMITH_E2E_IMAGE"
 
 
 @pytest.fixture(scope="session")
-def docker_client() -> docker.DockerClient:
+def docker_client() -> Iterator[docker.DockerClient]:
     try:
         client = docker.from_env()
-        client.ping()
     except Exception:  # whatever the SDK raises, there is no daemon to talk to
         pytest.skip("Docker is required to run the image")
-    return client
+    with contextlib.closing(client):
+        try:
+            client.ping()
+        except Exception:
+            pytest.skip("Docker is required to run the image")
+        yield client
 
 
 @pytest.fixture(scope="session")

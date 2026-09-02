@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys  # required for platform check below
 import warnings
@@ -12,6 +13,7 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import docker
+import freezegun
 import pytest
 import pytest_asyncio
 from sqlalchemy import Engine, create_engine, text
@@ -22,6 +24,15 @@ from testcontainers.redis import RedisContainer
 
 from tests.integration.aio.builder import PartitioningScenarioBuilder
 from tests.integration.sync.builder import PartitioningScenarioBuilder as SyncPartitioningScenarioBuilder
+
+# freeze_time walks every loaded module's attributes to find the datetimes to
+# patch. testcontainers' config module answers a module-level __getattr__ for
+# its deprecated names by asking the Docker daemon for its socket path -- so a
+# frozen clock in a unit test opened a docker client, and on a machine without
+# Docker the SDK leaves the failed socket unclosed, which the garbage collector
+# then reports in whatever test happens to be running. Neither module holds a
+# clock worth freezing.
+freezegun.configure(extend_ignore_list=["testcontainers", "docker"])
 
 # Set event loop policy for Windows as early as possible. Python 3.14
 # deprecates policies for removal in 3.16; until then the selector loop is
@@ -123,11 +134,15 @@ class ExternalPostgres:
 def _docker_is_available() -> bool:
     try:
         client = docker.from_env()
-        client.ping()
     except Exception:
         return False
-    else:
-        return True
+    # Closed, not dropped: the answer keeps a connection in its pool otherwise.
+    with contextlib.closing(client):
+        try:
+            client.ping()
+        except Exception:
+            return False
+    return True
 
 
 @pytest.fixture(scope="session")
