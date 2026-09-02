@@ -190,7 +190,10 @@ CronJob discovers at 03:00 after some of the run's DDL has committed. A missing 
 
 The block runs inline, in the process and on the loop that fires it. That is the same
 footing as a hook written as a class, and the same responsibility: a block that blocks,
-blocks maintenance.
+blocks maintenance — and blocks the stop. `SIGTERM` is handled on that same loop, so a
+block still running when a pod's deadline comes is killed with the process rather than
+cancelled. Work that can outlast a grace period belongs in a command hook, a child the
+stop terminates.
 
 ### What this is not
 

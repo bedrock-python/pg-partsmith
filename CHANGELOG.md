@@ -245,6 +245,19 @@ reads the library and the workflows; a pull request that adds a dependency with 
 vulnerability is refused; and once a week every link in the docs is asked whether it still
 answers.
 
+The image is run end to end, on both architectures: as a container with a read-only root
+filesystem, every capability dropped and the document mounted, against a PostgreSQL
+container on a network of its own — the commands the guides show, with the codes they
+promise. A fresh table drifts and `apply` converges it; `--output json` is the envelope
+alone on stdout; `--write` lands a textfile in a volume; the DSN arrives from a mounted
+secret; a secret only root can read, a rejected password and a document with hooks but no
+`--allow-hooks` each answer with their code and a sentence; `SIGTERM` during a command
+hook is exit `143` inside the grace period with the lock released; an overlapping run
+stands aside with `6`; `plan --save` in one container is applied by another and refused
+once the document changed; an image derived with one `COPY` runs a Python file hook from
+inside; and the Compose shape that holds an application until its partitions exist runs
+as written.
+
 The checks paid for themselves before they were merged. The command line no longer dies
 on a console that cannot show an em dash: a Windows pipe or a bare POSIX locale gets the
 character escaped rather than a traceback. A password the server rejects is exit `5` like
@@ -254,6 +267,14 @@ pipes left open, which a long-lived process would have seen as a warning at garb
 collection; they are closed. And `main()` runs its coroutine under a runner with a loop
 factory of its own, so a program embedding it next to an event loop of its own finds that
 loop where it left it.
+
+Running the image found two more. `--write` into a directory the container's user cannot
+write — a root-owned hostPath is the usual case — was a traceback, and `plan --save` into
+one was reported as a database error; both are exit `4` with the path in the message, and
+the previous textfile stays where it was. And a Python block hook still running when
+`SIGTERM` arrives holds the stop until it returns, because it runs on the loop that
+handles the signal; the guides now say so, and that work which can outlast a grace period
+belongs in a command hook.
 
 ### A container image
 

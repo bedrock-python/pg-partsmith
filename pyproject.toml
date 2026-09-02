@@ -136,6 +136,7 @@ addopts = [
 markers = [
     "unit: mark a test as a unit test.",
     "integration: mark a test as an integration test.",
+    "e2e: mark a test as an end-to-end test of the container image; needs PG_PARTSMITH_E2E_IMAGE.",
 ]
 # A warning is a deprecation notice with a date on it; the suite fails on the
 # day it appears rather than on the day the removal ships. The one ignored is

@@ -103,6 +103,11 @@ rolled back, the advisory lock released, a hook's child process terminated — a
 `143` with `pg-partsmith: terminated` in the log. That takes a few seconds; Docker's
 default grace of ten and Kubernetes' thirty are plenty.
 
+A Python block hook is the exception. It runs on the loop that handles the signal, so a
+block still running at the deadline holds the stop until it returns, and past the grace
+period the runtime kills the process — the `SIGKILL` case below. Anything that can take
+longer than a grace period belongs in a command hook, which is a child the stop terminates.
+
 On `SIGKILL` none of that runs, and the database is still fine: a dropped connection makes
 PostgreSQL cancel the statement and roll back its transaction, a session-level advisory
 lock goes with the session, and an interrupted `DETACH … CONCURRENTLY` leaves the pending

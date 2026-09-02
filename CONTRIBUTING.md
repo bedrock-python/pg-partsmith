@@ -83,6 +83,22 @@ is what keeps the declared bounds honest, so raise a bound rather than work arou
 version. Warnings are errors under pytest: a deprecation fails the suite the day it
 appears, not the day the removal ships.
 
+## The image, end to end
+
+The container image is tested as a container: a read-only root filesystem, every
+capability dropped, the document mounted read-only, against a PostgreSQL container on a
+network of its own — and the commands are the ones the guides show, with the exit codes
+they promise. Docker is required, and the image has to exist:
+
+```bash
+make test-e2e                                                    # builds pg-partsmith:local and runs the suite against it
+PG_PARTSMITH_E2E_IMAGE=pg-partsmith:ci uv run pytest -m e2e      # an image you already have
+```
+
+Without `PG_PARTSMITH_E2E_IMAGE` the suite skips. CI builds the image and runs it on both
+architectures. The Compose test needs the `docker compose` plugin and skips where it is
+missing.
+
 ## Adding a period strategy
 
 1. Create `pg_partsmith/strategies/your_strategy.py`, subclassing `BasePeriodCalculator`

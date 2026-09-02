@@ -247,16 +247,18 @@ jobs:
           test "$MB" -le "$IMAGE_SIZE_BUDGET_MB"
         env:
           IMAGE_SIZE_BUDGET_MB: 160
-      - name: It runs, not as root, with every library it links against
-        run: |
-          docker run --rm pg-partsmith:ci --version
-          docker run --rm pg-partsmith:ci plan --help >/dev/null
-          docker run --rm --entrypoint /opt/venv/bin/python pg-partsmith:ci -c '
-          import os, ssl, hashlib, zlib, bz2, lzma, uuid, asyncpg, pydantic_core, yaml, greenlet, sqlalchemy, typer
-          assert os.getuid() == 65532, os.getuid()
-          assert not os.path.exists("/bin/sh"), "a shell got in"
-          print("closure ok, uid 65532, no shell,", ssl.OPENSSL_VERSION)
-          '
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --no-default-groups --group test --extra pydantic-settings
+      # The image as a container, against a database on a network of its own,
+      # run the way the guides say to: read-only, no capabilities, the
+      # document mounted, the commands the guides show, the codes they promise.
+      - name: End to end
+        run: uv run --no-sync pytest -m e2e
+        env:
+          PG_PARTSMITH_E2E_IMAGE: pg-partsmith:ci
       - name: Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
