@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import io
 import json
 import re
 import signal
@@ -888,6 +889,20 @@ def test__write__puts_the_output_in_a_file_and_nothing_on_stdout(
     assert [p.name for p in target.parent.iterdir()] == ["partsmith.prom"]
 
 
+def test__plan__a_password_the_server_rejects__is_exit_5_and_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The driver raises its own error for a rejected password, before
+    # SQLAlchemy has a DBAPI error to wrap it in; it is still the database.
+    asyncpg = pytest.importorskip("asyncpg")
+    config = _write(tmp_path, "partitions.json", json.dumps(DOCUMENT))
+    rejected = asyncpg.InvalidPasswordError('password authentication failed for user "app"')
+    monkeypatch.setattr(cli, "run_plan", AsyncMock(side_effect=rejected))
+
+    # Act / Assert
+    assert main(["plan", "-c", str(config), "--dsn", "postgresql://app:wrong@localhost/app"]) == ExitCode.CONNECTION
+
+
 def test__ok_if_locked__turns_a_held_lock_into_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Arrange: an init container restarts on anything non-zero, and ten replicas
     # starting at once means nine of them find the lock held
@@ -902,3 +917,23 @@ def test__ok_if_locked__turns_a_held_lock_into_success(monkeypatch: pytest.Monke
     # Act / Assert
     assert main(["apply", "-c", str(config)]) == ExitCode.LOCKED
     assert main(["apply", "-c", str(config), "--ok-if-locked"]) == ExitCode.OK
+
+
+# ── The console's encoding ──────────────────────────────────────────────────────
+
+
+def test__main__survives_a_console_that_cannot_show_an_em_dash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Windows pipe or a bare POSIX locale may be ASCII, and human output has an em dash in it."""
+    # Arrange: an ASCII-only stdout, as strict as a redirected stream is opened
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="ascii", errors="strict"))
+
+    # Act
+    code = main(["--version"])
+    sys.stdout.write("events — ok\n")
+    sys.stdout.flush()
+
+    # Assert
+    assert code == ExitCode.OK
+    assert sys.stdout.errors == "backslashreplace"
+    assert b"events \\u2014 ok" in raw.getvalue()

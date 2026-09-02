@@ -147,6 +147,8 @@ did: Python 3.14, nothing to byte-compile, and less of everything to load.
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
+- **Both architectures.** The release publishes amd64 and arm64; CI builds and runs both,
+  natively, with the same size budget and the same scan.
 - **Scanned**, on every pull request and every release, with `HIGH` and `CRITICAL` failing
   the build. The runtime image holds nothing that is not needed to run one command, which
   is most of what keeps that list empty.

@@ -48,6 +48,17 @@ from .loader import (
 )
 from .render import to_json
 
+try:
+    from asyncpg.exceptions import InterfaceError as _DriverInterfaceError
+    from asyncpg.exceptions import PostgresError as _DriverPostgresError
+except ImportError:  # pragma: no cover - the cli extra brings asyncpg; a bare install may not
+    _DRIVER_ERRORS: tuple[type[Exception], ...] = ()
+else:
+    _DRIVER_ERRORS = (_DriverPostgresError, _DriverInterfaceError)
+
+# Whatever the database answers with, at any depth, so the mapping to exit 5 is one place.
+_DATABASE_ERRORS: tuple[type[Exception], ...] = (SQLAlchemyError, OSError, *_DRIVER_ERRORS)
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -330,6 +341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         The exit status, as :class:`~pg_partsmith.cli.exit_codes.ExitCode`.
     """
+    _survive_any_console_encoding()
     try:
         outcome = app(args=list(argv) if argv is not None else None, prog_name="pg-partsmith", standalone_mode=False)
     except typer.Abort:  # pragma: no cover - interactive only
@@ -350,7 +362,11 @@ def _execute(invocation: _Invocation) -> ExitCode:
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
-        result = asyncio.run(_supervised(invocation))
+        # A Runner with a loop factory rather than asyncio.run: the process is left
+        # with the current-loop state it had, which matters to a program that
+        # embeds main() next to a loop of its own, and to a test session.
+        with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+            result = runner.run(_supervised(invocation))
     except (ConfigError, InvalidPartitionConfigError, PlanConfigMismatchError) as exc:
         return _failed(str(exc), ExitCode.CONFIG)
     except LockAcquisitionError as exc:
@@ -358,10 +374,11 @@ def _execute(invocation: _Invocation) -> ExitCode:
         # and for an init container, which restarts on anything non-zero, it
         # is not even worth a code of its own.
         return _failed(str(exc), ExitCode.OK if invocation.ok_if_locked else ExitCode.LOCKED)
-    except (SQLAlchemyError, OSError) as exc:
-        # A refused connection surfaces as a bare OSError: the driver raises it
-        # before SQLAlchemy has a DBAPI error to wrap. Reading the document is
-        # already behind ConfigError, so an OSError here is the database.
+    except _DATABASE_ERRORS as exc:
+        # A refused connection surfaces as a bare OSError and a rejected
+        # password as the driver's own error: both come before SQLAlchemy has
+        # a DBAPI error to wrap. Reading the document is already behind
+        # ConfigError, so anything here is the database.
         return _failed(f"database error: {exc}", ExitCode.CONNECTION)
     except _StopSignalError as exc:
         word, code = _STOP_SIGNALS[exc.signum]
@@ -592,3 +609,20 @@ def _failed(message: str, code: ExitCode) -> ExitCode:
     sys.stderr.write(f"pg-partsmith: {message}\n")
     logger.debug("command failed with %s", code.name, exc_info=True)
     return code
+
+
+def _survive_any_console_encoding() -> None:
+    """Never die on a character the console cannot show.
+
+    Human output has an em dash in it, and a Windows pipe or a bare POSIX
+    locale may be encoding in something without one. An escaped character in
+    a CronJob log beats a traceback there.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (OSError, ValueError):  # pragma: no cover - a closed or exotic stream
+            pass

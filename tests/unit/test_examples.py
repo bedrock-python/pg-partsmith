@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from pg_partsmith.cli.loader import load_document, load_python_hooks
@@ -75,6 +76,10 @@ def test__example_shell_hook__parses_and_is_executable(script: Path) -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.skipif(
+    tuple(int(part) for part in pydantic.VERSION.split(".")[:2]) < (2, 11),
+    reason="the file is rendered by the pydantic in the lock; releases before 2.11 render the same schema differently",
+)
 def test__the_committed_schema__is_the_one_the_document_generates() -> None:
     # A stale schema file would validate the wrong vocabulary in an editor,
     # which is worse than none; `pg-partsmith schema` regenerates it.

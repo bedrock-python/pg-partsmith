@@ -277,8 +277,33 @@ the base images, the actions and the lock file.
 ### Pipelines
 
 CI caches the uv environment keyed on `uv.lock` and installs with `--frozen`, so a stale
-lock fails rather than resolving something else; a push cancels the run it supersedes;
-the image build reuses layers across runs; Python 3.14 joins the test matrix.
+lock fails rather than resolving something else, and `uv lock --check` says so in one
+line; a push cancels the run it supersedes; the image build reuses layers across runs.
+
+The matrix grew in every direction that has produced a bug before. Unit tests run on
+Python 3.11 through 3.14 on Linux, at both ends of that range on Windows and macOS, on
+arm64, and with the clock at UTC+14 and at UTC-12. The integration suite runs on
+PostgreSQL 15 through 18, on arm64, on Windows and macOS against a server the runner
+installs itself, and once with the server at UTC+14 and the client at UTC-12. One job
+installs every direct dependency at the lowest version `pyproject.toml` admits and runs
+both suites on it; it found the declared floors for pydantic and typer below what the code
+needs, and they now say what is true. The wheel is built, checked and installed on its own
+on all three platforms, and the command is run through to a refused connection. The image
+is built and run on both architectures the release publishes. Warnings are errors under
+pytest; the workflows go through actionlint and the Dockerfile through hadolint; CodeQL
+reads the library and the workflows; a pull request that adds a dependency with a known
+vulnerability is refused; and once a week every link in the docs is asked whether it still
+answers.
+
+The checks paid for themselves before they were merged. The command line no longer dies
+on a console that cannot show an em dash: a Windows pipe or a bare POSIX locale gets the
+character escaped rather than a traceback. A password the server rejects is exit `5` like
+any other database failure, where it used to be a traceback: the driver raises its own
+error before SQLAlchemy has one to wrap. A hook command that was stopped mid-run had its
+pipes left open, which a long-lived process would have seen as a warning at garbage
+collection; they are closed. And `main()` runs its coroutine under a runner with a loop
+factory of its own, so a program embedding it next to an event loop of its own finds that
+loop where it left it.
 
 ### A container image
 

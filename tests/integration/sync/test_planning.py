@@ -412,8 +412,8 @@ def foreign_leaf(
         metrics_table,
         postgres_container,
         suffix="__2025_01",
-        bounds=("2025-01-01", "2025-02-01"),
-        row_ts="2025-01-15",
+        bounds=("2025-01-01 00:00:00+00", "2025-02-01 00:00:00+00"),
+        row_ts="2025-01-15 00:00:00+00",
     )
 
 
@@ -427,8 +427,8 @@ def foreign_leaf_now(
         metrics_table,
         postgres_container,
         suffix="__2026_08",
-        bounds=("2026-08-01", "2026-09-01"),
-        row_ts="2026-08-15",
+        bounds=("2026-08-01 00:00:00+00", "2026-09-01 00:00:00+00"),
+        row_ts="2026-08-15 00:00:00+00",
     )
 
 

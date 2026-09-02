@@ -941,13 +941,13 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "asyncpg", marker = "extra == 'cli'", specifier = ">=0.29.0" },
-    { name = "pydantic", specifier = ">=2.0.0,<3.0.0" },
+    { name = "pydantic", specifier = ">=2.6.0,<3.0.0" },
     { name = "pydantic-settings", marker = "extra == 'pydantic-settings'", specifier = ">=2.0.0,<3.0.0" },
     { name = "python-dateutil", specifier = ">=2.7.0,<3.0.0" },
     { name = "pyyaml", marker = "extra == 'cli'", specifier = ">=6.0,<7.0" },
     { name = "redis", marker = "extra == 'redis-locks'", specifier = ">=4.2.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0,<3.0.0" },
-    { name = "typer", marker = "extra == 'cli'", specifier = ">=0.16,<1.0" },
+    { name = "typer", marker = "extra == 'cli'", specifier = ">=0.17,<1.0" },
 ]
 provides-extras = ["cli", "pydantic-settings", "redis-locks"]
 
@@ -965,7 +965,7 @@ dev = [
     { name = "pyyaml", specifier = ">=6.0,<7.0" },
     { name = "ruff", specifier = ">=0.15.1" },
     { name = "testcontainers", extras = ["redis"], specifier = ">=4.14.1" },
-    { name = "typer", specifier = ">=0.16,<1.0" },
+    { name = "typer", specifier = ">=0.17,<1.0" },
     { name = "types-python-dateutil", specifier = "~=2.9.0" },
     { name = "types-pyyaml", specifier = ">=6.0" },
     { name = "tzdata", specifier = ">=2024.1" },
@@ -984,7 +984,7 @@ test = [
     { name = "pytest-cov", specifier = ">=7.0.0" },
     { name = "pyyaml", specifier = ">=6.0,<7.0" },
     { name = "testcontainers", extras = ["redis"], specifier = ">=4.14.1" },
-    { name = "typer", specifier = ">=0.16,<1.0" },
+    { name = "typer", specifier = ">=0.17,<1.0" },
     { name = "types-python-dateutil", specifier = "~=2.9.0" },
     { name = "types-pyyaml", specifier = ">=6.0" },
     { name = "tzdata", specifier = ">=2024.1" },

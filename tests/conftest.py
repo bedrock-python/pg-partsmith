@@ -7,6 +7,7 @@ import os
 import sys  # required for platform check below
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import docker
@@ -73,13 +74,45 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 @pytest.fixture(scope="session")
-def postgres_container() -> Generator[PostgresContainer, None, None]:
-    """Start a PostgreSQL container for the test session."""
+def postgres_container() -> Generator[PostgresContainer | ExternalPostgres, None, None]:
+    """The session's PostgreSQL: a container, or the server ``PG_PARTSMITH_TEST_DSN`` names.
+
+    A runner without Docker -- Windows, macOS -- brings a server of its own and
+    points here at it; the few tests that reach into the container itself skip
+    there. ``PG_PARTSMITH_TEST_PG_TZ`` starts the container with that zone as the
+    server's default, so the suite also runs against a clock far from UTC.
+    """
+    dsn = os.environ.get("PG_PARTSMITH_TEST_DSN")
+    if dsn:
+        yield ExternalPostgres(dsn)
+        return
     if not _docker_is_available():
         pytest.skip("Docker is required for integration tests (testcontainers)")
-    image = os.environ.get("PG_PARTSMITH_TEST_PG_IMAGE", "postgres:17-alpine")
-    with PostgresContainer(image) as postgres:
+    image = os.environ.get("PG_PARTSMITH_TEST_PG_IMAGE") or "postgres:17-alpine"
+    container = PostgresContainer(image)
+    zone = os.environ.get("PG_PARTSMITH_TEST_PG_TZ")
+    if zone:
+        container = container.with_env("TZ", zone).with_env("PGTZ", zone)
+    with container as postgres:
         yield postgres
+
+
+class ExternalPostgres:
+    """A server the runner brought, wearing the parts of ``PostgresContainer`` the tests use."""
+
+    def __init__(self, dsn: str) -> None:
+        parts = urlparse(dsn)
+        self.username = unquote(parts.username or "postgres")
+        self.password = unquote(parts.password or "")
+        self.dbname = parts.path.lstrip("/") or "postgres"
+        self.port = parts.port or 5432
+        self._dsn = dsn
+
+    def get_connection_url(self) -> str:
+        return self._dsn
+
+    def exec(self, command: object) -> None:
+        pytest.skip(f"cannot run {command!r}: this server is not a container")
 
 
 def _docker_is_available() -> bool:

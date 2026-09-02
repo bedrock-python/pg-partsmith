@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
 # A push while the previous run is still going restarts it; the old one is
 # answering a question nobody is asking any more.
 concurrency:
@@ -22,19 +25,53 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
+      # A lock file out of step with pyproject.toml fails here, in one line,
+      # rather than in an image build three jobs away.
+      - run: uv lock --check
       - run: uv sync --frozen --group dev
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run mypy pg_partsmith
+      - name: The workflows parse, and their shell steps pass shellcheck
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+      - name: Dockerfile lint
+        run: docker run --rm -v "$PWD:/repo" -w /repo hadolint/hadolint:v2.15.1 hadolint Dockerfile
 
-  test-unit:
-    name: Unit tests (Python ${{ matrix.python-version }})
+  # Every direct dependency at the lowest version pyproject.toml admits, on
+  # the oldest Python. The bounds a library declares are a promise, and this
+  # is the only job that tests it; everything else runs on the lock file.
+  test-lowest:
+    name: Lowest declared dependencies (Python 3.11)
     needs: lint
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          cache-suffix: lowest
+      - run: uv sync --resolution lowest-direct --no-default-groups --group test --extra cli --extra pydantic-settings
+      - run: uv run --no-sync pytest
+
+  test-unit:
+    name: Unit tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # The other platforms at both ends of the range: the CLI runs
+        # subprocesses and handles signals differently on each of them.
+        include:
+          - { os: windows-latest, python-version: "3.11" }
+          - { os: windows-latest, python-version: "3.14" }
+          - { os: macos-latest, python-version: "3.11" }
+          - { os: macos-latest, python-version: "3.14" }
+          - { os: ubuntu-24.04-arm, python-version: "3.14" }
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -45,22 +82,63 @@ jobs:
       - run: uv sync --frozen --group dev --extra pydantic-settings
       - run: uv run pytest -m unit --cov=pg_partsmith --cov-report=xml
       - uses: codecov/codecov-action@v7
-        if: matrix.python-version == '3.11'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
         continue-on-error: true
 
-  test-integration:
-    name: Integration tests (PostgreSQL ${{ matrix.postgres }}) & coverage gate
+  # A partition boundary is a moment. The suite runs where the clock is
+  # furthest from UTC in either direction, so a naive datetime has nowhere
+  # to hide.
+  test-unit-far-from-utc:
+    name: Unit tests (TZ=${{ matrix.tz }})
     needs: lint
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        postgres: ["15-alpine", "16-alpine", "17-alpine"]
+        tz: [Pacific/Kiritimati, Etc/GMT+12]
     env:
-      PG_PARTSMITH_TEST_PG_IMAGE: postgres:${{ matrix.postgres }}
+      TZ: ${{ matrix.tz }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --group dev --extra pydantic-settings
+      - run: uv run pytest -m unit
+
+  test-integration:
+    name: Integration tests (${{ matrix.name }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: PostgreSQL 15, os: ubuntu-latest, image: postgres:15-alpine }
+          - { name: PostgreSQL 16, os: ubuntu-latest, image: postgres:16-alpine }
+          - { name: PostgreSQL 17, os: ubuntu-latest, image: postgres:17-alpine }
+          - { name: PostgreSQL 18, os: ubuntu-latest, image: postgres:18-alpine }
+          - { name: PostgreSQL 17 on arm64, os: ubuntu-24.04-arm, image: postgres:17-alpine }
+          # The server's clock at UTC+14 and the client's at UTC-12: a bound
+          # written as a date must mean the same day on both sides.
+          - name: PostgreSQL 17, server at UTC+14, client at UTC-12
+            os: ubuntu-latest
+            image: postgres:17-alpine
+            server-tz: Pacific/Kiritimati
+            client-tz: Etc/GMT+12
+          # No Docker on these runners; the action brings a server of its own,
+          # and the tests that reach into the container skip.
+          - { name: PostgreSQL 17 on Windows, os: windows-latest, server: "17" }
+          - { name: PostgreSQL 17 on macOS, os: macos-latest, server: "17" }
+    env:
+      PG_PARTSMITH_TEST_PG_IMAGE: ${{ matrix.image }}
+      PG_PARTSMITH_TEST_PG_TZ: ${{ matrix.server-tz }}
+      TZ: ${{ matrix.client-tz }}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -68,19 +146,79 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen --group dev --extra pydantic-settings
+      - name: A PostgreSQL server of the runner's own
+        if: matrix.server
+        id: postgres
+        uses: ikalnytskyi/action-setup-postgres@v8
+        with:
+          postgres-version: ${{ matrix.server }}
+          username: partsmith
+          password: partsmith
+          database: partsmith
       # Both suites together: the gate is on the whole library, not on one half of it.
-      - run: uv run pytest --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
+      - name: Both suites, and the coverage gate
+        if: ${{ !matrix.server }}
+        run: uv run pytest --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
+      - name: The integration suite against the runner's server
+        if: matrix.server
+        run: uv run pytest -m integration
+        env:
+          PG_PARTSMITH_TEST_DSN: ${{ steps.postgres.outputs.connection-uri }}
       - uses: codecov/codecov-action@v7
-        if: matrix.postgres == '17-alpine'
+        if: matrix.name == 'PostgreSQL 17'
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
         continue-on-error: true
 
-  image:
-    name: Container image
+  # What PyPI will get, installed from the wheel alone on each platform: the
+  # entry point, the package data, the extra's dependencies, and the whole
+  # stack up to the socket.
+  package:
+    name: Package (${{ matrix.os }})
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+      - run: uv build
+      - name: The wheel and the sdist pass the checks PyPI and a reader would make
+        shell: bash
+        run: |
+          uvx twine check --strict dist/*
+          uvx check-wheel-contents dist/*.whl
+      - name: Installed from the wheel alone, the command runs here
+        shell: bash
+        run: |
+          uv venv --python 3.14 smoke
+          if [ "$RUNNER_OS" = Windows ]; then BIN=smoke/Scripts; else BIN=smoke/bin; fi
+          WHEEL=$("$BIN/python" -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' dist/*.whl)
+          uv pip install --python "$BIN/python" "pg-partsmith[cli] @ $WHEEL"
+          "$BIN/pg-partsmith" --version
+          "$BIN/pg-partsmith" schema | "$BIN/python" -c 'import json, sys; json.load(sys.stdin)'
+          # Everything short of a server: the document parses, the driver loads,
+          # the connection is refused, and that is exit 5 -- not a traceback.
+          set +e
+          PYTHONIOENCODING=ascii "$BIN/pg-partsmith" plan -c examples/partitions.minimal.yaml --dsn postgresql://nobody:nobody@127.0.0.1:1/none
+          rc=$?
+          set -e
+          test "$rc" -eq 5
+
+  image:
+    name: Container image (${{ matrix.os }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The release builds both architectures; both are built and run here.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
@@ -91,8 +229,8 @@ jobs:
           load: true
           tags: pg-partsmith:ci
           build-args: VERSION=ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ runner.arch }}
+          cache-to: type=gha,mode=max,scope=${{ runner.arch }}
       # Size is the first thing a team evaluating this reads, so a regression in
       # it is a build failure and not a note in a release.
       - name: Size budget
@@ -121,11 +259,23 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+  # A dependency a pull request adds or bumps is looked up before it is
+  # merged: a known vulnerability or an incompatible license fails the check.
+  dependency-review:
+    name: New dependencies carry no known vulnerability
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+
   # Sentinel job — use this as the single required status check in branch protection.
   all-checks-passed:
     name: All checks passed
     if: always()
-    needs: [lint, test-unit, test-integration, image]
+    needs: [lint, test-lowest, test-unit, test-unit-far-from-utc, test-integration, package, image, dependency-review]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded

@@ -18,6 +18,7 @@ outlives the maintenance run that fired it is a process nobody is watching.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -140,17 +141,23 @@ def stop_hook_command(process: subprocess.Popen[bytes], *, grace_seconds: float 
         process: The child.
         grace_seconds: How long to wait between the two.
     """
-    if process.poll() is not None:
-        return
-    try:
-        process.terminate()
+    if process.poll() is None:
         try:
-            process.wait(timeout=grace_seconds)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-    except OSError:  # pragma: no cover - already gone between the poll and the signal
-        pass
+            process.terminate()
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        except OSError:  # pragma: no cover - already gone between the poll and the signal
+            pass
+    # The pipes are this side's end of the child. Nothing will read a stopped
+    # child's, and one left open is a ResourceWarning at garbage collection
+    # inside whatever long-lived process runs the maintenance.
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            with contextlib.suppress(OSError):
+                stream.close()
 
 
 def run_hook_command(

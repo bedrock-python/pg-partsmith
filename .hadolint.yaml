@@ -1,0 +1,8 @@
+# DL3008: apt versions are not pinned. binutils lives in the build stage,
+# which does not ship, and pinning Debian package versions across two
+# architectures is upkeep with no image to show for it.
+# DL3003: the prune step changes directory inside one RUN on purpose, so the
+# paths it deletes read as what they are.
+ignored:
+  - DL3008
+  - DL3003

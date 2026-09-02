@@ -1,0 +1,29 @@
+name: Links
+
+# The operator pages point at other projects' documentation, and those move.
+# Once a week, every link is asked whether it still answers; a pull request
+# is not held up on somebody else's outage.
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Every link in the docs answers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --no-progress
+            --exclude-all-private
+            --exclude-path site
+            README.md CHANGELOG.md CONTRIBUTING.md 'docs/**/*.md'
+          fail: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
