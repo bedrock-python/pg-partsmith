@@ -259,6 +259,10 @@ jobs:
         run: uv run --no-sync pytest -m e2e
         env:
           PG_PARTSMITH_E2E_IMAGE: pg-partsmith:ci
+          # One test builds an image FROM pg-partsmith:ci, which was loaded into
+          # the daemon; the container builder set up above keeps a store of its
+          # own and would go to the registry for it. The daemon's builder sees it.
+          BUILDX_BUILDER: default
       - name: Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
