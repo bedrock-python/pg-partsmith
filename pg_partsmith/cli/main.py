@@ -391,7 +391,14 @@ def _execute(invocation: _Invocation) -> ExitCode:
 
     text = result.render(output=invocation.output.value)
     if invocation.write is not None:
-        _write_atomically(invocation.write, text + "\n")
+        try:
+            _write_atomically(invocation.write, text + "\n")
+        except OSError as exc:
+            # A textfile directory the container's user cannot write -- a
+            # root-owned hostPath, usually -- is the deployment's to fix. The
+            # run has done its work; say which path, and leave the previous
+            # file where it was.
+            return _failed(f"Cannot write {invocation.write}: {exc.strerror or exc}", ExitCode.CONFIG)
         logger.info("wrote %s output to %s", invocation.output.value, invocation.write)
     elif text:
         sys.stdout.write(text + "\n")
@@ -557,7 +564,12 @@ def _save_plan(path: Path, result: CommandResult) -> None:
     if result.payload is None:  # pragma: no cover - every command builds one
         msg = "the command produced no plan to save"
         raise ConfigError(msg)
-    path.write_text(to_json(result.payload) + "\n", encoding="utf-8")
+    try:
+        path.write_text(to_json(result.payload) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # Raised inside the run, where a bare OSError would be read as the database's.
+        msg = f"Cannot write the plan to {path}: {exc.strerror or exc}"
+        raise ConfigError(msg) from exc
 
 
 def _as_code(outcome: object) -> ExitCode:

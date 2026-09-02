@@ -889,6 +889,54 @@ def test__write__puts_the_output_in_a_file_and_nothing_on_stdout(
     assert [p.name for p in target.parent.iterdir()] == ["partsmith.prom"]
 
 
+def test__write__a_path_that_cannot_be_written__is_exit_4_and_a_sentence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: the textfile directory a hostPath names is root's and the
+    # container is not root; here, the nearest thing on every platform -- a
+    # directory that is not there at all
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    async def planned(kit: Any, configs: Any, *, check: bool, locks: bool = False) -> Any:
+        return CommandResult(code=ExitCode.OK, lines=["planned"], payload=envelope("plan", [plan_entry(_plan())]))
+
+    monkeypatch.setattr(cli, "run_plan", planned)
+    target = tmp_path / "missing" / "partsmith.prom"
+
+    # Act
+    code = main(["plan", "-c", str(config), "--output", "metrics", "--write", str(target)])
+
+    # Assert: the path and the reason, not a traceback, and nothing on stdout
+    assert code == ExitCode.CONFIG
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("pg-partsmith: Cannot write ")
+    assert "partsmith.prom" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test__plan_save__a_path_that_cannot_be_written__is_exit_4_and_a_sentence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    async def planned(kit: Any, configs: Any, *, check: bool, locks: bool = False) -> Any:
+        return CommandResult(code=ExitCode.OK, lines=["planned"], payload=envelope("plan", [plan_entry(_plan())]))
+
+    monkeypatch.setattr(cli, "run_plan", planned)
+    saved = tmp_path / "missing" / "plan.json"
+
+    # Act
+    code = main(["plan", "-c", str(config), "--save", str(saved)])
+
+    # Assert: it used to come out as a database error, which it is not
+    assert code == ExitCode.CONFIG
+    assert capsys.readouterr().err.startswith("pg-partsmith: Cannot write the plan to ")
+
+
 def test__plan__a_password_the_server_rejects__is_exit_5_and_not_a_traceback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

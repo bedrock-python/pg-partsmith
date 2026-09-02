@@ -425,8 +425,12 @@ volumes:
   - { name: textfile, hostPath: { path: /var/lib/node_exporter/textfile, type: Directory } }
 ```
 
-A
-`plan --check` on a schedule of its own is the cheapest monitoring there is: exit `2`
+The directory is the node's and usually root's, and this container is not root: make it
+writable by UID 65532 on the node, or point `--write` at one that is. A directory it
+cannot write is exit `4` with the path in the message, and the previous file stays as it
+was.
+
+A `plan --check` on a schedule of its own is the cheapest monitoring there is: exit `2`
 means partitions that should exist do not yet, before an insert finds out.
 
 ### Hooks in a cluster

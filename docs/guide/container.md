@@ -34,7 +34,8 @@ which is what a CronJob log shows anyway.
 It runs as UID 65532, distroless' `nonroot` — a fixed high UID so a `runAsUser` can
 name the same one and a mounted document can be made readable to it without guessing. It
 writes nothing at runtime, so `readOnlyRootFilesystem: true` works; give `plan --save` and
-`--write` a volume.
+`--write` a volume that UID can write. A hostPath directory is root's, and one the
+container cannot write is exit `4` with the path in the message.
 
 Because there is no shell, the two things a wrapper used to do are flags:
 `--write FILE` puts any command's output in a file atomically (a node_exporter
