@@ -256,7 +256,11 @@ hook is exit `143` inside the grace period with the lock released; an overlappin
 stands aside with `6`; `plan --save` in one container is applied by another and refused
 once the document changed; an image derived with one `COPY` runs a Python file hook from
 inside; and the Compose shape that holds an application until its partitions exist runs
-as written.
+as written. After a release, the same suite runs against the image that was actually
+pushed, pulled back on both architectures, once the signature, the SBOM, the provenance,
+the version inside and the minor tag have been checked. And the Job and CronJob manifests
+the running guide shows go through kubeconform on every pull request, while a unit test
+reads every YAML block in the guides and refuses a flag the command does not take.
 
 The checks paid for themselves before they were merged. The command line no longer dies
 on a console that cannot show an em dash: a Windows pipe or a bare POSIX locale gets the

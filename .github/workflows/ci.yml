@@ -36,6 +36,13 @@ jobs:
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
       - name: Dockerfile lint
         run: docker run --rm -v "$PWD:/repo" -w /repo hadolint/hadolint:v2.15.1 hadolint Dockerfile
+      # The Job and CronJob the running guide shows are what a team pastes into
+      # a cluster: kubeconform checks them against the API schema, strictly, so
+      # a misspelt field fails here and not at kubectl apply.
+      - name: The Kubernetes manifests in the guide validate
+        run: |
+          uv run python scripts/k8s_manifests.py docs/guide/running.md manifests
+          docker run --rm -v "$PWD/manifests:/manifests:ro" ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary /manifests
 
   # Every direct dependency at the lowest version pyproject.toml admits, on
   # the oldest Python. The bounds a library declares are a promise, and this
