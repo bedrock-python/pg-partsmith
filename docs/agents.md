@@ -75,7 +75,11 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   `guide/hooks-in-config.md`.
 * The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command
   as its entrypoint; tags are the exact version and a moving minor, never `latest`. See
-  `guide/container.md`.
+  `guide/container.md` for the image and `guide/running.md` for every harness: plain
+  Docker, Compose (`docker compose run`, `service_completed_successfully`, a cron
+  sidecar), Swarm (swarm-cronjob), Kubernetes Pod / Job / CronJob / init container, the
+  plan-then-apply Jobs, node_exporter textfile, CI, systemd. The DSN can also come from a
+  secret file via `PG_PARTSMITH_DSN_FILE`.
 * `PartitionsDocument` is several tables and their wiring as one validated model — what a
   YAML or JSON file parses into. `document.configs()` gives every `TablePartitionConfig`,
   `document.config_for(name)` one of them, and

@@ -48,7 +48,8 @@ serialize, filter and apply. No extension, no superuser, no scheduler of its own
   JSON document, with a saved plan as the artifact between plan and apply, and exit codes
   a CronJob and a CI step can read
 - **A container image** — `ghcr.io/bedrock-python/pg-partsmith`, for stacks with no Python
-  in them
+  in them; documented shapes for plain Docker, Compose, Swarm, Kubernetes Pod / Job /
+  CronJob / init container, CI and systemd
 - **Hooks, locks, schemas** — eight lifecycle hooks, in Python or as commands named in a
   config file; PostgreSQL advisory or Redis locks; schema-qualified everything
 - **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15, 16 and 17 via testcontainers

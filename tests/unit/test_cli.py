@@ -20,6 +20,7 @@ from pg_partsmith.cli import ExitCode, main
 from pg_partsmith.cli.commands import run_apply, run_plan, run_validate
 from pg_partsmith.cli.loader import (
     DSN_ENV_VAR,
+    DSN_FILE_ENV_VAR,
     ConfigError,
     async_url,
     load_document,
@@ -166,6 +167,33 @@ def test__resolve_dsn__the_flag_outranks_the_environment_and_the_file(monkeypatc
     assert resolve_dsn(document) == "postgresql://env/db"
     monkeypatch.delenv(DSN_ENV_VAR)
     assert resolve_dsn(document) == "postgresql://file/db"
+
+
+def test__resolve_dsn__a_secret_file__is_read_after_the_variable_and_before_the_document(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Arrange: the Docker and Swarm secrets convention, a file under /run/secrets
+    secret = _write(tmp_path, "dsn", "postgresql://secret@host/db\n")
+    monkeypatch.delenv(DSN_ENV_VAR, raising=False)
+    monkeypatch.setenv(DSN_FILE_ENV_VAR, str(secret))
+    document = PartitionsDocument.model_validate({**DOCUMENT, "dsn": "postgresql://file/db"})
+
+    # Act / Assert: stripped of its newline, and outranked only by the variable and the flag
+    assert resolve_dsn(document) == "postgresql://secret@host/db"
+    monkeypatch.setenv(DSN_ENV_VAR, "postgresql://env/db")
+    assert resolve_dsn(document) == "postgresql://env/db"
+
+
+def test__resolve_dsn__a_secret_file_that_cannot_be_read__is_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Arrange
+    monkeypatch.delenv(DSN_ENV_VAR, raising=False)
+    monkeypatch.setenv(DSN_FILE_ENV_VAR, str(tmp_path / "absent"))
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match=DSN_FILE_ENV_VAR):
+        resolve_dsn(PartitionsDocument.model_validate(DOCUMENT))
 
 
 def test__resolve_dsn__nowhere_to_connect__says_all_three_places(monkeypatch: pytest.MonkeyPatch) -> None:

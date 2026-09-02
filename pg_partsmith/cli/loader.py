@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - PyYAML is an extra; JSON documents wor
 
 __all__ = [
     "DSN_ENV_VAR",
+    "DSN_FILE_ENV_VAR",
     "ConfigError",
     "async_url",
     "load_document",
@@ -39,6 +40,9 @@ __all__ = [
 
 DSN_ENV_VAR = "PG_PARTSMITH_DSN"
 """Environment variable read when neither ``--dsn`` nor the document carries one."""
+
+DSN_FILE_ENV_VAR = "PG_PARTSMITH_DSN_FILE"
+"""A file holding the DSN -- a Docker or Swarm secret under ``/run/secrets`` -- read after the variable."""
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 _JSON_SUFFIXES = frozenset({".json"})
@@ -93,11 +97,14 @@ def load_document(path: Path) -> PartitionsDocument:
 
 
 def resolve_dsn(document: PartitionsDocument, *, override: str | None = None) -> str:
-    """The connection string, from the flag, the environment, then the document.
+    """The connection string: the flag, the environment, a secret file, then the document.
 
     In that order, because that is the order of how specific to this run each
     one is -- and because a DSN carries a password, which a deployment may well
-    want to keep out of a file it mounts from a ConfigMap.
+    want to keep out of a file it mounts from a ConfigMap. ``PG_PARTSMITH_DSN_FILE``
+    is the Docker and Swarm secrets convention: the secret arrives as a file
+    under ``/run/secrets``, and naming the file is how a Compose stack hands it
+    over without a shell in between.
 
     Args:
         document: The document, which may carry a ``dsn``.
@@ -107,13 +114,25 @@ def resolve_dsn(document: PartitionsDocument, *, override: str | None = None) ->
         The connection string.
 
     Raises:
-        ConfigError: If none of the three names one.
+        ConfigError: If none of the four names one, or the named file cannot be read.
     """
-    dsn = override or os.environ.get(DSN_ENV_VAR) or document.dsn
+    dsn = override or os.environ.get(DSN_ENV_VAR) or _dsn_from_file() or document.dsn
     if not dsn:
-        msg = f"No connection string: pass --dsn, set {DSN_ENV_VAR}, or give the document a dsn"
+        msg = f"No connection string: pass --dsn, set {DSN_ENV_VAR} or {DSN_FILE_ENV_VAR}, or give the document a dsn"
         raise ConfigError(msg)
     return dsn
+
+
+def _dsn_from_file() -> str | None:
+    """The DSN a secret file holds, when ``PG_PARTSMITH_DSN_FILE`` names one."""
+    path = os.environ.get(DSN_FILE_ENV_VAR)
+    if not path:
+        return None
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        msg = f"Cannot read the DSN from {path} ({DSN_FILE_ENV_VAR}): {exc.strerror or exc}"
+        raise ConfigError(msg) from exc
 
 
 def async_url(dsn: str) -> str:

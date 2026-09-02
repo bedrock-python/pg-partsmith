@@ -224,6 +224,21 @@ series and a zero are different alerts.
 The numbers come off the same envelope the JSON does, so a metric cannot disagree with what
 the same run printed.
 
+### Every way to run it
+
+A deployment page with a copy-pasteable shape for each harness: plain Docker with host
+cron or a systemd timer; Compose as a service you run, as the equivalent of an init
+container (`service_completed_successfully`), and on a schedule with a cron sidecar; Swarm
+with swarm-cronjob; Kubernetes as a Pod, a Job, a CronJob and an init container, plus the
+plan-on-one-day-apply-on-another pair of Jobs and the node_exporter textfile; GitHub
+Actions and GitLab CI; and the note that anything which runs a container and reads an
+exit code runs this.
+
+`PG_PARTSMITH_DSN_FILE` reads the connection string from a file — the Docker and Swarm
+secrets convention — after `PG_PARTSMITH_DSN` and before the document, so a Compose
+stack hands a secret over without a shell wrapper and without it showing in
+`docker inspect`.
+
 ### A container image
 
 `ghcr.io/bedrock-python/pg-partsmith:<version>`, published from the release workflow, so a

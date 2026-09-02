@@ -18,6 +18,18 @@ pg-partsmith apply    -c partitions.yaml     # do it — creations only, by defa
 The first three issue no DDL, take no lock and fire no hook. `apply` is the one that
 acts.
 
+## Every flag
+
+| Command | Flags |
+|---|---|
+| all four | `-c/--config FILE` (required), `--dsn`, `--table NAME` (repeatable), `-o/--output human\|json\|metrics`, `-v/--verbose` |
+| `plan` | `--check` exit `2` on pending operations · `--save FILE` write the plan · `--locks` print what each operation locks |
+| `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks |
+| global | `--version` · `--install-completion` · `-h/--help` on anything |
+
+`--help` on any command is generated from the same declarations that parse it, so the
+table above can be stale and the help cannot.
+
 ## Being stopped
 
 Ctrl+C, or the `SIGTERM` a pod is sent at its deadline, cancels the run rather than
@@ -44,8 +56,10 @@ cannot drift from what the command accepts.
 
 ## Where the connection comes from
 
-`--dsn`, then `$PG_PARTSMITH_DSN`, then the document's `dsn` — in that order, so a
-mounted ConfigMap can carry the tables while the password stays in a secret.
+`--dsn`, then `$PG_PARTSMITH_DSN`, then the file `$PG_PARTSMITH_DSN_FILE` points at, then
+the document's `dsn` — in that order, so a mounted ConfigMap can carry the tables while
+the password stays in a secret. The file form is for Docker and Swarm secrets, which
+arrive as files under `/run/secrets`.
 
 A DSN naming no driver (`postgresql://…`) is driven with asyncpg, which the `cli` extra
 installs. One that names its own (`postgresql+psycopg://…`) is left exactly as written.
@@ -275,10 +289,12 @@ A document can name a command, or a block of Python, to run before a drop, after
 create, and at six other moments. They fire during `apply` only, and only with
 `--allow-hooks` — see [Commands around the lifecycle](hooks-in-config.md).
 
-## In a container
+## In a container, on a schedule, in CI
 
-The same commands, with nothing installed:
-`ghcr.io/bedrock-python/pg-partsmith:1.1` — see [the container image](container.md).
+The same commands, with nothing installed: `ghcr.io/bedrock-python/pg-partsmith:1.1`.
+[The container image](container.md) is about the image; [Ways to run it](running.md) is
+every harness — plain Docker, Compose, Swarm, a Pod, a Job, a CronJob, an init
+container, CI, systemd — with a copy-pasteable shape for each.
 
 ## What is not here yet
 
