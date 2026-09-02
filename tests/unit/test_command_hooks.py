@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +16,7 @@ import pytest
 from pg_partsmith.aio.command_hooks import CommandHookError, CommandHooks
 from pg_partsmith.entities import PartitionGranularity, PartitionInfo, TablePartitionConfig
 from pg_partsmith.events import HookPhase, PartitionEvent
+from pg_partsmith.hook_commands import stop_hook_command
 from pg_partsmith.plan import DropPartition, Reason
 from pg_partsmith.sync.command_hooks import CommandHooks as SyncCommandHooks
 from pg_partsmith.topology import RangeBounds
@@ -169,3 +173,41 @@ def test__hook_event__is_built_at_the_moment_the_test_says_it_is() -> None:
     # Guards the fixture rather than the code: a stale clock here would make
     # the window assertions above pass for the wrong reason.
     assert datetime.now(UTC).year >= 2024
+
+
+async def test__on_event__cancelled_while_the_command_runs__stops_the_child_and_returns_promptly() -> None:
+    # A run being stopped -- Ctrl+C, a pod's SIGTERM -- must not wait out a
+    # five-minute archiver, and must not leave it running unwatched either.
+    hooks = CommandHooks({HookPhase.BEFORE_DROP: _script("import time; time.sleep(60)")}, timeout_seconds=60)
+    task = asyncio.create_task(hooks.on_event(_event()))
+    await asyncio.sleep(0.5)
+
+    # Act
+    started = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Assert: seconds, not the minute the child had left
+    assert time.monotonic() - started < 15
+
+
+def test__stop_hook_command__a_child_that_ignores_nothing__is_terminated_then_gone() -> None:
+    # Arrange
+    process = subprocess.Popen(_script("import time; time.sleep(60)"), stdin=subprocess.PIPE)  # noqa: S603
+
+    # Act
+    stop_hook_command(process, grace_seconds=5)
+
+    # Assert
+    assert process.poll() is not None
+
+
+def test__stop_hook_command__a_child_already_gone__is_left_alone() -> None:
+    # Arrange
+    process = subprocess.Popen(_script("pass"))  # noqa: S603
+    process.wait()
+
+    # Act / Assert: nothing to do, and nothing raised
+    stop_hook_command(process)
+    assert process.returncode == 0

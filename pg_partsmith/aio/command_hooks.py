@@ -28,7 +28,13 @@ from typing import TYPE_CHECKING
 
 from pg_partsmith.constants import DEFAULT_HOOK_TIMEOUT_SECONDS
 from pg_partsmith.events import HookPhase, hook_environment
-from pg_partsmith.hook_commands import CommandHookError, run_hook_command, tail
+from pg_partsmith.hook_commands import (
+    CommandHookError,
+    finish_hook_command,
+    start_hook_command,
+    stop_hook_command,
+    tail,
+)
 
 from .hooks import BasePartitionLifecycleHooks
 
@@ -98,15 +104,24 @@ class CommandHooks(BasePartitionLifecycleHooks):
         command = self._commands.get(event.phase)
         if command is None:
             return
-        stdout = await asyncio.to_thread(
-            run_hook_command,
-            command,
-            event.model_dump_json(by_alias=True).encode(),
-            phase=event.phase,
-            partition_name=event.partition.name,
-            environment=hook_environment(event),
-            timeout_seconds=self._timeout,
+        process = start_hook_command(
+            command, phase=event.phase, partition_name=event.partition.name, environment=hook_environment(event)
         )
+        try:
+            stdout = await asyncio.to_thread(
+                finish_hook_command,
+                process,
+                event.model_dump_json(by_alias=True).encode(),
+                phase=event.phase,
+                partition_name=event.partition.name,
+                timeout_seconds=self._timeout,
+            )
+        except asyncio.CancelledError:
+            # The run is being stopped -- Ctrl+C, a pod's SIGTERM. The waiting
+            # thread cannot be cancelled, but the child can be stopped, which
+            # ends the wait and leaves nothing running unwatched.
+            await asyncio.to_thread(stop_hook_command, process)
+            raise
         if stdout:
             logger.info(
                 "%s hook said: %s",

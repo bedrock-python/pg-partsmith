@@ -135,6 +135,13 @@ declarations that parse it, shell completion via `--install-completion`. A usage
 `64` (`EX_USAGE`), never the `2` argument parsers default to: `2` is what this tool means
 "drift" by, and a CronJob alerting on drift must not page over a typo.
 
+A stop signal cancels the run rather than killing the process. `SIGTERM` — what a pod is
+sent at its deadline — used to end it on the spot, with no `finally`, no line in the log
+and, under a command hook, an archiver left running unwatched. Both it and Ctrl+C now take
+the path a raised exception takes: the statement is cancelled and rolled back, the lock
+released, the engine disposed, a hook's child terminated, and the exit code is `130` or
+`143` with a line on stderr saying which.
+
 `--output json` is the models' own dump under a versioned envelope, `by_alias=True`, so
 what comes out of `plan` and what goes into a document are one vocabulary; logs go to
 stderr. The connection comes from `--dsn`, then `$PG_PARTSMITH_DSN`, then the document.

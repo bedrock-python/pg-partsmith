@@ -62,7 +62,9 @@ run's issues, and the command exits `3`.
 
 A command that outlives `timeout_seconds` (default 300) is killed, and that counts as a
 refusal. There is no "wait forever": a hook that hangs is holding the table's maintenance
-lock.
+lock. A command is also stopped when the run is — Ctrl+C, a pod's `SIGTERM` — with
+`terminate` first and `kill` a few seconds later, so nothing it started keeps running
+unwatched.
 
 ## Hooks never fire during `plan`
 

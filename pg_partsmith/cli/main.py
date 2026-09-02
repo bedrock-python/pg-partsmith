@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import sys
 from dataclasses import dataclass
 from enum import StrEnum
@@ -311,7 +312,7 @@ def _execute(invocation: _Invocation) -> ExitCode:
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
-        result = asyncio.run(_run(invocation))
+        result = asyncio.run(_supervised(invocation))
     except (ConfigError, InvalidPartitionConfigError, PlanConfigMismatchError) as exc:
         return _failed(str(exc), ExitCode.CONFIG)
     except LockAcquisitionError as exc:
@@ -322,13 +323,77 @@ def _execute(invocation: _Invocation) -> ExitCode:
         # before SQLAlchemy has a DBAPI error to wrap. Reading the document is
         # already behind ConfigError, so an OSError here is the database.
         return _failed(f"database error: {exc}", ExitCode.CONNECTION)
-    except KeyboardInterrupt:  # pragma: no cover - interactive only
-        return _failed("interrupted", ExitCode.FAILED)
+    except _StopSignalError as exc:
+        word, code = _STOP_SIGNALS[exc.signum]
+        return _failed(word, code)
+    except KeyboardInterrupt:
+        # Where the loop cannot take a signal handler of its own -- Windows --
+        # asyncio.run's own Ctrl+C handling cancels the task and raises this
+        # once it has cleaned up. The same outcome, by the runner's route.
+        return _failed("interrupted", ExitCode.INTERRUPTED)
 
     text = result.render(output=invocation.output.value)
     if text:
         sys.stdout.write(text + "\n")
     return result.code
+
+
+class _StopSignalError(Exception):
+    """The run was stopped by a signal, and has cleaned up on the way here."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+_STOP_SIGNALS: dict[int, tuple[str, ExitCode]] = {
+    signal.SIGINT: ("interrupted", ExitCode.INTERRUPTED),
+    signal.SIGTERM: ("terminated", ExitCode.TERMINATED),
+}
+
+
+async def _supervised(invocation: _Invocation) -> CommandResult:
+    """Run the command, with a stop signal turned into a cancellation that cleans up.
+
+    ``SIGTERM`` is what a pod is sent at its deadline, and Python's default for
+    it is to die on the spot -- no ``finally``, no lock released by us, no line
+    in the log. The database survives that (a dropped connection cancels the
+    statement and rolls the transaction back; a session lock goes with the
+    session), but "survives" is not "was told". Cancelling the task instead
+    takes the same path a raised exception takes: the statement is cancelled
+    by the driver, the lock is released, the engine is disposed, a hook's child
+    process is stopped, and the exit code says which signal it was.
+
+    Where the loop cannot take signal handlers -- a worker thread, Windows --
+    nothing is installed and ``asyncio.run``'s own Ctrl+C handling applies.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    received: list[int] = []
+
+    def stop(signum: int) -> None:
+        # A second signal changes nothing: the first already cancelled the run,
+        # and what is left is the cleanup, which is worth letting finish.
+        if not received and task is not None:
+            received.append(signum)
+            task.cancel()
+
+    installed: list[int] = []
+    for signum in _STOP_SIGNALS:
+        try:
+            loop.add_signal_handler(signum, stop, signum)
+        except (NotImplementedError, RuntimeError, ValueError):
+            break
+        installed.append(signum)
+    try:
+        return await _run(invocation)
+    except asyncio.CancelledError:
+        if received:
+            raise _StopSignalError(received[0]) from None
+        raise
+    finally:
+        for signum in installed:
+            loop.remove_signal_handler(signum)
 
 
 async def _run(invocation: _Invocation) -> CommandResult:

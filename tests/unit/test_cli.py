@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import importlib
 import json
 import re
+import signal
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,6 +51,10 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 NOW = datetime(2026, 8, 28, tzinfo=UTC)
+
+# The package re-exports a function called main, which shadows the submodule on
+# attribute access; importlib reaches the module itself.
+cli = importlib.import_module("pg_partsmith.cli.main")
 
 DOCUMENT: dict[str, Any] = {
     "defaults": {"schema": "public", "granularity": "month"},
@@ -638,3 +646,76 @@ def test__hooks__a_python_file_that_is_missing__fails_validate_by_name(tmp_path:
 
     # Act / Assert
     assert main(["validate", "-c", str(config)]) == ExitCode.CONFIG
+
+
+# ── Being stopped ───────────────────────────────────────────────────────────────
+
+
+class _Recording:
+    """An engine that remembers being disposed, and is otherwise the real one."""
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+        self.disposed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine, name)
+
+    async def dispose(self) -> None:
+        self.disposed = True
+        await self._engine.dispose()
+
+
+def _stoppable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, signum: int) -> tuple[str, list[_Recording]]:
+    """A document that connects nowhere, and a plan that raises ``signum`` mid-run."""
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+    engines: list[_Recording] = []
+
+    def recording(url: str) -> _Recording:
+        engine = _Recording(cli.create_async_engine.__wrapped__(url))  # type: ignore[attr-defined]
+        engines.append(engine)
+        return engine
+
+    real = cli.create_async_engine
+    recording.__wrapped__ = real  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "create_async_engine", recording)
+
+    async def stopped_mid_run(kit: Any, configs: Any, *, check: bool, locks: bool = False) -> Any:
+        signal.raise_signal(signum)  # what the terminal, or the kubelet, does
+        await asyncio.sleep(5)  # the statement the run was in the middle of
+        raise AssertionError("never reached")
+
+    monkeypatch.setattr(cli, "run_plan", stopped_mid_run)
+    return str(config), engines
+
+
+def test__main__ctrl_c_mid_run__cleans_up_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange
+    config, engines = _stoppable(monkeypatch, tmp_path, signal.SIGINT)
+
+    # Act
+    code = main(["plan", "-c", config])
+
+    # Assert: 128 + 2, the engine disposed on the way out, one line saying why
+    assert code == ExitCode.INTERRUPTED
+    assert engines and engines[0].disposed
+    assert "interrupted" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="an event loop takes no signal handlers on Windows")
+def test__main__sigterm_mid_run__cleans_up_and_exits_143(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: what a pod is sent at its deadline
+    config, engines = _stoppable(monkeypatch, tmp_path, signal.SIGTERM)
+
+    # Act
+    code = main(["plan", "-c", config])
+
+    # Assert
+    assert code == ExitCode.TERMINATED
+    assert engines and engines[0].disposed
+    assert "terminated" in capsys.readouterr().err

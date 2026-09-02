@@ -104,6 +104,22 @@ Two things worth knowing before you point it at production:
   `plan --locks` prints it and `plan --output json` carries it per operation under
   `capabilities`, which is the thing to read before scheduling a window.
 
+## When the pod is killed
+
+`activeDeadlineSeconds`, an eviction, a rollout: the kubelet sends `SIGTERM`, waits
+`terminationGracePeriodSeconds`, then `SIGKILL`.
+
+On `SIGTERM` the run cancels itself cleanly — the statement in flight is cancelled and
+rolled back, the advisory lock released, a hook's child process terminated — and exits
+`143` with `pg-partsmith: terminated` in the log. That takes a few seconds; the default
+grace period of thirty is plenty.
+
+On `SIGKILL` none of that runs, and the database is still fine: a dropped connection makes
+PostgreSQL cancel the statement and roll back its transaction, a session-level advisory
+lock goes with the session, and an interrupted `DETACH … CONCURRENTLY` leaves the pending
+state the next run finalizes first. The difference is only that nothing says so in the log,
+and a hook's child process is on its own.
+
 ## Tags
 
 `1.4.2` is exact and immutable. `1.4` moves within the minor version, which is what a

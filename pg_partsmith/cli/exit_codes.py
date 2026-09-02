@@ -27,6 +27,10 @@ class ExitCode(IntEnum):
             ``EX_USAGE`` from ``sysexits.h``, and deliberately not the ``2``
             argument parsers default to: that is what this tool means "drift"
             by, and a CronJob alerting on drift must not page over a typo.
+        INTERRUPTED: Stopped by ``SIGINT`` -- Ctrl+C -- after cleaning up.
+            ``128 + 2``, the shell's own spelling of it.
+        TERMINATED: Stopped by ``SIGTERM`` -- what a pod is sent at its
+            deadline -- after cleaning up. ``128 + 15``, likewise.
     """
 
     OK = 0
@@ -37,3 +41,5 @@ class ExitCode(IntEnum):
     CONNECTION = 5
     LOCKED = 6
     USAGE = 64
+    INTERRUPTED = 130
+    TERMINATED = 143

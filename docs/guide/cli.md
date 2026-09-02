@@ -18,6 +18,21 @@ pg-partsmith apply    -c partitions.yaml     # do it — creations only, by defa
 The first three issue no DDL, take no lock and fire no hook. `apply` is the one that
 acts.
 
+## Being stopped
+
+Ctrl+C, or the `SIGTERM` a pod is sent at its deadline, cancels the run rather than
+killing the process. The statement in flight is cancelled by the driver and its
+transaction rolled back, the table's lock is released, the engine is disposed, a hook's
+child process is terminated, and the exit code says which signal it was: `130` or `143`.
+One line on stderr says the same in words.
+
+What a stopped run leaves behind is what the library promises for any cancellation: at
+most a detached, unattached table (attach is the last step of a creation) or a marked,
+half-detached partition, and the next run converges both.
+
+A block of Python in a hook cannot be interrupted mid-way — the signal is honoured the
+moment the block returns. A command can, and is.
+
 ## Shell completion
 
 ```bash
@@ -50,6 +65,8 @@ distinguishing:
 | 5 | the database could not be reached |
 | 6 | another maintainer holds the table's lock |
 | 64 | the invocation itself was wrong: a misspelled flag, no command |
+| 130 | stopped by Ctrl+C, after cleaning up |
+| 143 | stopped by `SIGTERM`, after cleaning up |
 
 Three of those deserve their reasoning spelled out.
 

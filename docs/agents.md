@@ -61,8 +61,8 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   reads back, and applying it is refused if it was made for another table or under a
   configuration that has since changed (`--allow-config-drift` overrides). Exit codes: 0
   nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
-  5 connection, 6 lock held, 64 usage (never the parser's 2, which means drift here), 1
-  unexpected. `--output json` is the model dump under a
+  5 connection, 6 lock held, 64 usage (never the parser's 2, which means drift here), 130
+  / 143 stopped by SIGINT / SIGTERM after cleaning up, 1 unexpected. `--output json` is the model dump under a
   versioned envelope; `--output metrics` is Prometheus text exposition for a node_exporter
   textfile, all gauges, prefixed `pg_partsmith_`; `plan --locks` prints the heaviest lock
   each operation takes. There is deliberately no `--sql`. See `guide/cli.md`.
