@@ -1,5 +1,6 @@
 """Sync implementations for partition management."""
 
+from .command_hooks import CommandHookError, CommandHooks
 from .hooks import BasePartitionLifecycleHooks, PartitionLifecycleHooks
 from .lock import PostgresAdvisoryLockManager, RedisDistributedLockManager
 from .maintainer import PartitionMaintainer, maintain_partitions
@@ -10,12 +11,16 @@ from .protocols import (
     PartitionMetadataProvider,
     PartitionRepository,
 )
+from .python_hooks import PythonHookError, PythonHooks
 from .repositories import PostgresPartitionRepository
 from .service import PartitionLifecycleService
 from .services import PartitionInspector, PartitionValidationService, PlanExecutor
+from .toolkit import PartitionToolkit
 
 __all__ = [
     "BasePartitionLifecycleHooks",
+    "CommandHookError",
+    "CommandHooks",
     "LockManager",
     "PartitionInspector",
     "PartitionLifecycle",
@@ -24,11 +29,14 @@ __all__ = [
     "PartitionMaintainer",
     "PartitionMetadataProvider",
     "PartitionRepository",
+    "PartitionToolkit",
     "PartitionValidationService",
     "PlanExecutor",
     "PostgresAdvisoryLockManager",
     "PostgresMetadataProvider",
     "PostgresPartitionRepository",
+    "PythonHookError",
+    "PythonHooks",
     "RedisDistributedLockManager",
     "maintain_partitions",
 ]

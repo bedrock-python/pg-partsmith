@@ -151,6 +151,25 @@ class PlanStaleError(PartitionError):
         self.detail = detail
 
 
+class PlanConfigMismatchError(PartitionError):
+    """Raised when a plan is applied under a configuration it was not made from.
+
+    In one process the plan and the configuration come from the same two
+    lines and cannot disagree. Once the plan is an artifact -- written by one
+    run, read by another, picked out of a document describing several tables
+    -- they can: the plan for one table applied under another's configuration,
+    or a plan made before the policy it was planned under was edited. Neither
+    is caught by the identity revalidation each destructive operation already
+    does, which answers whether this is still the same relation, not whether
+    it is still the same intent.
+    """
+
+    def __init__(self, table_name: str, detail: str) -> None:
+        super().__init__(f"Plan for {table_name!r} does not match this configuration: {detail}")
+        self.table_name = table_name
+        self.detail = detail
+
+
 class UnmanagedPartitionDropError(PartitionError):
     """Raised when attempting to drop a table not managed by this library."""
 

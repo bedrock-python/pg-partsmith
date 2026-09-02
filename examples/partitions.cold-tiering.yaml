@@ -1,0 +1,21 @@
+# Cold tiering: leaves are foreign tables on an archive server, so old data
+# lives elsewhere and PostgreSQL still sees one table. Foreign leaves are
+# inspected and retired, never dropped from the archive side.
+
+tables:
+  - table_name: metrics
+    schema: public
+    partition_column: ts
+    granularity: month
+    create_ahead_count: 2
+    retention_count: 24
+    leaves:
+      kind: foreign
+      server: archive
+      options:
+        table_name: "{relname}"
+        schema_name: "{schema}"
+
+hooks:
+  # Tell the archive side a partition is about to be retired on this side.
+  before_detach: ["/opt/hooks/notify.sh"]

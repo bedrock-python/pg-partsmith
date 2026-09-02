@@ -64,8 +64,40 @@ make test-integration
 PG_PARTSMITH_TEST_PG_IMAGE=postgres:15-alpine make test-integration   # another server version
 ```
 
-CI runs the integration suite on PostgreSQL 15, 16 and 17; the default image is
-`postgres:17-alpine`.
+CI runs the integration suite on PostgreSQL 15 through 18, on arm64, on Windows and
+macOS against a server the runner installs itself, and once with the server's clock at
+UTC+14 and the client's at UTC-12. The default image is `postgres:17-alpine`; four
+variables steer the session:
+
+| Variable | What it does |
+|---|---|
+| `PG_PARTSMITH_TEST_PG_IMAGE` | the container image, when Docker is there |
+| `PG_PARTSMITH_TEST_DSN` | any running server instead of a container; the few tests that reach into the container skip |
+| `PG_PARTSMITH_TEST_PG_TZ` | the container's default time zone, for a server far from UTC |
+| `PG_PARTSMITH_TEST_REDIS_URL` | a running Redis for the lock tests where no container can run; without it, and with a DSN set, they skip |
+
+Unit tests run on every supported Python on Linux, at both ends of the range on Windows
+and macOS, on arm64, and with `TZ` at UTC+14 and UTC-12. One job installs every direct
+dependency at the lowest version `pyproject.toml` admits and runs both suites on it; that
+is what keeps the declared bounds honest, so raise a bound rather than work around an old
+version. Warnings are errors under pytest: a deprecation fails the suite the day it
+appears, not the day the removal ships.
+
+## The image, end to end
+
+The container image is tested as a container: a read-only root filesystem, every
+capability dropped, the document mounted read-only, against a PostgreSQL container on a
+network of its own — and the commands are the ones the guides show, with the exit codes
+they promise. Docker is required, and the image has to exist:
+
+```bash
+make test-e2e                                                    # builds pg-partsmith:local and runs the suite against it
+PG_PARTSMITH_E2E_IMAGE=pg-partsmith:ci uv run pytest -m e2e      # an image you already have
+```
+
+Without `PG_PARTSMITH_E2E_IMAGE` the suite skips. CI builds the image and runs it on both
+architectures. The Compose test needs the `docker compose` plugin and skips where it is
+missing.
 
 ## Adding a period strategy
 
@@ -123,7 +155,17 @@ have a sync twin.
 Releases are cut by [release-please](https://github.com/googleapis/release-please) from the
 Conventional Commits on `master`: it keeps a release pull request open with the next version
 and the generated changelog section; merging that PR tags the release, and the publish
-workflow builds the package and uploads it to PyPI.
+workflow takes it from there, in this order: the image is built, made to say the version,
+scanned and pushed by digest on each architecture; the package is uploaded to PyPI; the
+two image tags are created over both architectures and signed; and the published image is
+pulled back on both architectures and run through the end-to-end suite. Nothing reaches
+PyPI unless the image is good, and a run repeated after a failure further down skips what
+PyPI already has and carries on. A failure in the last job is a red release run to read,
+not an unpublished image.
+
+The first push creates the `ghcr.io/bedrock-python/pg-partsmith` package private; make it
+public in the organisation's package settings once, or every `docker pull` in the guides
+is denied.
 
 - `feat:` bumps the minor version, `fix:` the patch version, `feat!:` / a `BREAKING CHANGE:`
   footer bumps the major version (before 1.0 a breaking change bumps the minor version —

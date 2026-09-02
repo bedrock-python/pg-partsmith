@@ -147,7 +147,10 @@ async def child_count(engine: AsyncEngine, parent: str) -> int:
 
 
 async def _child_bounds(engine: AsyncEngine, parent: str) -> list[Any]:
-    async with engine.connect() as conn:
+    # Bounds are rendered in the session time zone. Read in UTC whatever the
+    # server defaults to, so a bound is one string in every test environment.
+    async with engine.begin() as conn:
+        await conn.execute(text("SET LOCAL TIME ZONE 'UTC'"))
         result = await conn.execute(text(CHILD_BOUNDS_SQL), {"parent": quote_identifier(parent)})
         return list(result.fetchall())
 

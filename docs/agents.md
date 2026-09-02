@@ -51,7 +51,45 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   each with the reason it is there, plus **findings**: what the planner saw and
   deliberately did not touch.
 * `apply()` runs a plan under the table's lock, revalidating every destructive operation
-  against the catalog first.
+  against the catalog first, and refusing a plan this configuration did not produce.
+* `PartitionToolkit.from_engine(engine, ...)` builds the repository, the metadata provider,
+  the locks, the service and the maintainer around one engine, giving each setting that
+  belongs to two of them (`marker_prefix`, `ddl_timezone`, `boundary_codec`) exactly once.
+* `pg-partsmith` (extra `cli`) runs `inspect` / `plan` / `validate` / `apply` over a
+  document and a DSN. The first three issue no DDL; `apply` withholds detaches and drops
+  unless `--allow-destructive`. `plan --save FILE` writes the artifact `apply --plan FILE`
+  reads back, and applying it is refused if it was made for another table or under a
+  configuration that has since changed (`--allow-config-drift` overrides). Exit codes: 0
+  nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
+  5 connection, 6 lock held, 64 usage (never the parser's 2, which means drift here), 130
+  / 143 stopped by SIGINT / SIGTERM after cleaning up, 1 unexpected. `--output json` is the model dump under a
+  versioned envelope; `--output metrics` is Prometheus text exposition for a node_exporter
+  textfile, all gauges, prefixed `pg_partsmith_`; `--write FILE` puts any output in a file
+  atomically; `plan --locks` prints the heaviest lock each operation takes;
+  `apply --ok-if-locked` exits 0 on a held lock. There is deliberately no `--sql`. See
+  `guide/cli.md`.
+* `CommandHooks` (both mirrors) runs a configured command per phase with the
+  `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. `PythonHooks`
+  runs a block of Python per phase with `event` and `log` in scope; raising refuses. In a
+  document both are the `hooks` section (a command list, or `{python: ...}` /
+  `{python_file: ...}`), honoured only under `apply --allow-hooks`; every block is compiled
+  by `validate`. No sandbox is claimed. Hooks never fire during `plan`. See
+  `guide/hooks-in-config.md`.
+* The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command
+  as its entrypoint: distroless, Python 3.14, no shell, no pip, UID 65532, signed, with an
+  SBOM and provenance; tags are the exact version and a moving minor, never `latest`. See
+  `guide/container.md` for the image and `guide/running.md` for every harness: plain
+  Docker, Compose (`docker compose run`, `service_completed_successfully`, a cron
+  sidecar), Swarm (swarm-cronjob), Kubernetes Pod / Job / CronJob / init container, the
+  plan-then-apply Jobs, node_exporter textfile, CI, systemd. The DSN can also come from a
+  secret file via `PG_PARTSMITH_DSN_FILE`. `pg-partsmith schema` prints the document's
+  JSON Schema; validated examples of every document shape and of hook scripts live under
+  `examples/` (see `guide/examples.md`).
+* `PartitionsDocument` is several tables and their wiring as one validated model — what a
+  YAML or JSON file parses into. `document.configs()` gives every `TablePartitionConfig`,
+  `document.config_for(name)` one of them, and
+  `PartitionToolkit.from_options(engine, document.runtime)` the wiring. The library parses
+  no files: hand it `yaml.safe_load(...)` / `json.loads(...)` output.
 * `maintain()` is both under one lock, and is what a scheduled tick calls.
 
 Two kinds of level:
@@ -230,7 +268,7 @@ Every method takes the `TablePartitionConfig` as its first argument.
 |---|---|---|---|
 | `inspect(config)` | no | no | `ActualTree \| None` |
 | `plan(config, *, mode=PlanMode.MAINTAIN, now=None, windows=None)` | no | no | `MaintenancePlan` |
-| `apply(config, plan, *, continue_on_error=False)` | **yes** | yes | `MaintenanceResult` |
+| `apply(config, plan, *, continue_on_error=False, allow_config_drift=False)` | **yes** | yes | `MaintenanceResult` |
 | `maintain(config, *, skip_create=False, skip_detach=False, skip_drop=False, continue_on_error=False)` | **yes** | yes | `MaintenanceResult` |
 | `reconcile(config)` | no | yes | `MaintenanceResult` |
 | `ensure_partition(config, period_or_window_or_position)` | no | yes | `PartitionInfo \| None` |
@@ -250,9 +288,21 @@ raises and reports the failure on `result.error` instead, which is what a schedu
 `EXPLICIT` (only the windows named in `windows=`).
 
 On a `MaintenancePlan`: `.operations`, `.findings`, `.cursors`, `.generated_at`,
-`.creates` / `.attaches` / `.detaches` / `.drops`, `.is_noop`, `.only(*kinds)`,
-`.without(*kinds)`, `.describe()`. Filtering a plan and applying the rest is supported and
-is how you split creation from pruning across schedules.
+`.config_fingerprint`, `.creates` / `.attaches` / `.detaches` / `.drops`, `.is_noop`,
+`.only(*kinds)`, `.without(*kinds)`, `.describe()`. Filtering a plan and applying the rest
+is supported and is how you split creation from pruning across schedules.
+
+Every operation dumps its `capabilities` (the heaviest lock it takes, and whether it can
+run in a transaction block) and `is_destructive` beside its fields; both are computed on the
+way out and ignored on the way in, so the round trip holds.
+
+Serialize a plan with `model_dump_json(by_alias=True)` — the same vocabulary a
+configuration uses (`kind`, `method`, `schema`) — and read it back with
+`MaintenancePlan.model_validate_json`. `apply()` refuses a plan made for another table, or
+one whose `config_fingerprint` no longer matches `config.fingerprint`, with
+`PlanConfigMismatchError`; pass `allow_config_drift=True` to apply it anyway. OID
+revalidation asks whether this is still the same relation, the fingerprint whether it is
+still the same intent.
 
 Results:
 
@@ -373,6 +423,7 @@ for issue in result.issues:                 # non-fatal, but they are why nothin
 
 `InvalidPartitionConfigError` (the config does not match the table),
 `LockAcquisitionError` (another maintainer holds the lock), `PlanStaleError`,
+`PlanConfigMismatchError` (the plan was not made from this configuration),
 `PartitionTopologyError`, `PartitionReferencedError` (a detach PostgreSQL refused because
 rows still reference the partition), `RowMoveRefusedError` (a row move an incoming foreign
 key's `ON DELETE` action would corrupt), `PartitionAlreadyExistsError`,

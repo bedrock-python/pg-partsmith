@@ -13,6 +13,7 @@ from .boundaries import (
     UUIDv7BoundaryCodec,
     Window,
 )
+from .document import HookOptions, PartitionsDocument, PartitionTableSpec, PythonHook, ToolkitOptions
 from .entities import (
     DefaultBounds,
     HashBounds,
@@ -43,6 +44,7 @@ from .exceptions import (
     PartitionNotFoundError,
     PartitionReferencedError,
     PartitionTopologyError,
+    PlanConfigMismatchError,
     PlanStaleError,
     RowMoveRefusedError,
     UnmanagedPartitionDropError,
@@ -89,6 +91,7 @@ from .plan import (
     PartitionBy,
     Reason,
     Severity,
+    validate_plan_for_config,
 )
 from .planner import PlanMode, PlanningContext, plan_maintenance
 from .protocols import (
@@ -148,6 +151,7 @@ __all__ = [
     "ForeignLeaves",
     "HashBounds",
     "HashPartitioning",
+    "HookOptions",
     "HookPhase",
     "HourPeriodCalculator",
     "IntegerSequence",
@@ -190,15 +194,19 @@ __all__ = [
     "PartitionReferencedError",
     "PartitionScheme",
     "PartitionStrategy",
+    "PartitionTableSpec",
     "PartitionTopologyError",
     "PartitionType",
+    "PartitionsDocument",
     "Period",
     "PeriodCalculator",
+    "PlanConfigMismatchError",
     "PlanMode",
     "PlanStaleError",
     "PlanningContext",
     "PositionedCalculator",
     "Predicate",
+    "PythonHook",
     "QuarterPeriodCalculator",
     "RangeBoundaries",
     "RangeBoundaryCodec",
@@ -215,6 +223,7 @@ __all__ = [
     "TablePartitionConfig",
     "TimeBoundaries",
     "TimezoneAwareCalculator",
+    "ToolkitOptions",
     "UUIDv7BoundaryCodec",
     "UnmanagedPartitionDropError",
     "Unreferenced",
@@ -227,4 +236,5 @@ __all__ = [
     "plan_maintenance",
     "qualify",
     "split_qualified_name",
+    "validate_plan_for_config",
 ]

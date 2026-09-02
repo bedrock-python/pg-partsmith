@@ -144,6 +144,14 @@ drop_max_retries=3, drop_retry_delay=0.5, drop_max_backoff=300)`.
 `PostgresMetadataProvider(engine, *, marker_prefix=None, boundary_codec=None,
 ddl_timezone=None)`.
 
+`PartitionToolkit.from_engine(engine, *, hooks=None, locks=None, marker_prefix=None,
+ddl_timezone="UTC", ddl_timeout_seconds=30, boundary_codec=None, lock_prefix="partitioner",
+lock_min_interval_seconds=0, drop_allow_unmanaged=False, drop_lock_timeout_ms=3000,
+drop_max_retries=3, drop_retry_delay=0.5, drop_max_backoff=300)` builds all of them around
+one engine and returns them as `repo` / `metadata` / `locks` / `service` / `maintainer`,
+with each shared setting given once. Construct `PartitionToolkit(...)` directly to hold
+parts of your own.
+
 `marker_prefix` must be the same on the repository and the provider — the first writes the
 ownership marker, the second finds it — and `PartitionLifecycleService` refuses a pair that
 disagrees. The provider's `boundary_codec` and `ddl_timezone` are used by
@@ -157,7 +165,10 @@ acquire_min_interval_seconds=0)`.
 ## Serialization
 
 `config.model_dump(mode="json", by_alias=True)` round-trips through
-`TablePartitionConfig.model_validate`. Boundaries dump with a `kind` (`time`, `integer`,
+`TablePartitionConfig.model_validate`. `config.fingerprint` is a digest of that form,
+which is what a plan records in `config_fingerprint` and what `apply()` compares against;
+anything excluded from serialization is invisible to it, so two configurations differing
+only in a `Callback`'s function share a fingerprint. Boundaries dump with a `kind` (`time`, `integer`,
 `sequence`), levels with `method` (`range`, `list`, `hash`), policies and predicates with
 `kind`, leaves with `kind` (`local`, `foreign`). Custom calculators, custom codecs and
 `Callback` functions are left out.

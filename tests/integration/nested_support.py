@@ -34,8 +34,8 @@ FROZEN_WEEK = "2026-08-26"
 WEEK_SUFFIX = "__2026_w35"
 NEXT_WEEK_SUFFIX = "__2026_w36"
 PREVIOUS_WEEK_SUFFIX = "__2026_w34"
-WEEK_BOUNDS = ("2026-08-24", "2026-08-31")
-PREVIOUS_WEEK_BOUNDS = ("2026-08-17", "2026-08-24")
+WEEK_BOUNDS = ("2026-08-24 00:00:00+00", "2026-08-31 00:00:00+00")
+PREVIOUS_WEEK_BOUNDS = ("2026-08-17 00:00:00+00", "2026-08-24 00:00:00+00")
 
 # Timestamp-keyed root. The primary key carries tenant_id because PostgreSQL
 # requires every unique constraint on a partitioned table to include all of its

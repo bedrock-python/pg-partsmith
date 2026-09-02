@@ -98,7 +98,7 @@ class PlanningContext(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     now: datetime
-    cursors: dict[str, Any] = Field(default_factory=dict)
+    cursors: dict[str, int] = Field(default_factory=dict)
     mode: PlanMode = PlanMode.MAINTAIN
     explicit_windows: dict[str, tuple[Window, ...]] = Field(default_factory=dict)
 
@@ -121,6 +121,7 @@ def plan_maintenance(config: TablePartitionConfig, actual: ActualTree, context: 
         table_name=config.qualified_name,
         generated_at=context.now,
         cursors=dict(context.cursors),
+        config_fingerprint=config.fingerprint,
         operations=tuple(planner.creates + planner.attaches + planner.detaches + planner.drops),
         findings=tuple(planner.findings),
     )

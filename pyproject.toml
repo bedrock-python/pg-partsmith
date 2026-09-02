@@ -16,12 +16,13 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
 dependencies = [
-    "pydantic>=2.0.0,<3.0.0",
+    "pydantic>=2.6.0,<3.0.0",
     "python-dateutil>=2.7.0,<3.0.0",
     "sqlalchemy[asyncio]>=2.0.0,<3.0.0",
 ]
@@ -32,9 +33,13 @@ Documentation = "https://bedrock-python.github.io/pg-partsmith/"
 Changelog = "https://github.com/bedrock-python/pg-partsmith/blob/master/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/bedrock-python/pg-partsmith/issues"
 
+[project.scripts]
+pg-partsmith = "pg_partsmith.console:main"
+
 [project.optional-dependencies]
 redis-locks = ["redis>=4.2.0"]
 pydantic-settings = ["pydantic-settings>=2.0.0,<3.0.0"]
+cli = ["pyyaml>=6.0,<7.0", "asyncpg>=0.29.0", "typer>=0.17,<1.0"]
 
 [dependency-groups]
 test = [
@@ -47,6 +52,10 @@ test = [
     "tzdata>=2024.1",
     "psycopg2-binary>=2.9.11",
     "types-python-dateutil~=2.9.0",
+    "pyyaml>=6.0,<7.0",
+    "types-pyyaml>=6.0",
+    "pydantic-settings>=2.0.0,<3.0.0",
+    "typer>=0.17,<1.0",
 ]
 docs = [
     "zensical>=0.0.37",
@@ -62,6 +71,11 @@ dev = [
 
 [tool.uv]
 link-mode = "copy"
+
+[tool.check-wheel-contents]
+# W002, duplicate files: the sync package mirrors the aio one file for file,
+# and a package marker that says nothing is the same bytes in both.
+ignore = ["W002"]
 
 [tool.hatch.version]
 path = "pg_partsmith/__version__.py"
@@ -96,6 +110,7 @@ warn_unreachable = true
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+extend-exclude = ["examples"]
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "I", "B", "N", "S", "C4", "DTZ", "SIM", "TRY", "PERF", "RUF", "UP", "ANN", "T20", "PTH", "PLC", "PLE", "PLW"]
@@ -121,6 +136,14 @@ addopts = [
 markers = [
     "unit: mark a test as a unit test.",
     "integration: mark a test as an integration test.",
+    "e2e: mark a test as an end-to-end test of the container image; needs PG_PARTSMITH_E2E_IMAGE.",
+]
+# A warning is a deprecation notice with a date on it; the suite fails on the
+# day it appears rather than on the day the removal ships. The one ignored is
+# testcontainers deprecating a decorator it still uses itself.
+filterwarnings = [
+    "error",
+    "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
 ]
 
 [tool.coverage.run]

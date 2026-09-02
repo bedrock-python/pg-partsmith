@@ -147,7 +147,10 @@ def child_count(engine: Engine, parent: str) -> int:
 
 
 def _child_bounds(engine: Engine, parent: str) -> list[Any]:
-    with engine.connect() as conn:
+    # Bounds are rendered in the session time zone. Read in UTC whatever the
+    # server defaults to, so a bound is one string in every test environment.
+    with engine.begin() as conn:
+        conn.execute(text("SET LOCAL TIME ZONE 'UTC'"))
         result = conn.execute(text(CHILD_BOUNDS_SQL), {"parent": quote_identifier(parent)})
         return list(result.fetchall())
 

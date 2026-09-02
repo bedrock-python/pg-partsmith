@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-integration fmt check build install docs-serve docs-build clean
+.PHONY: test test-unit test-integration test-e2e fmt check build install docs-serve docs-build clean
 
 install:
 	uv sync --group dev
@@ -17,6 +17,10 @@ test-unit:
 
 test-integration:
 	uv run --extra pydantic-settings pytest -m integration
+
+test-e2e:
+	docker build --build-arg VERSION=local -t pg-partsmith:local .
+	PG_PARTSMITH_E2E_IMAGE=pg-partsmith:local uv run --extra pydantic-settings pytest -m e2e
 
 test:
 	uv run --extra pydantic-settings pytest --cov=pg_partsmith --cov-report=term --cov-fail-under=90 --cov-report=xml:coverage.xml

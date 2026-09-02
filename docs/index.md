@@ -98,7 +98,7 @@ result = await service.apply(config, plan)   # takes the table's lock, runs the 
 
 | | |
 |---|---|
-| Requirements | Python 3.11+, PostgreSQL 15+ (tested on 15, 16 and 17), SQLAlchemy 2 |
+| Requirements | Python 3.11+, PostgreSQL 15+ (tested on 15 through 18), SQLAlchemy 2 |
 | Install | `pip install pg-partsmith` |
 | Partitioning | `RANGE` over time, encoded keys (UUIDv7, epoch) and integers; `LIST` (static and sliding); `HASH`; nested to any depth |
 | Lifecycle | create ahead / until a horizon / when the newest partition is full; keep by count, age, distance or predicate; detach, then drop after a grace period |

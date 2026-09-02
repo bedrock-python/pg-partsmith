@@ -58,7 +58,10 @@ calculators and custom codecs cannot be expressed in JSON; build those configs i
 
 ## Several tables
 
-One subclass per table, each with its own prefix:
+A deployment maintaining several tables from a file wants
+[the configuration document](document.md): one list of tables, shared `defaults`, and the
+same field list as below. From the environment, it is one subclass per table, each with its
+own prefix:
 
 ```python
 class EventsSettings(PartitionTableSettings):

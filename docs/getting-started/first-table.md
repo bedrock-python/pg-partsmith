@@ -91,6 +91,33 @@ the same table.
     )
     ```
 
+Spelling the three out is worth doing once, because they are what everything else in
+this library is made of. From here on, `PartitionToolkit.from_engine(engine)` builds
+exactly this set and hands it back by name — `kit.repo`, `kit.metadata`, `kit.locks`,
+`kit.service`, `kit.maintainer`:
+
+=== "asyncio"
+
+    ```python
+    from pg_partsmith.aio import PartitionToolkit
+
+    kit = PartitionToolkit.from_engine(engine)
+    service = kit.service
+    ```
+
+=== "sync"
+
+    ```python
+    from pg_partsmith.sync import PartitionToolkit
+
+    kit = PartitionToolkit.from_engine(engine)
+    service = kit.service
+    ```
+
+Use it wherever you would otherwise pass `marker_prefix`, `ddl_timezone` or
+`boundary_codec`: each of those belongs to two objects at once, and the toolkit takes it
+once instead of leaving you to keep two constructors in step.
+
 ## 4. Look before you leap
 
 `plan()` reads the catalog and decides what to do. It issues no DDL and takes no lock, so

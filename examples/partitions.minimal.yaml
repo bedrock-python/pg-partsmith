@@ -1,0 +1,11 @@
+# The ordinary case: one table, partitioned by month on a timestamp, three
+# months kept ahead, a year kept behind. Everything else is a default.
+#
+#   pg-partsmith plan -c partitions.minimal.yaml --dsn postgresql://app@localhost/app
+
+tables:
+  - table_name: events
+    partition_column: created_at
+    granularity: month
+    create_ahead_count: 3
+    retention_count: 12

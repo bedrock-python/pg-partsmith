@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -382,6 +383,19 @@ class TablePartitionConfig(BaseModel):
     def qualified_name(self) -> str:
         """``schema.table`` when a schema is set, else the bare table name."""
         return qualify(self.schema_name, self.table_name)
+
+    @property
+    def fingerprint(self) -> str:
+        """Digest of the configuration, identifying what a plan was planned under.
+
+        Taken over the serialized form, so it moves with everything a plan
+        could have been planned differently for -- the scheme, the policy, the
+        leaves -- and not with the identity of the object. What serialization
+        leaves out is invisible to it: two configurations differing only in a
+        ``Callback``'s function, or in the behaviour of two custom codecs of
+        the same class name, share a fingerprint.
+        """
+        return hashlib.sha256(self.model_dump_json(by_alias=True).encode()).hexdigest()[:16]
 
     @property
     def root(self) -> SchemeBase:

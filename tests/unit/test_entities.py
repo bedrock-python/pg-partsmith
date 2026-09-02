@@ -998,3 +998,22 @@ def test__config__misspelled_field__refused_not_ignored() -> None:
             granularity=PartitionGranularity.MONTH,
             retention_cout=12,  # type: ignore[call-arg]
         )
+
+
+def test__fingerprint__is_stable_across_a_round_trip_and_moves_with_the_policy() -> None:
+    # Arrange
+    config = TablePartitionConfig(
+        schema="public",
+        table_name="events",
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+        retention_count=12,
+    )
+    read_back = TablePartitionConfig.model_validate_json(config.model_dump_json(by_alias=True))
+    edited = config.model_copy(
+        update={"lifecycle": config.lifecycle.model_copy(update={"retention": KeepNewest(count=3)})}
+    )
+
+    # Assert: a plan can be told what it was planned under, and told when that changed
+    assert read_back.fingerprint == config.fingerprint
+    assert edited.fingerprint != config.fingerprint

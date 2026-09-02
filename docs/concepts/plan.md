@@ -96,7 +96,33 @@ detached this run cannot be dropped this run. The `skip_create` / `skip_detach` 
 
 The JSON form is what a CLI, a dashboard or an audit log would store. A plan carries the
 instant it was made (`generated_at`), the cursors it was made against, every operation
-with its bounds and reason, and every finding.
+with its bounds and reason, every finding, and `config_fingerprint` — a digest of the
+configuration it was planned under.
+
+## Applying a plan that was written down
+
+`apply()` refuses a plan it was not handed the configuration for: one made for another
+table, or one made before the policy was edited. Both raise `PlanConfigMismatchError`
+before any DDL runs.
+
+```python
+plan = await service.plan(config)
+Path("plan.json").write_text(plan.model_dump_json(by_alias=True))   # zero DDL, review it
+
+restored = MaintenancePlan.model_validate_json(Path("plan.json").read_text())
+await service.apply(config, restored)                    # refused if config has moved
+await service.apply(config, restored, allow_config_drift=True)      # take it as it stands
+```
+
+The two guards answer different questions and neither replaces the other. Revalidation
+against the catalog — done for every destructive operation, always — asks whether the
+relation the plan named is still *the same relation*. The fingerprint asks whether the
+plan is still *the same intent*: a plan made under `retention_count=12` names exactly the
+right partitions to expire, for a reason that stopped being true when someone wrote `120`.
+
+Serialize with `by_alias=True`. That is the form the configuration vocabulary uses —
+`kind`, `method`, `schema` — and the form the documentation describes; both forms read
+back, but only one of them matches a config file written by hand.
 
 ## Convergence rules
 

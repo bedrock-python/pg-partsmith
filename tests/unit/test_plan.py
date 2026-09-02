@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 
+from pg_partsmith.entities import PartitionGranularity, TablePartitionConfig
+from pg_partsmith.exceptions import PlanConfigMismatchError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import (
     AttachPartition,
@@ -22,6 +25,7 @@ from pg_partsmith.plan import (
     PartitionBy,
     Reason,
     Severity,
+    validate_plan_for_config,
 )
 from pg_partsmith.topology import DefaultBounds, HashBounds, ListBounds, PartitionType, RangeBounds
 
@@ -592,3 +596,126 @@ def test__create_and_attach_capabilities__name_the_locks_on_referencing_tables()
     expected = "SHARE ROW EXCLUSIVE on every table referencing the parent"
     assert expected in _create().capabilities.lock
     assert expected in _attach().capabilities.lock
+
+
+# ── The plan as an artifact ─────────────────────────────────────────────────────
+
+
+def _config(*, schema: str | None = "public", retention: int = 12) -> TablePartitionConfig:
+    return TablePartitionConfig(
+        schema=schema,
+        table_name="events",
+        partition_column="created_at",
+        granularity=PartitionGranularity.MONTH,
+        retention_count=retention,
+    )
+
+
+def test__model_dump_json__round_trip__gives_back_the_same_plan() -> None:
+    # Arrange: everything a real plan carries beyond its operations
+    plan = FULL_PLAN.model_copy(update={"cursors": {"id": 42}, "config_fingerprint": "0123456789abcdef"})
+
+    # Act / Assert: the aliased form is what the configuration vocabulary uses,
+    # and both forms read back, so a plan written by one process and applied by
+    # another is the plan that was written.
+    assert MaintenancePlan.model_validate_json(plan.model_dump_json(by_alias=True)) == plan
+    assert MaintenancePlan.model_validate_json(plan.model_dump_json()) == plan
+
+
+def test__model_dump_json__by_alias__spells_every_operation_kind_as_the_documented_key() -> None:
+    # Arrange / Act
+    dumped = json.loads(FULL_PLAN.model_dump_json(by_alias=True))
+
+    # Assert
+    assert [op["kind"] for op in dumped["operations"]] == ["create", "attach", "detach", "drop", "drop"]
+
+
+def test__cursors__integers__survive_the_round_trip_as_integers() -> None:
+    # Arrange
+    plan = MaintenancePlan(table_name=ROOT, generated_at=NOW, cursors={"id": 900_001})
+
+    # Act
+    back = MaintenancePlan.model_validate_json(plan.model_dump_json(by_alias=True))
+
+    # Assert
+    assert back.cursors == {"id": 900_001}
+    assert back == plan
+
+
+def test__cursors__a_value_no_integer_axis_could_have__is_rejected() -> None:
+    # Only an integer axis records a cursor -- a time axis is cursored by
+    # ``generated_at`` -- so anything else would not have round-tripped.
+    with pytest.raises(ValidationError):
+        MaintenancePlan(table_name=ROOT, generated_at=NOW, cursors={"created_at": NOW})  # type: ignore[dict-item]
+
+
+def test__validate_plan_for_config__the_configuration_it_was_planned_from__passes() -> None:
+    # Arrange
+    config = _config()
+    plan = MaintenancePlan(table_name=ROOT, generated_at=NOW, config_fingerprint=config.fingerprint)
+
+    # Act / Assert
+    validate_plan_for_config(config, plan)
+
+
+def test__validate_plan_for_config__a_plan_for_another_table__is_refused_naming_both() -> None:
+    # Arrange
+    plan = MaintenancePlan(table_name="public.audit", generated_at=NOW)
+
+    # Act / Assert
+    with pytest.raises(PlanConfigMismatchError) as exc:
+        validate_plan_for_config(_config(), plan)
+    assert "public.audit" in str(exc.value)
+    assert "public.events" in str(exc.value)
+
+
+def test__validate_plan_for_config__configuration_edited_after_planning__is_refused() -> None:
+    # Arrange: the plan still names the right relations, for reasons that have
+    # stopped being true -- which OID revalidation cannot see.
+    planned_under = _config(retention=12)
+    plan = MaintenancePlan(table_name=ROOT, generated_at=NOW, config_fingerprint=planned_under.fingerprint)
+    edited = _config(retention=3)
+
+    # Act / Assert
+    with pytest.raises(PlanConfigMismatchError) as exc:
+        validate_plan_for_config(edited, plan)
+    assert planned_under.fingerprint in str(exc.value)
+    assert edited.fingerprint in str(exc.value)
+
+
+def test__validate_plan_for_config__allow_config_drift__takes_the_plan_as_it_stands() -> None:
+    # Arrange
+    plan = MaintenancePlan(table_name=ROOT, generated_at=NOW, config_fingerprint=_config(retention=12).fingerprint)
+
+    # Act / Assert
+    validate_plan_for_config(_config(retention=3), plan, allow_config_drift=True)
+
+
+def test__validate_plan_for_config__plan_without_a_fingerprint__is_checked_for_its_table_alone() -> None:
+    # Arrange: a plan built by hand, or by a version that recorded none
+    plan = MaintenancePlan(table_name=ROOT, generated_at=NOW)
+
+    # Act / Assert
+    validate_plan_for_config(_config(), plan)
+    with pytest.raises(PlanConfigMismatchError):
+        validate_plan_for_config(_config(schema="archive"), plan)
+
+
+def test__model_dump__carries_the_lock_each_operation_takes() -> None:
+    # A plan written to a file is what an operator reads before agreeing to a
+    # window, so what each operation locks is in the dump, not only on the object.
+    dumped = json.loads(FULL_PLAN.model_dump_json(by_alias=True))
+
+    # Assert
+    by_kind = {op["kind"]: op for op in dumped["operations"]}
+    assert "ACCESS EXCLUSIVE on the dropped table only" in by_kind["drop"]["capabilities"]["lock"]
+    assert by_kind["detach"]["capabilities"]["transactional"] is False
+    assert by_kind["drop"]["is_destructive"] is True
+    assert by_kind["create"]["is_destructive"] is False
+    # and a subtree member says so as well
+    assert "capabilities" in by_kind["create"]["children"][0]
+
+
+def test__model_validate__a_dump_carrying_capabilities__reads_back_as_the_same_plan() -> None:
+    # Computed on the way out, ignored on the way in: the round trip holds.
+    assert MaintenancePlan.model_validate_json(FULL_PLAN.model_dump_json(by_alias=True)) == FULL_PLAN

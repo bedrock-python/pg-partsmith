@@ -5,6 +5,312 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.2.0 — a command line, an image, and hooks from a config file
+
+Everything here is reachable without writing Python: `pg-partsmith` on the command line
+or in a container, a document that describes every table a deployment maintains, and
+hooks that run a command. Underneath, the library gains what those needed — the
+collaborators built once and handed back by name, the document as a model, and a plan
+that refuses to be applied under a configuration it was not made from.
+
+### The plan as an artifact
+
+`plan()` and `apply()` were always separable and the plan was always a pydantic model, but
+nothing checked that the plan handed to `apply()` was the one this configuration produced.
+In one process the pair cannot disagree; written to a file by one run and read by another
+— which is the whole point of the split — it can.
+
+- `MaintenancePlan.config_fingerprint` records `TablePartitionConfig.fingerprint`, a digest
+  of the configuration the plan was made from. `apply()` now refuses a plan made for
+  another table, and one made under a configuration that has since been edited, with
+  `PlanConfigMismatchError` and before any DDL runs; `allow_config_drift=True` applies it
+  as it stands. The identity revalidation each destructive operation already did answers
+  whether this is still the same *relation*, not whether it is still the same *intent* — a
+  plan made under `retention_count=12` names exactly the right partitions to expire for a
+  reason that stopped being true the moment someone wrote `120`.
+- `MaintenancePlan.cursors` is typed `dict[str, int]`. Only an integer axis records a
+  cursor — a time axis is cursored by `generated_at` — and leaving it `Any` meant a plan
+  written to JSON did not always read back as the plan that was written.
+- `validate_plan_for_config(config, plan, *, allow_config_drift=False)` is exported for
+  anything that pairs a plan with a configuration itself.
+
+### `PartitionToolkit`
+
+`PartitionToolkit.from_engine(engine, ...)` in both mirrors builds the repository, the
+metadata provider, the lock manager, the service and the maintainer around one engine, and
+returns them by name. Three settings live on two objects and have to agree — `marker_prefix`
+(one writes the orphan marker, the other looks for it), `ddl_timezone` (one writes naive
+boundary literals, the other reads them back, and the two constructors do not even default
+to the same value) and `boundary_codec` — and each is now given once. Parts rather than
+just a maintainer, so code calling `metadata.is_partition_closed` or `locks.acquire_lock`
+directly does not build a second set to keep in step. Construct `PartitionToolkit(...)`
+directly to hold parts of your own.
+
+### A configuration written down
+
+`PartitionsDocument` describes every table a deployment maintains, and the wiring it
+maintains them through, as one validated model — what a ConfigMap, a mounted YAML or a
+JSON blob parses into. `document.configs()` yields the `TablePartitionConfig` of each,
+`config_for(name)` one by name, and `PartitionToolkit.from_options(engine, document.runtime)`
+builds the collaborators the file describes. The library still reads no files and opens no
+connections: parsing belongs to whoever owns the format.
+
+`PartitionTableSpec` is one table's entry, and `PartitionTableSettings` is now that same
+model read from the environment rather than a second field list beside it — so a field
+added once is available in both. `ToolkitOptions` is the `runtime` section, one field per
+keyword of `PartitionToolkit.from_engine`.
+
+Unknown keys are refused wherever they appear, including in `defaults`, where a typo would
+otherwise reach every table at once. A document with no tables, and one relation described
+twice, are refused for the same reason: both are silent at 03:00 otherwise.
+
+### A command line
+
+`pip install "pg-partsmith[cli]"` installs `pg-partsmith`, which runs the library's
+read-only half over a document and a DSN — no Python in the calling application at all.
+Three of the four commands issue no DDL, take no lock and fire no hook:
+
+- `inspect` — the tree that actually exists.
+- `plan` — what maintenance would do and why, straight from `MaintenancePlan`.
+- `validate` — the document against the catalog. The one that belongs in CI.
+
+Exit codes are the point of a CLI a CronJob runs, so they are distinguishable: `2` for
+drift under `plan --check` (what "maintenance has stopped running" looks like), `3` for
+findings that need a person, which outranks drift, `4` configuration, `5` the database, and
+`6` for a lock another maintainer holds — ordinary operation, and the first false page
+every deployment gets if it is reported as a failure.
+
+The arguments are typer declarations — every flag typed, the help generated from the same
+declarations that parse it, shell completion via `--install-completion`. A usage error exits
+`64` (`EX_USAGE`), never the `2` argument parsers default to: `2` is what this tool means
+"drift" by, and a CronJob alerting on drift must not page over a typo.
+
+A stop signal cancels the run rather than killing the process. `SIGTERM` — what a pod is
+sent at its deadline — used to end it on the spot, with no `finally`, no line in the log
+and, under a command hook, an archiver left running unwatched. Both it and Ctrl+C now take
+the path a raised exception takes: the statement is cancelled and rolled back, the lock
+released, the engine disposed, a hook's child terminated, and the exit code is `130` or
+`143` with a line on stderr saying which.
+
+`--output json` is the models' own dump under a versioned envelope, `by_alias=True`, so
+what comes out of `plan` and what goes into a document are one vocabulary; logs go to
+stderr. The connection comes from `--dsn`, then `$PG_PARTSMITH_DSN`, then the document.
+`--version` reads `pg_partsmith.__version__`: one number for the library and the CLI.
+
+`apply` carries maintenance out, and withholds every destructive operation unless
+`--allow-destructive` is given — the safe behaviour is the default one rather than a second
+mode to remember, and it is what an init container wants. With no `--plan` it plans and
+applies under one lock, which is also what finalizes an interrupted `DETACH CONCURRENTLY`.
+
+`plan --save FILE` writes the artifact between the two halves, and `apply --plan FILE`
+reads it back. Both guards from earlier in this release apply to it: a plan made for
+another table, or under a configuration that has since been edited, is refused with exit
+`4` unless `--allow-config-drift` is passed.
+
+### Commands around the lifecycle
+
+`CommandHooks` runs a configured command at each lifecycle phase, handing it the
+`PartitionEvent` as JSON on stdin and treating a non-zero exit exactly as a raised
+exception. It needed no new context: the event has been one pydantic model for every phase
+since 1.1.0, so the payload is a dump of the object a Python hook already
+receives. In a document it is a `hooks` section, and it is what makes the destructive half
+usable by a team that does not write Python — they own the archiver already, they only
+need it invoked at the right moment.
+
+The commands run only when the run is told to run them (`apply --allow-hooks`), and a
+document declaring hooks is refused rather than quietly stripped when it is not: silently
+skipping a configured `before_drop` would let an operator read the file, believe their
+archiver ran, and be wrong. No sandbox is provided and none is claimed; the container
+boundary is the answer if isolation is wanted.
+
+Both mirrors run the command through one implementation, so it does not depend on the
+event loop being able to spawn processes — a hook that works in production works on a
+developer's machine too.
+
+### A block of Python instead of a command
+
+A hook phase in a document can take a block of Python — inline as `python`, or from a
+file as `python_file` relative to the document — evaluated with `event` and `log` in
+scope, raising to refuse. `PythonHooks` is the same from code, in both mirrors.
+
+Every block is compiled when the document is read, and a file-backed one by `validate`: a
+`SyntaxError` is a validation error with a line number in it, not something a CronJob
+finds at 03:00 after some of the run's DDL has committed. Tracebacks name the phase, or
+the file, rather than `<string>`.
+
+It is behind the same `--allow-hooks` as a command, for the same reason, and no sandbox is
+claimed: `exec` with a filtered `__builtins__` is not a security boundary, and the
+documentation says so rather than pretending otherwise.
+
+### What a plan will lock
+
+Every operation now serializes its `capabilities` — the heaviest lock it takes and on
+what, and whether it can run inside a transaction block — and `is_destructive` beside its
+fields. They were on the object before and not in the dump, which meant a plan written to
+a file lost the one thing a DBA reads before agreeing to a window. Both are computed on
+the way out and ignored on the way in, so the round trip holds. `plan --locks` prints the
+same for a person.
+
+There is deliberately no `--sql`. The DDL is built at execution time from decisions only
+made then — a concurrent detach falling back to the blocking form, rows moved out of a
+DEFAULT partition, an orphan marker cleared — and a rendering without them would be
+read as a transcript in exactly the cases a review exists to catch.
+
+### Monitoring, for free
+
+`--output metrics` renders any command as Prometheus text exposition for a node_exporter
+textfile collector. Most systems that partition PostgreSQL have no monitoring of it at all
+— they find out at 03:00, from an insert PostgreSQL rejected — and a CronJob already runs
+this on a schedule, so the cheapest monitoring available is for that run to leave a file
+behind.
+
+`plan` emits pending operations by kind and findings by severity, `inspect` the size of the
+tree and the age of the oldest orphan, `validate` whether each table still matches its
+configuration, and `apply` what it did and what it could not. Every run also stamps
+`pg_partsmith_run_timestamp_seconds`, so a textfile nothing refreshed reads as stale rather
+than as good news, and a converged table reports zeroes rather than nothing — a missing
+series and a zero are different alerts.
+
+The numbers come off the same envelope the JSON does, so a metric cannot disagree with what
+the same run printed.
+
+### Examples that are tested, and a schema for the editor
+
+`examples/` holds a minimal document, one with everything in it, an id-partitioned queue,
+cold tiering, and three hook scripts — a `pg_dump` before a drop in bash, a webhook after
+a create, a `COPY` out before a detach as a Python file. The test suite validates every
+document, compiles every hook and syntax-checks every script, so an example that stops
+being right fails a build rather than teaching the wrong vocabulary.
+
+`pg-partsmith schema` prints the document's JSON Schema; with one comment line at the top
+of the file, an editor validates keys and completes them. The committed copy is checked
+against the generated one.
+
+### Every way to run it
+
+A deployment page with a copy-pasteable shape for each harness: plain Docker with host
+cron or a systemd timer; Compose as a service you run, as the equivalent of an init
+container (`service_completed_successfully`), and on a schedule with a cron sidecar; Swarm
+with swarm-cronjob; Kubernetes as a Pod, a Job, a CronJob and an init container, plus the
+plan-on-one-day-apply-on-another pair of Jobs and the node_exporter textfile; GitHub
+Actions and GitLab CI; and the note that anything which runs a container and reads an
+exit code runs this.
+
+`PG_PARTSMITH_DSN_FILE` reads the connection string from a file — the Docker and Swarm
+secrets convention — after `PG_PARTSMITH_DSN` and before the document, so a Compose
+stack hands a secret over without a shell wrapper and without it showing in
+`docker inspect`.
+
+### What is inside the image
+
+The runtime is [distroless](https://github.com/GoogleContainerTools/distroless): glibc,
+OpenSSL, CA certificates, a timezone database, and nothing else — no shell, no package
+manager, no pip. Python 3.14 and a pruned standard library are copied in from the build
+stage, the virtualenv is installed from `uv.lock` with `uv sync --locked` so the image holds
+the versions the tests ran against and a stale lock fails the build, compiled extensions
+are stripped, bytecode is precompiled, typer's `rich` is left out, and exactly the five
+shared libraries the kept extension modules link against come along. There is no Debian
+userland to carry: the budget is 160 MB, the image sits well under it, and a start is an
+interpreter with nothing to byte-compile.
+
+Two flags replace the two things a shell wrapper in the image used to do: `--write FILE`
+writes any command's output to a file atomically (a node_exporter textfile), and
+`apply --ok-if-locked` makes a held lock exit `0` (an init container, which restarts on
+anything else). A command hook inside the image is therefore a binary or a Python file
+run through `/opt/venv/bin/python`, not a bash script; the docs say so, and say how to
+build an image with bash in it in one line.
+
+Published images carry an SBOM and a SLSA provenance attestation and are signed keylessly
+with the release workflow's identity; `cosign verify` is in the docs. Dependabot watches
+the base images, the actions and the lock file.
+
+### Pipelines
+
+CI caches the uv environment keyed on `uv.lock` and installs with `--frozen`, so a stale
+lock fails rather than resolving something else, and `uv lock --check` says so in one
+line; a push cancels the run it supersedes; the image build reuses layers across runs.
+
+The matrix grew in every direction that has produced a bug before. Unit tests run on
+Python 3.11 through 3.14 on Linux, at both ends of that range on Windows and macOS, on
+arm64, and with the clock at UTC+14 and at UTC-12. The integration suite runs on
+PostgreSQL 15 through 18, on arm64, on Windows and macOS against a server the runner
+installs itself, and once with the server at UTC+14 and the client at UTC-12. One job
+installs every direct dependency at the lowest version `pyproject.toml` admits and runs
+both suites on it; it found the declared floors for pydantic and typer below what the code
+needs, and they now say what is true. The wheel is built, checked and installed on its own
+on all three platforms, and the command is run through to a refused connection. The image
+is built and run on both architectures the release publishes. Warnings are errors under
+pytest; the workflows go through actionlint and the Dockerfile through hadolint; CodeQL
+reads the library and the workflows; a pull request that adds a dependency with a known
+vulnerability is refused; and once a week every link in the docs is asked whether it still
+answers.
+
+The image is run end to end, on both architectures: as a container with a read-only root
+filesystem, every capability dropped and the document mounted, against a PostgreSQL
+container on a network of its own — the commands the guides show, with the codes they
+promise. A fresh table drifts and `apply` converges it; `--output json` is the envelope
+alone on stdout; `--write` lands a textfile in a volume; the DSN arrives from a mounted
+secret; a secret only root can read, a rejected password and a document with hooks but no
+`--allow-hooks` each answer with their code and a sentence; `SIGTERM` during a command
+hook is exit `143` inside the grace period with the lock released; an overlapping run
+stands aside with `6`; `plan --save` in one container is applied by another and refused
+once the document changed; an image derived with one `COPY` runs a Python file hook from
+inside; and the Compose shape that holds an application until its partitions exist runs
+as written. After a release, the same suite runs against the image that was actually
+pushed, pulled back on both architectures, once the signature, the SBOM, the provenance,
+the version inside and the minor tag have been checked. And the Job and CronJob manifests
+the running guide shows go through kubeconform on every pull request, while a unit test
+reads every YAML block in the guides and refuses a flag the command does not take.
+
+The checks paid for themselves before they were merged. The command line no longer dies
+on a console that cannot show an em dash: a Windows pipe or a bare POSIX locale gets the
+character escaped rather than a traceback. A password the server rejects is exit `5` like
+any other database failure, where it used to be a traceback: the driver raises its own
+error before SQLAlchemy has one to wrap. A hook command that was stopped mid-run had its
+pipes left open, which a long-lived process would have seen as a warning at garbage
+collection; they are closed. And `main()` runs its coroutine under a runner with a loop
+factory of its own, so a program embedding it next to an event loop of its own finds that
+loop where it left it.
+
+Running the image found two more. `--write` into a directory the container's user cannot
+write — a root-owned hostPath is the usual case — was a traceback, and `plan --save` into
+one was reported as a database error; both are exit `4` with the path in the message, and
+the previous textfile stays where it was. And a Python block hook still running when
+`SIGTERM` arrives holds the stop until it returns, because it runs on the loop that
+handles the signal; the guides now say so, and that work which can outlast a grace period
+belongs in a command hook.
+
+A read of the whole change before the release found the rest. A run that stopped on a
+hook's refusal or a stale plan was a traceback, and is exit `3`; a connection string
+SQLAlchemy cannot parse was reported as the database's fault, and is exit `4`; an unknown
+`runtime.boundary_codec` and an empty command vector passed `validate` and failed at
+`apply`, and are refused where they are written; a command hook on a table partitioned by
+a sequence crashed the run building the hook's environment, because a window edge there is
+a number; and a bare `pip install pg-partsmith` put a `pg-partsmith` on PATH that died
+with a traceback, where it now says what to install and exits `64`. The release itself
+would have failed after the PyPI upload, building arm64 on an amd64 machine with nothing
+able to run its binaries: the image is now built on each architecture natively, scanned on
+each, and finished before anything reaches PyPI.
+
+### A container image
+
+`ghcr.io/bedrock-python/pg-partsmith:<version>`, published from the release workflow, so a
+Go, Ruby or Node stack runs partition maintenance as a CronJob, a Compose service or an
+init container with no Python of its own. The entrypoint is the command itself, it runs as
+UID 65532, and the build stage — pip, the build backend, every `__pycache__` — is thrown
+away rather than shipped.
+
+The library, the CLI and the image carry the same number, always; CI refuses to publish an
+image whose `--version` disagrees with its tag. Tags are the exact version and a moving
+minor, never `latest`: a scheduled job following `latest` would cross a major on its own,
+at 02:15, with `DROP` in its hands. The image size is checked against a budget on every
+pull request and a regression fails the build.
+
+The init-container case needs no flag of its own: `apply` without `--allow-destructive`
+creates and retires nothing, which is exactly what running maintenance at application
+startup should do. The documentation states the grants this thing needs and recommends a
+dedicated role, because it issues DDL and nobody should have to guess that.
+
 ## [1.1.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.0.0...pg-partsmith-v1.1.0) (2026-09-02)
 
 
