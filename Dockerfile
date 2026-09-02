@@ -12,13 +12,11 @@
 # virtualenv are copied over, plus exactly the shared libraries the extension
 # modules we keep link against.
 
-ARG PYTHON_IMAGE=python:3.14-slim-bookworm
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.9
-ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+# The base images are written out rather than taken from build arguments:
+# Dependabot reads FROM lines, and a rebuild on a base-image fix is what it is for.
+FROM ghcr.io/astral-sh/uv:0.12.9 AS uv
 
-FROM ${UV_IMAGE} AS uv
-
-FROM ${PYTHON_IMAGE} AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 # binutils for strip; nothing else is installed into the image being built.
 RUN apt-get update -qq \
@@ -54,7 +52,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # library -- and the extension modules whose libraries the runtime leaves out.
 RUN cd /opt/venv/lib/python3.*/site-packages \
     && rm -rf rich rich-*.dist-info pygments pygments-*.dist-info markdown_it markdown_it_py-*.dist-info \
-              mdurl mdurl-*.dist-info sqlalchemy/testing \
+              mdurl mdurl-*.dist-info sqlalchemy/testing greenlet/tests \
+              /opt/venv/bin/pygmentize /opt/venv/bin/markdown-it \
     && find /opt/venv -name '*.so' -exec strip --strip-unneeded {} + \
     && find /opt/venv \( -name '*.pyx' -o -name '*.pxd' -o -name '*.c' -o -name '*.h' -o -name '*.pyi' \) -delete \
     && cd /usr/local/lib/python3.* \
@@ -62,7 +61,7 @@ RUN cd /opt/venv/lib/python3.*/site-packages \
               site-packages/pip site-packages/pip-*.dist-info site-packages/setuptools* site-packages/wheel* \
               lib-dynload/_tkinter* lib-dynload/_curses* lib-dynload/readline* lib-dynload/_dbm* \
               lib-dynload/_gdbm* lib-dynload/_sqlite3* lib-dynload/_test* lib-dynload/xxlimited* \
-              lib-dynload/_ctypes_test* lib-dynload/_xxtestfuzz* \
+              lib-dynload/_ctypes_test* lib-dynload/_xxtestfuzz* lib-dynload/_zstd* \
     && strip --strip-unneeded /usr/local/lib/libpython3.*.so.1.0 lib-dynload/*.so \
     && python3 -m compileall -q -j0 --invalidation-mode unchecked-hash /usr/local/lib/python3.*
 
@@ -78,7 +77,7 @@ RUN set -eu \
        done
 
 
-FROM ${RUNTIME_IMAGE} AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 ARG VERSION=0.0.0
 LABEL org.opencontainers.image.title="pg-partsmith" \

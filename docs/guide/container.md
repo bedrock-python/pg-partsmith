@@ -130,11 +130,10 @@ refuses to publish an image whose `--version` disagrees with its tag.
 ## Size
 
 The image is checked against a budget in CI and a regression fails the build, because for
-anyone not writing Python the size is the first thing they read about this project. The
-Debian userland that made up half of the previous image is gone with the switch to
-distroless; the budget is 160 MB and the image sits well under it (the CI log prints the
-exact number for every build). It also starts in about half the time the previous one
-did: Python 3.14, nothing to byte-compile, and less of everything to load.
+anyone not writing Python the size is the first thing they read about this project. There
+is no Debian userland to carry: the budget is 160 MB and the image sits well under it (the
+CI log prints the exact number for every build). A start is an interpreter with nothing to
+byte-compile and little else to load.
 
 ## Supply chain
 
@@ -186,7 +185,7 @@ image that adds a hook binary is one `FROM` and one `COPY` — see
 ## Exit codes
 
 The same ones [the CLI](cli.md#exit-codes) documents. `0` nothing pending, `2` drift under
-`plan --check`, `3` findings or run issues, `4` configuration, `5` connection, `6` the lock
+`plan --check`, `3` findings or run issues, `4` configuration, `5` the database, `6` the lock
 is held, `64` usage, `130` / `143` stopped by a signal, `1` unexpected. Treat `6` as
 success in whatever runs this: two runs overlapping is ordinary, and the second standing
 aside is the lock doing its job.

@@ -54,12 +54,15 @@ serialize, filter and apply. No extension, no superuser, no scheduler of its own
   scripts parse, and `pg-partsmith schema` gives an editor the JSON Schema
 - **Hooks, locks, schemas** — eight lifecycle hooks, in Python or as commands named in a
   config file; PostgreSQL advisory or Redis locks; schema-qualified everything
-- **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15, 16 and 17 via testcontainers
+- **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15 through 18 via testcontainers
 
 ## Installation
 
 ```bash
 pip install pg-partsmith
+
+# The pg-partsmith command, for a config file and a CronJob instead of Python
+pip install "pg-partsmith[cli]"
 
 # With Redis distributed locks
 pip install "pg-partsmith[redis-locks]"

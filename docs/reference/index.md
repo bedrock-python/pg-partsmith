@@ -154,6 +154,7 @@ entities, exceptions and period calculators.
         - OperationKind
         - OperationCapabilities
         - PartitionBy
+        - validate_plan_for_config
 
 ::: pg_partsmith.planner
     options:
@@ -185,6 +186,31 @@ entities, exceptions and period calculators.
         - hash_keyspace_covered
         - missing_remainders
 
+### The document
+
+A deployment's tables and their wiring, written down: what a ConfigMap, a mounted YAML or a
+JSON blob parses into, and what the command line reads.
+
+::: pg_partsmith.document
+    options:
+      heading_level: 4
+      members:
+        - PartitionsDocument
+        - PartitionTableSpec
+        - ToolkitOptions
+        - HookOptions
+        - PythonHook
+
+### Hook events
+
+::: pg_partsmith.events
+    options:
+      heading_level: 4
+      members:
+        - PartitionEvent
+        - HookPhase
+        - hook_environment
+
 ### Exceptions
 
 ::: pg_partsmith.exceptions
@@ -203,6 +229,7 @@ entities, exceptions and period calculators.
         - PartitionTopologyError
         - PartitionReferencedError
         - PlanStaleError
+        - PlanConfigMismatchError
         - RowMoveRefusedError
 
 ### Period strategies
@@ -294,6 +321,20 @@ Async implementations: service, executor, inspector, repositories, lock managers
     options:
       heading_level: 4
 
+::: pg_partsmith.aio.command_hooks.CommandHooks
+    options:
+      heading_level: 4
+
+::: pg_partsmith.aio.python_hooks.PythonHooks
+    options:
+      heading_level: 4
+
+### The toolkit
+
+::: pg_partsmith.aio.toolkit.PartitionToolkit
+    options:
+      heading_level: 4
+
 ---
 
 ## pg_partsmith.sync
@@ -341,6 +382,18 @@ built on the sync SQLAlchemy `Engine`.
       heading_level: 4
 
 ::: pg_partsmith.sync.hooks.BasePartitionLifecycleHooks
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.command_hooks.CommandHooks
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.python_hooks.PythonHooks
+    options:
+      heading_level: 4
+
+::: pg_partsmith.sync.toolkit.PartitionToolkit
     options:
       heading_level: 4
 

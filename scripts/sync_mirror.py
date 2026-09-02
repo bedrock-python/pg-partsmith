@@ -8,7 +8,8 @@ aio modules, then format and review the diff::
     uv run python scripts/sync_mirror.py
     uv run ruff check --fix pg_partsmith/sync && uv run ruff format pg_partsmith/sync
 
-Hand-maintained (not mirrored): ``lock/``, ``maintainer.py`` and
+Hand-maintained (not mirrored): ``lock/``, ``maintainer.py``,
+``command_hooks.py``, ``python_hooks.py`` and
 ``repositories/{resolver,fk_manager,timeouts,pin}.py``.
 """
 
@@ -36,6 +37,7 @@ FILES = [
     "repositories/creator.py",
     "repositories/remover.py",
     "repositories/repository.py",
+    "toolkit.py",
 ]
 
 RULES: list[tuple[str, str]] = [

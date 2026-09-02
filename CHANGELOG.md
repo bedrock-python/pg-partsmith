@@ -68,7 +68,7 @@ twice, are refused for the same reason: both are silent at 03:00 otherwise.
 
 `pip install "pg-partsmith[cli]"` installs `pg-partsmith`, which runs the library's
 read-only half over a document and a DSN — no Python in the calling application at all.
-Three commands so far, none of which issues DDL, takes a lock or fires a hook:
+Three of the four commands issue no DDL, take no lock and fire no hook:
 
 - `inspect` — the tree that actually exists.
 - `plan` — what maintenance would do and why, straight from `MaintenancePlan`.
@@ -76,7 +76,7 @@ Three commands so far, none of which issues DDL, takes a lock or fires a hook:
 
 Exit codes are the point of a CLI a CronJob runs, so they are distinguishable: `2` for
 drift under `plan --check` (what "maintenance has stopped running" looks like), `3` for
-findings that need a person, which outranks drift, `4` configuration, `5` connection, and
+findings that need a person, which outranks drift, `4` configuration, `5` the database, and
 `6` for a lock another maintainer holds — ordinary operation, and the first false page
 every deployment gets if it is reported as a failure.
 
@@ -201,17 +201,17 @@ secrets convention — after `PG_PARTSMITH_DSN` and before the document, so a Co
 stack hands a secret over without a shell wrapper and without it showing in
 `docker inspect`.
 
-### The image, rebuilt
+### What is inside the image
 
-The runtime is now [distroless](https://github.com/GoogleContainerTools/distroless): glibc,
+The runtime is [distroless](https://github.com/GoogleContainerTools/distroless): glibc,
 OpenSSL, CA certificates, a timezone database, and nothing else — no shell, no package
 manager, no pip. Python 3.14 and a pruned standard library are copied in from the build
-stage, the virtualenv is installed from `uv.lock` with `uv sync --frozen` so the image holds
-the versions the tests ran against, compiled extensions are stripped, bytecode is
-precompiled, typer's `rich` is left out, and exactly the five shared libraries the kept
-extension modules link against come along. The Debian userland that was half of the
-previous image is gone; the size budget drops from 280 MB to 160, and a start takes about
-half the time.
+stage, the virtualenv is installed from `uv.lock` with `uv sync --locked` so the image holds
+the versions the tests ran against and a stale lock fails the build, compiled extensions
+are stripped, bytecode is precompiled, typer's `rich` is left out, and exactly the five
+shared libraries the kept extension modules link against come along. There is no Debian
+userland to carry: the budget is 160 MB, the image sits well under it, and a start is an
+interpreter with nothing to byte-compile.
 
 Two flags replace the two things a shell wrapper in the image used to do: `--write FILE`
 writes any command's output to a file atomically (a node_exporter textfile), and
@@ -279,6 +279,18 @@ the previous textfile stays where it was. And a Python block hook still running 
 `SIGTERM` arrives holds the stop until it returns, because it runs on the loop that
 handles the signal; the guides now say so, and that work which can outlast a grace period
 belongs in a command hook.
+
+A read of the whole change before the release found the rest. A run that stopped on a
+hook's refusal or a stale plan was a traceback, and is exit `3`; a connection string
+SQLAlchemy cannot parse was reported as the database's fault, and is exit `4`; an unknown
+`runtime.boundary_codec` and an empty command vector passed `validate` and failed at
+`apply`, and are refused where they are written; a command hook on a table partitioned by
+a sequence crashed the run building the hook's environment, because a window edge there is
+a number; and a bare `pip install pg-partsmith` put a `pg-partsmith` on PATH that died
+with a traceback, where it now says what to install and exits `64`. The release itself
+would have failed after the PyPI upload, building arm64 on an amd64 machine with nothing
+able to run its binaries: the image is now built on each architecture natively, scanned on
+each, and finished before anything reaches PyPI.
 
 ### A container image
 

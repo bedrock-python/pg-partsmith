@@ -403,7 +403,8 @@ person, a Job that reads.
 # Job 1
 args: ["plan", "-c", "/etc/partitions.yaml", "--save", "/work/plan.json", "--locks"]
 volumeMounts: [{ name: work, mountPath: /work }]
-# read it:  kubectl cp <pod>:/work/plan.json ./plan.json   (or run `plan --output json` and read the log)
+# read it:  `plan --output json` in the log, or a second Job with a shell mounting the same
+#           volume -- the image has no tar, which is what `kubectl cp` needs
 # Job 2
 args: ["apply", "-c", "/etc/partitions.yaml", "--plan", "/work/plan.json", "--allow-destructive"]
 ```

@@ -26,7 +26,7 @@ acts.
 | `plan` | `--check` exit `2` on pending operations · `--save FILE` write the plan · `--locks` print what each operation locks |
 | `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks · `--ok-if-locked` exit `0` rather than `6` on a held lock |
 | `schema` | no flags: prints the document's JSON Schema for an editor |
-| global | `--version` · `--install-completion` · `-h/--help` on anything |
+| global | `--version` · `--install-completion` · `--show-completion` · `-h/--help` on anything |
 
 `--help` on any command is generated from the same declarations that parse it, so the
 table above can be stale and the help cannot.
@@ -77,7 +77,7 @@ distinguishing:
 | 2 | `plan --check` found operations waiting to be applied |
 | 3 | the planner reported something a human has to act on |
 | 4 | the document does not parse, or does not match the database |
-| 5 | the database could not be reached |
+| 5 | the database: unreachable, refused the credentials, or failed a statement |
 | 6 | another maintainer holds the table's lock |
 | 64 | the invocation itself was wrong: a misspelled flag, no command |
 | 130 | stopped by Ctrl+C, after cleaning up |

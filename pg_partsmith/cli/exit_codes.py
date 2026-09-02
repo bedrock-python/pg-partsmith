@@ -20,7 +20,7 @@ class ExitCode(IntEnum):
         FINDINGS: The planner reported something an operator has to act on.
             Outranks :attr:`DRIFT`: drift is what a run fixes, a finding is not.
         CONFIG: The document does not parse, or does not match the database.
-        CONNECTION: The database could not be reached.
+        CONNECTION: The database: unreachable, refused the credentials, or failed a statement.
         LOCKED: Another maintainer holds the table's lock. Overlapping runs are
             ordinary, so this is its own code rather than a failure to page on.
         USAGE: The invocation itself was wrong -- a misspelled flag, no command.

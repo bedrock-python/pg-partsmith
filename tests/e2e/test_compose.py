@@ -26,7 +26,7 @@ services:
     environment: { POSTGRES_USER: @USER@, POSTGRES_PASSWORD: @PASSWORD@, POSTGRES_DB: @DB@ }
     volumes: ["./init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U @USER@ -d @DB@"]
+      test: ["CMD-SHELL", "pg_isready -h localhost -U @USER@ -d @DB@"]
       interval: 1s
       timeout: 3s
       retries: 30

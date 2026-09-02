@@ -138,7 +138,7 @@ one of a small number of states, each of which the next run converges:
 
 ## Hooks
 
-Six hooks fire around create, detach and drop, once per **lifecycle unit** — the partition
+Eight hooks fire around create, attach, detach and drop, once per **lifecycle unit** — the partition
 under the root, never per leaf of its subtree — and once per member of a root `HASH` or
 `LIST`. A `before_*` hook that raises aborts that operation (the partition comes back on
 the next run); an `after_*` hook that raises is logged and re-raised — the operation has

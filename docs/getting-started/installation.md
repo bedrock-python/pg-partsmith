@@ -18,6 +18,7 @@ pip install pg-partsmith
 Extras:
 
 ```bash
+pip install "pg-partsmith[cli]"                # the pg-partsmith command
 pip install "pg-partsmith[redis-locks]"        # Redis distributed locks
 pip install "pg-partsmith[pydantic-settings]"  # configuration from environment variables
 ```
