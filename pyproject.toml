@@ -72,6 +72,11 @@ dev = [
 [tool.uv]
 link-mode = "copy"
 
+[tool.check-wheel-contents]
+# W002, duplicate files: the sync package mirrors the aio one file for file,
+# and a package marker that says nothing is the same bytes in both.
+ignore = ["W002"]
+
 [tool.hatch.version]
 path = "pg_partsmith/__version__.py"
 

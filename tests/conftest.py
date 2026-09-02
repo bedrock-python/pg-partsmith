@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys  # required for platform check below
+import warnings
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -22,9 +23,13 @@ from testcontainers.redis import RedisContainer
 from tests.integration.aio.builder import PartitioningScenarioBuilder
 from tests.integration.sync.builder import PartitioningScenarioBuilder as SyncPartitioningScenarioBuilder
 
-# Set event loop policy for Windows as early as possible
+# Set event loop policy for Windows as early as possible. Python 3.14
+# deprecates policies for removal in 3.16; until then the selector loop is
+# what the drivers need here, and the notice is not this suite's to fail on.
 if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -127,7 +132,15 @@ def _docker_is_available() -> bool:
 
 @pytest.fixture(scope="session")
 def redis_container() -> Generator[RedisContainer, None, None]:
-    """Start a Redis container for the test session."""
+    """Start a Redis container for the test session.
+
+    A runner that brought its own PostgreSQL (``PG_PARTSMITH_TEST_DSN``) has no
+    Linux containers to offer whatever ``docker`` answers there -- a Windows
+    runner has a daemon that cannot run one -- so Redis is the server
+    ``PG_PARTSMITH_TEST_REDIS_URL`` names, or the lock tests skip.
+    """
+    if os.environ.get("PG_PARTSMITH_TEST_DSN"):
+        pytest.skip("no container runtime here; PG_PARTSMITH_TEST_REDIS_URL names a Redis, or the lock tests skip")
     if not _docker_is_available():
         pytest.skip("Docker is required for integration tests (testcontainers)")
     with RedisContainer("redis:7-alpine") as container:
@@ -135,10 +148,14 @@ def redis_container() -> Generator[RedisContainer, None, None]:
 
 
 @pytest.fixture(scope="session")
-def redis_url(redis_container: RedisContainer) -> str:
-    """``redis://host:port/0`` of the session's Redis container."""
-    host = redis_container.get_container_host_ip()
-    port = redis_container.get_exposed_port(redis_container.port)
+def redis_url(request: pytest.FixtureRequest) -> str:
+    """``redis://host:port/0``: the server named in the environment, or the session's container."""
+    named = os.environ.get("PG_PARTSMITH_TEST_REDIS_URL")
+    if named:
+        return named
+    container: RedisContainer = request.getfixturevalue("redis_container")
+    host = container.get_container_host_ip()
+    port = container.get_exposed_port(container.port)
     return f"redis://{host}:{port}/0"
 
 

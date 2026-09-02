@@ -53,7 +53,9 @@ jobs:
           cache-dependency-glob: uv.lock
           cache-suffix: lowest
       - run: uv sync --resolution lowest-direct --no-default-groups --group test --extra cli --extra pydantic-settings
-      - run: uv run --no-sync pytest
+      # An old floor on a new transitive dependency deprecates things between
+      # the two; that is theirs to fail on, not this library's.
+      - run: uv run --no-sync pytest -W default::DeprecationWarning
 
   test-unit:
     name: Unit tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
@@ -138,7 +140,9 @@ jobs:
     env:
       PG_PARTSMITH_TEST_PG_IMAGE: ${{ matrix.image }}
       PG_PARTSMITH_TEST_PG_TZ: ${{ matrix.server-tz }}
-      TZ: ${{ matrix.client-tz }}
+      # An unset matrix value is an empty string here, and an empty TZ is not
+      # "unset" to everything that reads it; the default is spelled out.
+      TZ: ${{ matrix.client-tz || 'UTC' }}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
