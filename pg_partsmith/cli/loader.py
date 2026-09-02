@@ -21,11 +21,6 @@ from pg_partsmith.python_hooks import compile_hook_source
 
 from .render import OUTPUT_VERSION
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover - PyYAML is an extra; JSON documents work without it
-    yaml = None  # type: ignore[assignment]
-
 __all__ = [
     "DSN_ENV_VAR",
     "DSN_FILE_ENV_VAR",
@@ -190,9 +185,14 @@ def _parse_json(text: str, path: Path) -> Any:
 
 
 def _parse_yaml(text: str, path: Path) -> Any:
-    if yaml is None:  # pragma: no cover - exercised by the extra being absent
+    # Imported here, not at the top: PyYAML is an extra, and a JSON document
+    # must load on an installation without it. A module-level fallback to None
+    # is unreachable to mypy once the stubs are installed, which CI has.
+    try:
+        import yaml  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - exercised by the extra being absent
         msg = f"Reading {path} needs PyYAML: pip install 'pg-partsmith[cli]' (or write the document as JSON)"
-        raise ConfigError(msg)
+        raise ConfigError(msg) from exc
     try:
         return yaml.safe_load(text)
     except yaml.YAMLError as exc:
