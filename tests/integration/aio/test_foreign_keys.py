@@ -8,6 +8,7 @@ refused detach that does get planned is an issue, not the end of the run.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -86,7 +87,7 @@ async def test__unreferenced__referenced_partition_is_kept_and_the_other_expires
     config = _keep_unreferenced(events)
 
     # Act
-    plan = await make_service(db_engine).plan(config, now=None)
+    plan = await make_service(db_engine).plan(config, now=datetime.fromisoformat(NOW).replace(tzinfo=UTC))
     result = await run_maintenance(db_engine, config, at_time=NOW)
 
     # Assert
