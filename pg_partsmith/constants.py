@@ -28,11 +28,11 @@ DEFAULT_DROP_MAX_RETRIES = 3
 DEFAULT_DROP_RETRY_DELAY = 0.5
 DEFAULT_DROP_MAX_BACKOFF = 300.0
 
-# Hashed into advisory lock IDs / Redis keys; changing it breaks cross-version
-# mutual exclusion between deployments.
 DEFAULT_HOOK_TIMEOUT_SECONDS = 300.0
 """How long a configured command hook may run before it is killed: it holds the table's lock."""
 
+# Hashed into advisory lock IDs / Redis keys; changing it breaks cross-version
+# mutual exclusion between deployments.
 DEFAULT_LOCK_PREFIX = "partitioner"
 
 # PostgreSQL SQLSTATEs.

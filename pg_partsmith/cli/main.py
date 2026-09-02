@@ -26,18 +26,26 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import typer
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ArgumentError, NoSuchModuleError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.aio import CommandHooks, PartitionToolkit, PythonHooks
 from pg_partsmith.document import PartitionsDocument
-from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError, PlanConfigMismatchError
+from pg_partsmith.exceptions import (
+    InvalidPartitionConfigError,
+    LockAcquisitionError,
+    PartitionError,
+    PlanConfigMismatchError,
+)
+from pg_partsmith.hook_commands import CommandHookError
+from pg_partsmith.python_hooks import PythonHookError
 
 from .commands import CommandResult, run_apply, run_inspect, run_plan, run_validate
 from .exit_codes import ExitCode
 from .loader import (
     DSN_ENV_VAR,
+    DSN_FILE_ENV_VAR,
     ConfigError,
     async_url,
     load_document,
@@ -70,7 +78,8 @@ __all__ = ["app", "main"]
 
 _EPILOG = (
     "Exit codes: 0 nothing pending, 2 drift found (plan --check), 3 findings need a human, "
-    "4 configuration, 5 connection, 6 another maintainer holds the lock, 64 usage, 1 unexpected."
+    "4 configuration, 5 the database, 6 another maintainer holds the lock, 64 usage, "
+    "130 / 143 stopped by a signal, 1 unexpected."
 )
 
 
@@ -103,7 +112,10 @@ ConfigOption = Annotated[
 DsnOption = Annotated[
     str | None,
     typer.Option(
-        "--dsn", show_default=False, help=f"connection string; falls back to ${DSN_ENV_VAR}, then to the document's dsn"
+        "--dsn",
+        show_default=False,
+        help=f"connection string; falls back to ${DSN_ENV_VAR}, then to the file ${DSN_FILE_ENV_VAR} names, "
+        "then to the document's dsn",
     ),
 ]
 TableOption = Annotated[
@@ -374,6 +386,15 @@ def _execute(invocation: _Invocation) -> ExitCode:
         # and for an init container, which restarts on anything non-zero, it
         # is not even worth a code of its own.
         return _failed(str(exc), ExitCode.OK if invocation.ok_if_locked else ExitCode.LOCKED)
+    except (PartitionError, CommandHookError, PythonHookError) as exc:
+        # A run that stopped on its own terms -- a hook refused, a plan went
+        # stale, a partition is still referenced -- is a finding for a person,
+        # the way --continue-on-error would have recorded it. Not a traceback.
+        return _failed(str(exc), ExitCode.FINDINGS)
+    except (ArgumentError, NoSuchModuleError) as exc:
+        # A connection string SQLAlchemy cannot parse, or one naming a driver
+        # that is not installed: the deployment's to fix, before any database.
+        return _failed(f"the connection string is not usable: {exc}", ExitCode.CONFIG)
     except _DATABASE_ERRORS as exc:
         # A refused connection surfaces as a bare OSError and a rejected
         # password as the driver's own error: both come before SQLAlchemy has
@@ -472,10 +493,15 @@ async def _run(invocation: _Invocation) -> CommandResult:
 
     engine = create_async_engine(url)
     try:
-        hooks = _hooks(
-            document, command=invocation.command, config=invocation.config, allow_hooks=invocation.allow_hooks
-        )
-        kit = PartitionToolkit.from_options(engine, document.runtime, hooks=hooks)
+        try:
+            hooks = _hooks(
+                document, command=invocation.command, config=invocation.config, allow_hooks=invocation.allow_hooks
+            )
+            kit = PartitionToolkit.from_options(engine, document.runtime, hooks=hooks)
+        except ValueError as exc:
+            # The models refuse what they can see; whatever the wiring still
+            # objects to is the document's fault all the same.
+            raise ConfigError(str(exc)) from exc
         if invocation.command == "inspect":
             return await run_inspect(kit, configs)
         if invocation.command == "plan":

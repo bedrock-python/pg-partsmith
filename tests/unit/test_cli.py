@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pg_partsmith import console
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.aio.command_hooks import CommandHooks
 from pg_partsmith.cli import ExitCode, main
@@ -37,6 +38,7 @@ from pg_partsmith.document import PartitionsDocument
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult
 from pg_partsmith.events import HookPhase
 from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError
+from pg_partsmith.hook_commands import CommandHookError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import (
     CreatePartition,
@@ -935,6 +937,93 @@ def test__plan_save__a_path_that_cannot_be_written__is_exit_4_and_a_sentence(
     # Assert: it used to come out as a database error, which it is not
     assert code == ExitCode.CONFIG
     assert capsys.readouterr().err.startswith("pg-partsmith: Cannot write the plan to ")
+
+
+# ── What the run itself refuses, and what the document refuses first ─────────────
+
+
+def test__apply__a_hook_that_refuses_without_continue_on_error__is_exit_3_and_a_sentence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: the archiver said no, and the run stopped there, as it should
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+    refused = CommandHookError(HookPhase.BEFORE_DROP, "events__2020_01", "exit status 1")
+    monkeypatch.setattr(cli, "run_apply", AsyncMock(side_effect=refused))
+
+    # Act
+    code = main(["apply", "-c", str(config), "--allow-destructive"])
+
+    # Assert: a finding for a person, the way --continue-on-error would have recorded it
+    assert code == ExitCode.FINDINGS
+    assert capsys.readouterr().err == "pg-partsmith: before_drop hook for 'events__2020_01' failed: exit status 1\n"
+
+
+def test__dsn__a_string_that_is_no_url__is_exit_4_before_any_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _write(tmp_path, "partitions.json", json.dumps(DOCUMENT))
+
+    # Act
+    code = main(["plan", "-c", str(config), "--dsn", "not a connection string"])
+
+    # Assert: the deployment's mistake, not the database's
+    assert code == ExitCode.CONFIG
+    err = capsys.readouterr().err
+    assert err.startswith("pg-partsmith: the connection string is not usable: ")
+    assert "Traceback" not in err
+
+
+def test__runtime_boundary_codec__that_nothing_resolves__is_refused_by_validate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: a typo in the wiring section, which used to surface as a bare ValueError at apply
+    payload = {**DOCUMENT, "runtime": {"boundary_codec": "uuid7"}}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    # Act
+    code = main(["validate", "-c", str(config), "--dsn", "postgresql://nobody@127.0.0.1:1/none"])
+
+    # Assert: named where it is written, before any connection
+    assert code == ExitCode.CONFIG
+    err = capsys.readouterr().err
+    assert "boundary_codec" in err
+    assert "uuid7" in err
+
+
+def test__hooks__an_empty_command__is_refused_where_it_is_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = {**DOCUMENT, "hooks": {"before_drop": []}}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    # Act
+    code = main(["validate", "-c", str(config), "--dsn", "postgresql://nobody@127.0.0.1:1/none"])
+
+    # Assert
+    assert code == ExitCode.CONFIG
+    assert "before_drop" in capsys.readouterr().err
+
+
+def test__console_script__without_the_cli_extra__is_a_sentence_and_exit_64(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: typer is what the extra brings; without it the package cannot
+    # import, and the console script is on PATH all the same
+    monkeypatch.setitem(sys.modules, "typer", None)
+    for name in ("pg_partsmith.cli", "pg_partsmith.cli.main"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    # Act
+    code = console.main(["--version"])
+
+    # Assert
+    assert code == ExitCode.USAGE
+    assert capsys.readouterr().err.startswith('pg-partsmith needs the cli extra: pip install "pg-partsmith[cli]"')
+
+
+def test__console_script__with_the_extra__is_the_command_line() -> None:
+    assert console.main(["--version"]) == ExitCode.OK
 
 
 def test__plan__a_password_the_server_rejects__is_exit_5_and_not_a_traceback(

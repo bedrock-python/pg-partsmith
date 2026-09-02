@@ -223,6 +223,19 @@ jobs:
           rc=$?
           set -e
           test "$rc" -eq 5
+      - name: Without the extra, the command on PATH says what to install
+        shell: bash
+        run: |
+          uv venv --python 3.14 bare
+          if [ "$RUNNER_OS" = Windows ]; then BIN=bare/Scripts; else BIN=bare/bin; fi
+          WHEEL=$("$BIN/python" -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' dist/*.whl)
+          uv pip install --python bare "pg-partsmith @ $WHEEL"
+          set +e
+          "$BIN/pg-partsmith" --version 2> bare.err
+          rc=$?
+          set -e
+          test "$rc" -eq 64
+          grep -q 'pip install "pg-partsmith\[cli\]"' bare.err
 
   image:
     name: Container image (${{ matrix.os }})

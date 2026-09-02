@@ -34,7 +34,7 @@ Changelog = "https://github.com/bedrock-python/pg-partsmith/blob/master/CHANGELO
 "Bug Tracker" = "https://github.com/bedrock-python/pg-partsmith/issues"
 
 [project.scripts]
-pg-partsmith = "pg_partsmith.cli:main"
+pg-partsmith = "pg_partsmith.console:main"
 
 [project.optional-dependencies]
 redis-locks = ["redis>=4.2.0"]

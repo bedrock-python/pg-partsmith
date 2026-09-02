@@ -16,8 +16,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from pg_partsmith.aio.command_hooks import CommandHookError, CommandHooks
+from pg_partsmith.boundaries import Window
 from pg_partsmith.entities import PartitionGranularity, PartitionInfo, TablePartitionConfig
-from pg_partsmith.events import HookPhase, PartitionEvent
+from pg_partsmith.events import HookPhase, PartitionEvent, hook_environment
 from pg_partsmith.hook_commands import finish_hook_command, stop_hook_command
 from pg_partsmith.plan import DropPartition, Reason
 from pg_partsmith.sync.command_hooks import CommandHooks as SyncCommandHooks
@@ -292,3 +293,15 @@ def test__stop_hook_command__a_child_that_ignores_terminate__is_killed_after_the
 
     # Assert
     assert process.poll() is not None
+
+
+def test__hook_environment__an_integer_axis__hands_the_window_over_as_numbers() -> None:
+    # Arrange: a table partitioned on a sequence, whose window edges are ids, not moments
+    event = _event().model_copy(update={"window": Window(start=1000, end=2000)})
+
+    # Act
+    environment = hook_environment(event)
+
+    # Assert
+    assert environment["PG_PARTSMITH_WINDOW_START"] == "1000"
+    assert environment["PG_PARTSMITH_WINDOW_END"] == "2000"

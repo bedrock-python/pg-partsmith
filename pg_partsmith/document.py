@@ -23,9 +23,9 @@ Usage::
 from __future__ import annotations
 
 from datetime import UTC, tzinfo
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .boundaries import resolve_codec
 from .constants import (
@@ -200,6 +200,14 @@ class ToolkitOptions(BaseModel):
     drop_retry_delay: float = Field(default=DEFAULT_DROP_RETRY_DELAY, ge=0, description="Delay before the retry")
     drop_max_backoff: float = Field(default=DEFAULT_DROP_MAX_BACKOFF, ge=0, description="Ceiling on that backoff")
 
+    @field_validator("boundary_codec")
+    @classmethod
+    def _a_codec_that_exists(cls, value: str | None) -> str | None:
+        # Resolved here, where `validate` sees it and names the field, and again
+        # in to_kwargs for the object itself.
+        resolve_codec(value)
+        return value
+
     def to_kwargs(self) -> dict[str, Any]:
         """These options as the keywords ``PartitionToolkit.from_engine`` takes.
 
@@ -247,8 +255,8 @@ class PythonHook(BaseModel):
         return self
 
 
-HookAction = tuple[str, ...] | PythonHook
-"""What a phase runs: a command as an argument vector, or a block of Python."""
+HookAction = Annotated[tuple[str, ...], Field(min_length=1)] | PythonHook
+"""What a phase runs: a command as an argument vector, never an empty one, or a block of Python."""
 
 
 class HookOptions(BaseModel):

@@ -189,7 +189,13 @@ def hook_environment(event: PartitionEvent) -> dict[str, str]:
     )
     if event.window is not None:
         environment.update(
-            PG_PARTSMITH_WINDOW_START=event.window.start.isoformat(),
-            PG_PARTSMITH_WINDOW_END=event.window.end.isoformat(),
+            PG_PARTSMITH_WINDOW_START=_position(event.window.start),
+            PG_PARTSMITH_WINDOW_END=_position(event.window.end),
         )
     return environment
+
+
+def _position(value: object) -> str:
+    """A window edge as text: ISO 8601 for a moment, the number itself on an integer axis."""
+    render = getattr(value, "isoformat", None)
+    return str(render()) if callable(render) else str(value)
