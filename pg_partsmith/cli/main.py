@@ -334,7 +334,7 @@ def _execute(invocation: _Invocation) -> ExitCode:
     except _StopSignalError as exc:
         word, code = _STOP_SIGNALS[exc.signum]
         return _failed(word, code)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt:  # pragma: no cover - the Windows route; CI runs on Linux
         # Where the loop cannot take a signal handler of its own -- Windows --
         # asyncio.run's own Ctrl+C handling cancels the task and raises this
         # once it has cleaned up. The same outcome, by the runner's route.
@@ -390,7 +390,7 @@ async def _supervised(invocation: _Invocation) -> CommandResult:
     for signum in _STOP_SIGNALS:
         try:
             loop.add_signal_handler(signum, stop, signum)
-        except (NotImplementedError, RuntimeError, ValueError):
+        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover - Windows, or a worker thread
             break
         installed.append(signum)
     try:

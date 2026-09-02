@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from pg_partsmith.aio.command_hooks import CommandHookError, CommandHooks
 from pg_partsmith.entities import PartitionGranularity, PartitionInfo, TablePartitionConfig
 from pg_partsmith.events import HookPhase, PartitionEvent
-from pg_partsmith.hook_commands import stop_hook_command
+from pg_partsmith.hook_commands import finish_hook_command, stop_hook_command
 from pg_partsmith.plan import DropPartition, Reason
 from pg_partsmith.sync.command_hooks import CommandHooks as SyncCommandHooks
 from pg_partsmith.topology import RangeBounds
@@ -211,3 +213,82 @@ def test__stop_hook_command__a_child_already_gone__is_left_alone() -> None:
     # Act / Assert: nothing to do, and nothing raised
     stop_hook_command(process)
     assert process.returncode == 0
+
+
+def test__command_hooks__a_phase_that_is_not_one__is_refused() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="not a hook phase"):
+        CommandHooks({"before_lunch": ["/bin/true"]})  # type: ignore[dict-item]
+
+
+async def test__on_event__what_the_command_prints__is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    # Arrange
+    hooks = CommandHooks({HookPhase.BEFORE_DROP: _script("print('archived 4096 bytes')")})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="pg_partsmith.aio.command_hooks"):
+        await hooks.on_event(_event())
+
+    # Assert
+    assert "archived 4096 bytes" in caplog.text
+
+
+def test__sync_command_hooks__the_same_refusals_and_the_same_phases() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="not a hook phase"):
+        SyncCommandHooks({"before_lunch": ["/bin/true"]})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="non-empty"):
+        SyncCommandHooks({HookPhase.BEFORE_DROP: []})
+    assert SyncCommandHooks({HookPhase.AFTER_CREATE: ["/bin/true"]}).phases == (HookPhase.AFTER_CREATE,)
+
+
+def test__sync_command_hooks__another_phase__runs_nothing(tmp_path: Path) -> None:
+    # Arrange
+    marker = tmp_path / "ran"
+    body = f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')"
+    hooks = SyncCommandHooks({HookPhase.BEFORE_DROP: _script(body)})
+
+    # Act
+    hooks.on_event(_event(HookPhase.AFTER_CREATE))
+
+    # Assert
+    assert not marker.exists()
+
+
+def test__sync_command_hooks__what_the_command_prints__is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    # Arrange
+    hooks = SyncCommandHooks({HookPhase.BEFORE_DROP: _script("print('archived')")})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="pg_partsmith.sync.command_hooks"):
+        hooks.on_event(_event())
+
+    # Assert
+    assert "archived" in caplog.text
+
+
+def test__finish_hook_command__interrupted_while_waiting__stops_the_child_and_re_raises() -> None:
+    # Arrange: what Ctrl+C in the sync mirror looks like from inside the wait
+    process = MagicMock()
+    process.args = ["archive"]
+    process.communicate.side_effect = KeyboardInterrupt
+    process.poll.return_value = None
+
+    # Act / Assert
+    with pytest.raises(KeyboardInterrupt):
+        finish_hook_command(process, b"{}", phase=HookPhase.BEFORE_DROP, partition_name="p", timeout_seconds=5)
+    process.terminate.assert_called_once()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="terminate and kill are the same signal on Windows")
+def test__stop_hook_command__a_child_that_ignores_terminate__is_killed_after_the_grace() -> None:
+    # Arrange: a child that shrugs off SIGTERM
+    body = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    process = subprocess.Popen(_script(body))  # noqa: S603
+    time.sleep(0.5)
+
+    # Act
+    stop_hook_command(process, grace_seconds=0.5)
+
+    # Assert
+    assert process.poll() is not None

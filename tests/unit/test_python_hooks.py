@@ -138,3 +138,27 @@ def test__sync_python_hooks__a_block_that_raises__refuses_the_operation() -> Non
     # Act / Assert
     with pytest.raises(PythonHookError, match="KeyError"):
         hooks.on_event(_event())
+
+
+def test__python_hooks__a_phase_that_is_not_one__is_refused_in_both_mirrors() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="not a hook phase"):
+        PythonHooks({"before_lunch": "pass"})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="not a hook phase"):
+        SyncPythonHooks({"before_lunch": "pass"})  # type: ignore[dict-item]
+
+
+def test__sync_python_hooks__the_same_refusals_the_same_phases_and_the_same_silence(tmp_path: Path) -> None:
+    # Arrange
+    marker = tmp_path / "ran"
+    body = f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')"
+    hooks = SyncPythonHooks({HookPhase.BEFORE_DROP: body})
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="empty"):
+        SyncPythonHooks({HookPhase.BEFORE_DROP: "  "})
+    with pytest.raises(SyntaxError):
+        SyncPythonHooks({HookPhase.BEFORE_DROP: "def broken(:"})
+    assert hooks.phases == (HookPhase.BEFORE_DROP,)
+    hooks.on_event(_event(HookPhase.AFTER_CREATE))
+    assert not marker.exists()

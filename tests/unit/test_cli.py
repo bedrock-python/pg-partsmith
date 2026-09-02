@@ -17,7 +17,7 @@ import pytest
 
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.cli import ExitCode, main
-from pg_partsmith.cli.commands import run_apply, run_plan, run_validate
+from pg_partsmith.cli.commands import CommandResult, run_apply, run_plan, run_validate
 from pg_partsmith.cli.loader import (
     DSN_ENV_VAR,
     DSN_FILE_ENV_VAR,
@@ -757,3 +757,103 @@ def test__main__schema__prints_the_document_schema_and_needs_no_database(capsys:
     # Assert: the vocabulary an editor validates against is the model's own
     assert code == ExitCode.OK
     assert set(printed["properties"]) >= {"tables", "defaults", "runtime", "hooks", "dsn", "version"}
+
+
+# ── The corners of reading files ────────────────────────────────────────────────
+
+
+def test__load_document__json_that_does_not_parse__names_the_file(tmp_path: Path) -> None:
+    # Arrange
+    path = _write(tmp_path, "partitions.json", "{not json")
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match="not valid JSON"):
+        load_document(path)
+
+
+def test__load_document__yaml_that_does_not_parse__names_the_file(tmp_path: Path) -> None:
+    # Arrange
+    pytest.importorskip("yaml")
+    path = _write(tmp_path, "partitions.yaml", "tables: [unclosed")
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match="not valid YAML"):
+        load_document(path)
+
+
+def test__async_url__a_scheme_that_is_not_postgres__is_left_alone() -> None:
+    # Arrange / Act / Assert: not ours to rewrite
+    assert async_url("mysql://app@host/db") == "mysql://app@host/db"
+
+
+def test__load_plans__a_file_that_is_not_there__is_a_configuration_error(tmp_path: Path) -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ConfigError, match="Cannot read"):
+        load_plans(tmp_path / "absent.json")
+
+
+def test__load_plans__a_file_that_is_not_json__is_a_configuration_error(tmp_path: Path) -> None:
+    # Arrange
+    path = _write(tmp_path, "plan.json", "{")
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match="not valid JSON"):
+        load_plans(path)
+
+
+def test__load_plans__an_entry_with_no_plan__is_refused(tmp_path: Path) -> None:
+    # Arrange
+    path = _write(tmp_path, "plan.json", json.dumps({"version": 1, "tables": [{"table": "public.events"}]}))
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match="no plan"):
+        load_plans(path)
+
+
+def test__load_plans__a_plan_this_version_cannot_read__is_refused(tmp_path: Path) -> None:
+    # Arrange: a plan with an instant no plan could have
+    saved = {"version": 1, "tables": [{"table": "public.events", "plan": {"table_name": "x", "generated_at": "no"}}]}
+    path = _write(tmp_path, "plan.json", json.dumps(saved))
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match="cannot read"):
+        load_plans(path)
+
+
+def test__load_plans__a_file_naming_no_table__is_refused(tmp_path: Path) -> None:
+    # Arrange
+    path = _write(tmp_path, "plan.json", json.dumps({"version": 1, "tables": []}))
+
+    # Act / Assert
+    with pytest.raises(ConfigError, match="names no table"):
+        load_plans(path)
+
+
+def test__as_code__turns_what_the_app_returns_into_an_exit_code() -> None:
+    # Arrange / Act / Assert: a command's own code, click's 0 for --help, an
+    # integer that is no code of ours, and nothing at all
+    assert cli._as_code(ExitCode.DRIFT) is ExitCode.DRIFT
+    assert cli._as_code(0) is ExitCode.OK
+    assert cli._as_code(99) is ExitCode.FAILED
+    assert cli._as_code(None) is ExitCode.OK
+
+
+def test__plan_save__writes_the_envelope_where_apply_can_read_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Arrange: no database is reached; the plan is handed back by a fake
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    async def planned(kit: Any, configs: Any, *, check: bool, locks: bool = False) -> Any:
+        return CommandResult(code=ExitCode.OK, lines=["planned"], payload=envelope("plan", [plan_entry(_plan())]))
+
+    monkeypatch.setattr(cli, "run_plan", planned)
+    saved = tmp_path / "plan.json"
+
+    # Act
+    code = main(["plan", "-c", str(config), "--save", str(saved)])
+
+    # Assert: the file is the artifact, whatever the terminal was shown
+    assert code == ExitCode.OK
+    assert load_plans(saved)["public.events"] == _plan()

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from pg_partsmith.cli.metrics import render_metrics
+from pg_partsmith.cli.metrics import _labels, render_metrics
 
 
 def _samples(text: str) -> dict[str, float]:
@@ -193,3 +193,42 @@ def test__render_metrics__a_command_it_has_no_numbers_for__still_says_when_it_ra
     # Assert
     assert "pg_partsmith_run_timestamp_seconds" in text
     assert len(_samples(text)) == 1
+
+
+def test__render_metrics__an_unreadable_run_instant__falls_back_to_now() -> None:
+    # A textfile with no timestamp would read as never-stale; now is the honest fallback.
+    before = datetime.now(UTC).timestamp()
+    text = render_metrics({"version": 1, "command": "plan", "generated_at": "not a date", "tables": []})
+
+    # Assert
+    assert _samples(text)['pg_partsmith_run_timestamp_seconds{command="plan"}'] >= before
+
+
+def test__inspect__orphans_with_unreadable_or_naive_instants__age_what_can_be_aged() -> None:
+    # Arrange
+    payload = _envelope(
+        "inspect",
+        [
+            {
+                "table": "public.events",
+                "tree": {
+                    "root": {"children": []},
+                    "orphans": [
+                        {"name": "a", "detached_at": "not a date"},
+                        {"name": "b", "detached_at": "2026-01-01T00:00:00"},
+                    ],
+                },
+            }
+        ],
+    )
+
+    # Act
+    samples = _samples(render_metrics(payload))
+
+    # Assert: the naive one is read as UTC; the unreadable one is skipped
+    assert samples['pg_partsmith_oldest_detached_age_seconds{table="public.events"}'] > 0
+
+
+def test__labels__no_labels__is_no_braces() -> None:
+    # Arrange / Act / Assert
+    assert _labels({}) == ""

@@ -40,6 +40,14 @@ LABEL org.opencontainers.image.title="pg-partsmith" \
 # mounted document can be made readable to it without guessing.
 RUN useradd --uid 65532 --user-group --create-home --shell /usr/sbin/nologin partsmith
 
+# The base image ships pip too, and ensurepip carries a wheel of it: neither
+# is run here, and both vendor the msgpack/urllib3 a scanner then reports.
+# Removed by path rather than through pip itself, so the step cannot depend
+# on which of the two the base image happens to provide.
+RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-*.dist-info 
+    /usr/local/lib/python3*/site-packages/setuptools* /usr/local/lib/python3*/site-packages/wheel* 
+    /usr/local/lib/python3*/ensurepip /usr/local/bin/pip*
+
 COPY --from=builder /opt/venv /opt/venv
 
 ENV PATH="/opt/venv/bin:${PATH}" \

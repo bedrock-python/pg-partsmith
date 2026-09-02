@@ -267,3 +267,27 @@ def test__hooks__commands_and_blocks__mix_across_phases() -> None:
     assert document.hooks is not None
     assert list(document.hooks.commands()) == [HookPhase.AFTER_CREATE]
     assert list(document.hooks.python_blocks()) == [HookPhase.BEFORE_DROP]
+
+
+def test__hooks__an_empty_python_block__is_refused() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="empty"):
+        PartitionsDocument.model_validate(_document(hooks={"before_drop": {"python": "   "}}))
+
+
+def test__defaults__that_are_not_a_mapping__are_refused_by_the_field() -> None:
+    # Arrange / Act / Assert: the merge steps aside and the field's own validation speaks
+    with pytest.raises(ValidationError):
+        PartitionsDocument.model_validate(_document(defaults="month"))
+
+
+def test__tables__that_are_not_a_list__are_refused_by_the_field() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError):
+        PartitionsDocument.model_validate({"defaults": {"schema": "public"}, "tables": {"table_name": "events"}})
+
+
+def test__document__something_that_is_not_a_mapping_at_all__is_refused() -> None:
+    # Arrange / Act / Assert: the defaults merge steps aside; validation says what it is
+    with pytest.raises(ValidationError):
+        PartitionsDocument.model_validate("tables: events")
