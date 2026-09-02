@@ -10,10 +10,12 @@ on:
         description: "Release tag to publish (e.g. pg-partsmith-v0.1.0)"
         required: true
 
+# Each job asks for exactly what it needs; the workflow itself only reads.
 permissions:
   contents: read
-  id-token: write   # Trusted Publisher (PyPI OIDC)
-  packages: write   # ghcr.io
+
+env:
+  IMAGE: ghcr.io/bedrock-python/pg-partsmith
 
 jobs:
   check:
@@ -46,29 +48,23 @@ jobs:
             fi
           fi
 
-  publish:
-    name: Build and publish to PyPI
+  # The image first, on each architecture natively: built, made to say the
+  # version it is about to be tagged with, scanned, and pushed by digest --
+  # untagged, so nothing is visible yet. If any of that fails, PyPI has not
+  # been touched and there is no half of a release to explain.
+  image:
+    name: Build, scan and push the image (${{ matrix.arch }})
     needs: check
     if: needs.check.outputs.tag != ''
-    runs-on: ubuntu-latest
-    environment: pypi
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.check.outputs.tag }}
-
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-      - run: uv build
-      - run: uv publish
-
-  image:
-    name: Build and publish the image
-    needs: [check, publish]
-    if: needs.check.outputs.tag != ''
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
     outputs:
       version: ${{ steps.version.outputs.version }}
       minor: ${{ steps.version.outputs.minor }}
@@ -103,8 +99,8 @@ jobs:
           load: true
           tags: pg-partsmith:release
           build-args: VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ runner.arch }}
+          cache-to: type=gha,mode=max,scope=${{ runner.arch }}
 
       - name: The image reports the version it is tagged with
         run: |
@@ -120,43 +116,110 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
-      # The exact version, and a minor tag that moves within it. Never `latest`:
-      # a CronJob following it would cross a major on its own.
-      - name: Push
+      # The same build again, from the cache, pushed under its digest alone. An
+      # SBOM and a build provenance attestation travel with it, so "what is in
+      # it" and "what built it" are answers in the registry.
+      - name: Push by digest
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
           build-args: VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          # An SBOM and a build provenance attestation travel with the image,
-          # so "what is in it" and "what built it" are answers in the registry.
+          cache-from: type=gha,scope=${{ runner.arch }}
           sbom: true
           provenance: mode=max
-          tags: |
-            ghcr.io/bedrock-python/pg-partsmith:${{ steps.version.outputs.version }}
-            ghcr.io/bedrock-python/pg-partsmith:${{ steps.version.outputs.minor }}
+          tags: ${{ env.IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
 
-      # Signed keylessly with the workflow's own identity: `cosign verify` can
-      # then prove the image was built by this repository's release workflow,
-      # from this tag, and not by anyone holding a leaked token.
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign
-        run: cosign sign --yes "ghcr.io/bedrock-python/pg-partsmith@${DIGEST}"
+      - name: Hand the digest on
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish to PyPI
+    needs: [check, image]
+    if: needs.check.outputs.tag != ''
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write   # Trusted Publisher (PyPI OIDC)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv build
+      # --check-url: a run repeated after a failure further down skips what is
+      # already on the index instead of failing on it, and carries on to the tags.
+      - run: uv publish --check-url https://pypi.org/simple/pg-partsmith/
+
+  # One index over both architectures' images, under the exact tag and the
+  # minor one, signed. Never `latest`: a CronJob following it would cross a
+  # major on its own.
+  tags:
+    name: Tag and sign the image
+    needs: [check, image, publish]
+    if: needs.check.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # keyless signing
+    env:
+      VERSION: ${{ needs.image.outputs.version }}
+      MINOR: ${{ needs.image.outputs.minor }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: The two tags
+        run: |
+          cd "${RUNNER_TEMP}/digests"
+          refs=()
+          for digest in *; do refs+=("${IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create -t "${IMAGE}:${VERSION}" -t "${IMAGE}:${MINOR}" "${refs[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+      # Signed keylessly with the workflow's own identity: `cosign verify` can
+      # then prove the index was built by this repository's release workflow
+      # on master, and not by anyone holding a leaked token.
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign
+        run: |
+          DIGEST="sha256:$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw | sha256sum | cut -d' ' -f1)"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
 
   # What a team pulls is checked the way the container guide tells them to check
   # it, on both architectures: the signature, the SBOM and the provenance, the
   # version inside against the tag, the minor tag against the exact one -- and
   # then the end-to-end suite runs against the published image itself. A
-  # failure here is a red release run, not an unpublished image: the note in
-  # the log says what a team would find.
+  # failure here is a red release run to read, not an unpublished image.
   verify:
     name: The published image, verified (${{ matrix.os }})
-    needs: [check, image]
+    needs: [check, image, tags]
     if: needs.check.outputs.tag != ''
     runs-on: ${{ matrix.os }}
     permissions:
@@ -167,9 +230,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     env:
-      IMAGE: ghcr.io/bedrock-python/pg-partsmith:${{ needs.image.outputs.version }}
-      MINOR_IMAGE: ghcr.io/bedrock-python/pg-partsmith:${{ needs.image.outputs.minor }}
       VERSION: ${{ needs.image.outputs.version }}
+      MINOR: ${{ needs.image.outputs.minor }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -180,23 +242,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull what was pushed
-        run: docker pull "$IMAGE"
+        run: docker pull "${IMAGE}:${VERSION}"
 
       - uses: sigstore/cosign-installer@v3
-      - name: Signed by this repository's release workflow
+      - name: Signed by this repository's release workflow, on master
         run: |
-          cosign verify "$IMAGE" \
-            --certificate-identity-regexp '^https://github.com/bedrock-python/pg-partsmith/' \
+          cosign verify "${IMAGE}:${VERSION}" \
+            --certificate-identity "https://github.com/bedrock-python/pg-partsmith/.github/workflows/publish.yml@refs/heads/master" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
       - name: The version inside, the label, the minor tag, the SBOM and the provenance
         run: |
-          test "$(docker run --rm "$IMAGE" --version)" = "pg-partsmith ${VERSION}"
-          test "$(docker image inspect "$IMAGE" -f '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
-          test "$(docker buildx imagetools inspect "$IMAGE" --raw | sha256sum)" \
-            = "$(docker buildx imagetools inspect "$MINOR_IMAGE" --raw | sha256sum)"
-          docker buildx imagetools inspect "$IMAGE" --format '{{json .SBOM}}' | grep -q '"SPDX"'
-          docker buildx imagetools inspect "$IMAGE" --format '{{json .Provenance}}' | grep -q '"SLSA"'
+          test "$(docker run --rm "${IMAGE}:${VERSION}" --version)" = "pg-partsmith ${VERSION}"
+          test "$(docker image inspect "${IMAGE}:${VERSION}" -f '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "${VERSION}"
+          test "$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw | sha256sum)" \
+            = "$(docker buildx imagetools inspect "${IMAGE}:${MINOR}" --raw | sha256sum)"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .SBOM}}' | grep -q '"SPDX"'
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Provenance}}' | grep -q '"SLSA"'
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -206,4 +268,4 @@ jobs:
       - name: End to end, against the published image
         run: uv run --no-sync pytest -m e2e
         env:
-          PG_PARTSMITH_E2E_IMAGE: ${{ env.IMAGE }}
+          PG_PARTSMITH_E2E_IMAGE: ghcr.io/bedrock-python/pg-partsmith:${{ needs.image.outputs.version }}

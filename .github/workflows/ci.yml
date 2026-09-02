@@ -9,11 +9,12 @@ on:
 permissions:
   contents: read
 
-# A push while the previous run is still going restarts it; the old one is
-# answering a question nobody is asking any more.
+# A push to a pull request while the previous run is still going restarts it;
+# the old one is answering a question nobody is asking any more. A run on
+# master is left to finish: every commit there should end with a verdict.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:

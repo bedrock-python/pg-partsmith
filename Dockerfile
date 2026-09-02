@@ -42,7 +42,7 @@ COPY pg_partsmith ./pg_partsmith
 # and is always rebuilt: the cache keys built wheels by version, and the
 # version does not change between two commits of the same release.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable --extra cli --python /usr/local/bin/python3 \
+    uv sync --locked --no-dev --no-editable --extra cli --python /usr/local/bin/python3 \
         --reinstall-package pg-partsmith
 
 # What the runtime image will not have: rich and its dependencies exist for

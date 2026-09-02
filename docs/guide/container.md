@@ -138,7 +138,7 @@ did: Python 3.14, nothing to byte-compile, and less of everything to load.
 
 ## Supply chain
 
-- **Locked install.** The builder runs `uv sync --frozen` from `uv.lock`; a lock file out
+- **Locked install.** The builder runs `uv sync --locked` from `uv.lock`; a lock file out
   of step with `pyproject.toml` fails the build rather than resolving something else.
 - **SBOM and provenance.** Every published image carries an SBOM and a SLSA build
   provenance attestation, so "what is in it" and "what built it" are answers the registry
@@ -149,12 +149,19 @@ did: Python 3.14, nothing to byte-compile, and less of everything to load.
 
   ```bash
   cosign verify ghcr.io/bedrock-python/pg-partsmith:1.2.0 \
-    --certificate-identity-regexp '^https://github.com/bedrock-python/pg-partsmith/' \
+    --certificate-identity https://github.com/bedrock-python/pg-partsmith/.github/workflows/publish.yml@refs/heads/master \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
-- **Both architectures.** The release publishes amd64 and arm64; CI builds and runs both,
-  natively, with the same size budget and the same scan.
+  The identity is the release workflow on `master`, exactly: not any workflow in the
+  repository, and not a branch.
+
+- **Both architectures.** The release builds amd64 and arm64 each on a machine of its own
+  kind, scans each, and only then joins them under one tag; CI builds and runs both the
+  same way, with the same size budget and the same scan.
+- **The image before the index.** The release builds, proves and scans the image before
+  anything is uploaded to PyPI, so a base image that fails the scan on release day stops
+  the release whole rather than leaving a library with no image to go with it.
 - **Verified after publishing.** The release workflow pulls the image it just pushed, on
   both architectures, and checks it the way this page tells you to: the signature, the
   SBOM and the provenance, `--version` and the label against the tag, the minor tag

@@ -155,10 +155,17 @@ have a sync twin.
 Releases are cut by [release-please](https://github.com/googleapis/release-please) from the
 Conventional Commits on `master`: it keeps a release pull request open with the next version
 and the generated changelog section; merging that PR tags the release, and the publish
-workflow builds the package and uploads it to PyPI, then builds, scans, pushes and signs
-the image, then pulls it back on both architectures and runs the end-to-end suite against
-what was published. A failure in that last job is a red release run to read, not an
-unpublished image.
+workflow takes it from there, in this order: the image is built, made to say the version,
+scanned and pushed by digest on each architecture; the package is uploaded to PyPI; the
+two image tags are created over both architectures and signed; and the published image is
+pulled back on both architectures and run through the end-to-end suite. Nothing reaches
+PyPI unless the image is good, and a run repeated after a failure further down skips what
+PyPI already has and carries on. A failure in the last job is a red release run to read,
+not an unpublished image.
+
+The first push creates the `ghcr.io/bedrock-python/pg-partsmith` package private; make it
+public in the organisation's package settings once, or every `docker pull` in the guides
+is denied.
 
 - `feat:` bumps the minor version, `fix:` the patch version, `feat!:` / a `BREAKING CHANGE:`
   footer bumps the major version (before 1.0 a breaking change bumps the minor version —
