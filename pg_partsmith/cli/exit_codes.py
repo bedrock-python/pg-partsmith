@@ -23,6 +23,10 @@ class ExitCode(IntEnum):
         CONNECTION: The database could not be reached.
         LOCKED: Another maintainer holds the table's lock. Overlapping runs are
             ordinary, so this is its own code rather than a failure to page on.
+        USAGE: The invocation itself was wrong -- a misspelled flag, no command.
+            ``EX_USAGE`` from ``sysexits.h``, and deliberately not the ``2``
+            argument parsers default to: that is what this tool means "drift"
+            by, and a CronJob alerting on drift must not page over a typo.
     """
 
     OK = 0
@@ -32,3 +36,4 @@ class ExitCode(IntEnum):
     CONFIG = 4
     CONNECTION = 5
     LOCKED = 6
+    USAGE = 64

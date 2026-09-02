@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pg_partsmith.__version__ import __version__
-from pg_partsmith.cli import ExitCode, build_parser, main
+from pg_partsmith.cli import ExitCode, main
 from pg_partsmith.cli.commands import run_apply, run_plan, run_validate
 from pg_partsmith.cli.loader import (
     DSN_ENV_VAR,
@@ -299,10 +299,35 @@ def test__main__a_document_that_is_not_there__exits_config_without_connecting(tm
 
 def test__main__version__exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     # Act / Assert: one number for the library, the CLI and the image
-    with pytest.raises(SystemExit) as exc:
-        main(["--version"])
-    assert exc.value.code == 0
+    assert main(["--version"]) == ExitCode.OK
     assert __version__ in capsys.readouterr().out
+
+
+def test__main__a_misspelled_flag__is_a_usage_error_and_not_drift(capsys: pytest.CaptureFixture[str]) -> None:
+    # A CronJob alerting on exit 2 must not page over a typo.
+    assert main(["plan", "--bogus", "-c", "partitions.yaml"]) == ExitCode.USAGE
+    assert "--bogus" in capsys.readouterr().err
+
+
+def test__main__no_command__is_a_usage_error_that_shows_the_help(capsys: pytest.CaptureFixture[str]) -> None:
+    # Arrange / Act
+    code = main([])
+    captured = capsys.readouterr()
+
+    # Assert: the help explains itself; the code says it was not a run
+    assert code == ExitCode.USAGE
+    assert "inspect" in captured.out
+    assert captured.err == ""
+
+
+def test__main__help__exits_zero_and_names_every_command(capsys: pytest.CaptureFixture[str]) -> None:
+    # Arrange / Act
+    code = main(["--help"])
+    printed = capsys.readouterr().out
+
+    # Assert
+    assert code == ExitCode.OK
+    assert all(command in printed for command in ("inspect", "plan", "validate", "apply"))
 
 
 # ── Rendering ───────────────────────────────────────────────────────────────────
@@ -496,10 +521,9 @@ def test__plan__a_document_that_runs_commands__needs_no_permission(tmp_path: Pat
 def test__hooks__allowed__are_built_from_the_document(tmp_path: Path) -> None:
     # Arrange
     document = load_document(Path(_hooks_document(tmp_path)))
-    args = build_parser().parse_args(["apply", "-c", "x", "--allow-hooks"])
 
     # Act
-    hooks = _cli_hooks(document, args)
+    hooks = _cli_hooks(document, command="apply", config=tmp_path / "partitions.json", allow_hooks=True)
 
     # Assert
     assert hooks is not None
@@ -573,10 +597,9 @@ def test__hooks__a_python_block__is_built_alongside_the_commands(tmp_path: Path)
         "hooks": {"after_create": ["/bin/notify"], "before_drop": {"python": "log.info('x')"}},
     }
     document = load_document(_write(tmp_path, "partitions.json", json.dumps(payload)))
-    args = build_parser().parse_args(["apply", "-c", str(tmp_path / "partitions.json"), "--allow-hooks"])
 
     # Act
-    hooks = _cli_hooks(document, args)
+    hooks = _cli_hooks(document, command="apply", config=tmp_path / "partitions.json", allow_hooks=True)
 
     # Assert: one object per kind, each knowing its own phases
     assert hooks is not None

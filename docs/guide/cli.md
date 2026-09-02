@@ -18,6 +18,15 @@ pg-partsmith apply    -c partitions.yaml     # do it — creations only, by defa
 The first three issue no DDL, take no lock and fire no hook. `apply` is the one that
 acts.
 
+## Shell completion
+
+```bash
+pg-partsmith --install-completion      # bash, zsh, fish, PowerShell
+```
+
+`--help` on any command is generated from the same declarations that parse it, so it
+cannot drift from what the command accepts.
+
 ## Where the connection comes from
 
 `--dsn`, then `$PG_PARTSMITH_DSN`, then the document's `dsn` — in that order, so a
@@ -40,8 +49,13 @@ distinguishing:
 | 4 | the document does not parse, or does not match the database |
 | 5 | the database could not be reached |
 | 6 | another maintainer holds the table's lock |
+| 64 | the invocation itself was wrong: a misspelled flag, no command |
 
-Two of those deserve their reasoning spelled out.
+Three of those deserve their reasoning spelled out.
+
+**64 is not 2.** Argument parsers exit `2` on a misspelled flag, and `2` is what this tool
+means "drift" by. A CronJob alerting on drift must not page over a typo, so a usage error
+has the code `sysexits.h` gave it — `EX_USAGE` — and never the parser's default.
 
 **3 outranks 2.** Drift is what a maintenance run fixes; a finding is what it cannot —
 a range overlap, a hash set with a gap no repair is safe for. If both are true, the one

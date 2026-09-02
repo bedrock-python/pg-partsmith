@@ -5,19 +5,24 @@ acts, and withholds every destructive operation unless it is asked for them.
 Logging goes to stderr so stdout stays parseable; ``--output json`` is the
 models' own dump, so it cannot drift from the library.
 
-The argument parser is the standard library's. The image this ships in is
-measured, and a dependency is a poor trade for a nicer ``--help``.
+The arguments are declared as type annotations and parsed by typer, which is
+click underneath: every flag has a type, the help is generated from the same
+declarations that parse it, and shell completion comes for free. The process
+still leaves through :func:`main`, which turns whatever a command returns --
+or whatever parsing raised -- into one :class:`~pg_partsmith.cli.exit_codes.ExitCode`.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import logging
 import sys
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
+import typer
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -47,55 +52,238 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("pg_partsmith.cli")
 
-__all__ = ["build_parser", "main"]
+__all__ = ["app", "main"]
+
+_EPILOG = (
+    "Exit codes: 0 nothing pending, 2 drift found (plan --check), 3 findings need a human, "
+    "4 configuration, 5 connection, 6 another maintainer holds the lock, 64 usage, 1 unexpected."
+)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """The whole command surface, as a parser."""
-    parser = argparse.ArgumentParser(
-        prog="pg-partsmith",
-        description="Inspect, plan and run PostgreSQL partition maintenance from a configuration document.",
-        epilog=(
-            "Exit codes: 0 nothing pending, 2 drift found (plan --check), 3 findings need a human, "
-            "4 configuration, 5 connection, 6 another maintainer holds the lock, 1 unexpected."
-        ),
+class Output(StrEnum):
+    """The forms a result can be printed in."""
+
+    human = "human"
+    json = "json"
+    metrics = "metrics"
+
+
+app = typer.Typer(
+    name="pg-partsmith",
+    help="Inspect, plan and run PostgreSQL partition maintenance from a configuration document.",
+    epilog=_EPILOG,
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    # Tracebacks are ours to print, under --verbose; a rich one for an operator
+    # reading a CronJob log is noise dressed up.
+    pretty_exceptions_enable=False,
+)
+
+
+# ── Options every command takes ─────────────────────────────────────────────────
+
+ConfigOption = Annotated[
+    Path,
+    typer.Option("--config", "-c", metavar="FILE", show_default=False, help="the configuration document (.yaml/.json)"),
+]
+DsnOption = Annotated[
+    str | None,
+    typer.Option(
+        "--dsn", show_default=False, help=f"connection string; falls back to ${DSN_ENV_VAR}, then to the document's dsn"
+    ),
+]
+TableOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--table",
+        metavar="NAME",
+        show_default=False,
+        help="only this table, qualified or bare; repeatable. Every table in the document otherwise",
+    ),
+]
+OutputOption = Annotated[
+    Output,
+    typer.Option("--output", "-o", help="human, json, or Prometheus text for a node_exporter textfile"),
+]
+VerboseOption = Annotated[bool, typer.Option("--verbose", "-v", help="log what it is doing, to stderr")]
+
+
+@dataclass(frozen=True, slots=True)
+class _Invocation:
+    """One parsed command, with every flag it could carry."""
+
+    command: str
+    config: Path
+    dsn: str | None
+    tables: tuple[str, ...]
+    output: Output
+    verbose: bool
+    check: bool = False
+    save: Path | None = None
+    locks: bool = False
+    plan: Path | None = None
+    allow_destructive: bool = False
+    continue_on_error: bool = False
+    allow_config_drift: bool = False
+    allow_hooks: bool = False
+
+
+def _version(value: bool) -> None:
+    """``--version`` reads the library's own number: there is deliberately no second one."""
+    if value:
+        typer.echo(f"pg-partsmith {__version__}")
+        raise typer.Exit
+
+
+@app.callback()
+def _root(
+    version: Annotated[
+        bool, typer.Option("--version", callback=_version, is_eager=True, help="show the version and exit")
+    ] = False,
+) -> None:
+    """Inspect, plan and run PostgreSQL partition maintenance from a configuration document."""
+
+
+# ── The commands ────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def inspect(
+    config: ConfigOption,
+    dsn: DsnOption = None,
+    table: TableOption = None,
+    output: OutputOption = Output.human,
+    verbose: VerboseOption = False,
+) -> int:
+    """Read the partition tree that exists and print it."""
+    return _execute(
+        _Invocation("inspect", config=config, dsn=dsn, tables=tuple(table or ()), output=output, verbose=verbose)
     )
-    parser.add_argument("--version", action="version", version=f"pg-partsmith {__version__}")
-    subcommands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    for name, help_text in (
-        ("inspect", "read the partition tree that exists and print it"),
-        ("plan", "show what maintenance would do, and why; issues no DDL"),
-        ("validate", "check the document against the catalog; exits non-zero on a problem"),
-        ("apply", "carry out maintenance; creations only unless --allow-destructive"),
-    ):
-        sub = subcommands.add_parser(name, help=help_text, description=help_text)
-        _add_common_arguments(sub)
-        if name == "plan":
-            sub.add_argument(
-                "--check",
-                action="store_true",
-                help="exit 2 when any operation is pending, for alerting on maintenance that has stopped running",
-            )
-            sub.add_argument(
-                "--save",
-                metavar="FILE",
-                default=None,
-                help="write the plan to FILE, for review and for `apply --plan FILE`",
-            )
-            sub.add_argument(
-                "--locks",
-                action="store_true",
-                help="after each operation, the heaviest lock it takes and on what",
-            )
-        if name == "apply":
-            _add_apply_arguments(sub)
 
-    return parser
+@app.command()
+def plan(
+    config: ConfigOption,
+    dsn: DsnOption = None,
+    table: TableOption = None,
+    output: OutputOption = Output.human,
+    verbose: VerboseOption = False,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help="exit 2 when any operation is pending, for alerting on maintenance that has stopped running",
+        ),
+    ] = False,
+    save: Annotated[
+        Path | None,
+        typer.Option(
+            "--save", metavar="FILE", show_default=False, help="write the plan to FILE, for `apply --plan FILE`"
+        ),
+    ] = None,
+    locks: Annotated[
+        bool, typer.Option("--locks", help="after each operation, the heaviest lock it takes and on what")
+    ] = False,
+) -> int:
+    """Show what maintenance would do, and why. Issues no DDL."""
+    return _execute(
+        _Invocation(
+            "plan",
+            config=config,
+            dsn=dsn,
+            tables=tuple(table or ()),
+            output=output,
+            verbose=verbose,
+            check=check,
+            save=save,
+            locks=locks,
+        )
+    )
+
+
+@app.command()
+def validate(
+    config: ConfigOption,
+    dsn: DsnOption = None,
+    table: TableOption = None,
+    output: OutputOption = Output.human,
+    verbose: VerboseOption = False,
+) -> int:
+    """Check the document against the catalog. Exits non-zero on a problem."""
+    return _execute(
+        _Invocation("validate", config=config, dsn=dsn, tables=tuple(table or ()), output=output, verbose=verbose)
+    )
+
+
+@app.command()
+def apply(
+    config: ConfigOption,
+    dsn: DsnOption = None,
+    table: TableOption = None,
+    output: OutputOption = Output.human,
+    verbose: VerboseOption = False,
+    plan: Annotated[
+        Path | None,
+        typer.Option(
+            "--plan",
+            metavar="FILE",
+            show_default=False,
+            help="apply the plan saved in FILE instead of planning now; refused if it was not made from this document",
+        ),
+    ] = None,
+    allow_destructive: Annotated[
+        bool,
+        typer.Option(
+            "--allow-destructive",
+            help="carry out detaches and drops as well; without it, only partitions are created",
+        ),
+    ] = False,
+    continue_on_error: Annotated[
+        bool,
+        typer.Option("--continue-on-error", help="isolate a failed operation into the issues instead of aborting"),
+    ] = False,
+    allow_config_drift: Annotated[
+        bool,
+        typer.Option(
+            "--allow-config-drift", help="apply a saved plan whose configuration has changed since it was made"
+        ),
+    ] = False,
+    allow_hooks: Annotated[
+        bool,
+        typer.Option(
+            "--allow-hooks",
+            help="run what the document's hooks section names; without it, a document declaring any is refused",
+        ),
+    ] = False,
+) -> int:
+    """Carry out maintenance. Creations only, unless --allow-destructive."""
+    return _execute(
+        _Invocation(
+            "apply",
+            config=config,
+            dsn=dsn,
+            tables=tuple(table or ()),
+            output=output,
+            verbose=verbose,
+            plan=plan,
+            allow_destructive=allow_destructive,
+            continue_on_error=continue_on_error,
+            allow_config_drift=allow_config_drift,
+            allow_hooks=allow_hooks,
+        )
+    )
+
+
+# ── Leaving the process ─────────────────────────────────────────────────────────
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run one command.
+    """Run one command and answer with its exit status.
+
+    Parsing is left to typer, but the process leaves through here, so that a
+    usage error -- a misspelled flag, no command at all -- has a code of its own
+    rather than the ``2`` argparse and click both use, which this tool means
+    "drift" by. A CronJob alerting on drift must not page over a typo.
 
     Args:
         argv: Arguments, or None to read ``sys.argv``.
@@ -103,17 +291,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         The exit status, as :class:`~pg_partsmith.cli.exit_codes.ExitCode`.
     """
-    args = build_parser().parse_args(argv)
+    try:
+        outcome = app(args=list(argv) if argv is not None else None, prog_name="pg-partsmith", standalone_mode=False)
+    except typer.Abort:  # pragma: no cover - interactive only
+        return _failed("interrupted", ExitCode.FAILED)
+    except Exception as exc:
+        if not _is_usage_error(exc):
+            raise
+        _usage_error(exc)
+        return ExitCode.USAGE
+    return _as_code(outcome)
+
+
+def _execute(invocation: _Invocation) -> ExitCode:
+    """Read, connect, dispatch, print, and turn every failure into its code."""
     logging.basicConfig(
         stream=sys.stderr,
-        level=logging.DEBUG if args.verbose else logging.WARNING,
+        level=logging.DEBUG if invocation.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
-        result = asyncio.run(_run(args))
-    except (ConfigError, InvalidPartitionConfigError) as exc:
-        return _failed(str(exc), ExitCode.CONFIG)
-    except PlanConfigMismatchError as exc:
+        result = asyncio.run(_run(invocation))
+    except (ConfigError, InvalidPartitionConfigError, PlanConfigMismatchError) as exc:
         return _failed(str(exc), ExitCode.CONFIG)
     except LockAcquisitionError as exc:
         # An overlapping run is ordinary operation, not a failure to page on.
@@ -126,44 +325,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         return _failed("interrupted", ExitCode.FAILED)
 
-    text = result.render(output=args.output)
+    text = result.render(output=invocation.output.value)
     if text:
         sys.stdout.write(text + "\n")
     return result.code
 
 
-async def _run(args: argparse.Namespace) -> CommandResult:
+async def _run(invocation: _Invocation) -> CommandResult:
     """Read the document, bring up the engine, and dispatch one command."""
-    document = load_document(Path(args.config))
-    _check_python_hooks(document, args)
-    configs = select_configs(document, tuple(args.table))
-    url = async_url(resolve_dsn(document, override=args.dsn))
+    document = load_document(invocation.config)
+    _check_python_hooks(document, invocation.config)
+    configs = select_configs(document, invocation.tables)
+    url = async_url(resolve_dsn(document, override=invocation.dsn))
 
     engine = create_async_engine(url)
     try:
-        kit = PartitionToolkit.from_options(engine, document.runtime, hooks=_hooks(document, args))
-        if args.command == "inspect":
+        hooks = _hooks(
+            document, command=invocation.command, config=invocation.config, allow_hooks=invocation.allow_hooks
+        )
+        kit = PartitionToolkit.from_options(engine, document.runtime, hooks=hooks)
+        if invocation.command == "inspect":
             return await run_inspect(kit, configs)
-        if args.command == "plan":
-            result = await run_plan(kit, configs, check=args.check, locks=args.locks)
-            if args.save:
-                _save_plan(Path(args.save), result)
+        if invocation.command == "plan":
+            result = await run_plan(kit, configs, check=invocation.check, locks=invocation.locks)
+            if invocation.save is not None:
+                _save_plan(invocation.save, result)
             return result
-        if args.command == "apply":
+        if invocation.command == "apply":
             return await run_apply(
                 kit,
                 configs,
-                plans=load_plans(Path(args.plan)) if args.plan else None,
-                allow_destructive=args.allow_destructive,
-                continue_on_error=args.continue_on_error,
-                allow_config_drift=args.allow_config_drift,
+                plans=load_plans(invocation.plan) if invocation.plan is not None else None,
+                allow_destructive=invocation.allow_destructive,
+                continue_on_error=invocation.continue_on_error,
+                allow_config_drift=invocation.allow_config_drift,
             )
         return await run_validate(kit, configs)
     finally:
         await engine.dispose()
 
 
-def _hooks(document: PartitionsDocument, args: argparse.Namespace) -> list[PartitionLifecycleHooks] | None:
+def _hooks(
+    document: PartitionsDocument, *, command: str, config: Path, allow_hooks: bool
+) -> list[PartitionLifecycleHooks] | None:
     """The hooks this run honours, and a refusal when it was not told to honour any.
 
     Hooks fire during ``apply`` alone, so nothing else has to decide. Ignoring a
@@ -177,9 +381,9 @@ def _hooks(document: PartitionsDocument, args: argparse.Namespace) -> list[Parti
     hooks = document.hooks
     if hooks is None or hooks.is_empty:
         return None
-    if args.command != "apply":
+    if command != "apply":
         return None
-    if not getattr(args, "allow_hooks", False):
+    if not allow_hooks:
         named = ", ".join(phase.value for phase in hooks.actions())
         msg = (
             f"This document runs code at {named}. It executes in a process holding DDL credentials, "
@@ -191,13 +395,13 @@ def _hooks(document: PartitionsDocument, args: argparse.Namespace) -> list[Parti
     configured: list[PartitionLifecycleHooks] = []
     if hooks.commands():
         configured.append(CommandHooks(hooks.commands(), timeout_seconds=hooks.timeout_seconds))
-    sources, names = load_python_hooks(hooks, Path(args.config).resolve().parent)
+    sources, names = load_python_hooks(hooks, config.resolve().parent)
     if sources:
         configured.append(PythonHooks(sources, names=names))
     return configured
 
 
-def _check_python_hooks(document: PartitionsDocument, args: argparse.Namespace) -> None:
+def _check_python_hooks(document: PartitionsDocument, config: Path) -> None:
     """Read and compile every file-backed block, whatever the command.
 
     Inline blocks were compiled when the document validated; a file has to be
@@ -205,37 +409,7 @@ def _check_python_hooks(document: PartitionsDocument, args: argparse.Namespace) 
     missing or broken -- not ``apply``, and not at 03:00.
     """
     if document.hooks is not None and document.hooks.python_blocks():
-        load_python_hooks(document.hooks, Path(args.config).resolve().parent)
-
-
-def _add_apply_arguments(parser: argparse.ArgumentParser) -> None:
-    """What only ``apply`` takes, including the two that decide how much it may do."""
-    parser.add_argument(
-        "--plan",
-        metavar="FILE",
-        default=None,
-        help="apply the plan saved in FILE instead of planning now; refused if it was not made from this document",
-    )
-    parser.add_argument(
-        "--allow-destructive",
-        action="store_true",
-        help="carry out detaches and drops as well; without it, only partitions are created",
-    )
-    parser.add_argument(
-        "--continue-on-error",
-        action="store_true",
-        help="isolate a failed operation into the issues instead of aborting the run",
-    )
-    parser.add_argument(
-        "--allow-config-drift",
-        action="store_true",
-        help="apply a saved plan whose configuration has changed since it was made",
-    )
-    parser.add_argument(
-        "--allow-hooks",
-        action="store_true",
-        help="run the commands the document's hooks section names; without it, a document declaring any is refused",
-    )
+        load_python_hooks(document.hooks, config.resolve().parent)
 
 
 def _save_plan(path: Path, result: CommandResult) -> None:
@@ -250,6 +424,46 @@ def _save_plan(path: Path, result: CommandResult) -> None:
     path.write_text(to_json(result.payload) + "\n", encoding="utf-8")
 
 
+def _as_code(outcome: object) -> ExitCode:
+    """What ``app()`` handed back, as an exit code.
+
+    A command returns its :class:`ExitCode`; ``--help`` and ``--version`` leave
+    through click's own ``Exit`` and come back as ``0``.
+    """
+    if isinstance(outcome, ExitCode):
+        return outcome
+    if isinstance(outcome, int):
+        return ExitCode(outcome) if outcome in set(ExitCode) else ExitCode.FAILED
+    return ExitCode.OK
+
+
+def _is_usage_error(exc: Exception) -> bool:
+    """Whether parsing, not the command, raised this.
+
+    Recognised by click's own ``UsageError`` interface rather than by class:
+    typer vendors its copy of click from 0.27 and imports the real one before
+    that, so the class lives in two places across the versions this supports,
+    one of them private. The interface -- ``exit_code`` of ``2`` and
+    ``format_message`` -- is the documented, stable part.
+    """
+    return getattr(exc, "exit_code", None) == 2 and callable(getattr(exc, "format_message", None))
+
+
+def _usage_error(exc: Exception) -> None:
+    """Say what was wrong with the invocation, and how it is spelled.
+
+    No command at all is the one usage error that has already explained
+    itself: click prints the help for it before raising, so there is nothing
+    to add but the exit code.
+    """
+    if type(exc).__name__ == "NoArgsIsHelpError":
+        return
+    ctx = getattr(exc, "ctx", None)
+    if ctx is not None:
+        sys.stderr.write(ctx.get_usage() + "\n")
+    sys.stderr.write(f"pg-partsmith: {exc.format_message()}\n")  # type: ignore[attr-defined]
+
+
 def _failed(message: str, code: ExitCode) -> ExitCode:
     """Say what went wrong on stderr, and answer with the code that names it.
 
@@ -259,30 +473,3 @@ def _failed(message: str, code: ExitCode) -> ExitCode:
     sys.stderr.write(f"pg-partsmith: {message}\n")
     logger.debug("command failed with %s", code.name, exc_info=True)
     return code
-
-
-def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    """Every command reads a document, may be narrowed, and can speak JSON."""
-    parser.add_argument(
-        "-c", "--config", required=True, metavar="FILE", help="the configuration document (.yaml/.json)"
-    )
-    parser.add_argument(
-        "--dsn",
-        default=None,
-        help=f"connection string; falls back to ${DSN_ENV_VAR}, then to the document's dsn",
-    )
-    parser.add_argument(
-        "--table",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help="only this table, qualified or bare; repeatable (default: every table in the document)",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        choices=("human", "json", "metrics"),
-        default="human",
-        help="output format: human, json, or Prometheus text for a node_exporter textfile (default: human)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="log what it is doing, to stderr")

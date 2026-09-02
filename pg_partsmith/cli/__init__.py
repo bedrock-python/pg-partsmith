@@ -14,6 +14,6 @@ summary of one.
 
 from .exit_codes import ExitCode
 from .loader import ConfigError
-from .main import build_parser, main
+from .main import app, main
 
-__all__ = ["ConfigError", "ExitCode", "build_parser", "main"]
+__all__ = ["ConfigError", "ExitCode", "app", "main"]

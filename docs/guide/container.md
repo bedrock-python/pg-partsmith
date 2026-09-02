@@ -141,4 +141,4 @@ building on them.
 
 The same ones [the CLI](cli.md#exit-codes) documents. `0` nothing pending, `2` drift under
 `plan --check`, `3` findings or run issues, `4` configuration, `5` connection, `6` the lock
-is held, `1` unexpected.
+is held, `64` usage, `1` unexpected.

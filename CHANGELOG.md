@@ -130,6 +130,11 @@ findings that need a person, which outranks drift, `4` configuration, `5` connec
 `6` for a lock another maintainer holds — ordinary operation, and the first false page
 every deployment gets if it is reported as a failure.
 
+The arguments are typer declarations — every flag typed, the help generated from the same
+declarations that parse it, shell completion via `--install-completion`. A usage error exits
+`64` (`EX_USAGE`), never the `2` argument parsers default to: `2` is what this tool means
+"drift" by, and a CronJob alerting on drift must not page over a typo.
+
 `--output json` is the models' own dump under a versioned envelope, `by_alias=True`, so
 what comes out of `plan` and what goes into a document are one vocabulary; logs go to
 stderr. The connection comes from `--dsn`, then `$PG_PARTSMITH_DSN`, then the document.
