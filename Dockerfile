@@ -16,9 +16,13 @@ COPY pg_partsmith ./pg_partsmith
 
 # The venv is the whole payload: it is copied into the runtime stage as-is, so
 # pip, its caches and the build backend never reach the published image.
+# pip is uninstalled once it has done its job: the runtime image installs
+# nothing, and pip's vendored copies of msgpack, urllib3 and friends are
+# exactly what a scanner finds and an operator then has to explain away.
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/venv/bin/pip install --no-cache-dir ".[cli]" \
+    && /opt/venv/bin/pip uninstall -y pip setuptools wheel \
     && find /opt/venv -name '__pycache__' -type d -prune -exec rm -rf {} +
 
 

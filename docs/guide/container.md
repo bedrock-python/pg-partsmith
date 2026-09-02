@@ -110,7 +110,8 @@ refuses to publish an image whose `--version` disagrees with its tag.
 
 The image is checked against a budget in CI and a regression fails the build, because for
 anyone not writing Python the size is the first thing they read about this project. It is
-a `python:3.13-slim` base plus the venv, about 250 MB; the budget is 280.
+a `python:3.13-slim` base plus the venv: about 165 MB as CI measures it on Linux (Docker
+Desktop reports more for the same layers); the budget is 280.
 
 ## Building it yourself
 
