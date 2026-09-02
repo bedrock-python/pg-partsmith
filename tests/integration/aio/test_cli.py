@@ -68,7 +68,8 @@ async def _with_an_expired_partition(db_engine: AsyncEngine, table: str) -> None
     await make_service(db_engine).maintain(monthly_config(table, create_ahead=2, retention=12))
     await exec_sql(
         db_engine,
-        f"CREATE TABLE \"{table}__2020_01\" PARTITION OF \"{table}\" FOR VALUES FROM ('2020-01-01') TO ('2020-02-01')",
+        f'CREATE TABLE "{table}__2020_01" PARTITION OF "{table}" '
+        "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')",
     )
 
 

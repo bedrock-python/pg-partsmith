@@ -66,7 +66,7 @@ PG_PARTSMITH_TEST_PG_IMAGE=postgres:15-alpine make test-integration   # another 
 
 CI runs the integration suite on PostgreSQL 15 through 18, on arm64, on Windows and
 macOS against a server the runner installs itself, and once with the server's clock at
-UTC+14 and the client's at UTC-12. The default image is `postgres:17-alpine`; three
+UTC+14 and the client's at UTC-12. The default image is `postgres:17-alpine`; four
 variables steer the session:
 
 | Variable | What it does |
@@ -74,6 +74,7 @@ variables steer the session:
 | `PG_PARTSMITH_TEST_PG_IMAGE` | the container image, when Docker is there |
 | `PG_PARTSMITH_TEST_DSN` | any running server instead of a container; the few tests that reach into the container skip |
 | `PG_PARTSMITH_TEST_PG_TZ` | the container's default time zone, for a server far from UTC |
+| `PG_PARTSMITH_TEST_REDIS_URL` | a running Redis for the lock tests where no container can run; without it, and with a DSN set, they skip |
 
 Unit tests run on every supported Python on Linux, at both ends of the range on Windows
 and macOS, on arm64, and with `TZ` at UTC+14 and UTC-12. One job installs every direct

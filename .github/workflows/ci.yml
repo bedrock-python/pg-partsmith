@@ -203,7 +203,9 @@ jobs:
           uv venv --python 3.14 smoke
           if [ "$RUNNER_OS" = Windows ]; then BIN=smoke/Scripts; else BIN=smoke/bin; fi
           WHEEL=$("$BIN/python" -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' dist/*.whl)
-          uv pip install --python "$BIN/python" "pg-partsmith[cli] @ $WHEEL"
+          # The environment directory, not its interpreter: uv resolves that the
+          # same way on every platform, and Windows spells the interpreter differently.
+          uv pip install --python smoke "pg-partsmith[cli] @ $WHEEL"
           "$BIN/pg-partsmith" --version
           "$BIN/pg-partsmith" schema | "$BIN/python" -c 'import json, sys; json.load(sys.stdin)'
           # Everything short of a server: the document parses, the driver loads,
