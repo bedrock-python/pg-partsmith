@@ -44,9 +44,12 @@ RUN useradd --uid 65532 --user-group --create-home --shell /usr/sbin/nologin par
 # is run here, and both vendor the msgpack/urllib3 a scanner then reports.
 # Removed by path rather than through pip itself, so the step cannot depend
 # on which of the two the base image happens to provide.
-RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-*.dist-info 
-    /usr/local/lib/python3*/site-packages/setuptools* /usr/local/lib/python3*/site-packages/wheel* 
-    /usr/local/lib/python3*/ensurepip /usr/local/bin/pip*
+RUN rm -rf /usr/local/lib/python3*/site-packages/pip \
+    /usr/local/lib/python3*/site-packages/pip-*.dist-info \
+    /usr/local/lib/python3*/site-packages/setuptools* \
+    /usr/local/lib/python3*/site-packages/wheel* \
+    /usr/local/lib/python3*/ensurepip \
+    /usr/local/bin/pip*
 
 COPY --from=builder /opt/venv /opt/venv
 
