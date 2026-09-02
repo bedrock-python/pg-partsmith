@@ -1,0 +1,90 @@
+# A deployment's tables, all in one file. Every key is documented on
+# https://bedrock-python.github.io/pg-partsmith/reference/document/ ; unknown
+# keys are refused, so a typo is a validation error and not a silent policy.
+#
+# Editor support:  pg-partsmith schema > partitions.schema.json
+# then, at the top of this file:
+# yaml-language-server: $schema=partitions.schema.json
+
+version: 1
+
+# No dsn here on purpose: it carries a password. It comes from --dsn,
+# $PG_PARTSMITH_DSN, or a secret file named by $PG_PARTSMITH_DSN_FILE.
+
+# Every table starts from these; a table naming a key owns it entirely.
+defaults:
+  schema: public
+  tz: Europe/Berlin
+  granularity: month
+  create_ahead_count: 3
+  retention_count: 12
+
+tables:
+  # The flat spelling: a time-partitioned table, defaults filled in.
+  - table_name: events
+    partition_column: created_at
+
+  # Same shape, a different calendar and a longer memory.
+  - table_name: audit_log
+    partition_column: logged_at
+    granularity: day
+    retention_count: 400
+
+  # Any other topology is spelled out as a scheme: here RANGE by week over a
+  # UUIDv7 key (the timestamp lives inside the identifier), HASH by tenant
+  # underneath. Hooks fire once per week, never once per bucket.
+  - table_name: telemetry
+    scheme:
+      method: range
+      key: id
+      boundaries: { kind: time, granularity: week, codec: uuidv7 }
+      child: { method: hash, key: tenant_id, modulus: 8 }
+    lifecycle:
+      creation: { kind: create_ahead, count: 4 }
+      # Expire after 90 days, but never while rows are still pending -- the
+      # SQL is yours, evaluated while planning, {partition} is the candidate.
+      retention:
+        kind: all_of
+        members:
+          - { kind: keep_for, age: P90D }
+          - { kind: sql, sql: "SELECT NOT EXISTS (SELECT 1 FROM {partition} WHERE status = 'pending')" }
+      detach: concurrent
+      # A week between detach and drop, and only once nothing references it.
+      drop: { kind: drop_after, grace: P7D, when: { kind: unreferenced } }
+    leaves:
+      kind: local
+      tablespace: fast_ssd
+      storage_parameters: { fillfactor: 70 }
+      inherit_privileges: true
+
+  # A LIST root with a fixed set of groups and a catch-all. A set level: the
+  # planner fills gaps in the set and never expires a group.
+  - table_name: shipments
+    scheme:
+      method: list
+      key: region
+      groups:
+        - { name: eu, values: [de, fr, nl] }
+        - { name: us, values: [us, ca] }
+      include_default: true
+
+# The wiring every table is maintained through: one key per keyword of
+# PartitionToolkit.from_engine. Omit the section for the library's defaults.
+runtime:
+  ddl_timezone: Europe/Berlin
+  marker_prefix: acme
+  drop_lock_timeout_ms: 3000
+  drop_max_retries: 3
+
+# What to run around the lifecycle. Commands are argument vectors, never
+# shell strings; a block of Python sees `event` and `log`. Honoured only
+# under `apply --allow-hooks` -- they run in a process holding DDL rights.
+hooks:
+  timeout_seconds: 900
+  before_drop: ["/opt/hooks/archive-partition.sh"]
+  after_create: ["/opt/hooks/notify.sh"]
+  before_detach:
+    python_file: hooks/export_partition.py
+  after_drop:
+    python: |
+      log.info("dropped %s (%s)", event.partition.name, event.operation.reason)

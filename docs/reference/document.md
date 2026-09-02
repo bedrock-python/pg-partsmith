@@ -55,6 +55,9 @@ runtime:
   drop_lock_timeout_ms: 3000
 ```
 
+Complete, validated examples — one minimal, one with everything, a queue, cold tiering,
+and the hook scripts they name — are on [Configuration examples](../guide/examples.md).
+
 ## Fields
 
 | Field | Type | Default | Meaning |

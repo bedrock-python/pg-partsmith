@@ -41,6 +41,68 @@ is inherited, because a hook needs its own credentials and its `PATH`.
 `before_drop` is told the window and the size even though `DETACH` has already cleared the
 catalog's record of the bounds: what it gets is the window the planner decided the drop on.
 
+## Writing the script
+
+The shipped [`examples/hooks/`](https://github.com/bedrock-python/pg-partsmith/tree/master/examples/hooks)
+are the templates: a `pg_dump` before a drop, a webhook after a create, a `COPY` out
+before a detach. The pattern is the same in any language: read stdin if you want the whole
+event, read the environment if the name is enough, do the thing, exit non-zero to refuse.
+
+**Bash**, with the environment and nothing else:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null                                  # the event; not needed here
+partition="${PG_PARTSMITH_PARTITION:?}"
+pg_dump --format=custom --table="$partition" --file="/archive/${partition//./_}.dump.part"
+mv "/archive/${partition//./_}.dump.part" "/archive/${partition//./_}.dump"
+```
+
+**Bash with `jq`**, when the size or the window matters:
+
+```bash
+event=$(cat)
+size=$(jq -r '.operation.size_bytes // 0' <<<"$event")
+window_end=$(jq -r '.window.end' <<<"$event")
+[ "$size" -gt 10737418240 ] && echo "too big to archive tonight" >&2 && exit 1
+```
+
+**Go**, for a team that already has one:
+
+```go
+var event struct {
+    Phase     string `json:"phase"`
+    Partition struct{ Name string `json:"name"` } `json:"partition"`
+    Operation struct {
+        Reason    string `json:"reason"`
+        SizeBytes *int64 `json:"size_bytes"`
+    } `json:"operation"`
+}
+if err := json.NewDecoder(os.Stdin).Decode(&event); err != nil { log.Fatal(err) }
+if err := archive(event.Partition.Name); err != nil { os.Exit(1) }   // refuses the drop
+```
+
+**Python, as a file** (`python_file: hooks/export_partition.py`): no stdin, no JSON —
+`event` is the object itself, `log` is a logger, and `raise` refuses:
+
+```python
+if shutil.which("psql") is None:
+    raise RuntimeError("psql is not on PATH; refusing to detach without an export")
+log.info("exporting %s", event.partition.name)
+subprocess.run(["psql", "-c", f"COPY {event.partition.name} TO STDOUT WITH (FORMAT csv)"], stdout=out, check=True)
+```
+
+Three things every script should get right:
+
+- **Write to a temporary name and rename.** A run can be stopped mid-hook; the child is
+  terminated, and a half-written dump under the final name looks finished.
+- **Refuse loudly.** Whatever went wrong belongs on stderr: it is carried in the error the
+  run reports, and it is the only place anyone will look at 03:00.
+- **Do not talk to the table being dropped through the same connection pool the run
+  uses.** The hook is a separate process with its own credentials; `PGHOST`, `PGUSER`
+  and friends are inherited from the run's environment, so `pg_dump` and `psql` just work.
+
 ## The phases
 
 `before_create`, `after_create`, `before_attach`, `after_attach`, `before_detach`,

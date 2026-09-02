@@ -104,6 +104,7 @@ warn_unreachable = true
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+extend-exclude = ["examples"]
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "I", "B", "N", "S", "C4", "DTZ", "SIM", "TRY", "PERF", "RUF", "UP", "ANN", "T20", "PTH", "PLC", "PLE", "PLW"]

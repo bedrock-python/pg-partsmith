@@ -1,0 +1,562 @@
+{
+  "$defs": {
+    "HookOptions": {
+      "additionalProperties": false,
+      "description": "What to run at each lifecycle moment, as a file writes it.\n\nOne field per phase, spelled out rather than a free mapping, so a\nmisspelled ``befor_drop`` is refused where it is written instead of\nsilently never running -- which, for the phase that exports data before a\n``DROP``, is the difference between an archive and no archive.\n\nA phase takes either a command -- an argument vector, never a shell string,\nso a partition name can never be read as syntax -- or a block of Python,\ninline as ``python`` or from a file as ``python_file``.\n\nHooks fire during ``apply`` only. ``plan`` issues no DDL and runs no hook,\nwhich is what makes a plan safe to compute anywhere.",
+      "properties": {
+        "timeout_seconds": {
+          "default": 300.0,
+          "description": "How long a command may run before it is killed; it holds the table's lock",
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "before_create": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Before a partition exists",
+          "title": "Before Create"
+        },
+        "after_create": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "After it is created and attached",
+          "title": "After Create"
+        },
+        "before_attach": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Before a detached partition returns",
+          "title": "Before Attach"
+        },
+        "after_attach": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "After it is taking rows again",
+          "title": "After Attach"
+        },
+        "before_detach": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "While its rows are still reachable",
+          "title": "Before Detach"
+        },
+        "after_detach": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "After it stands alone",
+          "title": "After Detach"
+        },
+        "before_drop": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The last moment its rows exist",
+          "title": "Before Drop"
+        },
+        "after_drop": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "After the table is gone",
+          "title": "After Drop"
+        }
+      },
+      "title": "HookOptions",
+      "type": "object"
+    },
+    "PartitionGranularity": {
+      "description": "Time-based partition granularity.\n\nAttributes:\n    HOUR: Hourly partitions.\n    DAY: Daily partitions.\n    WEEK: Weekly partitions.\n    MONTH: Monthly partitions.\n    QUARTER: Quarterly partitions.\n    YEAR: Yearly partitions.",
+      "enum": [
+        "hour",
+        "day",
+        "week",
+        "month",
+        "quarter",
+        "year"
+      ],
+      "title": "PartitionGranularity",
+      "type": "string"
+    },
+    "PartitionStrategy": {
+      "description": "What drives a root table's partitions.\n\nDerived from the scheme; accepted as input only to be checked against it.\n\nAttributes:\n    TIME_BASED: RANGE over a time axis.\n    NUMERIC_BASED: RANGE over an integer axis.\n    VALUE_BASED: LIST.\n    HASH_BASED: HASH.",
+      "enum": [
+        "time_based",
+        "numeric_based",
+        "value_based",
+        "hash_based"
+      ],
+      "title": "PartitionStrategy",
+      "type": "string"
+    },
+    "PartitionTableSpec": {
+      "additionalProperties": false,
+      "description": "One table's entry: a configuration written down rather than constructed.\n\nThe flat fields describe the ordinary time-partitioned table; any other\ntopology is given as ``scheme``, which takes precedence over them;\n``lifecycle`` and ``leaves`` take the same JSON their models dump.\n``PartitionType``, ``PartitionStrategy`` and ``PartitionGranularity`` are\n``StrEnum`` values, so their lowercase spellings are what a file writes.\n\n``schema`` is accepted as a spelling of ``schema_name``, because that is\nwhat :class:`~pg_partsmith.TablePartitionConfig` dumps and what an operator\nwrites.\n\nUnknown keys are refused rather than ignored: a misspelled field in a file\nnobody reads until 03:00 is a silent policy, not a typo.",
+      "properties": {
+        "schema_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "PostgreSQL schema (omit for public)",
+          "title": "Schema Name"
+        },
+        "table_name": {
+          "description": "Partitioned table name",
+          "title": "Table Name",
+          "type": "string"
+        },
+        "partition_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitionType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Checked against the scheme: range, list, hash"
+        },
+        "partition_strategy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitionStrategy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Checked against the scheme: time_based, numeric_based, value_based, hash_based"
+        },
+        "partition_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Leading column of a time-partitioned root",
+          "title": "Partition Column"
+        },
+        "trailing_partition_columns": {
+          "default": [],
+          "description": "Rest of a composite partition key, as JSON: [\"tenant_id\"]",
+          "items": {
+            "type": "string"
+          },
+          "title": "Trailing Partition Columns",
+          "type": "array"
+        },
+        "granularity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitionGranularity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Time granularity: hour, day, week, month, quarter, year"
+        },
+        "tz": {
+          "default": "UTC",
+          "description": "IANA timezone the calendar is computed in",
+          "title": "Tz",
+          "type": "string"
+        },
+        "boundary_codec": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Physical key encoding by name: uuidv7, epoch_seconds, epoch_milliseconds",
+          "title": "Boundary Codec"
+        },
+        "create_ahead_count": {
+          "default": 6,
+          "description": "Number of periods to ensure exist, including the current period",
+          "minimum": 1,
+          "title": "Create Ahead Count",
+          "type": "integer"
+        },
+        "retention_count": {
+          "default": 12,
+          "description": "Number of newest periods to keep, current one included",
+          "minimum": 1,
+          "title": "Retention Count",
+          "type": "integer"
+        },
+        "scheme": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Any topology, as JSON: {\"method\": \"range\", \"key\": \"created_at\", \"boundaries\": {\"kind\": \"time\", \"granularity\": \"week\"}, \"child\": {\"method\": \"hash\", \"key\": \"tenant_id\", \"modulus\": 4}}",
+          "title": "Scheme"
+        },
+        "lifecycle": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Lifecycle policy, as JSON: {\"creation\": {\"kind\": \"create_ahead\", \"count\": 3}, ...}",
+          "title": "Lifecycle"
+        },
+        "leaves": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Leaf backend, as JSON: {\"kind\": \"local\", \"tablespace\": \"fast\", \"storage_parameters\": {\"fillfactor\": 70}} or {\"kind\": \"foreign\", \"server\": \"archive\", \"options\": {\"table_name\": \"{relname}\"}}",
+          "title": "Leaves"
+        }
+      },
+      "required": [
+        "table_name"
+      ],
+      "title": "PartitionTableSpec",
+      "type": "object"
+    },
+    "PartitionType": {
+      "description": "PostgreSQL partitioning method.\n\nAttributes:\n    RANGE: Range partitioning (e.g., by date ranges).\n    LIST: List partitioning (e.g., by specific values).\n    HASH: Hash partitioning (e.g., by hash of key).",
+      "enum": [
+        "range",
+        "list",
+        "hash"
+      ],
+      "title": "PartitionType",
+      "type": "string"
+    },
+    "PythonHook": {
+      "additionalProperties": false,
+      "description": "A block of Python to run at one lifecycle moment, inline or from a file.\n\nExactly one of the two. An inline block is compiled the moment the document\nis validated, so a ``SyntaxError`` is a validation error with a line number\nin it rather than something a CronJob finds at 03:00. A file is resolved\nand compiled by whoever reads the document, relative to where the document\nlives, since only they know where that is.\n\nAttributes:\n    python: The block itself.\n    python_file: A path to it, for blocks past a few lines -- editor\n        support, and a file that can be tested on its own.",
+      "properties": {
+        "python": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The block, inline",
+          "title": "Python"
+        },
+        "python_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A path to the block, relative to the document",
+          "title": "Python File"
+        }
+      },
+      "title": "PythonHook",
+      "type": "object"
+    },
+    "ToolkitOptions": {
+      "additionalProperties": false,
+      "description": "The wiring every table in the document is maintained through.\n\nOne field per keyword of ``PartitionToolkit.from_engine``, so a document\nconfigures the wiring the way code does. ``boundary_codec`` is a name here\n(``uuidv7``, ``epoch_seconds``, ``epoch_milliseconds``); :meth:`to_kwargs`\nresolves it to the codec itself.",
+      "properties": {
+        "marker_prefix": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "COMMENT prefix marking detached partitions as ours",
+          "title": "Marker Prefix"
+        },
+        "ddl_timezone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "UTC",
+          "description": "Session timezone naive boundary literals are written and read in",
+          "title": "Ddl Timezone"
+        },
+        "ddl_timeout_seconds": {
+          "default": 30.0,
+          "description": "Statement timeout",
+          "exclusiveMinimum": 0,
+          "title": "Ddl Timeout Seconds",
+          "type": "number"
+        },
+        "boundary_codec": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Codec name encoded bounds are read with",
+          "title": "Boundary Codec"
+        },
+        "lock_prefix": {
+          "default": "partitioner",
+          "description": "Prefix of the advisory lock keys",
+          "title": "Lock Prefix",
+          "type": "string"
+        },
+        "lock_min_interval_seconds": {
+          "default": 0.0,
+          "description": "Minimum seconds between acquire attempts per table; 0 disables",
+          "minimum": 0,
+          "title": "Lock Min Interval Seconds",
+          "type": "number"
+        },
+        "drop_allow_unmanaged": {
+          "default": false,
+          "description": "Allow dropping a relation with no ownership marker",
+          "title": "Drop Allow Unmanaged",
+          "type": "boolean"
+        },
+        "drop_lock_timeout_ms": {
+          "default": 3000,
+          "description": "lock_timeout for a drop",
+          "minimum": 0,
+          "title": "Drop Lock Timeout Ms",
+          "type": "integer"
+        },
+        "drop_max_retries": {
+          "default": 3,
+          "description": "Attempts a drop makes",
+          "minimum": 1,
+          "title": "Drop Max Retries",
+          "type": "integer"
+        },
+        "drop_retry_delay": {
+          "default": 0.5,
+          "description": "Delay before the retry",
+          "minimum": 0,
+          "title": "Drop Retry Delay",
+          "type": "number"
+        },
+        "drop_max_backoff": {
+          "default": 300.0,
+          "description": "Ceiling on that backoff",
+          "minimum": 0,
+          "title": "Drop Max Backoff",
+          "type": "number"
+        }
+      },
+      "title": "ToolkitOptions",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Every table a deployment maintains, and the wiring it maintains them through.\n\n``defaults`` is merged into each entry of ``tables`` before validation, key\nby key: a table naming a key owns it entirely. The merge is deliberately\nshallow -- a table with its own ``lifecycle`` replaces the default one\nrather than being merged into it, because a half-inherited policy is one\nnobody can read off the file.\n\n``dsn`` is for whoever connects; the library opens no connection of its own,\nand a deployment is free to keep the DSN out of the file entirely.\n\n``hooks`` names commands to run around the lifecycle. They are code this\nfile causes to run in a process holding DDL credentials -- which is not a\nnew privilege boundary, since the same file already authorises dropping\ntables, but it stops being true the moment the document is assembled from\nsomewhere less trusted than the DSN. Whoever runs the document decides\nwhether they are honoured; the CLI refuses to apply a document declaring\nhooks unless it is told to.",
+  "properties": {
+    "version": {
+      "const": 1,
+      "default": 1,
+      "description": "Document format version",
+      "title": "Version",
+      "type": "integer"
+    },
+    "dsn": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Connection string, when the file carries one",
+      "title": "Dsn"
+    },
+    "defaults": {
+      "additionalProperties": true,
+      "description": "Fields every table starts from",
+      "title": "Defaults",
+      "type": "object"
+    },
+    "tables": {
+      "description": "The tables to maintain",
+      "items": {
+        "$ref": "#/$defs/PartitionTableSpec"
+      },
+      "minItems": 1,
+      "title": "Tables",
+      "type": "array"
+    },
+    "runtime": {
+      "$ref": "#/$defs/ToolkitOptions",
+      "description": "How the collaborators are wired"
+    },
+    "hooks": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HookOptions"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Commands to run around the lifecycle; they fire during apply only"
+    }
+  },
+  "required": [
+    "tables"
+  ],
+  "title": "PartitionsDocument",
+  "type": "object"
+}

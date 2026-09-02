@@ -50,6 +50,8 @@ serialize, filter and apply. No extension, no superuser, no scheduler of its own
 - **A container image** — `ghcr.io/bedrock-python/pg-partsmith`, for stacks with no Python
   in them; documented shapes for plain Docker, Compose, Swarm, Kubernetes Pod / Job /
   CronJob / init container, CI and systemd
+- **Examples that are tested** — every document under `examples/` validates in CI, the hook
+  scripts parse, and `pg-partsmith schema` gives an editor the JSON Schema
 - **Hooks, locks, schemas** — eight lifecycle hooks, in Python or as commands named in a
   config file; PostgreSQL advisory or Redis locks; schema-qualified everything
 - **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15, 16 and 17 via testcontainers

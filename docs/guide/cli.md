@@ -25,6 +25,7 @@ acts.
 | all four | `-c/--config FILE` (required), `--dsn`, `--table NAME` (repeatable), `-o/--output human\|json\|metrics`, `-v/--verbose` |
 | `plan` | `--check` exit `2` on pending operations · `--save FILE` write the plan · `--locks` print what each operation locks |
 | `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks |
+| `schema` | no flags: prints the document's JSON Schema for an editor |
 | global | `--version` · `--install-completion` · `-h/--help` on anything |
 
 `--help` on any command is generated from the same declarations that parse it, so the

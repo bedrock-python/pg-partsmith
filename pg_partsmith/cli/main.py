@@ -15,6 +15,7 @@ or whatever parsing raised -- into one :class:`~pg_partsmith.cli.exit_codes.Exit
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 import sys
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.aio import CommandHooks, PartitionToolkit, PythonHooks
+from pg_partsmith.document import PartitionsDocument
 from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError, PlanConfigMismatchError
 
 from .commands import CommandResult, run_apply, run_inspect, run_plan, run_validate
@@ -49,7 +51,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from pg_partsmith.aio import PartitionLifecycleHooks
-    from pg_partsmith.document import PartitionsDocument
 
 logger = logging.getLogger("pg_partsmith.cli")
 
@@ -273,6 +274,13 @@ def apply(
             allow_hooks=allow_hooks,
         )
     )
+
+
+@app.command()
+def schema() -> int:
+    """Print the document's JSON Schema, for an editor to validate against."""
+    sys.stdout.write(json.dumps(PartitionsDocument.model_json_schema(), indent=2) + "\n")
+    return ExitCode.OK
 
 
 # ── Leaving the process ─────────────────────────────────────────────────────────

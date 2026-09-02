@@ -1,0 +1,18 @@
+# An id-partitioned queue: fixed-width windows over a BIGSERIAL, the cursor
+# read off the sequence rather than max(id), twenty windows kept behind the
+# cursor and four ahead of it. Time plays no part.
+
+tables:
+  - table_name: outbox
+    schema: app
+    scheme:
+      method: range
+      key: id
+      boundaries:
+        kind: integer
+        step: 1000000
+        cursor_source: sequence
+    lifecycle:
+      creation: { kind: create_ahead, count: 4 }
+      retention: { kind: keep_behind, distance: 20 }
+      drop: { kind: drop_after, grace: PT0S }

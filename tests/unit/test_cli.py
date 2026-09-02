@@ -747,3 +747,13 @@ def test__main__sigterm_mid_run__cleans_up_and_exits_143(
     assert code == ExitCode.TERMINATED
     assert engines and engines[0].disposed
     assert "terminated" in capsys.readouterr().err
+
+
+def test__main__schema__prints_the_document_schema_and_needs_no_database(capsys: pytest.CaptureFixture[str]) -> None:
+    # Arrange / Act
+    code = main(["schema"])
+    printed = json.loads(capsys.readouterr().out)
+
+    # Assert: the vocabulary an editor validates against is the model's own
+    assert code == ExitCode.OK
+    assert set(printed["properties"]) >= {"tables", "defaults", "runtime", "hooks", "dsn", "version"}

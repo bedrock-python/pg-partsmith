@@ -79,7 +79,9 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   Docker, Compose (`docker compose run`, `service_completed_successfully`, a cron
   sidecar), Swarm (swarm-cronjob), Kubernetes Pod / Job / CronJob / init container, the
   plan-then-apply Jobs, node_exporter textfile, CI, systemd. The DSN can also come from a
-  secret file via `PG_PARTSMITH_DSN_FILE`.
+  secret file via `PG_PARTSMITH_DSN_FILE`. `pg-partsmith schema` prints the document's
+  JSON Schema; validated examples of every document shape and of hook scripts live under
+  `examples/` (see `guide/examples.md`).
 * `PartitionsDocument` is several tables and their wiring as one validated model — what a
   YAML or JSON file parses into. `document.configs()` gives every `TablePartitionConfig`,
   `document.config_for(name)` one of them, and

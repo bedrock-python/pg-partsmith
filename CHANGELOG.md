@@ -224,6 +224,18 @@ series and a zero are different alerts.
 The numbers come off the same envelope the JSON does, so a metric cannot disagree with what
 the same run printed.
 
+### Examples that are tested, and a schema for the editor
+
+`examples/` holds a minimal document, one with everything in it, an id-partitioned queue,
+cold tiering, and three hook scripts — a `pg_dump` before a drop in bash, a webhook after
+a create, a `COPY` out before a detach as a Python file. The test suite validates every
+document, compiles every hook and syntax-checks every script, so an example that stops
+being right fails a build rather than teaching the wrong vocabulary.
+
+`pg-partsmith schema` prints the document's JSON Schema; with one comment line at the top
+of the file, an editor validates keys and completes them. The committed copy is checked
+against the generated one.
+
 ### Every way to run it
 
 A deployment page with a copy-pasteable shape for each harness: plain Docker with host
