@@ -1,7 +1,7 @@
 # The container image
 
 ```
-ghcr.io/bedrock-python/pg-partsmith:1.1
+ghcr.io/bedrock-python/pg-partsmith:1.2
 ```
 
 The image is [the CLI](cli.md) and nothing else: the entrypoint is `pg-partsmith`, so a
@@ -13,7 +13,7 @@ container, CI — is on [Ways to run it](running.md); this page is about the ima
 docker run --rm \
   -v "$PWD/partitions.yaml:/etc/partitions.yaml:ro" \
   -e PG_PARTSMITH_DSN=postgresql://app:secret@db.internal/app \
-  ghcr.io/bedrock-python/pg-partsmith:1.1 \
+  ghcr.io/bedrock-python/pg-partsmith:1.2 \
   plan -c /etc/partitions.yaml --check
 ```
 
@@ -142,7 +142,7 @@ did: Python 3.14, nothing to byte-compile, and less of everything to load.
   release workflow and not by someone holding a token:
 
   ```bash
-  cosign verify ghcr.io/bedrock-python/pg-partsmith:1.1.0 \
+  cosign verify ghcr.io/bedrock-python/pg-partsmith:1.2.0 \
     --certificate-identity-regexp '^https://github.com/bedrock-python/pg-partsmith/' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```

@@ -53,7 +53,7 @@ was reviewed.
 docker run --rm \
   -v "$PWD/partitions.yaml:/etc/partitions.yaml:ro" \
   -e PG_PARTSMITH_DSN=postgresql://app:secret@db.internal/app \
-  ghcr.io/bedrock-python/pg-partsmith:1.1 \
+  ghcr.io/bedrock-python/pg-partsmith:1.2 \
   plan -c /etc/partitions.yaml --check
 ```
 
@@ -68,7 +68,7 @@ container: `--network host`, or point the DSN at `host.docker.internal`.
 
 ```cron
 15 2 * * *  docker run --rm -v /etc/pg-partsmith/partitions.yaml:/etc/partitions.yaml:ro \
-            --env-file /etc/pg-partsmith/env ghcr.io/bedrock-python/pg-partsmith:1.1 \
+            --env-file /etc/pg-partsmith/env ghcr.io/bedrock-python/pg-partsmith:1.2 \
             apply -c /etc/partitions.yaml --allow-destructive >> /var/log/pg-partsmith.log 2>&1
 ```
 
@@ -88,7 +88,7 @@ Type=oneshot
 EnvironmentFile=/etc/pg-partsmith/env
 ExecStart=/usr/bin/docker run --rm \
   -v /etc/pg-partsmith/partitions.yaml:/etc/partitions.yaml:ro \
-  -e PG_PARTSMITH_DSN ghcr.io/bedrock-python/pg-partsmith:1.1 \
+  -e PG_PARTSMITH_DSN ghcr.io/bedrock-python/pg-partsmith:1.2 \
   apply -c /etc/partitions.yaml --allow-destructive
 SuccessExitStatus=6
 ```
@@ -115,7 +115,7 @@ Three shapes, depending on what should own the timing.
 ```yaml
 services:
   partition-maintenance:
-    image: ghcr.io/bedrock-python/pg-partsmith:1.1
+    image: ghcr.io/bedrock-python/pg-partsmith:1.2
     profiles: ["maintenance"]        # not started by `docker compose up`
     environment:
       PG_PARTSMITH_DSN_FILE: /run/secrets/pg_dsn
@@ -146,7 +146,7 @@ Compose has the equivalent of an init container:
 ```yaml
 services:
   partitions:
-    image: ghcr.io/bedrock-python/pg-partsmith:1.1
+    image: ghcr.io/bedrock-python/pg-partsmith:1.2
     command: ["apply", "-c", "/etc/partitions.yaml"]      # creations only
     environment: { PG_PARTSMITH_DSN_FILE: /run/secrets/pg_dsn }
     secrets: [pg_dsn]
@@ -177,7 +177,7 @@ services:
     volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
 
   partition-maintenance:
-    image: ghcr.io/bedrock-python/pg-partsmith:1.1
+    image: ghcr.io/bedrock-python/pg-partsmith:1.2
     command: ["apply", "-c", "/etc/partitions.yaml", "--allow-destructive"]
     environment: { PG_PARTSMITH_DSN_FILE: /run/secrets/pg_dsn }
     secrets: [pg_dsn]
@@ -203,7 +203,7 @@ services:
         constraints: [node.role == manager]
 
   partition-maintenance:
-    image: ghcr.io/bedrock-python/pg-partsmith:1.1
+    image: ghcr.io/bedrock-python/pg-partsmith:1.2
     command: ["apply", "-c", "/etc/partitions.yaml", "--allow-destructive"]
     environment: { PG_PARTSMITH_DSN_FILE: /run/secrets/pg_dsn }
     secrets: [pg_dsn]
@@ -234,7 +234,7 @@ must not overlap", the advisory lock is the inner half. A one-off run by hand:
 docker service create --name partition-plan --restart-condition none --detach=false \
   --config source=partitions,target=/etc/partitions.yaml --secret pg_dsn \
   -e PG_PARTSMITH_DSN_FILE=/run/secrets/pg_dsn \
-  ghcr.io/bedrock-python/pg-partsmith:1.1 plan -c /etc/partitions.yaml --locks
+  ghcr.io/bedrock-python/pg-partsmith:1.2 plan -c /etc/partitions.yaml --locks
 docker service logs partition-plan && docker service rm partition-plan
 ```
 
@@ -265,7 +265,7 @@ The container spec every shape shares:
 ```yaml
 # anchors are illustrative; paste the block where it is needed
 - name: pg-partsmith
-  image: ghcr.io/bedrock-python/pg-partsmith:1.1
+  image: ghcr.io/bedrock-python/pg-partsmith:1.2
   args: ["plan", "-c", "/etc/partitions.yaml"]
   env:
     - name: PG_PARTSMITH_DSN
@@ -289,9 +289,9 @@ The container spec every shape shares:
 
 ```bash
 kubectl run partition-plan --rm -it --restart=Never \
-  --image=ghcr.io/bedrock-python/pg-partsmith:1.1 \
+  --image=ghcr.io/bedrock-python/pg-partsmith:1.2 \
   --env="PG_PARTSMITH_DSN=$(kubectl get secret partsmith-dsn -o jsonpath='{.data.dsn}' | base64 -d)" \
-  --overrides='{"spec":{"containers":[{"name":"pg-partsmith","image":"ghcr.io/bedrock-python/pg-partsmith:1.1","args":["inspect","-c","/etc/partitions.yaml"],"volumeMounts":[{"name":"config","mountPath":"/etc/partitions.yaml","subPath":"partitions.yaml"}]}],"volumes":[{"name":"config","configMap":{"name":"partition-config"}}]}}'
+  --overrides='{"spec":{"containers":[{"name":"pg-partsmith","image":"ghcr.io/bedrock-python/pg-partsmith:1.2","args":["inspect","-c","/etc/partitions.yaml"],"volumeMounts":[{"name":"config","mountPath":"/etc/partitions.yaml","subPath":"partitions.yaml"}]}],"volumes":[{"name":"config","configMap":{"name":"partition-config"}}]}}'
 ```
 
 For a look, not a change: `inspect`, `plan --locks`, `validate`. The exit code comes back
@@ -312,7 +312,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: pg-partsmith
-          image: ghcr.io/bedrock-python/pg-partsmith:1.1
+          image: ghcr.io/bedrock-python/pg-partsmith:1.2
           args: ["apply", "-c", "/etc/partitions.yaml", "--allow-destructive", "--continue-on-error"]
           env:
             - { name: PG_PARTSMITH_DSN, valueFrom: { secretKeyRef: { name: partsmith-dsn, key: dsn } } }
@@ -349,7 +349,7 @@ spec:
           restartPolicy: Never
           containers:
             - name: pg-partsmith
-              image: ghcr.io/bedrock-python/pg-partsmith:1.1
+              image: ghcr.io/bedrock-python/pg-partsmith:1.2
               args: ["apply", "-c", "/etc/partitions.yaml", "--allow-destructive"]
               env:
                 - { name: PG_PARTSMITH_DSN, valueFrom: { secretKeyRef: { name: partsmith-dsn, key: dsn } } }
@@ -373,7 +373,7 @@ to be stingy — hourly for daily partitions is normal.
 spec:
   initContainers:
     - name: partitions
-      image: ghcr.io/bedrock-python/pg-partsmith:1.1
+      image: ghcr.io/bedrock-python/pg-partsmith:1.2
       args: ["apply", "-c", "/etc/partitions.yaml"]          # no --allow-destructive
       env:
         - { name: PG_PARTSMITH_DSN, valueFrom: { secretKeyRef: { name: partsmith-dsn, key: dsn } } }
@@ -435,7 +435,7 @@ A command hook runs *inside* this container, so what it runs has to be in it —
 image has no shell, so it is a binary or a Python file, not a bash script. Two ways in:
 
 ```dockerfile
-FROM ghcr.io/bedrock-python/pg-partsmith:1.1
+FROM ghcr.io/bedrock-python/pg-partsmith:1.2
 COPY --chmod=755 archive-partition /usr/local/bin/archive-partition
 ```
 
@@ -470,7 +470,7 @@ works, every table it describes is partitioned the way it claims.
 validate-partitions:
   image: python:3.14-slim
   before_script:
-    - pip install --quiet "pg-partsmith[cli]==1.1.0"
+    - pip install --quiet "pg-partsmith[cli]==1.2.0"
   script:
     - pg-partsmith validate -c partitions.yaml
   variables:
