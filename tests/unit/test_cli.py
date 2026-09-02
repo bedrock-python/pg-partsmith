@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pg_partsmith.__version__ import __version__
+from pg_partsmith.aio.command_hooks import CommandHooks
 from pg_partsmith.cli import ExitCode, main
 from pg_partsmith.cli.commands import CommandResult, run_apply, run_plan, run_validate
 from pg_partsmith.cli.loader import (
@@ -34,7 +35,7 @@ from pg_partsmith.cli.render import describe_locks, envelope, plan_entry
 from pg_partsmith.document import PartitionsDocument
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult
 from pg_partsmith.events import HookPhase
-from pg_partsmith.exceptions import InvalidPartitionConfigError
+from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import (
     CreatePartition,
@@ -563,6 +564,7 @@ def test__hooks__allowed__are_built_from_the_document(tmp_path: Path) -> None:
 
     # Assert
     assert hooks is not None
+    assert isinstance(hooks[0], CommandHooks)
     assert hooks[0].phases == (HookPhase.BEFORE_DROP,)
 
 
@@ -857,3 +859,46 @@ def test__plan_save__writes_the_envelope_where_apply_can_read_it(
     # Assert: the file is the artifact, whatever the terminal was shown
     assert code == ExitCode.OK
     assert load_plans(saved)["public.events"] == _plan()
+
+
+# ── What a shell wrapper used to be for ─────────────────────────────────────────
+
+
+def test__write__puts_the_output_in_a_file_and_nothing_on_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: a textfile collector reads the file; the log should not get a copy
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    async def planned(kit: Any, configs: Any, *, check: bool, locks: bool = False) -> Any:
+        return CommandResult(code=ExitCode.OK, lines=["planned"], payload=envelope("plan", [plan_entry(_plan())]))
+
+    monkeypatch.setattr(cli, "run_plan", planned)
+    target = tmp_path / "textfile" / "partsmith.prom"
+    target.parent.mkdir()
+
+    # Act
+    code = main(["plan", "-c", str(config), "--output", "metrics", "--write", str(target)])
+
+    # Assert: written whole, under its final name, and no temporary left beside it
+    assert code == ExitCode.OK
+    assert "# TYPE pg_partsmith_pending_operations gauge" in target.read_text(encoding="utf-8")
+    assert capsys.readouterr().out == ""
+    assert [p.name for p in target.parent.iterdir()] == ["partsmith.prom"]
+
+
+def test__ok_if_locked__turns_a_held_lock_into_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Arrange: an init container restarts on anything non-zero, and ten replicas
+    # starting at once means nine of them find the lock held
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+
+    async def locked(kit: Any, configs: Any, **kwargs: Any) -> Any:
+        raise LockAcquisitionError("public.events", "held by another maintainer")
+
+    monkeypatch.setattr(cli, "run_apply", locked)
+
+    # Act / Assert
+    assert main(["apply", "-c", str(config)]) == ExitCode.LOCKED
+    assert main(["apply", "-c", str(config), "--ok-if-locked"]) == ExitCode.OK

@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [master]
 
+# A push while the previous run is still going restarts it; the old one is
+# answering a question nobody is asking any more.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Lint & type check
@@ -13,7 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
-      - run: uv sync --group dev
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --group dev
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run mypy pg_partsmith
@@ -25,13 +34,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --group dev --extra pydantic-settings
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --group dev --extra pydantic-settings
       - run: uv run pytest -m unit --cov=pg_partsmith --cov-report=xml
       - uses: codecov/codecov-action@v7
         if: matrix.python-version == '3.11'
@@ -53,7 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
-      - run: uv sync --group dev --extra pydantic-settings
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --group dev --extra pydantic-settings
       # Both suites together: the gate is on the whole library, not on one half of it.
       - run: uv run pytest --cov=pg_partsmith --cov-report=xml --cov-fail-under=90
       - uses: codecov/codecov-action@v7
@@ -88,11 +102,17 @@ jobs:
           echo "image is ${MB} MB (budget ${IMAGE_SIZE_BUDGET_MB} MB)"
           test "$MB" -le "$IMAGE_SIZE_BUDGET_MB"
         env:
-          IMAGE_SIZE_BUDGET_MB: 280
-      - name: It runs, and it is not root
+          IMAGE_SIZE_BUDGET_MB: 160
+      - name: It runs, not as root, with every library it links against
         run: |
           docker run --rm pg-partsmith:ci --version
-          test "$(docker run --rm --entrypoint id pg-partsmith:ci -u)" = "65532"
+          docker run --rm pg-partsmith:ci plan --help >/dev/null
+          docker run --rm --entrypoint /opt/venv/bin/python pg-partsmith:ci -c '
+          import os, ssl, hashlib, zlib, bz2, lzma, uuid, asyncpg, pydantic_core, yaml, greenlet, sqlalchemy, typer
+          assert os.getuid() == 65532, os.getuid()
+          assert not os.path.exists("/bin/sh"), "a shell got in"
+          print("closure ok, uid 65532, no shell,", ssl.OPENSSL_VERSION)
+          '
       - name: Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:

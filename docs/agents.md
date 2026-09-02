@@ -64,8 +64,10 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   5 connection, 6 lock held, 64 usage (never the parser's 2, which means drift here), 130
   / 143 stopped by SIGINT / SIGTERM after cleaning up, 1 unexpected. `--output json` is the model dump under a
   versioned envelope; `--output metrics` is Prometheus text exposition for a node_exporter
-  textfile, all gauges, prefixed `pg_partsmith_`; `plan --locks` prints the heaviest lock
-  each operation takes. There is deliberately no `--sql`. See `guide/cli.md`.
+  textfile, all gauges, prefixed `pg_partsmith_`; `--write FILE` puts any output in a file
+  atomically; `plan --locks` prints the heaviest lock each operation takes;
+  `apply --ok-if-locked` exits 0 on a held lock. There is deliberately no `--sql`. See
+  `guide/cli.md`.
 * `CommandHooks` (both mirrors) runs a configured command per phase with the
   `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. `PythonHooks`
   runs a block of Python per phase with `event` and `log` in scope; raising refuses. In a
@@ -74,7 +76,8 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   by `validate`. No sandbox is claimed. Hooks never fire during `plan`. See
   `guide/hooks-in-config.md`.
 * The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command
-  as its entrypoint; tags are the exact version and a moving minor, never `latest`. See
+  as its entrypoint: distroless, Python 3.14, no shell, no pip, UID 65532, signed, with an
+  SBOM and provenance; tags are the exact version and a moving minor, never `latest`. See
   `guide/container.md` for the image and `guide/running.md` for every harness: plain
   Docker, Compose (`docker compose run`, `service_completed_successfully`, a cron
   sidecar), Swarm (swarm-cronjob), Kubernetes Pod / Job / CronJob / init container, the

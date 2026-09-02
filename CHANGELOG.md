@@ -251,6 +251,35 @@ secrets convention — after `PG_PARTSMITH_DSN` and before the document, so a Co
 stack hands a secret over without a shell wrapper and without it showing in
 `docker inspect`.
 
+### The image, rebuilt
+
+The runtime is now [distroless](https://github.com/GoogleContainerTools/distroless): glibc,
+OpenSSL, CA certificates, a timezone database, and nothing else — no shell, no package
+manager, no pip. Python 3.14 and a pruned standard library are copied in from the build
+stage, the virtualenv is installed from `uv.lock` with `uv sync --frozen` so the image holds
+the versions the tests ran against, compiled extensions are stripped, bytecode is
+precompiled, typer's `rich` is left out, and exactly the five shared libraries the kept
+extension modules link against come along. The Debian userland that was half of the
+previous image is gone; the size budget drops from 280 MB to 160, and a start takes about
+half the time.
+
+Two flags replace the two things a shell wrapper in the image used to do: `--write FILE`
+writes any command's output to a file atomically (a node_exporter textfile), and
+`apply --ok-if-locked` makes a held lock exit `0` (an init container, which restarts on
+anything else). A command hook inside the image is therefore a binary or a Python file
+run through `/opt/venv/bin/python`, not a bash script; the docs say so, and say how to
+build an image with bash in it in one line.
+
+Published images carry an SBOM and a SLSA provenance attestation and are signed keylessly
+with the release workflow's identity; `cosign verify` is in the docs. Dependabot watches
+the base images, the actions and the lock file.
+
+### Pipelines
+
+CI caches the uv environment keyed on `uv.lock` and installs with `--frozen`, so a stale
+lock fails rather than resolving something else; a push cancels the run it supersedes;
+the image build reuses layers across runs; Python 3.14 joins the test matrix.
+
 ### A container image
 
 `ghcr.io/bedrock-python/pg-partsmith:<version>`, published from the release workflow, so a

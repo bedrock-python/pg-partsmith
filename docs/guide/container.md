@@ -19,15 +19,30 @@ docker run --rm \
 
 ## What is inside
 
-A `python:3.13-slim` base and one virtualenv: the library, pydantic, SQLAlchemy,
-asyncpg, PyYAML and typer. The build stage — pip, the build backend, every
-`__pycache__` — is thrown away. There is a `/bin/sh`, used by nothing in the image; it
-exists for the one case that needs a redirect (writing metrics to a file) and for
-wrappers like the init-container one on the deployment page.
+Two stages, and only the second one ships.
 
-It runs as UID 65532 (`partsmith`), a fixed high UID so a `runAsUser` can name the same
-one and a mounted document can be made readable to it without guessing. It writes nothing
-at runtime, so `readOnlyRootFilesystem: true` works; give `plan --save` a volume.
+The runtime base is [distroless](https://github.com/GoogleContainerTools/distroless)
+`cc-debian12`: glibc, OpenSSL, CA certificates, a timezone database, and nothing else.
+**No shell, no package manager, no pip.** Onto that go a Python 3.14 interpreter with a
+pruned standard library (no IDE, no Tk, no test suite, no REPL modules), one virtualenv
+installed from `uv.lock` — the versions the test suite ran against, never whatever the
+index served on build day — and exactly the five shared libraries the extension modules
+still link against. Compiled extensions are stripped of debug symbols; bytecode is
+precompiled, so a start skips it. typer's `rich` is left out: `--help` is plain text,
+which is what a CronJob log shows anyway.
+
+It runs as UID 65532, distroless' `nonroot` — a fixed high UID so a `runAsUser` can
+name the same one and a mounted document can be made readable to it without guessing. It
+writes nothing at runtime, so `readOnlyRootFilesystem: true` works; give `plan --save` and
+`--write` a volume.
+
+Because there is no shell, the two things a wrapper used to do are flags:
+`--write FILE` puts any command's output in a file atomically (a node_exporter
+textfile), and `apply --ok-if-locked` makes a held lock exit `0` (an init container). A
+command hook inside this image is a binary, or a Python file run as
+`["/opt/venv/bin/python", "/opt/hooks/export.py"]` — not a shell script. A team that
+needs bash in the image builds one line of its own: `FROM python:3.14-slim` and
+`pip install "pg-partsmith[cli]"`.
 
 ## Inputs
 
@@ -109,9 +124,34 @@ refuses to publish an image whose `--version` disagrees with its tag.
 ## Size
 
 The image is checked against a budget in CI and a regression fails the build, because for
-anyone not writing Python the size is the first thing they read about this project. It is
-a `python:3.13-slim` base plus the venv: about 165 MB as CI measures it on Linux (Docker
-Desktop reports more for the same layers); the budget is 280.
+anyone not writing Python the size is the first thing they read about this project. The
+Debian userland that made up half of the previous image is gone with the switch to
+distroless; the budget is 160 MB and the image sits well under it (the CI log prints the
+exact number for every build). It also starts in about half the time the previous one
+did: Python 3.14, nothing to byte-compile, and less of everything to load.
+
+## Supply chain
+
+- **Locked install.** The builder runs `uv sync --frozen` from `uv.lock`; a lock file out
+  of step with `pyproject.toml` fails the build rather than resolving something else.
+- **SBOM and provenance.** Every published image carries an SBOM and a SLSA build
+  provenance attestation, so "what is in it" and "what built it" are answers the registry
+  gives.
+- **Signed.** Every published image is signed keylessly with the release workflow's own
+  identity. To check that what you are about to run was built by this repository's
+  release workflow and not by someone holding a token:
+
+  ```bash
+  cosign verify ghcr.io/bedrock-python/pg-partsmith:1.1.0 \
+    --certificate-identity-regexp '^https://github.com/bedrock-python/pg-partsmith/' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+- **Scanned**, on every pull request and every release, with `HIGH` and `CRITICAL` failing
+  the build. The runtime image holds nothing that is not needed to run one command, which
+  is most of what keeps that list empty.
+- **Kept current.** Dependabot opens a pull request for the base images, the actions and
+  the lock file, so a base-image security rebuild is a merge and a release.
 
 ## Building it yourself
 

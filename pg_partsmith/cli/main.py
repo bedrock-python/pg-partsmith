@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 from dataclasses import dataclass
@@ -108,6 +109,15 @@ OutputOption = Annotated[
     typer.Option("--output", "-o", help="human, json, or Prometheus text for a node_exporter textfile"),
 ]
 VerboseOption = Annotated[bool, typer.Option("--verbose", "-v", help="log what it is doing, to stderr")]
+WriteOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--write",
+        metavar="FILE",
+        show_default=False,
+        help="write the output to FILE instead of stdout, atomically; for a node_exporter textfile",
+    ),
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +138,8 @@ class _Invocation:
     continue_on_error: bool = False
     allow_config_drift: bool = False
     allow_hooks: bool = False
+    write: Path | None = None
+    ok_if_locked: bool = False
 
 
 def _version(value: bool) -> None:
@@ -156,10 +168,13 @@ def inspect(
     table: TableOption = None,
     output: OutputOption = Output.human,
     verbose: VerboseOption = False,
+    write: WriteOption = None,
 ) -> int:
     """Read the partition tree that exists and print it."""
     return _execute(
-        _Invocation("inspect", config=config, dsn=dsn, tables=tuple(table or ()), output=output, verbose=verbose)
+        _Invocation(
+            "inspect", config=config, dsn=dsn, tables=tuple(table or ()), output=output, verbose=verbose, write=write
+        )
     )
 
 
@@ -170,6 +185,7 @@ def plan(
     table: TableOption = None,
     output: OutputOption = Output.human,
     verbose: VerboseOption = False,
+    write: WriteOption = None,
     check: Annotated[
         bool,
         typer.Option(
@@ -199,6 +215,7 @@ def plan(
             check=check,
             save=save,
             locks=locks,
+            write=write,
         )
     )
 
@@ -210,10 +227,13 @@ def validate(
     table: TableOption = None,
     output: OutputOption = Output.human,
     verbose: VerboseOption = False,
+    write: WriteOption = None,
 ) -> int:
     """Check the document against the catalog. Exits non-zero on a problem."""
     return _execute(
-        _Invocation("validate", config=config, dsn=dsn, tables=tuple(table or ()), output=output, verbose=verbose)
+        _Invocation(
+            "validate", config=config, dsn=dsn, tables=tuple(table or ()), output=output, verbose=verbose, write=write
+        )
     )
 
 
@@ -224,6 +244,7 @@ def apply(
     table: TableOption = None,
     output: OutputOption = Output.human,
     verbose: VerboseOption = False,
+    write: WriteOption = None,
     plan: Annotated[
         Path | None,
         typer.Option(
@@ -257,6 +278,13 @@ def apply(
             help="run what the document's hooks section names; without it, a document declaring any is refused",
         ),
     ] = False,
+    ok_if_locked: Annotated[
+        bool,
+        typer.Option(
+            "--ok-if-locked",
+            help="exit 0 rather than 6 when another maintainer holds the lock; for an init container",
+        ),
+    ] = False,
 ) -> int:
     """Carry out maintenance. Creations only, unless --allow-destructive."""
     return _execute(
@@ -272,6 +300,8 @@ def apply(
             continue_on_error=continue_on_error,
             allow_config_drift=allow_config_drift,
             allow_hooks=allow_hooks,
+            write=write,
+            ok_if_locked=ok_if_locked,
         )
     )
 
@@ -324,8 +354,10 @@ def _execute(invocation: _Invocation) -> ExitCode:
     except (ConfigError, InvalidPartitionConfigError, PlanConfigMismatchError) as exc:
         return _failed(str(exc), ExitCode.CONFIG)
     except LockAcquisitionError as exc:
-        # An overlapping run is ordinary operation, not a failure to page on.
-        return _failed(str(exc), ExitCode.LOCKED)
+        # An overlapping run is ordinary operation, not a failure to page on --
+        # and for an init container, which restarts on anything non-zero, it
+        # is not even worth a code of its own.
+        return _failed(str(exc), ExitCode.OK if invocation.ok_if_locked else ExitCode.LOCKED)
     except (SQLAlchemyError, OSError) as exc:
         # A refused connection surfaces as a bare OSError: the driver raises it
         # before SQLAlchemy has a DBAPI error to wrap. Reading the document is
@@ -341,7 +373,10 @@ def _execute(invocation: _Invocation) -> ExitCode:
         return _failed("interrupted", ExitCode.INTERRUPTED)
 
     text = result.render(output=invocation.output.value)
-    if text:
+    if invocation.write is not None:
+        _write_atomically(invocation.write, text + "\n")
+        logger.info("wrote %s output to %s", invocation.output.value, invocation.write)
+    elif text:
         sys.stdout.write(text + "\n")
     return result.code
 
@@ -483,6 +518,17 @@ def _check_python_hooks(document: PartitionsDocument, config: Path) -> None:
     """
     if document.hooks is not None and document.hooks.python_blocks():
         load_python_hooks(document.hooks, config.resolve().parent)
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Write next to the target and rename, so a reader never sees half a file.
+
+    A node_exporter textfile collector reads whenever it likes; a partially
+    written file parses as a broken one, and a broken one is dropped whole.
+    """
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
 
 
 def _save_plan(path: Path, result: CommandResult) -> None:

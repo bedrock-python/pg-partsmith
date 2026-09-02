@@ -283,7 +283,7 @@ The container spec every shape shares:
 ```
 
 `readOnlyRootFilesystem: true` works: the image writes nothing at runtime. Give
-`plan --save` a mounted volume to write to.
+`plan --save` and `--write` a mounted volume to write to.
 
 ### A Pod, once, by hand
 
@@ -386,12 +386,12 @@ spec:
 
 Creations only. Retention at application startup is a bad idea — every replica restart
 would be a chance to drop something — and the default is what makes it impossible by
-accident. Ten replicas starting at once are fine: nine find the lock held, exit `6`, and
-`6` is not a failure for the pod to restart on... except that an init container *does*
-restart on non-zero. Give it the standard wrapper for that one case:
+accident. Ten replicas starting at once are fine: nine find the lock held, and with
+`--ok-if-locked` that is exit `0` rather than `6` — an init container restarts on anything
+non-zero, and standing aside is not a failure:
 
 ```yaml
-      command: ["sh", "-c", "pg-partsmith apply -c /etc/partitions.yaml; rc=$?; [ $rc -eq 6 ] && exit 0; exit $rc"]
+      args: ["apply", "-c", "/etc/partitions.yaml", "--ok-if-locked"]
 ```
 
 ### Plan on one day, apply on another
@@ -413,34 +413,44 @@ after review does not get the old plan applied under it.
 
 ### Metrics, into a node_exporter textfile
 
-The textfile collector reads a directory on the node; the run writes into it. That needs
-a redirect, which is the one place a shell is used:
+The textfile collector reads a directory on the node; the run writes into it with
+`--write`, which writes next to the target and renames, so the collector never reads
+half a file:
 
 ```yaml
-command: ["sh", "-c", "pg-partsmith plan -c /etc/partitions.yaml --check --output metrics > /textfile/partsmith.prom.$$ && mv /textfile/partsmith.prom.$$ /textfile/partsmith.prom"]
+args: ["plan", "-c", "/etc/partitions.yaml", "--check", "--output", "metrics", "--write", "/textfile/partsmith.prom"]
 volumeMounts:
   - { name: textfile, mountPath: /textfile }
 volumes:
   - { name: textfile, hostPath: { path: /var/lib/node_exporter/textfile, type: Directory } }
 ```
 
-The rename makes the write atomic, so the collector never reads half a file. A
+A
 `plan --check` on a schedule of its own is the cheapest monitoring there is: exit `2`
 means partitions that should exist do not yet, before an insert finds out.
 
 ### Hooks in a cluster
 
-A command hook runs *inside* this container, so the binary has to be in it. Two ways:
+A command hook runs *inside* this container, so what it runs has to be in it — and the
+image has no shell, so it is a binary or a Python file, not a bash script. Two ways in:
 
 ```dockerfile
 FROM ghcr.io/bedrock-python/pg-partsmith:1.1
 COPY --chmod=755 archive-partition /usr/local/bin/archive-partition
 ```
 
-or an init container that copies it into a shared `emptyDir` mounted at `/opt/hooks`,
-with the document naming `/opt/hooks/archive-partition`. Either way, `apply` needs
-`--allow-hooks`, and the document declaring hooks is refused without it — see
-[Commands around the lifecycle](hooks-in-config.md).
+or an init container that copies it into a shared `emptyDir` mounted at `/opt/hooks`. A
+Python hook file is run through the image's interpreter:
+
+```yaml
+hooks:
+  before_drop: ["/opt/venv/bin/python", "/opt/hooks/archive.py"]
+```
+
+Either way, `apply` needs `--allow-hooks`, and the document declaring hooks is refused
+without it — see [Commands around the lifecycle](hooks-in-config.md). The bash scripts
+under `examples/hooks/` are for a host that has bash; a team that wants them in the image
+builds its own from `python:3.14-slim` with `pip install "pg-partsmith[cli]"`.
 
 ## CI
 
@@ -458,16 +468,18 @@ works, every table it describes is partitioned the way it claims.
 ```yaml
 # GitLab CI
 validate-partitions:
-  image: { name: "ghcr.io/bedrock-python/pg-partsmith:1.1", entrypoint: [""] }
+  image: python:3.14-slim
+  before_script:
+    - pip install --quiet "pg-partsmith[cli]==1.1.0"
   script:
     - pg-partsmith validate -c partitions.yaml
   variables:
     PG_PARTSMITH_DSN: $STAGING_DATABASE_URL
 ```
 
-GitLab runs `script` through a shell, so the image's entrypoint is cleared. A scheduled
-pipeline running `plan --check` against production is the same alert as the CronJob
-version, from the other side.
+GitLab runs `script` through a shell, and the published image has none, so a CI job
+installs the package instead. A scheduled pipeline running `plan --check` against
+production is the same alert as the CronJob version, from the other side.
 
 ## Any other scheduler
 

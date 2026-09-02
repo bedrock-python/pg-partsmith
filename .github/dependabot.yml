@@ -1,18 +1,29 @@
+# What moves under this project without a commit of its own: the base images,
+# the actions the workflows run, and the lock file. Each gets one pull request
+# a week, so a security rebuild of the image is a merge and a release rather
+# than a hunt for which digest to bump.
 version: 2
 updates:
-  - package-ecosystem: "pip"
-    directory: "/"
+  - package-ecosystem: docker
+    directory: /
     schedule:
-      interval: "weekly"
-      day: "monday"
-    groups:
-      dev-dependencies:
-        dependency-type: "development"
-    open-pull-requests-limit: 5
+      interval: weekly
+    labels: [dependencies, image]
 
-  - package-ecosystem: "github-actions"
-    directory: "/"
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
+      interval: weekly
+    labels: [dependencies, ci]
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+    groups:
+      dev:
+        dependency-type: development

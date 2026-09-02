@@ -22,9 +22,9 @@ acts.
 
 | Command | Flags |
 |---|---|
-| all four | `-c/--config FILE` (required), `--dsn`, `--table NAME` (repeatable), `-o/--output human\|json\|metrics`, `-v/--verbose` |
+| all four | `-c/--config FILE` (required), `--dsn`, `--table NAME` (repeatable), `-o/--output human\|json\|metrics`, `--write FILE` (the output, into a file, atomically), `-v/--verbose` |
 | `plan` | `--check` exit `2` on pending operations · `--save FILE` write the plan · `--locks` print what each operation locks |
-| `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks |
+| `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks · `--ok-if-locked` exit `0` rather than `6` on a held lock |
 | `schema` | no flags: prints the document's JSON Schema for an editor |
 | global | `--version` · `--install-completion` · `-h/--help` on anything |
 
@@ -189,8 +189,11 @@ contract: what, why, how big, what it locks.
 textfile collector:
 
 ```bash
-pg-partsmith plan -c partitions.yaml --output metrics > /var/lib/node_exporter/textfile/partsmith.prom
+pg-partsmith plan -c partitions.yaml --output metrics --write /var/lib/node_exporter/textfile/partsmith.prom
 ```
+
+`--write` writes next to the target and renames, so the collector never reads half a
+file; a shell redirect would leave that to luck.
 
 ```
 # HELP pg_partsmith_pending_operations Operations a maintenance run would carry out.

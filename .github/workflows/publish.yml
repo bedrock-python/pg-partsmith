@@ -58,6 +58,9 @@ jobs:
           ref: ${{ needs.check.outputs.tag }}
 
       - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv build
       - run: uv publish
 
@@ -97,6 +100,8 @@ jobs:
           load: true
           tags: pg-partsmith:release
           build-args: VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: The image reports the version it is tagged with
         run: |
@@ -115,12 +120,27 @@ jobs:
       # The exact version, and a minor tag that moves within it. Never `latest`:
       # a CronJob following it would cross a major on its own.
       - name: Push
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
           build-args: VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          # An SBOM and a build provenance attestation travel with the image,
+          # so "what is in it" and "what built it" are answers in the registry.
+          sbom: true
+          provenance: mode=max
           tags: |
             ghcr.io/bedrock-python/pg-partsmith:${{ steps.version.outputs.version }}
             ghcr.io/bedrock-python/pg-partsmith:${{ steps.version.outputs.minor }}
+
+      # Signed keylessly with the workflow's own identity: `cosign verify` can
+      # then prove the image was built by this repository's release workflow,
+      # from this tag, and not by anyone holding a leaked token.
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign
+        run: cosign sign --yes "ghcr.io/bedrock-python/pg-partsmith@${DIGEST}"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}

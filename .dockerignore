@@ -2,6 +2,7 @@
 # context that carries the test suite and a virtualenv is how it stops being.
 *
 !pyproject.toml
+!uv.lock
 !README.md
 !LICENSE
 !CHANGELOG.md
