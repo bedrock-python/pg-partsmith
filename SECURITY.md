@@ -14,7 +14,9 @@ reaches all three in the same release.
 
 **Please do not report security vulnerabilities via public GitHub Issues.**
 
-Send a report to **shalaevad.alexey@gmail.com** with:
+Report it privately through GitHub, by
+[opening a draft security advisory](https://github.com/bedrock-python/pg-partsmith/security/advisories/new),
+or send an email to **shalaevad.alexey@gmail.com**. Either way, include:
 
 - Description of the vulnerability
 - Steps to reproduce
