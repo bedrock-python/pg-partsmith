@@ -78,8 +78,10 @@ pass the table's boundaries to the one method that uses them:
 
 The protocol's reads: `get_partition_type`, `get_partition_columns`, `get_actual_tree`,
 `measure`, `get_partition_tree`, `get_default_partition`, `partition_exists`,
-`is_partition_attached`, `get_relation_oid`, `get_unique_constraint_columns`,
-`get_key_high_water_mark`, `get_leading_key_minimum`, `list_partitions`.
+`is_partition_attached`, `get_relation_oid`, `get_relation_kind`,
+`get_unique_constraint_columns`, `get_key_high_water_mark`, `get_leading_key_minimum`,
+`list_partitions`, and `is_partition_closed`, which a provider of your own answers with
+False rather than an exception when it cannot read the bound.
 
 ## A lock manager
 

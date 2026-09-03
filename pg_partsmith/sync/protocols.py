@@ -18,6 +18,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Any, Protocol, runtime_checkable
 
+from pg_partsmith.boundaries import TimeBoundaries
 from pg_partsmith.entities import MaintenanceResult, PartitionInfo, TablePartitionConfig
 from pg_partsmith.leaves import LocalLeaves
 from pg_partsmith.lifecycle import DetachMode, SqlPredicate
@@ -365,6 +366,29 @@ class PartitionMetadataProvider(Protocol):
 
     def list_partitions(self, table_name: str) -> list[PartitionInfo]:
         """List the direct partitions of a table, including its marker-tagged orphans."""
+        ...
+
+    def is_partition_closed(
+        self, partition_name: str, *, settle_seconds: int = 0, boundaries: TimeBoundaries | None = None
+    ) -> bool:
+        """True when the partition can no longer receive in-range rows.
+
+        The question an export pipeline asks before it finalizes: has the
+        partition's upper bound, plus ``settle_seconds`` for writers still
+        holding open transactions, passed on the database's own clock? A
+        provider that cannot read the bound -- a DEFAULT partition, a
+        non-RANGE one, an unbounded upper bound, a bound the codec cannot
+        decode, a detached table, a name that does not resolve -- answers
+        False rather than raising.
+
+        Args:
+            partition_name: Attached partition table name.
+            settle_seconds: Extra buffer after the upper bound.
+            boundaries: The RANGE boundaries of the table the partition
+                belongs to -- ``config.time_boundaries``. When given, its
+                timezone and codec read the bound instead of whatever the
+                provider was constructed with.
+        """
         ...
 
 

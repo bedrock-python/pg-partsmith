@@ -128,5 +128,6 @@ p.schema_name  # "public"
 
 `metadata.is_partition_closed(name, settle_seconds=900)` answers "can this partition
 still receive in-range rows?" with one server-side check — `now()` is evaluated in the
-database, so replica lag and application clock skew do not skew the answer. With an
-encoded key pass the codec to the metadata provider.
+database, so replica lag and application clock skew do not skew the answer. Hand it the
+table's own boundaries, `boundaries=config.time_boundaries`, so the bound is read with the
+timezone and codec that wrote it.
