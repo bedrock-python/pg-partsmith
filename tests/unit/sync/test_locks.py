@@ -639,3 +639,29 @@ def test__redis_lock__a_key_carrying_another_token__is_not_ours() -> None:
     # Act / Assert
     with pytest.raises(LockAcquisitionError), manager.acquire_lock("events"):
         pass
+
+
+def test__redis_lock__a_get_that_fails_after_a_retried_set__releases_and_is_not_acquired() -> None:
+    # Arrange: the connection that timed out on the SET fails the GET too
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=False)
+    redis_client.get = MagicMock(side_effect=ConnectionError("gone"))
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert: not acquired, and whatever the SET left behind is released
+    with pytest.raises(LockAcquisitionError), manager.acquire_lock("events"):
+        pass
+    assert unlock_script.called
+
+
+def test__redis_lock__an_interrupt_during_the_token_check__releases_the_key() -> None:
+    # Arrange: Ctrl+C lands while the GET is in flight
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=False)
+    redis_client.get = MagicMock(side_effect=KeyboardInterrupt())
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert
+    with pytest.raises(KeyboardInterrupt), manager.acquire_lock("events"):
+        pass
+    assert unlock_script.called

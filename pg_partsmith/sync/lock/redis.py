@@ -165,8 +165,20 @@ class RedisDistributedLockManager:
             self._release_safely(key, token, table_name)
             raise
 
-        if not acquired and not self._holds_our_token(key, token):
-            raise LockAcquisitionError(table_name, "Redis lock unavailable")
+        if not acquired:
+            # The key may already carry this attempt's token, so this is the
+            # held-key window too: an interrupt or a failed GET releases
+            # rather than leaks, and a failed GET is a lock not acquired.
+            try:
+                ours = self._holds_our_token(key, token)
+            except (KeyboardInterrupt, SystemExit):
+                self._release_safely(key, token, table_name)
+                raise
+            except Exception as exc:
+                self._release_safely(key, token, table_name)
+                raise LockAcquisitionError(table_name, f"Redis lock unavailable: {exc}") from exc
+            if not ours:
+                raise LockAcquisitionError(table_name, "Redis lock unavailable")
 
         # From here on the key is held: any failure must release it rather than leak it until TTL.
         stop_event = threading.Event()

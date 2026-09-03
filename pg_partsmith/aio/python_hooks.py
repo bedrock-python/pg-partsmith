@@ -10,9 +10,9 @@ Usage::
     hooks = PythonHooks({HookPhase.BEFORE_DROP: "log.warning('dropping %s', event.partition.name)"})
     service = PartitionLifecycleService(repo=repo, metadata=metadata, locks=locks, hooks=[hooks])
 
-The block runs inline, in the process and on the loop that fires it. That is
-the same footing as any hook written as a class, and the same responsibility:
-a block that blocks, blocks maintenance.
+The block runs in the process, on a thread of its own, so the loop that fires
+it stays free to take a stop. The responsibility is the one any hook written as
+a class carries: a block that blocks, blocks maintenance until it returns.
 """
 
 from __future__ import annotations

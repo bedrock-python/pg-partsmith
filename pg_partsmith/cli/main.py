@@ -26,15 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import typer
-from sqlalchemy.exc import (
-    ArgumentError,
-    DataError,
-    IntegrityError,
-    NoSuchModuleError,
-    NotSupportedError,
-    ProgrammingError,
-    SQLAlchemyError,
-)
+from sqlalchemy.exc import ArgumentError, DBAPIError, NoSuchModuleError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
@@ -48,6 +40,7 @@ from pg_partsmith.exceptions import (
 )
 from pg_partsmith.hook_commands import CommandHookError
 from pg_partsmith.python_hooks import PythonHookError
+from pg_partsmith.utils import pg_sqlstate
 
 from .commands import CommandResult, run_apply, run_inspect, run_plan, run_validate
 from .exit_codes import ExitCode
@@ -399,11 +392,14 @@ def _execute(invocation: _Invocation) -> ExitCode:
         # stale, a partition is still referenced -- is a finding for a person,
         # the way --continue-on-error would have recorded it. Not a traceback.
         return _failed(str(exc), ExitCode.FINDINGS)
-    except (ProgrammingError, IntegrityError, DataError, NotSupportedError) as exc:
-        # The database was reached and said no to a statement -- a missing
-        # grant, a constraint, a type it will not take. A person acts on that,
-        # the way they act on a finding; the connection did nothing wrong.
-        return _failed(f"the database refused: {exc.orig or exc}", ExitCode.FINDINGS)
+    except DBAPIError as exc:
+        # The server answered with a SQLSTATE. One about the statement -- a
+        # missing grant, a constraint, a statement timeout -- is a finding for
+        # a person, the way --continue-on-error would have recorded it; one
+        # about reaching the server at all is the connection's.
+        if _refused_by_the_server(exc):
+            return _failed(f"the database refused: {_reason(exc)}", ExitCode.FINDINGS)
+        return _failed(f"database error: {_reason(exc)}", ExitCode.CONNECTION)
     except (ArgumentError, NoSuchModuleError) as exc:
         # A connection string SQLAlchemy cannot parse, or one naming a driver
         # that is not installed: the deployment's to fix, before any database.
@@ -649,6 +645,25 @@ def _usage_error(exc: Exception) -> None:
     if ctx is not None:
         sys.stderr.write(ctx.get_usage() + "\n")
     sys.stderr.write(f"pg-partsmith: {exc.format_message()}\n")  # type: ignore[attr-defined]
+
+
+# SQLSTATE classes about reaching the server rather than about a statement:
+# connection exceptions, authorization, an unknown database, resources the
+# server ran out of, and the operator taking it down.
+_NOT_THE_STATEMENTS_FAULT = ("08", "28", "3D", "53", "57P")
+
+
+def _refused_by_the_server(exc: DBAPIError) -> bool:
+    """Whether the server answered a statement with a SQLSTATE of its own, rather than failing to answer."""
+    state = pg_sqlstate(exc)
+    if not state:
+        return False
+    return not state.startswith(_NOT_THE_STATEMENTS_FAULT)
+
+
+def _reason(exc: DBAPIError) -> object:
+    """The driver's own message: the asyncpg adapter wraps it and prefixes the class name."""
+    return getattr(exc.orig, "__cause__", None) or exc.orig or exc
 
 
 def _failed(message: str, code: ExitCode) -> ExitCode:

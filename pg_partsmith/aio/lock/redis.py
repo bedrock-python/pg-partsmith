@@ -164,8 +164,20 @@ class RedisDistributedLockManager:
             await asyncio.shield(self._release_safely(key, token, table_name))
             raise
 
-        if not acquired and not await self._holds_our_token(key, token):
-            raise LockAcquisitionError(table_name, "Redis lock unavailable")
+        if not acquired:
+            # The key may already carry this attempt's token, so this is the
+            # held-key window too: a cancellation or a failed GET releases
+            # rather than leaks, and a failed GET is a lock not acquired.
+            try:
+                ours = await self._holds_our_token(key, token)
+            except asyncio.CancelledError:
+                await asyncio.shield(self._release_safely(key, token, table_name))
+                raise
+            except Exception as exc:
+                await asyncio.shield(self._release_safely(key, token, table_name))
+                raise LockAcquisitionError(table_name, f"Redis lock unavailable: {exc}") from exc
+            if not ours:
+                raise LockAcquisitionError(table_name, "Redis lock unavailable")
 
         # From here on the key is held: any failure must release it rather than leak it until TTL.
         watchdog: asyncio.Task[None] | None = None

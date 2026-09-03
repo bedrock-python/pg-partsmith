@@ -13,11 +13,12 @@ calendar's timezone and an empty one was a validation error. A subclass with a p
 its own — the documented shape, `EVENTS_TABLE_NAME` — is untouched. If you used the base
 class directly, add the prefix to your variables.
 
-A Python block hook runs on a thread of its own. `SIGTERM` used to wait for a block to
-return, because the block ran on the loop that handles the signal, and a block that
-outlasted the grace period had the process killed under it. The stop now cancels the run,
-which cleans up and exits `143` at once; a block still running at that point is abandoned
-with the process.
+In the async mirror, and so in the command line, a Python block hook runs on a thread of
+its own. `SIGTERM` used to wait for a block to return, because the block ran on the loop
+that handles the signal, and a block that outlasted the grace period had the process
+killed under it. The stop now cancels the run, which cleans up and exits `143` at once; a
+block still running at that point is abandoned with the process. The sync mirror runs the
+block inline, as before: there is no loop to keep free.
 
 The command line tells a database that said no apart from a database that was not there.
 A statement the server refused — a missing grant, a constraint — is exit `3`, a finding
@@ -26,12 +27,19 @@ for a person, where it used to be `5` with the connection failures.
 The Redis lock recognises its own token. redis-py retries a `SET NX` that timed out, and
 the first attempt can have landed: the retry answered "not set", and the run gave up on a
 lock it held until the TTL expired it. A key that carries the attempt's token is the lock,
-acquired.
+acquired. The manager reads the key back for that, so a client of your own handed to
+`RedisDistributedLockManager` needs `get` alongside `set`, `exists` and `register_script`.
+
+The command line also classifies a database error by its SQLSTATE rather than by the
+exception class the driver adapter happens to choose: under asyncpg only a syntax or
+access error and a constraint violation came back as their own classes, and a statement
+timeout or a dependent object would have stayed with the connection failures.
 
 Smaller: the agents page lists the `cli` extra; the plan-artifact guard is described as
 what it is, a fingerprint of the table's configuration rather than of the whole document;
 the lock guides say that redis-py 8 speaks RESP3 and that a server older than 6 wants
-`?protocol=2`; the docs build installs with `--locked` like every other job; and the
+`?protocol=2`; the docs build installs from the lock file like every other job, and refuses
+a stale one; and the
 Dockerfile names no Python version outside the builder stage.
 
 ## [1.2.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.1.0...pg-partsmith-v1.2.0) (2026-09-02)
