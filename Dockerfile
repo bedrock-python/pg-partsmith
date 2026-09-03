@@ -65,16 +65,23 @@ RUN cd /opt/venv/lib/python3.*/site-packages \
     && strip --strip-unneeded /usr/local/lib/libpython3.*.so.1.0 lib-dynload/*.so \
     && python3 -m compileall -q -j0 --invalidation-mode unchecked-hash /usr/local/lib/python3.*
 
-# The shared libraries the kept extension modules need beyond what distroless
-# provides (glibc, libgcc, libstdc++, OpenSSL). Staged under the same paths
-# they will occupy, so one COPY places them. The multiarch directory comes
-# from the interpreter, so the arm64 build stages arm64 libraries.
+# Everything the runtime takes from the builder, staged under the paths it
+# will occupy so one COPY places it: the shared libraries the kept extension
+# modules need beyond what distroless provides (glibc, libgcc, libstdc++,
+# OpenSSL), the interpreter, its shared library and its standard library. The
+# multiarch directory comes from the interpreter, so the arm64 build stages
+# arm64 libraries; the Python version comes from the base image, so nothing
+# below names it.
 RUN set -eu \
     && arch="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("MULTIARCH"))')" \
-    && mkdir -p "/staging/usr/lib/${arch}" \
+    && mkdir -p "/staging/usr/lib/${arch}" /staging/usr/local/bin /staging/usr/local/lib \
     && for lib in libz.so.1 libbz2.so.1.0 liblzma.so.5 libffi.so.8 libuuid.so.1; do \
          cp "/usr/lib/${arch}/${lib}" "/staging/usr/lib/${arch}/"; \
-       done
+       done \
+    && cp -a /usr/local/bin/python3 /usr/local/bin/python3.* /staging/usr/local/bin/ \
+    && rm -f /staging/usr/local/bin/python3*-config \
+    && cp -a /usr/local/lib/libpython3*.so.1.0 /staging/usr/local/lib/ \
+    && cp -a /usr/local/lib/python3.* /staging/usr/local/lib/
 
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
@@ -89,9 +96,6 @@ LABEL org.opencontainers.image.title="pg-partsmith" \
       org.opencontainers.image.base.name="gcr.io/distroless/cc-debian12:nonroot"
 
 COPY --from=builder /staging/ /
-COPY --from=builder /usr/local/bin/python3* /usr/local/bin/
-COPY --from=builder /usr/local/lib/libpython3*.so.1.0 /usr/local/lib/
-COPY --from=builder /usr/local/lib/python3.14 /usr/local/lib/python3.14
 COPY --from=builder /opt/venv /opt/venv
 
 # TYPER_USE_RICH=0: typer assumes rich is installed unless told otherwise, and

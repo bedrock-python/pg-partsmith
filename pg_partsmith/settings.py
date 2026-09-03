@@ -35,9 +35,11 @@ class PartitionTableSettings(PartitionTableSpec, BaseSettings):
 
     The same fields as :class:`~pg_partsmith.document.PartitionTableSpec` — the
     entry a configuration file gives per table — with an environment as their
-    source instead of a document. Subclass it, set ``model_config`` with your
-    env prefix, then call :meth:`~pg_partsmith.document.PartitionTableSpec.to_config`
-    to get a ready-to-use ``TablePartitionConfig``.
+    source instead of a document. Used as it is, it reads
+    ``PG_PARTSMITH_TABLE_NAME`` and the rest under that prefix; subclass it and
+    set ``model_config`` with a prefix of your own for one table among several.
+    Then call :meth:`~pg_partsmith.document.PartitionTableSpec.to_config` to get
+    a ready-to-use ``TablePartitionConfig``.
 
     The flat fields describe the ordinary time-partitioned table; any other
     topology is given as ``scheme`` (JSON), which takes precedence over them;
@@ -57,8 +59,10 @@ class PartitionTableSettings(PartitionTableSpec, BaseSettings):
     """
 
     # Restated so the two bases agree on one config type; the values are the
-    # spec's, and a subclass adding ``env_prefix`` still merges into them.
-    model_config = SettingsConfigDict(extra="forbid", populate_by_name=True)
+    # spec's, and a subclass setting its own ``env_prefix`` still merges into
+    # them. The prefix is the package's: without one, the class read bare names,
+    # and a host's TZ became a calendar's timezone.
+    model_config = SettingsConfigDict(extra="forbid", populate_by_name=True, env_prefix="PG_PARTSMITH_")
 
 
 __all__ = ["PartitionTableSettings"]

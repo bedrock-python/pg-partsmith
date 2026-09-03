@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from pathlib import Path
 
 import pytest
@@ -162,3 +164,19 @@ def test__sync_python_hooks__the_same_refusals_the_same_phases_and_the_same_sile
     assert hooks.phases == (HookPhase.BEFORE_DROP,)
     hooks.on_event(_event(HookPhase.AFTER_CREATE))
     assert not marker.exists()
+
+
+async def test__on_event__a_block_that_blocks__does_not_hold_a_cancellation() -> None:
+    # Arrange: a block that sleeps far longer than any stop should wait
+    hooks = PythonHooks({HookPhase.BEFORE_DROP: "import time\ntime.sleep(5)"})
+    task = asyncio.create_task(hooks.on_event(_event()))
+    await asyncio.sleep(0.2)
+
+    # Act
+    started = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Assert: the cancellation came back at once; the block is left to the process
+    assert time.monotonic() - started < 1.0

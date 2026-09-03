@@ -2,7 +2,9 @@
 
 `pg_partsmith.settings.PartitionTableSettings` (requires
 `pip install "pg-partsmith[pydantic-settings]"`) loads one table's configuration from
-environment variables. Subclass it with an `env_prefix`, then call `to_config()`.
+environment variables. Used as it is, it reads `PG_PARTSMITH_TABLE_NAME` and the rest under
+that prefix; for one table among several, subclass it with an `env_prefix` of your own.
+Then call `to_config()`.
 
 ```python
 from pydantic_settings import SettingsConfigDict

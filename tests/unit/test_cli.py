@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from pg_partsmith import console
 from pg_partsmith.__version__ import __version__
@@ -957,6 +958,55 @@ def test__apply__a_hook_that_refuses_without_continue_on_error__is_exit_3_and_a_
     # Assert: a finding for a person, the way --continue-on-error would have recorded it
     assert code == ExitCode.FINDINGS
     assert capsys.readouterr().err == "pg-partsmith: before_drop hook for 'events__2020_01' failed: exit status 1\n"
+
+
+def test__apply__a_statement_the_database_refused__is_exit_3_with_the_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: reached, connected, and told no -- a missing grant, not a missing
+    # database. Built the way the asyncpg dialect builds it: the SQLSTATE on the
+    # adapted error, the driver's own error as its cause, the class name in front.
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+    refused = DBAPIError("CREATE TABLE ...", {}, _adapted("42501", "permission denied for schema public"))
+    monkeypatch.setattr(cli, "run_apply", AsyncMock(side_effect=refused))
+
+    # Act
+    code = main(["apply", "-c", str(config)])
+
+    # Assert: a finding, in the server's words and without the connection's
+    assert code == ExitCode.FINDINGS
+    assert capsys.readouterr().err == "pg-partsmith: the database refused: permission denied for schema public\n"
+
+
+def test__apply__a_connection_the_server_dropped__is_still_exit_5(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: SQLSTATE class 08 is the connection, not the statement
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+    dropped = DBAPIError("SELECT 1", {}, _adapted("08006", "server closed the connection unexpectedly"))
+    monkeypatch.setattr(cli, "run_apply", AsyncMock(side_effect=dropped))
+
+    # Act
+    code = main(["apply", "-c", str(config)])
+
+    # Assert
+    assert code == ExitCode.CONNECTION
+    assert capsys.readouterr().err == "pg-partsmith: database error: server closed the connection unexpectedly\n"
+
+
+class _AdaptedError(Exception):
+    """What the asyncpg dialect raises: the SQLSTATE as an attribute, the driver's error as the cause."""
+
+    sqlstate: str
+
+
+def _adapted(sqlstate: str, message: str) -> _AdaptedError:
+    error = _AdaptedError(f"<class 'asyncpg.exceptions.SomeError'>: {message}")
+    error.sqlstate = sqlstate
+    error.__cause__ = Exception(message)
+    return error
 
 
 def test__dsn__a_string_that_is_no_url__is_exit_4_before_any_database(

@@ -148,6 +148,9 @@ from pg_partsmith.aio import RedisDistributedLockManager
 locks = RedisDistributedLockManager(Redis.from_url("redis://cache:6379"), prefix="app:partitions", ttl_seconds=300)
 ```
 
+redis-py 8 speaks RESP3 on the wire by default; a Redis server older than 6 wants
+`redis://cache:6379?protocol=2`.
+
 The async manager renews the lease while the run lasts and cancels the run if the lease
 is lost; the sync one renews and warns.
 

@@ -40,6 +40,7 @@ def _make_redis_mock(
     redis_client = MagicMock()
     redis_client.set = MagicMock(return_value=acquire_result)
     redis_client.exists = MagicMock(return_value=1 if acquire_result else 0)
+    redis_client.get = MagicMock(return_value=None)
     unlock_script = MagicMock(return_value=1)
     renew_script = MagicMock(return_value=1)
     redis_client.register_script.side_effect = [unlock_script, renew_script]
@@ -605,3 +606,62 @@ def test__redis_lock__watchdog_thread_start_fails__releases_key_and_propagates()
 
     # Assert
     unlock_script.assert_called_once()
+
+
+def test__redis_lock__a_set_the_client_retried__is_held_when_the_key_carries_our_token() -> None:
+    # Arrange: SET NX landed on the first try, the retry answered "not set", and the key holds our token
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=False)
+    stored: dict[str, str] = {}
+
+    def remember(name: str, value: str, **_: Any) -> None:
+        stored[name] = value
+
+    redis_client.set = MagicMock(side_effect=remember)
+    redis_client.get = MagicMock(side_effect=stored.get)
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act
+    with manager.acquire_lock("events"):
+        redis_client.get.assert_called_once()
+
+    # Assert: held, and released like any other
+    assert unlock_script.called
+
+
+def test__redis_lock__a_key_carrying_another_token__is_not_ours() -> None:
+    # Arrange
+    redis_client, _, _ = _make_redis_mock(acquire_result=False)
+    redis_client.get = MagicMock(return_value=b"somebody-else")
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert
+    with pytest.raises(LockAcquisitionError), manager.acquire_lock("events"):
+        pass
+
+
+def test__redis_lock__a_get_that_fails_after_a_retried_set__releases_and_is_not_acquired() -> None:
+    # Arrange: the connection that timed out on the SET fails the GET too
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=False)
+    redis_client.get = MagicMock(side_effect=ConnectionError("gone"))
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert: not acquired, and whatever the SET left behind is released
+    with pytest.raises(LockAcquisitionError), manager.acquire_lock("events"):
+        pass
+    assert unlock_script.called
+
+
+def test__redis_lock__an_interrupt_during_the_token_check__releases_the_key() -> None:
+    # Arrange: Ctrl+C lands while the GET is in flight
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=False)
+    redis_client.get = MagicMock(side_effect=KeyboardInterrupt())
+    with patch("pg_partsmith.sync.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert
+    with pytest.raises(KeyboardInterrupt), manager.acquire_lock("events"):
+        pass
+    assert unlock_script.called

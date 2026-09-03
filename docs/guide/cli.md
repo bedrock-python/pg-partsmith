@@ -75,9 +75,9 @@ distinguishing:
 | 0 | did what it was asked; nothing pending |
 | 1 | something unexpected; the message is on stderr |
 | 2 | `plan --check` found operations waiting to be applied |
-| 3 | the planner reported something a human has to act on |
+| 3 | the planner reported something a human has to act on, or the database refused a statement: a missing grant, a constraint |
 | 4 | the document does not parse, or does not match the database |
-| 5 | the database: unreachable, refused the credentials, or failed a statement |
+| 5 | the database could not be reached, refused the credentials, or dropped the connection |
 | 6 | another maintainer holds the table's lock |
 | 64 | the invocation itself was wrong: a misspelled flag, no command |
 | 130 | stopped by Ctrl+C, after cleaning up |
@@ -277,8 +277,9 @@ Two things are checked before anything runs, by the library rather than by the C
 
 - **The plan must be for this table.** A plan for `public.events` applied under the
   configuration of `public.audit` is refused.
-- **The configuration must not have moved.** The plan records a fingerprint of the
-  configuration it was made under; if the document has been edited since, applying it is
+- **The configuration must not have moved.** The plan records a fingerprint of the table's
+  configuration it was made under — the scheme, the policy, the leaves; not the document's
+  `hooks`, `runtime` or `dsn` sections — and if that has been edited since, applying it is
   refused with exit `4`. `--allow-config-drift` applies it as it stands.
 
 That second one is not the same as the OID revalidation every destructive operation

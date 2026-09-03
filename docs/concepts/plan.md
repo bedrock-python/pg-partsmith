@@ -106,6 +106,8 @@ table, or one made before the policy was edited. Both raise `PlanConfigMismatchE
 before any DDL runs.
 
 ```python
+from pathlib import Path
+
 plan = await service.plan(config)
 Path("plan.json").write_text(plan.model_dump_json(by_alias=True))   # zero DDL, review it
 

@@ -373,3 +373,20 @@ def test__settings__to_config__without_leaves__plain_local_tables() -> None:
     settings = PartitionTableSettings(table_name="events", partition_column="created_at", granularity="month")
 
     assert settings.to_config().leaves == LocalLeaves()
+
+
+def test__settings__used_as_they_are__read_the_package_prefix_and_not_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: a host's TZ is a fact about the machine, not about the calendar
+    monkeypatch.setenv("TZ", "Pacific/Kiritimati")
+    monkeypatch.setenv("PG_PARTSMITH_TABLE_NAME", "events")
+    monkeypatch.setenv("PG_PARTSMITH_PARTITION_COLUMN", "created_at")
+    monkeypatch.setenv("PG_PARTSMITH_GRANULARITY", "month")
+
+    # Act
+    settings = PartitionTableSettings()
+
+    # Assert
+    assert settings.table_name == "events"
+    assert str(settings.tz) == "UTC"

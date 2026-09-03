@@ -60,6 +60,10 @@ class RedisClientProtocol(Protocol):
         """Check if keys exist."""
         ...
 
+    async def get(self, name: str) -> Any:
+        """Read a key; None when it is not there."""
+        ...
+
 
 class RedisDistributedLockManager:
     """Lock manager using Redis for distributed coordination.
@@ -161,7 +165,19 @@ class RedisDistributedLockManager:
             raise
 
         if not acquired:
-            raise LockAcquisitionError(table_name, "Redis lock unavailable")
+            # The key may already carry this attempt's token, so this is the
+            # held-key window too: a cancellation or a failed GET releases
+            # rather than leaks, and a failed GET is a lock not acquired.
+            try:
+                ours = await self._holds_our_token(key, token)
+            except asyncio.CancelledError:
+                await asyncio.shield(self._release_safely(key, token, table_name))
+                raise
+            except Exception as exc:
+                await asyncio.shield(self._release_safely(key, token, table_name))
+                raise LockAcquisitionError(table_name, f"Redis lock unavailable: {exc}") from exc
+            if not ours:
+                raise LockAcquisitionError(table_name, "Redis lock unavailable")
 
         # From here on the key is held: any failure must release it rather than leak it until TTL.
         watchdog: asyncio.Task[None] | None = None
@@ -263,6 +279,18 @@ class RedisDistributedLockManager:
         except asyncio.CancelledError:
             if (cur := asyncio.current_task()) is not None and cur.cancelling() > 0:
                 raise
+
+    async def _holds_our_token(self, key: str, token: str) -> bool:
+        """Whether the key carries this attempt's token.
+
+        The client retries a ``SET NX`` that timed out, and the first attempt
+        can have landed: the retry then answers "not set" for a lock this run
+        holds, which used to be given up on until the TTL expired it.
+        """
+        held = await self._redis.get(key)
+        if isinstance(held, bytes):
+            held = held.decode()
+        return bool(held == token)
 
     async def _release_safely(self, key: str, token: str, table_name: str) -> None:
         """Release the lock; failures are logged but do not propagate.
