@@ -320,9 +320,10 @@ UID 65532, and the build stage â€” pip, the build backend, every `__pycache__` â
 away rather than shipped.
 
 The library, the CLI and the image carry the same number, always; CI refuses to publish an
-image whose `--version` disagrees with its tag. Tags are the exact version and a moving
-minor, never `latest`: a scheduled job following `latest` would cross a major on its own,
-at 02:15, with `DROP` in its hands. The image size is checked against a budget on every
+image whose `--version` disagrees with its tag. Tags are the exact version, a moving
+minor, and `latest` for the newest release; a schedule belongs on the minor, since
+following `latest` it would cross a major on its own, at 02:15, with `DROP` in its
+hands. The image size is checked against a budget on every
 pull request and a regression fails the build.
 
 The init-container case needs no flag of its own: `apply` without `--allow-destructive`

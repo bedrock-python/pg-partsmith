@@ -167,9 +167,9 @@ jobs:
       # already on the index instead of failing on it, and carries on to the tags.
       - run: uv publish --check-url https://pypi.org/simple/pg-partsmith/
 
-  # One index over both architectures' images, under the exact tag and the
-  # minor one, signed. Never `latest`: a CronJob following it would cross a
-  # major on its own.
+  # One index over both architectures' images, under the exact tag, the minor
+  # one and `latest`, signed. The guides tell a schedule to follow the minor:
+  # on `latest` it would cross a major on its own.
   tags:
     name: Tag and sign the image
     needs: [check, image, publish]
@@ -200,7 +200,7 @@ jobs:
           cd "${RUNNER_TEMP}/digests"
           refs=()
           for digest in *; do refs+=("${IMAGE}@sha256:${digest}"); done
-          docker buildx imagetools create -t "${IMAGE}:${VERSION}" -t "${IMAGE}:${MINOR}" "${refs[@]}"
+          docker buildx imagetools create -t "${IMAGE}:${VERSION}" -t "${IMAGE}:${MINOR}" -t "${IMAGE}:latest" "${refs[@]}"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
 
       # Signed keylessly with the workflow's own identity: `cosign verify` can
@@ -251,12 +251,13 @@ jobs:
             --certificate-identity "https://github.com/bedrock-python/pg-partsmith/.github/workflows/publish.yml@refs/heads/master" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-      - name: The version inside, the label, the minor tag, the SBOM and the provenance
+      - name: The version inside, the label, the minor and latest tags, the SBOM and the provenance
         run: |
           test "$(docker run --rm "${IMAGE}:${VERSION}" --version)" = "pg-partsmith ${VERSION}"
           test "$(docker image inspect "${IMAGE}:${VERSION}" -f '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "${VERSION}"
-          test "$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw | sha256sum)" \
-            = "$(docker buildx imagetools inspect "${IMAGE}:${MINOR}" --raw | sha256sum)"
+          exact="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw | sha256sum)"
+          test "$exact" = "$(docker buildx imagetools inspect "${IMAGE}:${MINOR}" --raw | sha256sum)"
+          test "$exact" = "$(docker buildx imagetools inspect "${IMAGE}:latest" --raw | sha256sum)"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .SBOM}}' | grep -q '"SPDX"'
           docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Provenance}}' | grep -q '"SLSA"'
 

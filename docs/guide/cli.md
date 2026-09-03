@@ -295,7 +295,7 @@ create, and at six other moments. They fire during `apply` only, and only with
 
 ## In a container, on a schedule, in CI
 
-The same commands, with nothing installed: `ghcr.io/bedrock-python/pg-partsmith:1.2`.
+The same commands, with nothing installed: `ghcr.io/bedrock-python/pg-partsmith:latest`.
 [The container image](container.md) is about the image; [Ways to run it](running.md) is
 every harness — plain Docker, Compose, Swarm, a Pod, a Job, a CronJob, an init
 container, CI, systemd — with a copy-pasteable shape for each.
