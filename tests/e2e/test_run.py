@@ -214,6 +214,27 @@ def test__sigterm__cancels_the_run_releases_the_lock_and_exits_143(
     assert after.code == 2, after.stderr
 
 
+def test__sigterm__a_python_block_still_running__does_not_hold_the_stop(
+    image: Image, postgres: PostgresContainer, tmp_path: Path, table: str
+) -> None:
+    # A block that sleeps runs on a thread of its own, so the stop does not wait for it.
+    block = {"python": "import time\ntime.sleep(120)\n"}
+    document = write_document(tmp_path / "partitions.json", table=table, hooks={"before_create": block})
+    container = image.start("apply", "-c", DOCUMENT_PATH, "--allow-hooks", env=ENV, mounts=_mounted(document))
+    try:
+        wait_until(lambda: holds_advisory_lock(postgres), what="the run taking its lock")
+        started = time.monotonic()
+        container.stop(timeout=20)
+        elapsed = time.monotonic() - started
+        outcome = finish(container)
+    finally:
+        container.remove(force=True)
+
+    assert outcome.code == 143, outcome.stderr
+    assert outcome.stderr.rstrip().endswith("pg-partsmith: terminated")
+    assert elapsed < 15, f"stopping took {elapsed:.1f}s: the block held the stop"
+
+
 def test__an_overlapping_run__stands_aside_with_6_or_with_0_when_told_to(
     image: Image, postgres: PostgresContainer, tmp_path: Path, table: str
 ) -> None:

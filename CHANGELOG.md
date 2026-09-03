@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.3.0 — a prefix for the environment, and a stop that waits for nothing
+
+**`PartitionTableSettings` reads `PG_PARTSMITH_TABLE_NAME` and the rest under that prefix
+when it is used as it is.** It used to read bare names, so a host's `TZ` became the
+calendar's timezone and an empty one was a validation error. A subclass with a prefix of
+its own — the documented shape, `EVENTS_TABLE_NAME` — is untouched. If you used the base
+class directly, add the prefix to your variables.
+
+A Python block hook runs on a thread of its own. `SIGTERM` used to wait for a block to
+return, because the block ran on the loop that handles the signal, and a block that
+outlasted the grace period had the process killed under it. The stop now cancels the run,
+which cleans up and exits `143` at once; a block still running at that point is abandoned
+with the process.
+
+The command line tells a database that said no apart from a database that was not there.
+A statement the server refused — a missing grant, a constraint — is exit `3`, a finding
+for a person, where it used to be `5` with the connection failures.
+
+The Redis lock recognises its own token. redis-py retries a `SET NX` that timed out, and
+the first attempt can have landed: the retry answered "not set", and the run gave up on a
+lock it held until the TTL expired it. A key that carries the attempt's token is the lock,
+acquired.
+
+Smaller: the agents page lists the `cli` extra; the plan-artifact guard is described as
+what it is, a fingerprint of the table's configuration rather than of the whole document;
+the lock guides say that redis-py 8 speaks RESP3 and that a server older than 6 wants
+`?protocol=2`; the docs build installs with `--locked` like every other job; and the
+Dockerfile names no Python version outside the builder stage.
+
 ## [1.2.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.1.0...pg-partsmith-v1.2.0) (2026-09-02)
 
 
@@ -863,4 +892,3 @@ First public release of `pg-partsmith`.
 - Python 3.11, 3.12, and 3.13 support.
 
 [0.1.0]: https://github.com/bedrock-python/pg-partsmith/releases/tag/v0.1.0
-[Unreleased]: https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v0.5.0...HEAD

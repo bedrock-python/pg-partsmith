@@ -26,7 +26,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import typer
-from sqlalchemy.exc import ArgumentError, NoSuchModuleError, SQLAlchemyError
+from sqlalchemy.exc import (
+    ArgumentError,
+    DataError,
+    IntegrityError,
+    NoSuchModuleError,
+    NotSupportedError,
+    ProgrammingError,
+    SQLAlchemyError,
+)
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
@@ -391,6 +399,11 @@ def _execute(invocation: _Invocation) -> ExitCode:
         # stale, a partition is still referenced -- is a finding for a person,
         # the way --continue-on-error would have recorded it. Not a traceback.
         return _failed(str(exc), ExitCode.FINDINGS)
+    except (ProgrammingError, IntegrityError, DataError, NotSupportedError) as exc:
+        # The database was reached and said no to a statement -- a missing
+        # grant, a constraint, a type it will not take. A person acts on that,
+        # the way they act on a finding; the connection did nothing wrong.
+        return _failed(f"the database refused: {exc.orig or exc}", ExitCode.FINDINGS)
     except (ArgumentError, NoSuchModuleError) as exc:
         # A connection string SQLAlchemy cannot parse, or one naming a driver
         # that is not installed: the deployment's to fix, before any database.

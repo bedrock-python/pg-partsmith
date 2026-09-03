@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.exc import ProgrammingError
 
 from pg_partsmith import console
 from pg_partsmith.__version__ import __version__
@@ -957,6 +958,23 @@ def test__apply__a_hook_that_refuses_without_continue_on_error__is_exit_3_and_a_
     # Assert: a finding for a person, the way --continue-on-error would have recorded it
     assert code == ExitCode.FINDINGS
     assert capsys.readouterr().err == "pg-partsmith: before_drop hook for 'events__2020_01' failed: exit status 1\n"
+
+
+def test__apply__a_statement_the_database_refused__is_exit_3_with_the_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: reached, connected, and told no -- a missing grant, not a missing database
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+    refused = ProgrammingError("CREATE TABLE ...", {}, Exception("permission denied for schema public"))
+    monkeypatch.setattr(cli, "run_apply", AsyncMock(side_effect=refused))
+
+    # Act
+    code = main(["apply", "-c", str(config)])
+
+    # Assert: a finding, with the server's reason and not the connection's
+    assert code == ExitCode.FINDINGS
+    assert capsys.readouterr().err.startswith("pg-partsmith: the database refused: permission denied for schema public")
 
 
 def test__dsn__a_string_that_is_no_url__is_exit_4_before_any_database(

@@ -17,10 +17,13 @@ class ExitCode(IntEnum):
         FAILED: Something unexpected. The message is on stderr.
         DRIFT: ``plan --check`` found operations waiting to be applied. Not a
             failure -- it is what "maintenance has not run lately" looks like.
-        FINDINGS: The planner reported something an operator has to act on.
-            Outranks :attr:`DRIFT`: drift is what a run fixes, a finding is not.
+        FINDINGS: The planner reported something an operator has to act on,
+            or the database refused a statement -- a missing grant, a
+            constraint. Outranks :attr:`DRIFT`: drift is what a run fixes, a
+            finding is not.
         CONFIG: The document does not parse, or does not match the database.
-        CONNECTION: The database: unreachable, refused the credentials, or failed a statement.
+        CONNECTION: The database could not be reached, refused the
+            credentials, or dropped the connection.
         LOCKED: Another maintainer holds the table's lock. Overlapping runs are
             ordinary, so this is its own code rather than a failure to page on.
         USAGE: The invocation itself was wrong -- a misspelled flag, no command.

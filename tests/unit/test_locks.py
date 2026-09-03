@@ -41,6 +41,7 @@ def _make_redis_mock(
     redis_client = MagicMock()
     redis_client.set = AsyncMock(return_value=acquire_result)
     redis_client.exists = AsyncMock(return_value=1 if acquire_result else 0)
+    redis_client.get = AsyncMock(return_value=None)
     unlock_script = AsyncMock(return_value=1)
     renew_script = AsyncMock(return_value=1)
     redis_client.register_script.side_effect = [unlock_script, renew_script]
@@ -679,3 +680,37 @@ async def test__redis_lock__holder_cancelled_while_awaiting_watchdog__cancellati
     for pending in [t for t in asyncio.all_tasks() if t.get_name().startswith("redis-lock-watchdog:")]:
         with contextlib.suppress(asyncio.CancelledError):
             await pending
+
+
+async def test__redis_lock__a_set_the_client_retried__is_held_when_the_key_carries_our_token() -> None:
+    # Arrange: SET NX landed on the first try, the retry answered "not set", and the key holds our token
+    redis_client, unlock_script, _ = _make_redis_mock(acquire_result=False)
+    stored: dict[str, str] = {}
+
+    async def remember(name: str, value: str, **_: Any) -> None:
+        stored[name] = value
+
+    redis_client.set = AsyncMock(side_effect=remember)
+    redis_client.get = AsyncMock(side_effect=stored.get)
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act
+    async with manager.acquire_lock("events"):
+        redis_client.get.assert_awaited_once()
+
+    # Assert: held, and released like any other
+    assert unlock_script.called
+
+
+async def test__redis_lock__a_key_carrying_another_token__is_not_ours() -> None:
+    # Arrange
+    redis_client, _, _ = _make_redis_mock(acquire_result=False)
+    redis_client.get = AsyncMock(return_value=b"somebody-else")
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        manager = RedisDistributedLockManager(redis_client)
+
+    # Act / Assert
+    with pytest.raises(LockAcquisitionError):
+        async with manager.acquire_lock("events"):
+            pass

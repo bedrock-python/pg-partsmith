@@ -103,10 +103,10 @@ rolled back, the advisory lock released, a hook's child process terminated — a
 `143` with `pg-partsmith: terminated` in the log. That takes a few seconds; Docker's
 default grace of ten and Kubernetes' thirty are plenty.
 
-A Python block hook is the exception. It runs on the loop that handles the signal, so a
-block still running at the deadline holds the stop until it returns, and past the grace
-period the runtime kills the process — the `SIGKILL` case below. Anything that can take
-longer than a grace period belongs in a command hook, which is a child the stop terminates.
+A Python block hook runs on a thread of its own, so the stop does not wait for it either:
+the run is cancelled, cleans up and exits `143`, and a block still running at that point
+is abandoned with the process. A command hook's child is terminated on purpose; a block is
+simply not waited for.
 
 On `SIGKILL` none of that runs, and the database is still fine: a dropped connection makes
 PostgreSQL cancel the statement and roll back its transaction, a session-level advisory
@@ -187,7 +187,8 @@ image that adds a hook binary is one `FROM` and one `COPY` — see
 ## Exit codes
 
 The same ones [the CLI](cli.md#exit-codes) documents. `0` nothing pending, `2` drift under
-`plan --check`, `3` findings or run issues, `4` configuration, `5` the database, `6` the lock
+`plan --check`, `3` findings, run issues or a statement the database refused, `4` configuration,
+`5` the database not reached, `6` the lock
 is held, `64` usage, `130` / `143` stopped by a signal, `1` unexpected. Treat `6` as
 success in whatever runs this: two runs overlapping is ordinary, and the second standing
 aside is the lock doing its job.

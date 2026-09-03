@@ -17,7 +17,9 @@ a block that blocks, blocks maintenance.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 from pg_partsmith.events import HookPhase
@@ -76,6 +78,10 @@ class PythonHooks(BasePartitionLifecycleHooks):
     async def on_event(self, event: PartitionEvent) -> None:
         """Run the block configured for this event's phase, if there is one.
 
+        The block runs on a thread of its own, so the loop stays free to take a
+        stop signal while it runs: the run is cancelled and cleans up, and a
+        block still running at that point is abandoned when the process exits.
+
         Raises:
             PythonHookError: If the block raises, which is how it refuses the
                 operation.
@@ -83,4 +89,34 @@ class PythonHooks(BasePartitionLifecycleHooks):
         code = self._code.get(event.phase)
         if code is None:
             return
-        run_hook_source(code, event, logger=self._loggers[event.phase])
+        loop = asyncio.get_running_loop()
+        outcome: asyncio.Future[None] = loop.create_future()
+        hook_logger = self._loggers[event.phase]
+
+        def run() -> None:
+            try:
+                run_hook_source(code, event, logger=hook_logger)
+            except BaseException as exc:
+                _settle(loop, outcome, exc)
+            else:
+                _settle(loop, outcome, None)
+
+        threading.Thread(target=run, name=f"pg-partsmith-hook-{event.phase.value}", daemon=True).start()
+        await outcome
+
+
+def _settle(loop: asyncio.AbstractEventLoop, outcome: asyncio.Future[None], exc: BaseException | None) -> None:
+    """Hand the block's result to the loop; nothing to hand if the run was cancelled or the loop is gone."""
+
+    def deliver() -> None:
+        if outcome.done():
+            return
+        if exc is None:
+            outcome.set_result(None)
+        else:
+            outcome.set_exception(exc)
+
+    try:
+        loop.call_soon_threadsafe(deliver)
+    except RuntimeError:  # the loop closed while the block ran: the process is on its way out
+        pass

@@ -129,6 +129,9 @@ from pg_partsmith.aio import RedisDistributedLockManager
 locks = RedisDistributedLockManager(Redis.from_url("redis://cache:6379"), prefix="app:partitions", ttl_seconds=300)
 ```
 
+redis-py 8 speaks RESP3 on the wire by default; a Redis server older than 6 wants
+`redis://cache:6379?protocol=2`.
+
 Even without a working lock two maintainers cannot corrupt the tree: a partition the
 other one created first is recognised by its bounds as a lost race, and every detach and
 drop is re-checked against the catalog before it runs. The lock saves wasted work; safety

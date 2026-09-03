@@ -188,12 +188,11 @@ read: a `SyntaxError` is a validation error with a line number in it, not someth
 CronJob discovers at 03:00 after some of the run's DDL has committed. A missing or broken
 `python_file` fails `validate` by name.
 
-The block runs inline, in the process and on the loop that fires it. That is the same
-footing as a hook written as a class, and the same responsibility: a block that blocks,
-blocks maintenance — and blocks the stop. `SIGTERM` is handled on that same loop, so a
-block still running when a pod's deadline comes is killed with the process rather than
-cancelled. Work that can outlast a grace period belongs in a command hook, a child the
-stop terminates.
+The block runs in the process, on a thread of its own, so the loop that fires it stays free
+to take a stop: `SIGTERM` cancels the run, which cleans up and exits, and a block still
+running at that point is abandoned with the process. The responsibility is the one a hook
+written as a class carries: a block that blocks, blocks maintenance until it returns. Work
+that can outlast a grace period is better as a command hook, a child the stop terminates.
 
 ### What this is not
 

@@ -44,8 +44,8 @@ pg-partsmith plan  -c partitions.yaml --save plan.json     # zero DDL; read it, 
 pg-partsmith apply -c partitions.yaml --plan plan.json --allow-destructive
 ```
 
-`apply --plan` is refused if the document was edited in between, so what runs is what
-was reviewed.
+`apply --plan` is refused if the table's configuration was edited in between (the `hooks`
+and `runtime` sections are outside the fingerprint), so what runs is what was reviewed.
 
 ## Plain Docker
 
@@ -409,8 +409,9 @@ volumeMounts: [{ name: work, mountPath: /work }]
 args: ["apply", "-c", "/etc/partitions.yaml", "--plan", "/work/plan.json", "--allow-destructive"]
 ```
 
-`apply --plan` refuses the file if the ConfigMap changed in between, so a document edited
-after review does not get the old plan applied under it.
+`apply --plan` refuses the file if a table's configuration in the ConfigMap changed in
+between, so a document edited after review does not get the old plan applied under it;
+the `hooks` and `runtime` sections are outside the fingerprint.
 
 ### Metrics, into a node_exporter textfile
 
