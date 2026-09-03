@@ -1,7 +1,7 @@
 # The container image
 
 ```
-ghcr.io/bedrock-python/pg-partsmith:1.2
+ghcr.io/bedrock-python/pg-partsmith:latest
 ```
 
 The image is [the CLI](cli.md) and nothing else: the entrypoint is `pg-partsmith`, so a
@@ -13,7 +13,7 @@ container, CI — is on [Ways to run it](running.md); this page is about the ima
 docker run --rm \
   -v "$PWD/partitions.yaml:/etc/partitions.yaml:ro" \
   -e PG_PARTSMITH_DSN=postgresql://app:secret@db.internal/app \
-  ghcr.io/bedrock-python/pg-partsmith:1.2 \
+  ghcr.io/bedrock-python/pg-partsmith:latest \
   plan -c /etc/partitions.yaml --check
 ```
 
@@ -118,9 +118,11 @@ and a hook's child process is on its own.
 
 `1.4.2` is exact and immutable. `1.4` moves within the minor version, which is what a
 schedule should follow — base-image security rebuilds reach it without a config change.
+`latest` is the newest release, whatever its number: what the examples in these guides
+name, so they never go stale, and what a laptop pulls to try it out.
 
-There is deliberately **no `latest`**: a scheduled job following it would cross a major
-version on its own, at 02:15, with `DROP` in its hands.
+Put a schedule on the minor tag rather than on `latest`: following `latest`, a CronJob
+would cross a major version on its own, at 02:15, with `DROP` in its hands.
 
 The library, the CLI and the image carry the same number, always: `pg-partsmith` 1.4.2 on
 PyPI, `pg-partsmith --version` → 1.4.2, and `ghcr.io/bedrock-python/pg-partsmith:1.4.2`
@@ -147,7 +149,7 @@ byte-compile and little else to load.
   release workflow and not by someone holding a token:
 
   ```bash
-  cosign verify ghcr.io/bedrock-python/pg-partsmith:1.2.0 \
+  cosign verify ghcr.io/bedrock-python/pg-partsmith:latest \
     --certificate-identity https://github.com/bedrock-python/pg-partsmith/.github/workflows/publish.yml@refs/heads/master \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```

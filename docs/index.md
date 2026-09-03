@@ -7,6 +7,17 @@ what the tree should look like — monthly partitions, twelve of them kept, thre
 ahead, each split by tenant — and it reads what actually exists, works out the difference,
 shows you the plan, and applies it. No extension, no superuser, no scheduler of its own.
 
+Three ways in, one version number:
+
+- **Library** — `pip install pg-partsmith`: Python, `asyncio` or sync, on any SQLAlchemy 2
+  engine. Start with [installation](getting-started/installation.md).
+- **Command line** — `pip install "pg-partsmith[cli]"`: `pg-partsmith plan`, `apply` and
+  `validate` over a YAML document, with exit codes a CronJob can read. See
+  [the CLI](guide/cli.md).
+- **Container image** — `ghcr.io/bedrock-python/pg-partsmith:latest`: the command line with
+  no Python of your own, as a Job, a CronJob or an init container. See
+  [the image](guide/container.md) and [ways to run it](guide/running.md).
+
 !!! agents "Building this with an AI assistant?"
 
     Hand it **[one page](agents.md)** instead of this site. It carries the whole API

@@ -16,6 +16,14 @@ tree that actually exists from the catalog, and turns the difference into a
 **maintenance plan** — typed operations with a reason on each — that you can inspect,
 serialize, filter and apply. No extension, no superuser, no scheduler of its own.
 
+Three ways in, one version number:
+
+| | | |
+|---|---|---|
+| **Library** | `pip install pg-partsmith` | Python, `asyncio` or sync, on any SQLAlchemy 2 engine. [Getting started](https://bedrock-python.github.io/pg-partsmith/getting-started/installation/) |
+| **Command line** | `pip install "pg-partsmith[cli]"` | `pg-partsmith plan`, `apply` and `validate` over a YAML document, with exit codes a CronJob can read. [The CLI](https://bedrock-python.github.io/pg-partsmith/guide/cli/) |
+| **Container image** | `ghcr.io/bedrock-python/pg-partsmith:latest` | The command line with no Python of your own: a Job, a CronJob, an init container. [The image](https://bedrock-python.github.io/pg-partsmith/guide/container/) |
+
 > [!TIP]
 > **Building this with an AI assistant?** Hand it
 > **[one page](https://bedrock-python.github.io/pg-partsmith/agents/)** instead of the
