@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.4.0 — the closed check, on the protocol
+
+`is_partition_closed(partition_name, *, settle_seconds=0, boundaries=None)` is a method of
+`PartitionMetadataProvider` in both mirrors. It was always the export pipeline's question —
+the archiving guide has a section for it, and `PartitionToolkit.from_engine` takes a
+`boundary_codec` for that one call — but only the Postgres provider declared it, and the
+toolkit hands its provider back under the protocol's type. So under a type checker
+`kit.metadata.is_partition_closed(...)` did not exist, and a caller narrowed with
+`isinstance` first, which is what the toolkit was built to make unnecessary.
+
+A provider of your own now has to answer it. The contract is the Postgres one: True once
+the partition's upper bound plus the settle buffer has passed on the database's clock;
+False, never an exception, when the bound cannot be read — a DEFAULT partition, a non-RANGE
+one, an unbounded upper bound, a bound the codec cannot decode, a detached table, a name
+that does not resolve.
+
 ## [1.3.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.2.0...pg-partsmith-v1.3.0) (2026-09-03)
 
 
