@@ -4,13 +4,19 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | ✅        |
+| 1.2.x   | ✅ the current release; fixes ship as the next patch or minor |
+| older   | ❌ upgrade to the current release first |
+
+The library, the command line and the container image share one version number, so a fix
+reaches all three in the same release.
 
 ## Reporting a vulnerability
 
 **Please do not report security vulnerabilities via public GitHub Issues.**
 
-Send a report to **shalaevad.alexey@gmail.com** with:
+Report it privately through GitHub, by
+[opening a draft security advisory](https://github.com/bedrock-python/pg-partsmith/security/advisories/new),
+or send an email to **shalaevad.alexey@gmail.com**. Either way, include:
 
 - Description of the vulnerability
 - Steps to reproduce
