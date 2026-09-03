@@ -4,7 +4,11 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | ✅        |
+| 1.2.x   | ✅ the current release; fixes ship as the next patch or minor |
+| older   | ❌ upgrade to the current release first |
+
+The library, the command line and the container image share one version number, so a fix
+reaches all three in the same release.
 
 ## Reporting a vulnerability
 
