@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.2.0...pg-partsmith-v1.3.0) (2026-09-03)
+
+
+### Features
+
+* a prefix for the environment, and a stop that waits for nothing ([d555cde](https://github.com/bedrock-python/pg-partsmith/commit/d555cde8858e9014c0f0c9dc486820c2683ba8a3))
+* a prefix for the environment, and a stop that waits for nothing ([45160a5](https://github.com/bedrock-python/pg-partsmith/commit/45160a566f5fb3c5f380af302f9d53ae0963f476))
+
+
+### Bug Fixes
+
+* the token check inside the guard, exit 3 by SQLSTATE, and three sentences ([8267d89](https://github.com/bedrock-python/pg-partsmith/commit/8267d89a359ffb0957b233e6d255dc8edcb639d8))
+
+
+### Documentation
+
+* the security policy names the release it supports ([#53](https://github.com/bedrock-python/pg-partsmith/issues/53)) ([2e06d1e](https://github.com/bedrock-python/pg-partsmith/commit/2e06d1e8f9f58827cc455b6942c3cf3a16cf0208))
+
 ## 1.3.0 — a prefix for the environment, and a stop that waits for nothing
 
 **`PartitionTableSettings` reads `PG_PARTSMITH_TABLE_NAME` and the rest under that prefix
