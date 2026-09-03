@@ -110,7 +110,10 @@ warn_unreachable = true
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = ["examples"]
+# The Markdown guides hold fragments -- a keyword argument on its own, a body
+# without its def -- that read as code to a formatter and come out as
+# something else. ruff 0.16 formats fenced Python in Markdown by default.
+extend-exclude = ["examples", "*.md"]
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "I", "B", "N", "S", "C4", "DTZ", "SIM", "TRY", "PERF", "RUF", "UP", "ANN", "T20", "PTH", "PLC", "PLE", "PLW"]
