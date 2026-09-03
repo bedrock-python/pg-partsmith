@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.3.0...pg-partsmith-v1.4.0) (2026-09-03)
+
+
+### Features
+
+* the closed check, on the protocol ([#56](https://github.com/bedrock-python/pg-partsmith/issues/56)) ([6f5e742](https://github.com/bedrock-python/pg-partsmith/commit/6f5e742b19a2064ee3e4206df1ca12b80eee8bda))
+
 ## 1.4.0 — the closed check, on the protocol
 
 `is_partition_closed(partition_name, *, settle_seconds=0, boundaries=None)` is a method of
