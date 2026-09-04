@@ -30,6 +30,15 @@ complete subtree before it is attached, windows that already have a partition sk
 The return value lists the partitions this call created, in order; `ensure_partition`
 returns one or `None`.
 
+## From the command line
+
+`pg-partsmith backfill` is the same migration without Python of your own: it runs
+[`partition_data`](partition-existing-table.md) over every table in the document,
+resumable through `--max-batches`, exiting `2` while anything is left to move. See
+[The command line](cli.md#adopting-a-table-full-of-data). What has no command yet is
+`ensure_partitions` for windows that hold no rows — a history imported into a table with
+no DEFAULT partition still names its windows in Python.
+
 ## Rows already in a DEFAULT partition
 
 If the history sits in the parent's DEFAULT partition, `ensure_partitions` moves each

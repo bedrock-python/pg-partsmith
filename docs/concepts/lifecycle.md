@@ -112,7 +112,7 @@ with the core, which is what keeps a user predicate from turning into an acciden
 
 | `DetachMode` | Statement |
 |---|---|
-| `AUTO` (default) | `DETACH … CONCURRENTLY`, falling back to the blocking form when PostgreSQL refuses it — it does when a DEFAULT partition exists |
+| `AUTO` (default) | `DETACH … CONCURRENTLY`, falling back to the blocking form when PostgreSQL refuses it |
 | `CONCURRENT` | the concurrent form only; the refusal propagates |
 | `BLOCKING` | plain `DETACH`: `ACCESS EXCLUSIVE` on the parent for the duration |
 
@@ -120,6 +120,13 @@ The concurrent form takes `SHARE UPDATE EXCLUSIVE` on the parent and lets reader
 writers through; it cannot run inside a transaction block, so it goes out on an
 autocommit connection. A detach interrupted mid-way is finished with `DETACH … FINALIZE`
 on the next attempt.
+
+PostgreSQL refuses the concurrent form outright while the parent holds a DEFAULT
+partition. The planner reads that from the catalog, so an `AUTO` detach of a parent with
+a DEFAULT partition is planned as the blocking form and says so — `plan --locks` names
+the `ACCESS EXCLUSIVE` it will take, and no statement is issued that could only fail.
+`CONCURRENT` is left as written: asking for the concurrent form and being refused is the
+answer that mode exists to give.
 
 Either form takes `ACCESS EXCLUSIVE` on every table that references the parent through a
 foreign key, and neither can detach a partition whose rows such a table still references:

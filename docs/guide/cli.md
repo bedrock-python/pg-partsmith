@@ -13,17 +13,20 @@ pg-partsmith validate -c partitions.yaml     # does the document match the datab
 pg-partsmith inspect  -c partitions.yaml     # what tree actually exists?
 pg-partsmith plan     -c partitions.yaml     # what would maintenance do, and why?
 pg-partsmith apply    -c partitions.yaml     # do it — creations only, by default
+pg-partsmith backfill -c partitions.yaml     # move a DEFAULT partition's rows where they belong
 ```
 
 The first three issue no DDL, take no lock and fire no hook. `apply` is the one that
-acts.
+acts. `backfill` is the one an existing installation runs once, before the first `apply`
+has anything sensible to do: see [Adopting a table full of data](#adopting-a-table-full-of-data).
 
 ## Every flag
 
 | Command | Flags |
 |---|---|
-| all four | `-c/--config FILE` (required), `--dsn`, `--table NAME` (repeatable), `-o/--output human\|json\|metrics`, `--write FILE` (the output, into a file, atomically), `-v/--verbose` |
+| all five | `-c/--config FILE` (required), `--dsn`, `--table NAME` (repeatable), `-o/--output human\|json\|metrics`, `--write FILE` (the output, into a file, atomically), `-v/--verbose` |
 | `plan` | `--check` exit `2` on pending operations · `--save FILE` write the plan · `--locks` print what each operation locks |
+| `backfill` | `--batch-rows N` rows per statement (default 10000) · `--max-batches N` stop after N statements and exit `2` · `--allow-hooks` · `--ok-if-locked` |
 | `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks · `--ok-if-locked` exit `0` rather than `6` on a held lock |
 | `schema` | no flags: prints the document's JSON Schema for an editor |
 | global | `--version` · `--install-completion` · `--show-completion` · `-h/--help` on anything |
@@ -288,11 +291,44 @@ fingerprint asks whether the plan is still the same intent: a plan made under
 `retention_count: 12` names exactly the right partitions to expire, for a reason that
 stopped being true the moment someone wrote `120`.
 
+## Adopting a table full of data
+
+Creation walks forward from the cursor, so a table that was partitioned around data
+already in it — everything in one DEFAULT partition — is a table `apply` has nothing
+useful to say about: the rows it holds are behind the cursor, and no create-ahead will
+ever reach them.
+
+`backfill` is the migration that fixes that, once:
+
+```bash
+pg-partsmith backfill -c partitions.yaml
+```
+
+Window by window, oldest first, it creates the partition, fills it in batches of
+`--batch-rows` and attaches it. Afterwards DEFAULT is empty and the ordinary
+`plan`/`apply` cycle takes over.
+
+It is resumable, which is what makes it usable on a table too large for one maintenance
+window. `--max-batches N` stops after N statements per table and exits `2`; every row
+already moved stays moved. So a Job can simply be run until it stops saying 2:
+
+```bash
+until pg-partsmith backfill -c partitions.yaml --max-batches 50; do sleep 60; done
+```
+
+Two things to know before running it on a busy table. It takes the table's maintenance
+lock for the duration of each call, so a scheduled `apply` will decline while it runs
+(exit `6`), which is the lock doing its job. And a window's rows are invisible through
+the parent between the moment they leave DEFAULT and the moment the partition is attached
+— PostgreSQL will not attach a partition while DEFAULT still holds rows for it, so there
+is no order that keeps them visible throughout. `--batch-rows` bounds how long that is.
+
 ## Commands around the lifecycle
 
 A document can name a command, or a block of Python, to run before a drop, after a
-create, and at six other moments. They fire during `apply` only, and only with
-`--allow-hooks` — see [Commands around the lifecycle](hooks-in-config.md).
+create, and at six other moments. They fire during `apply` and `backfill` — the commands
+that carry out DDL — and only with `--allow-hooks` — see
+[Commands around the lifecycle](hooks-in-config.md).
 
 ## In a container, on a schedule, in CI
 
@@ -303,5 +339,9 @@ container, CI, systemd — with a copy-pasteable shape for each.
 
 ## What is not here yet
 
-`partition_data` and `unpartition` — the batched row-movement verbs — are library-only for
-now, because both want a progress story a one-shot command does not have yet.
+`unpartition` — the way back from a partitioned tree to one plain table — is library-only
+for now. `partition_data`, its counterpart, is `backfill` above: what a one-shot command
+needed first was a progress story, and `--max-batches` with exit `2` and the
+`pg_partsmith_backfill_incomplete` gauge is one. `unpartition` also has a destination
+table to name and a `drop_emptied` to decide, and neither has an obvious spelling on a
+command line yet.

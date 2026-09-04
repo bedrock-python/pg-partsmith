@@ -11,8 +11,8 @@ Three ways in, one version number:
 
 - **Library** — `pip install pg-partsmith`: Python, `asyncio` or sync, on any SQLAlchemy 2
   engine. Start with [installation](getting-started/installation.md).
-- **Command line** — `pip install "pg-partsmith[cli]"`: `pg-partsmith plan`, `apply` and
-  `validate` over a YAML document, with exit codes a CronJob can read. See
+- **Command line** — `pip install "pg-partsmith[cli]"`: `pg-partsmith plan`, `apply`,
+  `validate` and `backfill` over a YAML document, with exit codes a CronJob can read. See
   [the CLI](guide/cli.md).
 - **Container image** — `ghcr.io/bedrock-python/pg-partsmith:latest`: the command line with
   no Python of your own, as a Job, a CronJob or an init container. See

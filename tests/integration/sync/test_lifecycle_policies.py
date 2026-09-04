@@ -395,10 +395,13 @@ def test__detach_mode_concurrent__without_a_default_partition__detaches(sync_db_
     assert result.dropped_count == 1
 
 
-def test__detach_mode_auto__with_a_default_partition__falls_back_to_the_blocking_form(
+def test__detach_mode_auto__with_a_default_partition__is_planned_as_the_blocking_form(
     sync_db_engine: Engine, table: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Arrange
+    # Arrange: the server refuses the concurrent form outright while a DEFAULT
+    # exists, and the planner reads the DEFAULT from the same catalog snapshot
+    # it plans from -- so the plan says blocking, and no statement is issued
+    # that could only fail.
     _seed_june_and_default(sync_db_engine, table, DetachMode.AUTO, default=True)
     config = monthly_config(table, lifecycle=_detach_config(table, DetachMode.AUTO))
 
@@ -406,11 +409,30 @@ def test__detach_mode_auto__with_a_default_partition__falls_back_to_the_blocking
     with caplog.at_level(logging.WARNING, logger="pg_partsmith.sync.repositories.remover"):
         result = run_maintenance(sync_db_engine, config, at_time="2026-08-01")
 
-    # Assert
+    # Assert: the outcome is what the fallback used to reach, without the failure
     assert result.issues == ()
     assert result.detached_count == 1
     assert result.dropped_count == 1
-    assert any("falling back to non-concurrent DETACH" in record.getMessage() for record in caplog.records)
+    assert not any("falling back to non-concurrent DETACH" in record.getMessage() for record in caplog.records)
+    assert result.maintenance_plan is not None
+    detach = result.maintenance_plan.detaches[0]
+    assert detach.mode is DetachMode.BLOCKING
+    assert "DEFAULT partition" in detach.detail
+
+
+def test__detach_mode_auto__without_a_default_partition__stays_concurrent(sync_db_engine: Engine, table: str) -> None:
+    # Arrange: nothing forces the blocking form here, so AUTO is what it says.
+    _seed_june_and_default(sync_db_engine, table, DetachMode.AUTO, default=False)
+    config = monthly_config(table, lifecycle=_detach_config(table, DetachMode.AUTO))
+
+    # Act
+    result = run_maintenance(sync_db_engine, config, at_time="2026-08-01")
+
+    # Assert
+    assert result.issues == ()
+    assert result.detached_count == 1
+    assert result.maintenance_plan is not None
+    assert result.maintenance_plan.detaches[0].mode is DetachMode.AUTO
 
 
 # ── Policies over facts ─────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ from pg_partsmith import console
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.aio.command_hooks import CommandHooks
 from pg_partsmith.cli import ExitCode, main
-from pg_partsmith.cli.commands import CommandResult, run_apply, run_plan, run_validate
+from pg_partsmith.cli.commands import CommandResult, run_apply, run_backfill, run_plan, run_validate
 from pg_partsmith.cli.loader import (
     DSN_ENV_VAR,
     DSN_FILE_ENV_VAR,
@@ -36,7 +36,7 @@ from pg_partsmith.cli.loader import (
 from pg_partsmith.cli.main import _hooks as _cli_hooks
 from pg_partsmith.cli.render import describe_locks, envelope, plan_entry
 from pg_partsmith.document import PartitionsDocument
-from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult
+from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult, MigrationResult
 from pg_partsmith.events import HookPhase
 from pg_partsmith.exceptions import InvalidPartitionConfigError, LockAcquisitionError
 from pg_partsmith.hook_commands import CommandHookError
@@ -404,6 +404,13 @@ def _applying_kit(result: MaintenanceResult | None = None) -> MagicMock:
     return kit
 
 
+def _migrating_kit(result: MigrationResult | None = None) -> MagicMock:
+    kit = MagicMock()
+    answer = result if result is not None else MigrationResult(rows_moved=900, batches=1, partitions=("p1", "p2"))
+    kit.service.partition_data = AsyncMock(return_value=answer)
+    return kit
+
+
 def _destructive_plan() -> MaintenancePlan:
     return MaintenancePlan(
         table_name="public.events",
@@ -496,6 +503,58 @@ async def test__apply__json__carries_the_plan_beside_the_result() -> None:
     assert entry["plan"]["operations"][0]["kind"] == "create"
 
 
+async def test__backfill__a_drained_default__is_exit_ok_and_says_so() -> None:
+    # Arrange
+    kit = _migrating_kit()
+
+    # Act
+    result = await run_backfill(kit, _configs())
+
+    # Assert
+    assert result.code is ExitCode.OK
+    assert kit.service.partition_data.await_args.kwargs == {"batch_rows": 10_000, "max_batches": None}
+    assert "moved 900 rows in 1 batches into 2 partitions; DEFAULT is drained" in result.render(output="human")
+
+
+async def test__backfill__the_batch_budget_ran_out__is_exit_drift_so_a_job_can_repeat() -> None:
+    # Arrange: exit 2 is the contract that lets a Job be run until it exits 0,
+    # rather than having to parse the output to learn there is more left.
+    kit = _migrating_kit(MigrationResult(rows_moved=10_000, batches=1, complete=False))
+
+    # Act
+    result = await run_backfill(kit, _configs(), max_batches=1)
+
+    # Assert
+    assert result.code is ExitCode.DRIFT
+    assert "run it again" in result.render(output="human")
+    assert kit.service.partition_data.await_args.kwargs["max_batches"] == 1
+
+
+async def test__backfill__a_window_it_could_not_move__outranks_the_drift() -> None:
+    # Arrange
+    issue = MaintenanceIssue(step=MaintenanceIssueStep.CREATE, partition_name="public.events_default", error="refused")
+    kit = _migrating_kit(MigrationResult(rows_moved=0, batches=0, complete=False, issues=(issue,)))
+
+    # Act
+    result = await run_backfill(kit, _configs())
+
+    # Assert
+    assert result.code is ExitCode.FINDINGS
+    assert "refused" in result.render(output="human")
+
+
+async def test__backfill__metrics__carry_the_rows_and_whether_anything_is_left() -> None:
+    # Arrange
+    kit = _migrating_kit(MigrationResult(rows_moved=250, batches=1, complete=False))
+
+    # Act
+    text = (await run_backfill(kit, _configs())).render(output="metrics")
+
+    # Assert
+    assert 'pg_partsmith_backfilled_rows{table="public.events"} 250' in text
+    assert 'pg_partsmith_backfill_incomplete{table="public.events"} 1' in text
+
+
 def test__load_plans__a_file_plan_save_wrote__reads_back_as_the_plan(tmp_path: Path) -> None:
     # Arrange
     saved = envelope("plan", [plan_entry(_plan())])
@@ -548,6 +607,15 @@ def test__apply__a_document_that_runs_commands__is_refused_unless_asked_for(tmp_
 
     # Assert: refused as configuration, before any connection is made
     assert code == ExitCode.CONFIG
+
+
+def test__backfill__a_document_that_runs_commands__is_refused_unless_asked_for(tmp_path: Path) -> None:
+    # Arrange: backfill creates partitions through the same executor apply
+    # uses, so its hooks really do fire; the permission is the same one.
+    config = _hooks_document(tmp_path)
+
+    # Act / Assert
+    assert main(["backfill", "-c", config]) == ExitCode.CONFIG
 
 
 def test__plan__a_document_that_runs_commands__needs_no_permission(tmp_path: Path) -> None:

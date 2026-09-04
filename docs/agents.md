@@ -55,9 +55,11 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
 * `PartitionToolkit.from_engine(engine, ...)` builds the repository, the metadata provider,
   the locks, the service and the maintainer around one engine, giving each setting that
   belongs to two of them (`marker_prefix`, `ddl_timezone`, `boundary_codec`) exactly once.
-* `pg-partsmith` (extra `cli`) runs `inspect` / `plan` / `validate` / `apply` over a
-  document and a DSN. The first three issue no DDL; `apply` withholds detaches and drops
-  unless `--allow-destructive`. `plan --save FILE` writes the artifact `apply --plan FILE`
+* `pg-partsmith` (extra `cli`) runs `inspect` / `plan` / `validate` / `apply` / `backfill`
+  over a document and a DSN. The first three issue no DDL; `apply` withholds detaches and
+  drops unless `--allow-destructive`. `backfill` is `partition_data` from the command line —
+  the one-off migration of a DEFAULT partition's rows into the partitions they belong in,
+  `--batch-rows` / `--max-batches`, exiting 2 while anything is left to move. `plan --save FILE` writes the artifact `apply --plan FILE`
   reads back, and applying it is refused if it was made for another table or under a
   configuration that has since changed (`--allow-config-drift` overrides). Exit codes: 0
   nothing pending, 2 drift under `plan --check`, 3 findings or run issues, 4 configuration,
@@ -72,7 +74,7 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   `PartitionEvent` as JSON on stdin; a non-zero exit refuses the operation. `PythonHooks`
   runs a block of Python per phase with `event` and `log` in scope; raising refuses. In a
   document both are the `hooks` section (a command list, or `{python: ...}` /
-  `{python_file: ...}`), honoured only under `apply --allow-hooks`; every block is compiled
+  `{python_file: ...}`), honoured only under `apply --allow-hooks` or `backfill --allow-hooks`; every block is compiled
   by `validate`. No sandbox is claimed. Hooks never fire during `plan`. See
   `guide/hooks-in-config.md`.
 * The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command

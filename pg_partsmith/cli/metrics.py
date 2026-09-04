@@ -141,11 +141,29 @@ def _apply_metrics(lines: list[str], tables: list[dict[str, Any]]) -> None:
     _emit(lines, f"{_PREFIX}_issues", "Problems this run reported and did not fail on.", issues)
 
 
+def _backfill_metrics(lines: list[str], tables: list[dict[str, Any]]) -> None:
+    """How far the migration out of DEFAULT has got, and whether it is finished."""
+    moved: list[tuple[dict[str, str], float]] = []
+    remaining: list[tuple[dict[str, str], float]] = []
+    issues: list[tuple[dict[str, str], float]] = []
+    for entry in tables:
+        table = str(entry.get("table", ""))
+        result = entry.get("result") or {}
+        moved.append(({"table": table}, result.get("rows_moved", 0)))
+        remaining.append(({"table": table}, 0.0 if result.get("complete", True) else 1.0))
+        issues.append(({"table": table}, len(result.get("issues", []))))
+
+    _emit(lines, f"{_PREFIX}_backfilled_rows", "Rows this run moved out of a DEFAULT partition.", moved)
+    _emit(lines, f"{_PREFIX}_backfill_incomplete", "1 while a table still has rows left in DEFAULT.", remaining)
+    _emit(lines, f"{_PREFIX}_issues", "Problems this run reported and did not fail on.", issues)
+
+
 _RENDERERS = {
     "plan": _plan_metrics,
     "inspect": _inspect_metrics,
     "validate": _validate_metrics,
     "apply": _apply_metrics,
+    "backfill": _backfill_metrics,
 }
 
 

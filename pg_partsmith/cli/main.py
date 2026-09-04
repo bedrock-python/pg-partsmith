@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg_partsmith.__version__ import __version__
 from pg_partsmith.aio import CommandHooks, PartitionToolkit, PythonHooks
+from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
 from pg_partsmith.document import PartitionsDocument
 from pg_partsmith.exceptions import (
     InvalidPartitionConfigError,
@@ -42,7 +43,7 @@ from pg_partsmith.hook_commands import CommandHookError
 from pg_partsmith.python_hooks import PythonHookError
 from pg_partsmith.utils import pg_sqlstate
 
-from .commands import CommandResult, run_apply, run_inspect, run_plan, run_validate
+from .commands import CommandResult, run_apply, run_backfill, run_inspect, run_plan, run_validate
 from .exit_codes import ExitCode
 from .loader import (
     DSN_ENV_VAR,
@@ -164,6 +165,8 @@ class _Invocation:
     allow_hooks: bool = False
     write: Path | None = None
     ok_if_locked: bool = False
+    batch_rows: int = DEFAULT_MOVE_BATCH_ROWS
+    max_batches: int | None = None
 
 
 def _version(value: bool) -> None:
@@ -325,6 +328,58 @@ def apply(
             allow_config_drift=allow_config_drift,
             allow_hooks=allow_hooks,
             write=write,
+            ok_if_locked=ok_if_locked,
+        )
+    )
+
+
+@app.command()
+def backfill(
+    config: ConfigOption,
+    dsn: DsnOption = None,
+    table: TableOption = None,
+    output: OutputOption = Output.human,
+    verbose: VerboseOption = False,
+    write: WriteOption = None,
+    batch_rows: Annotated[
+        int,
+        typer.Option("--batch-rows", metavar="N", min=1, help="rows moved per statement"),
+    ] = DEFAULT_MOVE_BATCH_ROWS,
+    max_batches: Annotated[
+        int | None,
+        typer.Option(
+            "--max-batches",
+            metavar="N",
+            min=1,
+            show_default=False,
+            help="stop after this many statements per table and exit 2; the next run carries on",
+        ),
+    ] = None,
+    allow_hooks: Annotated[
+        bool,
+        typer.Option(
+            "--allow-hooks",
+            help="run what the document's hooks section names; without it, a document declaring any is refused",
+        ),
+    ] = False,
+    ok_if_locked: Annotated[
+        bool,
+        typer.Option("--ok-if-locked", help="exit 0 rather than 6 when another maintainer holds the lock"),
+    ] = False,
+) -> int:
+    """Move a DEFAULT partition's rows into the partitions they belong in. Exits 2 while more is left."""
+    return _execute(
+        _Invocation(
+            "backfill",
+            config=config,
+            dsn=dsn,
+            tables=tuple(table or ()),
+            output=output,
+            verbose=verbose,
+            write=write,
+            batch_rows=batch_rows,
+            max_batches=max_batches,
+            allow_hooks=allow_hooks,
             ok_if_locked=ok_if_locked,
         )
     )
@@ -527,6 +582,10 @@ async def _run(invocation: _Invocation) -> CommandResult:
                 continue_on_error=invocation.continue_on_error,
                 allow_config_drift=invocation.allow_config_drift,
             )
+        if invocation.command == "backfill":
+            return await run_backfill(
+                kit, configs, batch_rows=invocation.batch_rows, max_batches=invocation.max_batches
+            )
         return await run_validate(kit, configs)
     finally:
         await engine.dispose()
@@ -537,7 +596,9 @@ def _hooks(
 ) -> list[PartitionLifecycleHooks] | None:
     """The hooks this run honours, and a refusal when it was not told to honour any.
 
-    Hooks fire during ``apply`` alone, so nothing else has to decide. Ignoring a
+    Hooks fire during the commands that carry out DDL -- ``apply`` and
+    ``backfill``, which creates partitions through the same executor -- so
+    nothing read-only has to decide. Ignoring a
     configured ``before_drop`` silently would be the worst outcome available: an
     operator would read the file, believe their archiver ran, and be wrong. So a
     document declaring hooks is refused rather than quietly stripped.
@@ -548,7 +609,7 @@ def _hooks(
     hooks = document.hooks
     if hooks is None or hooks.is_empty:
         return None
-    if command != "apply":
+    if command not in {"apply", "backfill"}:
         return None
     if not allow_hooks:
         named = ", ".join(phase.value for phase in hooks.actions())
