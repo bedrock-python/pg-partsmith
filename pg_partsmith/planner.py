@@ -31,7 +31,7 @@ from .boundaries import Axis, CursorSource, RangeBoundaries, Window
 from .constants import MAX_IDENTIFIER_LENGTH
 from .entities import MaintenanceIssue, MaintenanceIssueStep, TablePartitionConfig
 from .exceptions import PartitionTopologyError
-from .lifecycle import Candidate, DropAfter, LifecyclePolicy
+from .lifecycle import Candidate, DetachMode, DropAfter, LifecyclePolicy
 from .plan import (
     AttachPartition,
     CreatePartition,
@@ -546,6 +546,21 @@ class _Planner:
         )
         return _Member(child, None, None, None, managed=False, claimed=readable)
 
+    def _detach_mode(self, node: PartitionNode) -> DetachMode:
+        """The mode a detach from ``node`` will really run in.
+
+        PostgreSQL refuses ``DETACH … CONCURRENTLY`` outright while the parent
+        holds a DEFAULT partition, so AUTO there is the blocking form in
+        everything but name. Deciding that here rather than on the failure is
+        what lets ``plan --locks`` name the ``ACCESS EXCLUSIVE`` the operation
+        is really going to take, and spares the executor a statement that can
+        only fail. Every other reason to fall back is still discovered by
+        trying.
+        """
+        if self.policy.detach is not DetachMode.AUTO:
+            return self.policy.detach
+        return DetachMode.BLOCKING if any(child.is_default for child in node.children) else DetachMode.AUTO
+
     def _candidate(self, member: _Member, cursor_window: Window, boundaries: RangeBoundaries) -> Candidate:
         return Candidate(
             window=member.window,
@@ -576,12 +591,15 @@ class _Planner:
             return False
 
         detail = f"{boundaries.describe(member.window)} expired under '{self.policy.retention.describe()}'"
+        mode = self._detach_mode(node)
+        if mode is not self.policy.detach:
+            detail += "; the parent has a DEFAULT partition, so the detach is the blocking form"
         self.detaches.append(
             DetachPartition(
                 target=member.node.name,
                 oid=member.node.oid,
                 parent_name=node.name,
-                mode=self.policy.detach,
+                mode=mode,
                 bounds=member.node.bounds,
                 reason=Reason.RETENTION_EXPIRED,
                 detail=detail,

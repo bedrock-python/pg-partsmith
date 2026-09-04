@@ -443,7 +443,7 @@ class DetachPartition(OperationBase):
             transactional=False,
             lock="SHARE UPDATE EXCLUSIVE on the parent (CONCURRENTLY), ACCESS EXCLUSIVE on the partition and, in "
             "the second transaction, on every table referencing the parent through a foreign key; ACCESS EXCLUSIVE "
-            "on the parent when a DEFAULT partition forces the blocking form",
+            "on the parent should the server refuse the concurrent form",
         )
 
     @property

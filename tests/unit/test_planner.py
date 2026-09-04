@@ -1366,6 +1366,35 @@ def test__plan_maintenance__detach_mode__taken_from_the_policy() -> None:
     assert plan.detaches[0].mode is DetachMode.BLOCKING
 
 
+def test__plan_maintenance__detach_mode__auto_is_blocking_when_the_parent_holds_a_default() -> None:
+    # Arrange: PostgreSQL refuses a concurrent detach while a DEFAULT exists,
+    # so the plan says so rather than leaving it to the failure.
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=1)))
+    root = _root(*_months(7, 8), PartitionNode(name=f"{ROOT}_default", parent_name=ROOT, bounds=DefaultBounds()))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert plan.detaches[0].mode is DetachMode.BLOCKING
+    assert "DEFAULT partition" in plan.detaches[0].detail
+    assert "ACCESS EXCLUSIVE on the parent" in plan.detaches[0].capabilities.lock
+
+
+def test__plan_maintenance__detach_mode__concurrent_is_not_downgraded_by_a_default() -> None:
+    # Arrange: CONCURRENT means "fail when refused", which is a choice the
+    # planner has no business overruling.
+    config = _config(lifecycle=_policy(retention=KeepNewest(count=1), detach=DetachMode.CONCURRENT))
+    root = _root(*_months(7, 8), PartitionNode(name=f"{ROOT}_default", parent_name=ROOT, bounds=DefaultBounds()))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert plan.detaches[0].mode is DetachMode.CONCURRENT
+    assert "DEFAULT partition" not in plan.detaches[0].detail
+
+
 def test__plan_maintenance__keep_for__expires_windows_over_for_longer_than_the_age() -> None:
     # Arrange: 90 days before the 28th of August is the 30th of May.
     config = _config(lifecycle=_policy(retention=KeepFor(age=timedelta(days=90))))
