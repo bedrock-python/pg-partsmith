@@ -209,6 +209,60 @@ async def test__apply__allow_destructive__retires_what_retention_expired(
     assert payload["tables"][0]["result"]["detached_count"] == 1
 
 
+async def _with_a_default_full_of_history(db_engine: AsyncEngine, table: str) -> None:
+    """The state of an installation partitioned around data already in it."""
+    await exec_sql(db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    await exec_sql(
+        db_engine,
+        f'INSERT INTO "{table}" (created_at, payload) '  # noqa: S608
+        "SELECT now() - (n * interval '20 days'), 'row' FROM generate_series(1, 9) AS n",
+    )
+
+
+async def _rows_left_in_default(db_engine: AsyncEngine, table: str) -> int:
+    async with db_engine.begin() as conn:
+        return (await conn.execute(text(f'SELECT count(*) FROM "{table}_default"'))).scalar_one()  # noqa: S608
+
+
+async def test__backfill__rows_in_a_default_partition__are_moved_into_the_windows_they_belong_in(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: creation walks forward from the cursor, so nothing else reaches these rows
+    await _with_a_default_full_of_history(db_engine, table)
+    config = _document(tmp_path, table, _dsn(db_engine))
+
+    # Act
+    code = await _run_cli("backfill", "-c", config)
+
+    # Assert
+    assert code == ExitCode.OK
+    assert await _rows_left_in_default(db_engine, table) == 0
+    async with db_engine.begin() as conn:
+        total = (await conn.execute(text(f'SELECT count(*) FROM "{table}"'))).scalar_one()  # noqa: S608
+    assert total == 9
+
+
+async def test__backfill__the_batch_budget__exits_drift_and_the_next_run_carries_on(
+    db_engine: AsyncEngine, table: str, tmp_path: Path
+) -> None:
+    # Arrange: exit 2 is what lets a Job be run until it exits 0
+    await _with_a_default_full_of_history(db_engine, table)
+    config = _document(tmp_path, table, _dsn(db_engine))
+
+    # Act
+    first = await _run_cli("backfill", "-c", config, "--max-batches", "1")
+    left_after_the_first = await _rows_left_in_default(db_engine, table)
+    while await _run_cli("backfill", "-c", config, "--max-batches", "1") == ExitCode.DRIFT:
+        pass
+
+    # Assert: every row already moved stayed moved, and nothing was lost
+    assert first == ExitCode.DRIFT
+    assert 0 < left_after_the_first < 9
+    assert await _rows_left_in_default(db_engine, table) == 0
+    async with db_engine.begin() as conn:
+        assert (await conn.execute(text(f'SELECT count(*) FROM "{table}"'))).scalar_one() == 9  # noqa: S608
+
+
 async def test__plan_save__then_apply__is_the_artifact_between_the_two(
     db_engine: AsyncEngine, table: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

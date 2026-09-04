@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from pg_partsmith.aio import PartitionToolkit, PartitionValidationService
+from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
 from pg_partsmith.exceptions import InvalidPartitionConfigError
 from pg_partsmith.plan import MaintenancePlan, OperationKind
 
@@ -24,11 +25,11 @@ from .render import describe_locks, describe_tree, envelope, plan_entry, to_json
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from pg_partsmith.entities import MaintenanceResult, TablePartitionConfig
+    from pg_partsmith.entities import MaintenanceResult, MigrationResult, TablePartitionConfig
 
 logger = logging.getLogger("pg_partsmith.cli")
 
-__all__ = ["CommandResult", "run_apply", "run_inspect", "run_plan", "run_validate"]
+__all__ = ["CommandResult", "run_apply", "run_backfill", "run_inspect", "run_plan", "run_validate"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +216,53 @@ async def run_apply(
     )
 
 
+async def run_backfill(
+    kit: PartitionToolkit,
+    configs: Sequence[TablePartitionConfig],
+    *,
+    batch_rows: int = DEFAULT_MOVE_BATCH_ROWS,
+    max_batches: int | None = None,
+) -> CommandResult:
+    """Move what a DEFAULT partition holds into the partitions those rows belong in.
+
+    The migration an existing installation needs once, and the half of adoption
+    create-ahead cannot reach: a table partitioned around data already in it
+    has every old row in DEFAULT, and creation walks forward from the cursor.
+    Window by window, oldest first, the partition is created, filled in
+    batches and attached.
+
+    Exiting DRIFT while anything is left to move is what lets a Job be run
+    until it exits 0, rather than having to parse the output to learn whether
+    the batch budget ran out.
+
+    Args:
+        kit: The wiring.
+        configs: The tables to migrate, in order.
+        batch_rows: Rows moved per statement.
+        max_batches: Stop after this many statements per table and report what is left.
+
+    Returns:
+        What was moved, and the code to exit with.
+    """
+    blocks: list[str] = []
+    entries: list[dict[str, Any]] = []
+    incomplete = False
+    issues = False
+    for config in configs:
+        result = await kit.service.partition_data(config, batch_rows=batch_rows, max_batches=max_batches)
+        incomplete = incomplete or not result.complete
+        issues = issues or bool(result.issues)
+        entries.append({"table": config.qualified_name, "result": result.model_dump(mode="json", by_alias=True)})
+        blocks.append(_describe_migration(config.qualified_name, result))
+
+    code = ExitCode.OK
+    if issues:
+        code = ExitCode.FINDINGS
+    elif incomplete:
+        code = ExitCode.DRIFT
+    return CommandResult(code=code, lines=blocks, payload=envelope("backfill", entries))
+
+
 def _plan_for(config: TablePartitionConfig, plans: dict[str, MaintenancePlan]) -> MaintenancePlan:
     """The saved plan for one table, or a refusal naming what the file does hold."""
     plan = plans.get(config.qualified_name)
@@ -223,6 +271,15 @@ def _plan_for(config: TablePartitionConfig, plans: dict[str, MaintenancePlan]) -
         msg = f"The plan file has nothing for {config.qualified_name!r}; it holds {known}"
         raise ConfigError(msg)
     return plan
+
+
+def _describe_migration(table_name: str, result: MigrationResult) -> str:
+    """One block per table: what moved, into how many partitions, and what is left."""
+    into = f" into {len(result.partitions)} partitions" if result.partitions else ""
+    state = "DEFAULT is drained" if result.complete else "more to move — run it again"
+    lines = [f"{table_name} — moved {result.rows_moved} rows in {result.batches} batches{into}; {state}"]
+    lines.extend(f"  [{issue.step.value}] {issue.partition_name}: {issue.error}" for issue in result.issues)
+    return "\n".join(lines)
 
 
 def _describe_result(table_name: str, result: MaintenanceResult) -> str:
