@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.4.0...pg-partsmith-v1.5.0) (2026-09-04)
+
+
+### Features
+
+* **cli:** backfill from the command line, and a plan that names the blocking detach ([#58](https://github.com/bedrock-python/pg-partsmith/issues/58)) ([d61f285](https://github.com/bedrock-python/pg-partsmith/commit/d61f285021fa355d503c1b2990d026970750fd24))
+
 ## [1.4.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.3.0...pg-partsmith-v1.4.0) (2026-09-03)
 
 
