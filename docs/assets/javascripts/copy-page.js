@@ -9,9 +9,10 @@
 
   var RESET_AFTER_MS = 2000;
 
-  /* Where the Markdown of a page is written, as an absolute URL. The pair of
-     data attributes says how far the site root is from here and where this
-     page sits below it; scripts/emit_markdown.py writes the file to match. */
+  /* Where the Markdown of a page is written, as an absolute URL. Two data
+     attributes say how far the site root is from here and where this page sits
+     below it; scripts/emit_markdown.py writes the file to match. The site's own
+     name is a third, so this file is the same in every project that carries it. */
   function markdownUrl(widget) {
     var base = (widget.dataset.copyBase || ".").replace(/\/$/, "");
     var page = widget.dataset.copyPage || "";
@@ -21,12 +22,15 @@
 
   function prompt(widget) {
     var title = widget.dataset.copyTitle || document.title;
+    var site = widget.dataset.copySite || "project";
     return (
       "Read " +
       markdownUrl(widget) +
       ' -- the "' +
       title +
-      '" page of the pg-partsmith documentation -- so I can ask questions about it.'
+      '" page of the ' +
+      site +
+      " documentation -- so I can ask questions about it."
     );
   }
 
