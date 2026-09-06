@@ -230,7 +230,7 @@ Nesting is `child=`, up to five levels including the root.
 
 | Axis | Constructor |
 |---|---|
-| Calendar over a timestamp | `TimeBoundaries(granularity=… \| calculator=…, tz="UTC", codec=None)` |
+| Calendar over a timestamp | `TimeBoundaries(granularity=… | calculator=…, tz="UTC", codec=None)` |
 | Calendar over an encoded key | the same, with `codec=UUIDv7BoundaryCodec()` or `EpochBoundaryCodec(unit)` |
 | Fixed-width integer windows | `NumericBoundaries(step, origin=0, name_suffix="__{start}", cursor_source=…)` |
 | One value per partition | `IntegerSequence(start=1, name_suffix="__{value}", cursor_source=…)` |
@@ -268,12 +268,12 @@ Every method takes the `TablePartitionConfig` as its first argument.
 
 | Method | Lock | DDL | Returns |
 |---|---|---|---|
-| `inspect(config)` | no | no | `ActualTree \| None` |
+| `inspect(config)` | no | no | `ActualTree | None` |
 | `plan(config, *, mode=PlanMode.MAINTAIN, now=None, windows=None)` | no | no | `MaintenancePlan` |
 | `apply(config, plan, *, continue_on_error=False, allow_config_drift=False)` | **yes** | yes | `MaintenanceResult` |
 | `maintain(config, *, skip_create=False, skip_detach=False, skip_drop=False, continue_on_error=False)` | **yes** | yes | `MaintenanceResult` |
 | `reconcile(config)` | no | yes | `MaintenanceResult` |
-| `ensure_partition(config, period_or_window_or_position)` | no | yes | `PartitionInfo \| None` |
+| `ensure_partition(config, period_or_window_or_position)` | no | yes | `PartitionInfo | None` |
 | `ensure_partitions(config, periods)` | no | yes | `list[PartitionInfo]` |
 | `partition_data(config, *, batch_rows=10_000, max_batches=None)` | **yes** | yes | `MigrationResult` |
 | `unpartition(config, into, *, batch_rows=10_000, max_batches=None, drop_emptied=False)` | **yes** | yes | `MigrationResult` |
