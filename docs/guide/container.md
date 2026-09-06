@@ -66,12 +66,12 @@ its own rather than the application's:
 ```sql
 CREATE ROLE partsmith LOGIN PASSWORD '…';
 
--- Enough to create partitions in the schema and attach them
+-- The schema: needed, and not enough on its own
 GRANT USAGE, CREATE ON SCHEMA public TO partsmith;
 
--- Enough to detach and drop them: PostgreSQL requires ownership of both the
--- partition and the parent for ATTACH/DETACH, so the role owns the tables it
--- maintains, or is a member of the role that does.
+-- The tables: PostgreSQL lets only the parent's owner run CREATE TABLE … PARTITION OF,
+-- ATTACH and DETACH, and only a table's owner drop it, so the role owns the tables
+-- it maintains, or is a member of the role that does.
 ALTER TABLE public.events OWNER TO partsmith;
 -- or: GRANT app_owner TO partsmith;
 ```

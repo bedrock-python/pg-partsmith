@@ -4,7 +4,7 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.2.x   | ✅ the current release; fixes ship as the next patch or minor |
+| 1.5.x   | ✅ the current release; fixes ship as the next patch or minor |
 | older   | ❌ upgrade to the current release first |
 
 The library, the command line and the container image share one version number, so a fix

@@ -27,7 +27,7 @@ Every one of them takes the same `PartitionEvent`:
 
 | Field | What it is |
 |---|---|
-| `phase` | which of the six moments this is |
+| `phase` | which of the eight moments this is |
 | `config` | the table's configuration — the calendar, the codec, the policy in force |
 | `partition` | the partition itself: `name`, `bounds`, `oid`, `subpartition_type` |
 | `window` | the period it covers; `None` for a member of a root `HASH` or `LIST` |
@@ -64,7 +64,7 @@ logs.
 
 ### One method for every phase
 
-An audit trail or a metrics counter wants all six moments and treats them alike. That is
+An audit trail or a metrics counter wants all eight moments and treats them alike. That is
 `on_event`, which fires for every phase in addition to the method named after it — so a
 hook implementing both is called twice, on purpose:
 

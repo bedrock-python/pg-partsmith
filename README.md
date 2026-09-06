@@ -52,7 +52,7 @@ Three ways in, one version number:
   at their own modulus; partitions the scheme did not produce are reported, never touched;
   foreign tables are inspected, never dropped
 - **Async and sync** — `pg_partsmith.aio` on `AsyncEngine`, `pg_partsmith.sync` on `Engine`
-- **A command line** — `pg-partsmith inspect / plan / validate / apply` over a YAML or
+- **A command line** — `pg-partsmith inspect / plan / validate / apply / backfill` over a YAML or
   JSON document, with a saved plan as the artifact between plan and apply, and exit codes
   a CronJob and a CI step can read
 - **A container image** — `ghcr.io/bedrock-python/pg-partsmith`, for stacks with no Python
@@ -187,7 +187,8 @@ LifecyclePolicy(retention=ExpireIf(AllOf((KeepNewest(count=2),
 
 ## What maintenance does
 
-1. **Inspect** — one catalog round-trip reads the whole tree (`pg_partition_tree`), the
+1. **Inspect** — one catalog round-trip reads the whole tree (a recursive walk over
+   `pg_inherits`, which still sees a half-detached partition), the
    marker-tagged detached orphans, and — only when a policy asks — sizes and row estimates.
 2. **Plan** — the planner walks the scheme and the tree together. At a `RANGE` level it
    decides which windows must exist ahead of the cursor (the clock, or `max(key)` for an
@@ -212,7 +213,8 @@ test, not a promise.
 - A hash set at a modulus the config no longer uses is preserved if complete and repaired
   *at its own modulus* if not; mixed moduli leaving a gap are reported, never guessed at.
 - A plan made at 10:00 and applied at 10:05 refuses to drop a table that was recreated in
-  between (`PlanStaleError`, reported as an issue).
+  between (`PlanStaleError`: the run stops there, or records the issue under
+  `continue_on_error`).
 
 ## Sync usage
 
@@ -236,8 +238,10 @@ service = PartitionLifecycleService(
 result = PartitionMaintainer(service).run_maintenance_safe(config)
 ```
 
-Two behavioural differences: `ddl_timeout_seconds` is enforced server-side via
-`statement_timeout` per statement, and the Redis lock renews from a background thread.
+Three behavioural differences: `ddl_timeout_seconds` is enforced server-side via
+`statement_timeout` per statement, the Redis lock renews from a background thread and can
+only warn when the lease is lost, and a Python block hook runs inline rather than on a
+thread of its own.
 
 ## Hooks
 
@@ -267,7 +271,9 @@ planned and the size the policy measured, when it asked for one.
 | `before_drop` / `after_drop` | around a drop — `before_drop` is the last chance to read the data |
 | `on_event` | every one of the above, for an audit trail or metrics in one method |
 
-`before_*` exceptions abort that operation; `after_*` exceptions are logged.
+`before_*` exceptions abort that operation; `after_*` exceptions are logged and re-raised
+too — the operation already happened, but the run stops there (or records the issue under
+`continue_on_error`).
 
 ## Documentation
 
