@@ -133,8 +133,8 @@ uv run python scripts/sync_mirror.py
 uv run ruff check --fix pg_partsmith/sync && uv run ruff format pg_partsmith/sync
 ```
 
-The lock managers, `maintainer.py`, `repositories/{resolver,fk_manager,timeouts}.py` are
-maintained by hand.
+The lock managers, `maintainer.py`, `command_hooks.py`, `python_hooks.py` and
+`repositories/{resolver,fk_manager,timeouts,pin}.py` are maintained by hand.
 
 The tests follow the same rule. `tests/integration/sync/` is generated from
 `tests/integration/aio/`:

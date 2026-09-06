@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Package | `pg-partsmith` on PyPI, import root `pg_partsmith` |
-| Requires | Python 3.11+, PostgreSQL 15+ (tested on 15, 16 and 17), SQLAlchemy 2 |
+| Requires | Python 3.11+, PostgreSQL 15+ (tested on 15 through 18), SQLAlchemy 2 |
 | Install | `pip install pg-partsmith` · extras: `cli`, `redis-locks`, `pydantic-settings` |
 | Async | `pg_partsmith.aio`, on an `AsyncEngine` |
 | Sync | `pg_partsmith.sync` — same class names, same arguments, no `await` |

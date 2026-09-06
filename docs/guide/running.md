@@ -3,7 +3,7 @@
 `pg-partsmith` is a process that runs one command and exits with a code. It has no
 scheduler of its own, on purpose: cron, a CronJob, a CI schedule or a systemd timer
 already exist wherever it will run, and a long-lived daemon holding DDL credentials would
-need its own liveness story for no gain. Every scenario below is the same four commands
+need its own liveness story for no gain. Every scenario below is the same five commands
 in a different harness.
 
 The commands, and which ones change anything:
@@ -14,6 +14,7 @@ The commands, and which ones change anything:
 | `inspect` | no | no | no | a terminal, a dashboard |
 | `plan` | no | no | no | review, monitoring (`--check`, `--output metrics`) |
 | `apply` | yes | yes | with `--allow-hooks` | a schedule, an init step |
+| `backfill` | yes | yes | with `--allow-hooks` | a Job, once, when an existing table gets partitions |
 
 `apply` creates and re-attaches by default and retires nothing; `--allow-destructive`
 adds detaches and drops. That is the whole difference between "safe at startup" and
@@ -491,7 +492,7 @@ production is the same alert as the CronJob version, from the other side.
 
 Airflow's `KubernetesPodOperator` or `DockerOperator`, Argo Workflows, Nomad's periodic
 jobs, Dagster, Rundeck: anything that runs a container and reads an exit code runs this.
-The contract is the four commands, the three inputs, and the codes — nothing about the
+The contract is the five commands, the three inputs, and the codes — nothing about the
 harness is assumed. Treat `6` as success and `2` (under `--check`) as a signal, not a
 failure, and the rest maps onto whatever the scheduler calls "failed".
 

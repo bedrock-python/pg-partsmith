@@ -46,8 +46,9 @@ What a stopped run leaves behind is what the library promises for any cancellati
 most a detached, unattached table (attach is the last step of a creation) or a marked,
 half-detached partition, and the next run converges both.
 
-A block of Python in a hook cannot be interrupted mid-way — the signal is honoured the
-moment the block returns. A command can, and is.
+A block of Python in a hook runs on a thread of its own, so a stop does not wait for it:
+the run is cancelled and exits, and a block still running at that point is abandoned with
+the process. A command's child is terminated on purpose.
 
 ## Shell completion
 
@@ -180,9 +181,8 @@ therefore reviewable for its locks without the CLI.
 
 **Why there is no `--sql`.** Printing the statements would be the obvious next thing, and
 it is deliberately not offered. The DDL is built at execution time from decisions that are
-only made then — whether a `DETACH CONCURRENTLY` has to fall back to the blocking form
-because a DEFAULT sibling exists, how rows a DEFAULT partition holds for a new window get
-moved, which orphan marker gets cleared — and a rendering that left those out would be
+only made then — how rows a DEFAULT partition holds for a new window get moved, which
+orphan marker gets cleared — and a rendering that left those out would be
 read as a transcript in exactly the cases a review exists to catch. The plan is the
 contract: what, why, how big, what it locks.
 
