@@ -15,7 +15,7 @@
 - [ ] Tests added or updated
 - [ ] `make check` passes locally (`ruff` + `mypy`)
 - [ ] `CHANGELOG.md` updated under `[Unreleased]`
-- [ ] Documentation updated (if the public API changed)
+- [ ] Documentation updated (if the public API changed), `docs/agents.md` included
 
 ## Related issues
 

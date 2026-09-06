@@ -11,7 +11,7 @@
      with `copy_page: false` in its front matter. -#}
   {% if page.meta.copy_page != false %}
   <div class="md-copy-page" data-copy-base="{{ base_url }}" data-copy-page="{{ page.url }}"
-       data-copy-title="{{ page.title }}">
+       data-copy-title="{{ page.title }}" data-copy-site="{{ config.site_name }}">
     <div class="md-copy-page__group">
       <button type="button" class="md-copy-page__button md-copy-page__button--main" data-copy-action>
         <span class="md-copy-page__icon md-copy-page__icon--idle">
