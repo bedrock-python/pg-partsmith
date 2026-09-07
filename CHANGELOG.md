@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.5.0...pg-partsmith-v1.5.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* attach the window a live writer is filling, under one lock ([#65](https://github.com/bedrock-python/pg-partsmith/issues/65)) ([7e56adf](https://github.com/bedrock-python/pg-partsmith/commit/7e56adfcb3d670729657cd8d02a49c0496de2d59))
+
 ## [1.5.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.4.0...pg-partsmith-v1.5.0) (2026-09-04)
 
 
