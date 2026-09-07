@@ -48,7 +48,12 @@ await maintainer.run_maintenance_safe(config)
 
 The tick creates the current month and the two after it. As each is attached, the rows
 of that month move out of `events_legacy` into it — ordinary DEFAULT reconciliation.
-From now on new rows land in real partitions; the old ones are still in the DEFAULT.
+The current month is the one the application is writing into, and it attaches on this
+first tick like the empty future ones: the bulk of its rows move first, then the rows that
+arrived while that ran move *and* the partition goes live in one transaction. Inserts wait
+at the parent for that commit and are then routed into the new partition, their statement
+unchanged. From now on new rows land in real partitions; the old ones are still in the
+DEFAULT.
 
 ## 3. Drain the DEFAULT partition
 
@@ -65,7 +70,10 @@ Each call:
 3. moves the window's rows into it in batches of `batch_rows` — one
    `DELETE … RETURNING` / `INSERT` per batch, each committing on its own, so a row is in
    exactly one place at every commit point;
-4. attaches the partition once nothing of that window is left in DEFAULT;
+4. takes whatever landed during the last batch and attaches the partition, in one
+   transaction and under one lock — so a window still being written to is attached on the
+   same pass as a quiet one, and what the lock covers is a tail and a scan rather than a
+   month;
 5. moves on to the next window, until DEFAULT holds only rows no window can take (rows
    with a NULL key), or `max_batches` is spent.
 
@@ -80,14 +88,19 @@ finds it, finishes it and attaches it.
     a partition cannot be attached while DEFAULT still holds rows for it. Run the drain in
     a maintenance window, or with small batches during a quiet hour and readers that can
     tolerate a month's rows appearing a little later. Rows already in real partitions, and
-    rows still in DEFAULT for other windows, stay visible throughout.
+    rows still in DEFAULT for other windows, stay visible throughout. The attach that ends
+    a window blocks writers at the parent and holds `ACCESS EXCLUSIVE` on the DEFAULT
+    partition, for the length of the last batch's tail plus one scan of DEFAULT — so
+    inserts stall for that long rather than fail, and readers of the partitions already
+    drained carry on.
 
 `partition_data` takes the table's lock, so it does not race the scheduled tick. It
-refuses a window it cannot create (an unmanaged partition overlaps it), and any move an
-incoming foreign key's `ON DELETE` action would corrupt, with a `move` issue and
-`complete=False` rather than loop. A window whose partition already exists *detached*
-with this library's marker — retention retired it, and late rows for it landed in
-DEFAULT — is filled and re-attached rather than given up on.
+refuses a window it cannot create (an unmanaged partition overlaps it), any move an
+incoming foreign key's `ON DELETE` action would corrupt, and a DEFAULT partition it could
+not clear, with a `move` issue and `complete=False` rather than loop — and never by
+raising at the caller. A window whose partition already exists *detached* with this
+library's marker — retention retired it, and late rows for it landed in DEFAULT — is
+filled and re-attached rather than given up on.
 
 ## 4. Afterwards
 
@@ -102,6 +115,21 @@ DROP TABLE events_legacy;
 
 Without a DEFAULT partition, `DETACH … CONCURRENTLY` becomes available, which is what
 `DetachMode.AUTO` prefers.
+
+!!! note "A `serial` key's sequence still belongs to the old table"
+    `BIGSERIAL` makes the sequence **owned by** the column it was declared on, so after the
+    swap it belongs to `events_legacy` — while every partition's `id` default draws from it.
+    `DROP TABLE events_legacy` is refused for exactly that (`2BP01`, *other objects depend
+    on it*, listing one default per partition). Move the ownership to the live parent first:
+
+    ```sql
+    ALTER SEQUENCE events_id_seq OWNED BY events.id;
+    ```
+
+    Then the drop goes through and the ids carry on where they were. Do **not** reach for
+    `DROP TABLE … CASCADE` here: measured on 17, it takes the sequence with the table and
+    every default that drew from it, and the next insert fails
+    `null value in column "id" … violates not-null constraint`.
 
 ## The way back
 

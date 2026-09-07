@@ -439,6 +439,17 @@ class PlanExecutor:
     ) -> None:
         """Attach a partition, moving DEFAULT rows out of the way for a RANGE window.
 
+        The first attempt is the plain attach: a parent with no DEFAULT
+        partition, or one holding nothing for the window, pays for nothing
+        else. A DEFAULT conflict turns the second attempt into
+        ``reconcile_and_attach``, which moves and attaches in one transaction
+        under the lock ``ATTACH`` takes on the DEFAULT partition anyway -- the
+        two cannot be separate transactions on a table that is being written
+        to, because the writer fills the window again in the gap between them.
+        The bulk of the window is moved before that, in the reconcile's own
+        lighter transaction, so what the exclusive lock covers is the rows
+        that arrived while it ran, plus the scan.
+
         If the attach ultimately fails after rows were reconciled out of the
         DEFAULT partition, the moved rows are returned to DEFAULT (best effort)
         so they do not end up stranded in a table that is invisible through the
@@ -452,17 +463,34 @@ class PlanExecutor:
         key_arity = max(1, len(key_columns))
         reconciled_from: tuple[str, int | None] | None = None
         window = bounds if isinstance(bounds, RangeBounds) else None
+        default_partition: PartitionInfo | None = None
 
         for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
-                self._repo.attach_partition(
-                    parent_name,
-                    partition_name,
-                    bounds,
-                    key_arity=key_arity,
-                    expected_oid=expected_oid,
-                    expected_parent_oid=expected_parent_oid,
-                )
+                if default_partition is None or window is None:
+                    self._repo.attach_partition(
+                        parent_name,
+                        partition_name,
+                        bounds,
+                        key_arity=key_arity,
+                        expected_oid=expected_oid,
+                        expected_parent_oid=expected_parent_oid,
+                    )
+                else:
+                    moved = self._repo.reconcile_and_attach(
+                        parent_name,
+                        partition_name,
+                        window,
+                        key_columns=key_columns,
+                        default_partition_name=default_partition.name,
+                        expected_oid=expected_oid,
+                        expected_parent_oid=expected_parent_oid,
+                        expected_default_oid=default_partition.oid,
+                    )
+                    logger.info(
+                        "Attached with the window's last rows taken under one lock",
+                        extra={"partition_name": partition_name, "moved_rows": moved},
+                    )
             except (KeyboardInterrupt, SystemExit):
                 # Shielded so the compensating move-back completes even mid-cancellation.
                 (self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns))
@@ -470,6 +498,11 @@ class PlanExecutor:
             except (OSError, TimeoutError):
                 self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
                 raise
+            except RowMoveRefusedError as refusal:
+                # The move inside ``reconcile_and_attach`` rolled back with the
+                # attach; the rows moved before it go back here.
+                self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
+                raise self._rows_stuck_in_default(parent_name, partition_name, refusal.detail) from refusal
             except Exception as exc:
                 # Recognised structurally, by the SQLSTATE the driver carries,
                 # rather than by a driver's exception type: a repository built
@@ -505,12 +538,17 @@ class PlanExecutor:
                     ) from exc
 
                 if attempt == DEFAULT_CONFLICT_MAX_RETRIES:
-                    logger.exception(
+                    # Nothing left to try: the DEFAULT partition still holds
+                    # rows for this window and this run cannot take them. That
+                    # is a topology finding, not a failure of the run -- the
+                    # other partitions are maintained, and ``partition_data``
+                    # reports the window instead of ending on the exception.
+                    logger.warning(
                         "Failed to attach after reconciliation retries",
                         extra={"partition_name": partition_name, "attempts": attempt},
                     )
                     self._restore_reconciled_rows(reconciled_from, partition_name, expected_oid, window, key_columns)
-                    raise
+                    raise self._rows_stuck_in_default(parent_name, partition_name, describe_exception(exc)) from exc
 
                 default_partition = self._metadata.get_default_partition(parent_name)
                 if not default_partition:
@@ -552,17 +590,28 @@ class PlanExecutor:
                 except RowMoveRefusedError as refusal:
                     # Rows of DEFAULT belong to the new partition but cannot be
                     # moved safely; the partition stays out, the run goes on.
-                    raise PartitionTopologyError(
-                        parent_name,
-                        FindingReason.DEFAULT_HOLDS_ROWS.value,
-                        f"{parent_name} cannot gain {partition_name!r} while its DEFAULT partition holds rows that "
-                        f"belong to it, and they cannot be moved: {refusal.detail}",
-                    ) from refusal
+                    raise self._rows_stuck_in_default(parent_name, partition_name, refusal.detail) from refusal
                 if moved:
                     reconciled_from = (default_partition.name, default_partition.oid)
                 logger.info("Reconciliation completed", extra={"partition_name": partition_name, "moved_rows": moved})
             else:
                 return
+
+    @staticmethod
+    def _rows_stuck_in_default(parent_name: str, partition_name: str, detail: str) -> PartitionTopologyError:
+        """The DEFAULT partition holds rows for the new partition that this run could not clear.
+
+        A finding about the shape of the tree, not a failure of the run: every
+        other partition is still maintained, ``apply`` records it in
+        ``result.issues``, and ``partition_data`` reports the window rather
+        than ending on the driver's exception.
+        """
+        return PartitionTopologyError(
+            parent_name,
+            FindingReason.DEFAULT_HOLDS_ROWS.value,
+            f"{parent_name} cannot gain {partition_name!r} while its DEFAULT partition holds rows that belong to "
+            f"it, and this run could not clear them: {detail}",
+        )
 
     def _restore_reconciled_rows(
         self,

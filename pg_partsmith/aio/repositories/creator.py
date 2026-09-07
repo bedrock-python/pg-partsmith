@@ -391,21 +391,7 @@ class PartitionCreator:
         Returns:
             Number of rows moved.
         """
-        if not key_columns:
-            msg = "reconcile_default_rows needs the parent's partition key"
-            raise ValueError(msg)
-
-        column_quoted = quote_identifier(key_columns[0])
-        from_quoted = quote_literal(from_value)
-        to_quoted = quote_literal(to_value)
-
-        # PostgreSQL adds an IS NOT NULL test for *every* key column to a range
-        # partition's constraint, so a row with a NULL trailing key value
-        # belongs in DEFAULT whatever its leading value is. Moving it out would
-        # be rejected -- and the rejection would look exactly like the DEFAULT
-        # conflict this call exists to clear, so the retry would never converge.
-        not_null = "".join(f" AND {quote_identifier(column)} IS NOT NULL" for column in key_columns[1:])
-
+        condition = _window_condition("reconcile_default_rows", key_columns, from_value, to_value)
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             # Boundary literals must be interpreted in the same timezone ATTACH uses,
             # otherwise a non-UTC server timezone moves the wrong row range.
@@ -415,8 +401,6 @@ class PartitionCreator:
             # Deferred foreign-key checks would otherwise escape to COMMIT,
             # outside the per-statement translation below.
             await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
-            # All identifiers and literals are properly quoted, S608 is a false positive
-            condition = f"{column_quoted} >= {from_quoted} AND {column_quoted} < {to_quoted}{not_null}"
             return await self._move(
                 conn,
                 default_partition_name,
@@ -426,6 +410,95 @@ class PartitionCreator:
                 expected_source_oid=expected_source_oid,
                 expected_target_oid=expected_target_oid,
             )
+
+    async def reconcile_and_attach(
+        self,
+        parent_name: str,
+        partition_name: str,
+        bounds: RangeBounds,
+        *,
+        key_columns: tuple[str, ...],
+        default_partition_name: str,
+        expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
+        expected_default_oid: int | None = None,
+    ) -> int:
+        """Take the window's last rows out of DEFAULT and attach, in one transaction.
+
+        The reconcile-then-attach pair cannot be two transactions on a table
+        that is being written to: the move commits, the DEFAULT partition is
+        free again, and a row for the window lands in it before ``ATTACH``
+        scans -- which fails the attach with the very conflict the move was
+        clearing. Under a steady write rate that never converges.
+
+        So both go under one lock. The transaction takes its locks up front --
+        ``EXCLUSIVE`` on the parent, ``ACCESS EXCLUSIVE`` on the partition and
+        on the DEFAULT sibling -- moves the rows, and attaches. Nothing can put
+        a row into DEFAULT between the move and the scan, because nothing has
+        been able to reach DEFAULT since before the move; a writer waits at the
+        parent and is then routed into the new partition, statement unchanged.
+        A failed attach rolls the move back with it, so this path needs no
+        compensating move-back either.
+
+        Only the tail belongs here. The bulk of a window is moved first with
+        :meth:`reconcile_default_rows`, which holds the lighter ``SHARE ROW
+        EXCLUSIVE`` and leaves readers of DEFAULT alone; what this call takes
+        exclusively is the rows that arrived while that ran, plus the scan
+        ``ATTACH`` does anyway.
+
+        Args:
+            parent_name: Partitioned relation to attach to.
+            partition_name: Table to attach.
+            bounds: The RANGE window the partition owns, and the rows to take.
+            key_columns: The parent's partition key, leading column first.
+                Rows with a NULL in a trailing column stay in DEFAULT, where
+                PostgreSQL routes them.
+            default_partition_name: Qualified name of the DEFAULT partition.
+            expected_oid: The identity the decision to attach was made about.
+            expected_parent_oid: The identity of the relation the partition
+                should go into.
+            expected_default_oid: The identity of the relation the rows should
+                come from.
+
+        Returns:
+            Number of rows moved out of the DEFAULT partition.
+
+        Raises:
+            PlanStaleError: If any of the three names is not held by the
+                relation the caller decided about; nothing moves, nothing
+                stays attached.
+            RowMoveRefusedError: If a foreign key's ``ON DELETE`` action would
+                fire on the rows as they leave the DEFAULT partition.
+        """
+        condition = _window_condition("reconcile_and_attach", key_columns, bounds.from_value, bounds.to_value)
+        clause, values = _values_clause(bounds, max(1, len(key_columns)))
+        stmt = build_ddl_statement(
+            "ALTER TABLE {parent} ATTACH PARTITION {partition} " + clause,
+            parent=parent_name,
+            partition=partition_name,
+            **values,
+        )
+        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            if self._ddl_timezone is not None:
+                await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
+            await self._lock_for_attach(conn, parent_name, partition_name, default_partition_name)
+            await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+            moved = await self._move(
+                conn,
+                default_partition_name,
+                partition_name,
+                condition=condition,
+                limit=None,
+                expected_source_oid=expected_default_oid,
+                expected_target_oid=expected_oid,
+            )
+            await self._require_oid(conn, parent_name, expected_parent_oid)
+            await conn.execute(stmt)
+            # Under ATTACH's own locks now: what these see is what went live.
+            await self._require_oid(conn, partition_name, expected_oid)
+            await self._require_oid(conn, parent_name, expected_parent_oid)
+            await self._clear_orphan_marker(conn, partition_name)
+            return moved
 
     async def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:
         """Move rows from one relation into another, whatever their keys.
@@ -469,6 +542,42 @@ class PartitionCreator:
         for name in names:
             if await relation_kind(conn, name) != "f":
                 await conn.execute(text(f"LOCK TABLE {quote_identifier(name)} IN SHARE ROW EXCLUSIVE MODE"))
+
+    async def _lock_for_attach(
+        self, conn: AsyncConnection, parent_name: str, partition_name: str, default_partition_name: str
+    ) -> None:
+        """Take the move-and-attach's locks: the parent's writers out, then ATTACH's own two.
+
+        ``EXCLUSIVE`` on the parent is one level above what ``ATTACH`` itself
+        takes, and it is there for the writer's sake rather than this
+        transaction's. An INSERT routing through the parent chooses its
+        partition from the set it saw when it took ROW EXCLUSIVE on the parent:
+        one that got that far and then queued on the DEFAULT partition's lock
+        would come out of the wait still aimed at DEFAULT, and be rejected by
+        the constraint this attach just narrowed -- a lost write, and the same
+        thing a plain ``ATTACH`` does to a live writer. Blocking at the parent
+        instead means no insert is ever mid-routing while the partition set
+        changes: the writer waits, re-plans against the tree the attach left,
+        and lands in the new partition. ``EXCLUSIVE`` does not conflict with
+        ``ACCESS SHARE``, so readers of the other partitions carry on.
+
+        The other two are the ``ACCESS EXCLUSIVE`` locks ``ATTACH`` takes on
+        the partition and on the DEFAULT sibling it scans, taken early so the
+        move runs under the very lock the scan will hold. Taking the parent
+        first is also what keeps a concurrent ``ATTACH`` queued there instead
+        of deadlocking against this one over the DEFAULT partition. ``ONLY``
+        keeps the parent's other partitions out of it; the two below it are
+        locked with their own subtrees, which is where a branch's rows are
+        written.
+
+        A foreign relation cannot be locked at all, so a foreign DEFAULT
+        partition is left to ``ATTACH``'s own scan -- with the race that
+        implies, and the conflict it can still raise reported as an issue.
+        """
+        await conn.execute(text(f"LOCK TABLE ONLY {quote_identifier(parent_name)} IN EXCLUSIVE MODE"))
+        for name in (partition_name, default_partition_name):
+            if await relation_kind(conn, name) != "f":
+                await conn.execute(text(f"LOCK TABLE {quote_identifier(name)} IN ACCESS EXCLUSIVE MODE"))
 
     async def _move(
         self,
@@ -754,6 +863,25 @@ class PartitionCreator:
             text(RELATION_HAS_IDENTITY_ALWAYS_SQL), {"table_name": to_regclass_argument(table_name)}
         )
         return bool(result.scalar())
+
+
+def _window_condition(caller: str, key_columns: tuple[str, ...], from_value: str, to_value: str) -> str:
+    """The WHERE clause selecting a RANGE window's rows out of a DEFAULT partition.
+
+    PostgreSQL adds an IS NOT NULL test for *every* key column to a range
+    partition's constraint, so a row with a NULL trailing key value belongs in
+    DEFAULT whatever its leading value is. Moving it out would be rejected --
+    and the rejection would look exactly like the DEFAULT conflict the move
+    exists to clear, so the retry would never converge. Every identifier and
+    literal is quoted here, which is what makes S608 a false positive at the
+    call sites.
+    """
+    if not key_columns:
+        msg = f"{caller} needs the parent's partition key"
+        raise ValueError(msg)
+    column = quote_identifier(key_columns[0])
+    not_null = "".join(f" AND {quote_identifier(name)} IS NOT NULL" for name in key_columns[1:])
+    return f"{column} >= {quote_literal(from_value)} AND {column} < {quote_literal(to_value)}{not_null}"
 
 
 def _move_statement(

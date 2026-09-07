@@ -74,6 +74,24 @@ wait is itself a period of rejected writes for that partition.
 Hence: create standalone with `LIKE`, attach last; never `CREATE TABLE … PARTITION OF`
 against a live parent; a converged tree must issue no DDL at all.
 
+### A queued insert keeps the partition it chose (measured on 17, 2026-09-07)
+
+An `INSERT` through the parent picks its target from the partition set it saw when it took
+`ROW EXCLUSIVE` on the parent. `ATTACH` takes only `SHARE UPDATE EXCLUSIVE` there, which does
+not conflict — so an insert can route to the DEFAULT partition, queue on the `ACCESS
+EXCLUSIVE` the attach holds over it, and come out of that wait still aimed at DEFAULT. The
+row is then rejected by the constraint the attach has just narrowed:
+`23514 new row for relation "events_legacy" violates partition constraint`. Nothing re-routes
+it; the write is lost to the caller.
+
+Taking `EXCLUSIVE` on the parent instead — one level up, conflicting with `ROW EXCLUSIVE` but
+not with `ACCESS SHARE` — makes the insert wait *before* it chooses: it re-plans against the
+tree the attach left and lands in the new partition, its statement unchanged, while readers
+of the other partitions carry on. That is what the move-and-attach of
+[DEFAULT reconciliation](../concepts/execution.md#default-reconciliation) does; the
+integration suite asserts it on PostgreSQL 15 through 18 with a writer inserting into the
+window while the attach runs.
+
 ## Foreign tables
 
 - `CREATE FOREIGN TABLE … PARTITION OF parent` and `ATTACH PARTITION` of a foreign table are

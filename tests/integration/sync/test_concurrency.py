@@ -17,7 +17,7 @@ import freezegun
 import pytest
 from sqlalchemy import text
 
-from pg_partsmith.entities import MaintenanceResult
+from pg_partsmith.entities import MaintenanceResult, Period
 from pg_partsmith.exceptions import LockAcquisitionError
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.sync.maintainer import PartitionMaintainer
@@ -25,7 +25,7 @@ from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.topology import RangeBounds
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
-from tests.integration.sync.support import count_ddl, make_service, make_table
+from tests.integration.sync.support import count_ddl, exec_sql, is_attached, make_service, make_table, scalar
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -139,3 +139,114 @@ def test__drop_partition__lock_contention__retries_and_succeeds_after_release(
     assert len(retry_msgs) >= 1, (
         "Expected at least one retry warning; drop succeeded on first attempt without contention"
     )
+
+
+# ── attach under a live writer ──────────────────────────────────────────────────
+#
+# The thread-based twins of the two ``# sync-mirror: skip`` tests in
+# ``tests/integration/aio/test_migration.py``: the window the application is
+# inserting into is the one every live migration has to attach, and moving its
+# rows out of DEFAULT in one transaction and attaching in another cannot do it.
+
+
+def _default_with_rows(engine: Engine, table: str, *, month: int, rows: int) -> str:
+    """The migration starting point: the old monolithic table attached as DEFAULT, full of rows."""
+    default = f"{table}_legacy"
+    exec_sql(engine, f'CREATE TABLE "{default}" (LIKE "{table}" INCLUDING ALL)')
+    exec_sql(
+        engine,
+        f'INSERT INTO "{default}" (created_at, payload) '  # noqa: S608
+        f"SELECT make_timestamptz(2026, :month, 1 + (g % 27), 12, 0, 0, 'UTC'), 'row ' || g "
+        f"FROM generate_series(1, :rows) g",
+        month=month,
+        rows=rows,
+    )
+    exec_sql(engine, f'ALTER TABLE "{table}" ATTACH PARTITION "{default}" DEFAULT')
+    return default
+
+
+def _only_count(engine: Engine, table: str) -> int:
+    return int(scalar(engine, f'SELECT count(*) FROM ONLY "{table}"'))  # noqa: S608
+
+
+class _Writer:
+    """The application the migration happens under: one insert into a window, over and over.
+
+    One statement that never changes, on a thread of its own, going as fast as
+    the locks let it. While the window's rows are moved out of DEFAULT these
+    inserts queue on the move's lock and land the moment it commits, which is
+    the race the move-and-attach exists to close.
+    """
+
+    def __init__(self, engine: Engine, table: str, *, month: int) -> None:
+        self._engine = engine
+        self._sql = text(
+            f'INSERT INTO "{table}" (created_at, payload) '  # noqa: S608
+            f"VALUES (make_timestamptz(2026, {month:d}, 15, 12, 0, 0, 'UTC'), 'live')"
+        )
+        self._stop = threading.Event()
+        self._started = threading.Event()
+        self._thread = threading.Thread(target=self._write)
+        self.written = 0
+
+    def _write(self) -> None:
+        with self._engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            while not self._stop.is_set():
+                conn.execute(self._sql)
+                self.written += 1
+                self._started.set()
+
+    def __enter__(self) -> _Writer:
+        self._thread.start()
+        # The block must run against a writer that is already writing, not one
+        # that may not have been scheduled yet.
+        assert self._started.wait(timeout=30), "the writer thread never got an insert in"
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join()
+
+
+def test__ensure_partitions__writer_filling_the_window__attaches_on_the_first_pass(
+    sync_db_engine: Engine, partitioned_table: str
+) -> None:
+    """A tick attaches the window a writer keeps inserting into, and loses no row doing it."""
+    # Arrange: March's rows in DEFAULT, and an insert going in as fast as the locks allow
+    default = _default_with_rows(sync_db_engine, partitioned_table, month=3, rows=2000)
+    config = monthly_config(partitioned_table, create_ahead=1)
+    march = f"{partitioned_table}__2026_03"
+
+    # Act
+    with _Writer(sync_db_engine, partitioned_table, month=3) as writer:
+        created = make_service(sync_db_engine).ensure_partitions(config, [Period(year=2026, month=3)])
+
+    # Assert: live on the first pass, with every row in exactly one place
+    assert writer.written, "the writer never got an insert in"
+    assert [info.relname for info in created] == [march]
+    assert is_attached(sync_db_engine, march)
+    assert _only_count(sync_db_engine, default) == 0
+    assert _only_count(sync_db_engine, march) == 2000 + writer.written
+
+
+def test__partition_data__writer_filling_the_window__drains_it_without_raising(
+    sync_db_engine: Engine, partitioned_table: str
+) -> None:
+    """The drain finishes a window under a live writer instead of ending on the attach."""
+    # Arrange: enough rows for several batches, and a writer adding more the whole time
+    default = _default_with_rows(sync_db_engine, partitioned_table, month=3, rows=2000)
+    config = monthly_config(partitioned_table, create_ahead=1)
+    march = f"{partitioned_table}__2026_03"
+
+    # Act
+    with _Writer(sync_db_engine, partitioned_table, month=3) as writer:
+        result = make_service(sync_db_engine).partition_data(config, batch_rows=500)
+
+    # Assert
+    assert result.complete
+    assert result.issues == ()
+    assert result.partitions == (f"public.{march}",)
+    assert writer.written, "the writer never got an insert in"
+    assert is_attached(sync_db_engine, march)
+    assert _only_count(sync_db_engine, default) == 0
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{partitioned_table}"')) == 2000 + writer.written  # noqa: S608

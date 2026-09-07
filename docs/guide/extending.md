@@ -39,6 +39,7 @@ class PartitionRepository(Protocol):
     async def drop_partition(self, partition_name, *, expected_oid=None) -> None: ...
     async def adopt_partition(self, table_name, partition_name) -> bool: ...
     async def reconcile_default_rows(self, *, default_partition_name, target_partition_name, key_columns, from_value, to_value, limit=None) -> int: ...
+    async def reconcile_and_attach(self, parent_name, partition_name, bounds, *, key_columns, default_partition_name) -> int: ...
     async def move_rows(self, source_name, target_name, *, limit=None) -> int: ...
 ```
 
@@ -46,13 +47,23 @@ Every method takes and returns plain domain objects (`PartitionBounds`, `Partiti
 `DetachMode`, `LocalLeaves`), so an implementation never needs to know how the planner
 works.
 
+`reconcile_and_attach` is the one method with a transaction boundary in its contract: it
+must take the window's remaining rows out of the DEFAULT partition **and** attach in a
+single transaction, holding one lock across both, and roll the move back if the attach
+fails. Two transactions cannot do it — a writer refills the window in the gap and
+PostgreSQL refuses the attach every time. The bundled implementation locks the parent
+`EXCLUSIVE` (so no insert is mid-routing when the partition set changes) and the partition
+and DEFAULT sibling `ACCESS EXCLUSIVE`, then moves, then attaches. It is called only after
+`attach_partition` has failed on a DEFAULT conflict and the bulk of the window has been
+moved by `reconcile_default_rows`.
+
 One thing to know about errors: the executor recognises a failed `attach_partition` by the
 **SQLSTATE the exception carries**, not by its type. It reads `sqlstate` or `pgcode` off
 the exception, or off its `orig` if it wraps one — which covers a SQLAlchemy error, a bare
 `psycopg.Error` and an `asyncpg.PostgresError` alike. Let the driver's exception through
 rather than replacing it with one of your own, and three things keep working: a lost race
 with another worker is treated as benign, a DEFAULT partition holding rows for the new
-window triggers the reconcile-and-retry, and rows already moved out of DEFAULT are put back
+window triggers the reconcile-and-attach, and rows already moved out of DEFAULT are put back
 if the attach ultimately fails. An exception carrying no SQLSTATE is still safe — the rows
 are restored and it propagates — but it cannot be recognised as a race or a conflict.
 

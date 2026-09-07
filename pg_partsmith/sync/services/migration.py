@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from pg_partsmith.boundaries import Window
 from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MigrationResult
-from pg_partsmith.exceptions import InvalidPartitionConfigError, RowMoveRefusedError
+from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionTopologyError, RowMoveRefusedError
 from pg_partsmith.lifecycle import DropAfter
 from pg_partsmith.plan import AttachPartition, CreatePartition, DetachPartition, DropPartition, MaintenancePlan, Reason
 from pg_partsmith.planner import to_maintenance_issue
@@ -62,8 +62,16 @@ class DataMover:
         Window by window, oldest first: the partition for the oldest window
         still in DEFAULT is created detached (subtree included), filled from
         DEFAULT in batches of ``batch_rows``, and attached once DEFAULT holds
-        nothing more for it. A partition left detached when ``max_batches``
-        runs out is picked up and finished by the next call.
+        nothing more for it. The attach takes whatever arrived while the
+        batches ran in its own transaction and under one lock, so the window a
+        live writer is inserting into goes live on the same pass as the quiet
+        ones. A partition left detached when ``max_batches`` runs
+        out is picked up and finished by the next call.
+
+        A window that cannot be finished at all -- rows an incoming foreign
+        key holds down, a DEFAULT partition this run could not clear -- is
+        reported as a ``move`` issue with ``complete=False``; it is never
+        raised at the caller.
 
         Args:
             config: The table's configuration; its root must be a RANGE level.
@@ -115,7 +123,13 @@ class DataMover:
                     attached = self._executor.create_partition(config, plan, op, issues=tally.issues, fill=fill)
                 else:
                     attached = self._executor.attach_partition(config, plan, op, issues=tally.issues, fill=fill)
-            except RowMoveRefusedError as exc:
+            except (RowMoveRefusedError, PartitionTopologyError) as exc:
+                # A window this run cannot finish -- rows a foreign key holds
+                # down, a DEFAULT partition it could not clear, a name taken by
+                # a relation with other bounds. The caller asked for a drain,
+                # not for an exception: what stayed behind and why is on the
+                # result, and the loop stops rather than re-planning the same
+                # window forever.
                 tally.issue(
                     default.name, f"rows for {boundaries.describe(window)} stay in {default.name}: {exc.detail}"
                 )
