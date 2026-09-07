@@ -647,6 +647,95 @@ def test__reconcile_default_rows__unknown_rowcount__reads_as_zero() -> None:
     assert moved == 0
 
 
+# ── reconcile_and_attach ────────────────────────────────────────────────────────
+
+
+def test__reconcile_and_attach__locks_the_parent_and_both_sides_then_moves_and_attaches() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=7))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    moved = repo.reconcile_and_attach(
+        "events",
+        "events__2024_04",
+        RangeBounds(from_value="2024-04-01", to_value="2024-05-01"),
+        key_columns=("created_at",),
+        default_partition_name="events_default",
+    )
+
+    # Assert -- the parent's writers out first, then ATTACH's own two, all before the move
+    assert moved == 7
+    assert _locks(conn) == [
+        'LOCK TABLE ONLY "events" IN EXCLUSIVE MODE',
+        'LOCK TABLE "events__2024_04" IN ACCESS EXCLUSIVE MODE',
+        'LOCK TABLE "events_default" IN ACCESS EXCLUSIVE MODE',
+    ]
+    statements = _statements(conn)
+    assert statements[0] == "SET LOCAL TIME ZONE 'UTC'"
+    assert statements.index(_locks(conn)[-1]) < statements.index(_move_statement_of(conn))
+    assert statements.index(_move_statement_of(conn)) < statements.index(_attach_statement(conn))
+    assert _attach_statement(conn) == (
+        "ALTER TABLE \"events\" ATTACH PARTITION \"events__2024_04\" FOR VALUES FROM ('2024-04-01') TO ('2024-05-01')"
+    )
+    assert statements[-1] == _MARKER_LOOKUP
+
+
+def test__reconcile_and_attach__composite_key__pads_the_bound_and_keeps_null_keys_in_default() -> None:
+    # Arrange
+    engine, conn = _engine(_Catalog(moved_rows=1))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.reconcile_and_attach(
+        "events",
+        "events__2024_04",
+        RangeBounds(from_value="2024-04-01", to_value="2024-05-01"),
+        key_columns=("created_at", "tenant_id"),
+        default_partition_name="events_default",
+    )
+
+    # Assert
+    assert _attach_statement(conn).endswith("FOR VALUES FROM ('2024-04-01', MINVALUE) TO ('2024-05-01', MINVALUE)")
+    assert '"tenant_id" IS NOT NULL' in _move_statement_of(conn)
+
+
+def test__reconcile_and_attach__foreign_default_partition__is_not_locked() -> None:
+    # Arrange -- LOCK TABLE is refused for a foreign table, so ATTACH's own scan is all there is
+    engine, conn = _engine(_Catalog(relkind="f"))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act
+    repo.reconcile_and_attach(
+        "events",
+        "events__2024_04",
+        RangeBounds(from_value="2024-04-01", to_value="2024-05-01"),
+        key_columns=("created_at",),
+        default_partition_name="events_default",
+    )
+
+    # Assert
+    assert _locks(conn) == ['LOCK TABLE ONLY "events" IN EXCLUSIVE MODE']
+
+
+def test__reconcile_and_attach__empty_key__is_rejected_before_any_sql() -> None:
+    # Arrange
+    engine, _ = _engine()
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="partition key"):
+        repo.reconcile_and_attach(
+            "events",
+            "events__2024_04",
+            RangeBounds(from_value="2024-04-01", to_value="2024-05-01"),
+            key_columns=(),
+            default_partition_name="events_default",
+        )
+
+    engine.begin.assert_not_called()
+
+
 # ── detach_partition ────────────────────────────────────────────────────────────
 
 

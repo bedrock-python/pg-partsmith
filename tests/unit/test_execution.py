@@ -2146,6 +2146,50 @@ async def test__apply__reconcile_refused_by_a_foreign_key_action__recorded_and_t
     assert result.created_count == 0
 
 
+async def test__apply__attach_target_swapped_during_the_bulk_reconcile__fails_closed(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- the relation the rows would be moved into is no longer the planned one
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_default_rows.side_effect = PlanStaleError("events__2024_04", "the name now resolves to OID 9")
+    metadata.get_default_partition.return_value = _default_partition()
+    logger = MagicMock()
+
+    # Act / Assert -- nothing is handed to the replacement, and nothing is restored blindly
+    with (
+        patch("pg_partsmith.aio.services.execution.logger", logger),
+        pytest.raises(PlanStaleError, match="events__2024_04"),
+    ):
+        await executor.apply(_config(), _plan(_create_op()))
+
+    repo.reconcile_and_attach.assert_not_awaited()
+    assert repo.reconcile_default_rows.await_count == 1
+    logger.warning.assert_called_once()
+
+
+async def test__apply__tail_move_refused_inside_the_locked_attach__rows_go_back_and_it_is_an_issue(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange -- a row that became referenced between the bulk move and the attach
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_default_rows.return_value = 4
+    repo.reconcile_and_attach.side_effect = RowMoveRefusedError(
+        "events_default", "rows are still referenced through a foreign key"
+    )
+    metadata.get_default_partition.return_value = _default_partition()
+
+    # Act
+    result = await executor.apply(_config(), _plan(_create_op()))
+
+    # Assert -- the atomic move rolled back with the attach; the bulk one is put back here
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
+    assert "still referenced" in result.issues[0].error
+    assert result.created_count == 0
+    restore = repo.reconcile_default_rows.call_args_list[-1].kwargs
+    assert restore["default_partition_name"] == "events__2024_04"
+    assert restore["target_partition_name"] == "events_default"
+
+
 async def test__create_partition__existing_relation_vanished_before_recovery__is_stale(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:

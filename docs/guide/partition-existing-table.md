@@ -49,11 +49,11 @@ await maintainer.run_maintenance_safe(config)
 The tick creates the current month and the two after it. As each is attached, the rows
 of that month move out of `events_legacy` into it — ordinary DEFAULT reconciliation.
 The current month is the one the application is writing into, and it attaches on this
-first tick like the empty future ones: the bulk of its rows move first, then the rows
-that arrived while that ran move *and* the partition goes live in one transaction, under
-the lock `ATTACH` takes on the DEFAULT partition anyway. Inserts wait for that commit and
-are then routed into the new partition. From now on new rows land in real partitions; the
-old ones are still in the DEFAULT.
+first tick like the empty future ones: the bulk of its rows move first, then the rows that
+arrived while that ran move *and* the partition goes live in one transaction. Inserts wait
+at the parent for that commit and are then routed into the new partition, their statement
+unchanged. From now on new rows land in real partitions; the old ones are still in the
+DEFAULT.
 
 ## 3. Drain the DEFAULT partition
 
@@ -89,9 +89,10 @@ finds it, finishes it and attaches it.
     a maintenance window, or with small batches during a quiet hour and readers that can
     tolerate a month's rows appearing a little later. Rows already in real partitions, and
     rows still in DEFAULT for other windows, stay visible throughout. The attach that ends
-    the window holds `ACCESS EXCLUSIVE` on the DEFAULT partition — readers and writers of
-    the *undrained* rows wait for it, for the length of the last batch's tail plus one
-    scan of DEFAULT.
+    a window blocks writers at the parent and holds `ACCESS EXCLUSIVE` on the DEFAULT
+    partition, for the length of the last batch's tail plus one scan of DEFAULT — so
+    inserts stall for that long rather than fail, and readers of the partitions already
+    drained carry on.
 
 `partition_data` takes the table's lock, so it does not race the scheduled tick. It
 refuses a window it cannot create (an unmanaged partition overlaps it), any move an

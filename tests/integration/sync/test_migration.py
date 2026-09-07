@@ -85,6 +85,10 @@ def _count(engine: Engine, table: str) -> int:
     return int(scalar(engine, f'SELECT count(*) FROM "{table}"'))  # noqa: S608
 
 
+def _only_count(engine: Engine, table: str) -> int:
+    return int(scalar(engine, f'SELECT count(*) FROM ONLY "{table}"'))  # noqa: S608
+
+
 # ── partition_data ──────────────────────────────────────────────────────────────
 
 

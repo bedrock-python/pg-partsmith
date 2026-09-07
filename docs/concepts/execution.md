@@ -58,17 +58,25 @@ belong to the new window, PostgreSQL refuses the attach (`23514`). The executor:
    (`ATTACH` matches by name, so physical column order may differ) and leaving rows with a
    NULL trailing key where PostgreSQL routes them. This is one statement under
    `SHARE ROW EXCLUSIVE` on DEFAULT: writers wait, readers do not;
-2. moves whatever arrived in the meantime and attaches, **in one transaction**, under the
-   locks `ATTACH` needs anyway — `SHARE UPDATE EXCLUSIVE` on the parent, `ACCESS EXCLUSIVE`
-   on the partition and on DEFAULT, taken in that order and taken before the move.
+2. moves whatever arrived in the meantime and attaches, **in one transaction**, under
+   `EXCLUSIVE` on the parent and `ACCESS EXCLUSIVE` on the partition and on DEFAULT — taken
+   in that order, and taken before the move.
 
 Step 2 is what makes the window a live writer is inserting into attachable at all. Two
 transactions cannot do it: the move commits, DEFAULT is free again, and the next insert for
 the window lands in it before `ATTACH` scans — under any steady write rate that never
 converges, and every attempt is a full scan of DEFAULT under `ACCESS EXCLUSIVE`. Sharing one
-lock closes the gap; a writer waits for the commit and is then routed into the new partition.
-Step 1 is what keeps that exclusive window short: the bulk of the month moves before the
-heavy lock is taken, so what it covers is a tail and a scan.
+lock closes the gap. Step 1 is what keeps that exclusive window short: the bulk of the month
+moves before the heavy lock is taken, so what step 2 covers is a tail and a scan.
+
+The parent's lock is one level above what `ATTACH` itself takes, and it is there for the
+writer. An INSERT picks its partition from the set it saw when it took `ROW EXCLUSIVE` on
+the parent: one that got that far and then queued on DEFAULT's lock would come out of the
+wait still aimed at DEFAULT and be rejected by the constraint the attach just narrowed — a
+lost write, and what a plain `ATTACH` does to a live writer. Blocking at the parent instead
+means no insert is ever mid-routing while the partition set changes: the writer waits,
+re-plans, and lands in the new partition, its statement unchanged. `EXCLUSIVE` does not
+conflict with `ACCESS SHARE`, so readers of the other partitions carry on.
 
 If the attach still fails, the rows step 1 moved are returned to DEFAULT rather than left in
 a table no query can see — step 2's own move rolls back with the attach, and needs no
@@ -125,7 +133,7 @@ repository).
 | `CREATE TABLE … (LIKE parent)` | `ACCESS SHARE` on the parent |
 | `ATTACH PARTITION` | `SHARE UPDATE EXCLUSIVE` on the parent, `ACCESS EXCLUSIVE` on the child and on a DEFAULT sibling; `SHARE ROW EXCLUSIVE` on tables referencing the parent through a foreign key |
 | the reconciling row move ([DEFAULT reconciliation](#default-reconciliation), step 1) | `SHARE ROW EXCLUSIVE` on the DEFAULT partition and on the child: writers of DEFAULT wait, readers do not |
-| the move-and-attach ([DEFAULT reconciliation](#default-reconciliation), step 2) | the `ATTACH` row, taken up front — parent first, so a concurrent `ATTACH` queues there rather than deadlocking |
+| the move-and-attach ([DEFAULT reconciliation](#default-reconciliation), step 2) | `EXCLUSIVE` on the parent (one level above `ATTACH`'s own, so no writer is mid-routing), then `ATTACH`'s `ACCESS EXCLUSIVE` on the partition and the DEFAULT sibling — all taken before the move |
 | `DETACH PARTITION` (plain) | `ACCESS EXCLUSIVE` on parent, partition, and every table referencing the parent |
 | `DETACH PARTITION … CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` on the parent; `ACCESS EXCLUSIVE` on the partition and, in its second transaction, on referencing tables |
 | `DROP TABLE` of a detached table | `ACCESS EXCLUSIVE` on that table only |
