@@ -365,7 +365,11 @@ lifecycle units — partitions directly under the root — never once per leaf o
 10. **During `partition_data`, a window's rows are invisible through the parent** between
     the first batch and the attach: PostgreSQL will not attach a partition while DEFAULT
     still holds rows for it, so no ordering keeps them visible throughout. Rows are never
-    in two places, and never lost.
+    in two places, and never lost. The attach takes the rows that arrived during the last
+    batch *and* goes live in one transaction, so a window the application is writing into
+    is attached like any other; writers wait at the parent for that commit and are then
+    routed into the new partition. A window that still cannot be attached comes back as a
+    `move` issue with `complete=False` — `partition_data` does not raise for it.
 11. **Flat and composed spellings do not mix**, and `extra="forbid"` means a misspelled
     keyword raises rather than being ignored.
 12. **`schema=` goes in, `config.db_schema` comes out** — the field is aliased to avoid

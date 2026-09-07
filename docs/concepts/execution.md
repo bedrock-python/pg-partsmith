@@ -12,6 +12,12 @@ statements. There is no long transaction wrapping a run, because `DETACH … CON
 cannot run inside a transaction block at all, and because a run that creates three
 partitions and fails on the fourth should keep the three.
 
+Two steps are exceptions, and both for the same reason: a lock has to span more than one
+statement or the thing it protects can change underneath. A drop takes its lock, revalidates,
+drains and drops in one transaction; the last step of [DEFAULT reconciliation](#default-reconciliation)
+moves the window's remaining rows and attaches in one transaction. `ATTACH`, unlike
+`DETACH … CONCURRENTLY`, may run inside a transaction block.
+
 The consequence for callers: pass the service an **engine**, never a session you are
 using elsewhere.
 
@@ -50,13 +56,28 @@ belong to the new window, PostgreSQL refuses the attach (`23514`). The executor:
 
 1. moves those rows from DEFAULT into the new partition, naming columns on both sides
    (`ATTACH` matches by name, so physical column order may differ) and leaving rows with a
-   NULL trailing key where PostgreSQL routes them;
-2. retries the attach.
+   NULL trailing key where PostgreSQL routes them. This is one statement under
+   `SHARE ROW EXCLUSIVE` on DEFAULT: writers wait, readers do not;
+2. moves whatever arrived in the meantime and attaches, **in one transaction**, under the
+   locks `ATTACH` needs anyway — `SHARE UPDATE EXCLUSIVE` on the parent, `ACCESS EXCLUSIVE`
+   on the partition and on DEFAULT, taken in that order and taken before the move.
 
-If the attach still fails, the rows are returned to DEFAULT rather than left in a table
-no query can see. For a nested branch the moved rows are routed onward into its leaves.
-A DEFAULT sibling holding rows for a hash or list member is reported
-(`default_holds_rows`) rather than moved: only a RANGE window can be selected by its key.
+Step 2 is what makes the window a live writer is inserting into attachable at all. Two
+transactions cannot do it: the move commits, DEFAULT is free again, and the next insert for
+the window lands in it before `ATTACH` scans — under any steady write rate that never
+converges, and every attempt is a full scan of DEFAULT under `ACCESS EXCLUSIVE`. Sharing one
+lock closes the gap; a writer waits for the commit and is then routed into the new partition.
+Step 1 is what keeps that exclusive window short: the bulk of the month moves before the
+heavy lock is taken, so what it covers is a tail and a scan.
+
+If the attach still fails, the rows step 1 moved are returned to DEFAULT rather than left in
+a table no query can see — step 2's own move rolls back with the attach, and needs no
+compensation. A window that still cannot be attached is reported as `default_holds_rows`, an
+issue like any other: the run goes on, and `partition_data` returns it rather than raising.
+For a nested branch the moved rows are routed onward into its leaves. A DEFAULT sibling
+holding rows for a hash or list member is reported rather than moved: only a RANGE window can
+be selected by its key. A **foreign** DEFAULT partition cannot be locked at all, so there the
+race stays and the report is all there is.
 
 ## Detach
 
@@ -103,6 +124,8 @@ repository).
 |---|---|
 | `CREATE TABLE … (LIKE parent)` | `ACCESS SHARE` on the parent |
 | `ATTACH PARTITION` | `SHARE UPDATE EXCLUSIVE` on the parent, `ACCESS EXCLUSIVE` on the child and on a DEFAULT sibling; `SHARE ROW EXCLUSIVE` on tables referencing the parent through a foreign key |
+| the reconciling row move ([DEFAULT reconciliation](#default-reconciliation), step 1) | `SHARE ROW EXCLUSIVE` on the DEFAULT partition and on the child: writers of DEFAULT wait, readers do not |
+| the move-and-attach ([DEFAULT reconciliation](#default-reconciliation), step 2) | the `ATTACH` row, taken up front — parent first, so a concurrent `ATTACH` queues there rather than deadlocking |
 | `DETACH PARTITION` (plain) | `ACCESS EXCLUSIVE` on parent, partition, and every table referencing the parent |
 | `DETACH PARTITION … CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` on the parent; `ACCESS EXCLUSIVE` on the partition and, in its second transaction, on referencing tables |
 | `DROP TABLE` of a detached table | `ACCESS EXCLUSIVE` on that table only |
@@ -117,7 +140,7 @@ it takes on `op.capabilities`.
 
 | What happened | Effect on the run |
 |---|---|
-| a topology conflict at execution time — a DEFAULT sibling holding rows for a hash bucket, a name taken by a relation with other bounds, a detach PostgreSQL refuses because rows are still referenced | recorded in `result.issues`; the run goes on |
+| a topology conflict at execution time — a DEFAULT partition holding rows the attach could not take, a name taken by a relation with other bounds, a detach PostgreSQL refuses because rows are still referenced | recorded in `result.issues`; the run goes on |
 | a `PlanStaleError` — the relation is not the one the plan saw | recorded as an issue with `continue_on_error`, otherwise raised |
 | any other error — a connection drop, a permission denied, a `before_*` hook raising | aborts the run, unless `continue_on_error`, in which case it is recorded and the next operation runs |
 | validation or lock failure | fatal, always |

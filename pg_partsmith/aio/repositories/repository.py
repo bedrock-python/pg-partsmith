@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
     from pg_partsmith.leaves import LocalLeaves
     from pg_partsmith.plan import PartitionBy
-    from pg_partsmith.topology import PartitionBounds
+    from pg_partsmith.topology import PartitionBounds, RangeBounds
 
 
 class PostgresPartitionRepository:
@@ -204,6 +204,33 @@ class PostgresPartitionRepository:
             limit=limit,
             expected_source_oid=expected_source_oid,
             expected_target_oid=expected_target_oid,
+        )
+
+    async def reconcile_and_attach(
+        self,
+        parent_name: str,
+        partition_name: str,
+        bounds: RangeBounds,
+        *,
+        key_columns: tuple[str, ...],
+        default_partition_name: str,
+        expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
+        expected_default_oid: int | None = None,
+    ) -> int:
+        """Take the window's last rows out of DEFAULT and attach, in one transaction.
+
+        See :meth:`PartitionCreator.reconcile_and_attach`.
+        """
+        return await self._creator.reconcile_and_attach(
+            parent_name,
+            partition_name,
+            bounds,
+            key_columns=key_columns,
+            default_partition_name=default_partition_name,
+            expected_oid=expected_oid,
+            expected_parent_oid=expected_parent_oid,
+            expected_default_oid=expected_default_oid,
         )
 
     async def move_rows(self, source_name: str, target_name: str, *, limit: int | None = None) -> int:

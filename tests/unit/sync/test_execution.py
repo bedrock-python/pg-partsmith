@@ -115,6 +115,7 @@ def repo() -> MagicMock:
     repo.detach_partition = MagicMock(return_value=None)
     repo.drop_partition = MagicMock(return_value=0)
     repo.reconcile_default_rows = MagicMock(return_value=0)
+    repo.reconcile_and_attach = MagicMock(return_value=0)
     return repo
 
 
@@ -676,18 +677,18 @@ def test__apply__detached_branch_with_a_different_method__finding_becomes_an_iss
 # ── attach: DEFAULT reconciliation ──────────────────────────────────────────────
 
 
-def test__apply__default_conflict_on_range_attach__moves_rows_and_retries(
+def test__apply__default_conflict_on_range_attach__moves_the_bulk_then_attaches_under_one_lock(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_default_conflict(), None]
+    repo.attach_partition.side_effect = _default_conflict()
     repo.reconcile_default_rows.return_value = 5
     metadata.get_default_partition.return_value = _default_partition()
 
     # Act
     result = executor.apply(_config(), _plan(_create_op()))
 
-    # Assert
+    # Assert -- the bulk moves in its own transaction, the tail and the attach share one
     metadata.get_default_partition.assert_called_once_with("events")
     repo.reconcile_default_rows.assert_called_once_with(
         default_partition_name="events_default",
@@ -698,30 +699,41 @@ def test__apply__default_conflict_on_range_attach__moves_rows_and_retries(
         expected_source_oid=None,
         expected_target_oid=101,
     )
-    assert repo.attach_partition.call_count == 2
+    repo.reconcile_and_attach.assert_called_once_with(
+        "events",
+        "events__2024_04",
+        APRIL,
+        key_columns=("created_at",),
+        default_partition_name="events_default",
+        expected_oid=101,
+        expected_parent_oid=None,
+        expected_default_oid=None,
+    )
+    assert repo.attach_partition.call_count == 1
     assert result.created_count == 1
     assert result.issues == ()
 
 
-def test__apply__default_conflict_retries_exhausted__restores_rows_and_raises(
+def test__apply__default_conflict_survives_the_locked_attach__restores_rows_and_records_an_issue(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
-    # Arrange
+    # Arrange -- a DEFAULT partition nothing can clear: a foreign one, which no lock covers
     repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = _default_conflict()
     repo.reconcile_default_rows.return_value = 5
     metadata.get_default_partition.return_value = _default_partition()
-    logger = MagicMock()
 
-    # Act / Assert
-    with patch("pg_partsmith.sync.services.execution.logger", logger), pytest.raises(SQLAlchemyError):
-        executor.apply(_config(), _plan(_create_op()))
+    # Act
+    result = executor.apply(_config(), _plan(_create_op()))
 
-    assert repo.attach_partition.call_count == 2
+    # Assert -- a topology finding, not an exception out of the run
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
+    assert "could not clear them" in result.issues[0].error
+    assert result.created_count == 0
     assert repo.reconcile_default_rows.call_count == 2
     restore = repo.reconcile_default_rows.call_args_list[-1].kwargs
     assert restore["default_partition_name"] == "events__2024_04"
     assert restore["target_partition_name"] == "events_default"
-    logger.exception.assert_called_once()
 
 
 def test__apply__default_conflict_with_nothing_moved__nothing_is_restored(
@@ -729,13 +741,15 @@ def test__apply__default_conflict_with_nothing_moved__nothing_is_restored(
 ) -> None:
     # Arrange
     repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = _default_conflict()
     repo.reconcile_default_rows.return_value = 0
     metadata.get_default_partition.return_value = _default_partition()
 
-    # Act / Assert
-    with pytest.raises(SQLAlchemyError):
-        executor.apply(_config(), _plan(_create_op()))
+    # Act
+    result = executor.apply(_config(), _plan(_create_op()))
 
+    # Assert
+    assert "could not clear them" in result.issues[0].error
     assert repo.reconcile_default_rows.call_count == 1
 
 
@@ -845,7 +859,8 @@ def test__apply__attach_conflict_after_reconcile__rows_are_restored_before_the_r
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_default_conflict(), _sqlstate_error("42P07", "duplicate")]
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = _sqlstate_error("42P07", "duplicate")
     repo.reconcile_default_rows.return_value = 3
     metadata.get_default_partition.return_value = _default_partition()
     metadata.is_partition_attached.return_value = True
@@ -866,7 +881,8 @@ def test__apply__unrelated_database_error_on_attach__propagates_after_restoring_
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_default_conflict(), _sqlstate_error("53100", "disk full")]
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = _sqlstate_error("53100", "disk full")
     repo.reconcile_default_rows.return_value = 3
     metadata.get_default_partition.return_value = _default_partition()
 
@@ -882,7 +898,8 @@ def test__apply__transport_error_on_attach__propagates_after_restoring_rows(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock, error: BaseException
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_default_conflict(), error]
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = error
     repo.reconcile_default_rows.return_value = 3
     metadata.get_default_partition.return_value = _default_partition()
 
@@ -897,7 +914,8 @@ def test__apply__restore_fails__original_attach_error_still_propagates(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_default_conflict(), _sqlstate_error("53100", "disk full")]
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = _sqlstate_error("53100", "disk full")
     repo.reconcile_default_rows.side_effect = [3, SQLAlchemyError("restore failed")]
     metadata.get_default_partition.return_value = _default_partition()
     logger = MagicMock()
@@ -916,7 +934,8 @@ def test__apply__interrupted_while_restoring_rows__propagates_the_interruption(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange -- the compensating move-back itself is interrupted
-    repo.attach_partition.side_effect = [_default_conflict(), _sqlstate_error("53100", "disk full")]
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = _sqlstate_error("53100", "disk full")
     repo.reconcile_default_rows.side_effect = [5, KeyboardInterrupt()]
     metadata.get_default_partition.return_value = _default_partition()
 
@@ -929,7 +948,8 @@ def test__apply__interrupted_during_attach_after_reconcile__restores_rows_and_re
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_default_conflict(), KeyboardInterrupt()]
+    repo.attach_partition.side_effect = _default_conflict()
+    repo.reconcile_and_attach.side_effect = KeyboardInterrupt()
     repo.reconcile_default_rows.return_value = 5
     metadata.get_default_partition.return_value = _default_partition()
 
@@ -971,7 +991,7 @@ def test__apply__driver_error_default_conflict__moves_rows_and_retries(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_driver_default_conflict(), None]
+    repo.attach_partition.side_effect = _driver_default_conflict()
     repo.reconcile_default_rows.return_value = 5
     metadata.get_default_partition.return_value = _default_partition()
 
@@ -979,7 +999,8 @@ def test__apply__driver_error_default_conflict__moves_rows_and_retries(
     result = executor.apply(_config(), _plan(_create_op()))
 
     # Assert
-    assert repo.attach_partition.call_count == 2
+    assert repo.attach_partition.call_count == 1
+    assert repo.reconcile_and_attach.call_count == 1
     assert repo.reconcile_default_rows.call_count == 1
     assert result.created_count == 1
     assert result.issues == ()
@@ -989,7 +1010,8 @@ def test__apply__driver_error_on_attach__propagates_after_restoring_rows(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange
-    repo.attach_partition.side_effect = [_driver_default_conflict(), _DriverError("disk full", "53100")]
+    repo.attach_partition.side_effect = _driver_default_conflict()
+    repo.reconcile_and_attach.side_effect = _DriverError("disk full", "53100")
     repo.reconcile_default_rows.return_value = 3
     metadata.get_default_partition.return_value = _default_partition()
 
@@ -1009,7 +1031,8 @@ def test__apply__repository_error_without_a_sqlstate__propagates_after_restoring
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:
     # Arrange -- a stub or a caching layer failing on its own terms
-    repo.attach_partition.side_effect = [_driver_default_conflict(), RuntimeError("stub repository")]
+    repo.attach_partition.side_effect = _driver_default_conflict()
+    repo.reconcile_and_attach.side_effect = RuntimeError("stub repository")
     repo.reconcile_default_rows.return_value = 3
     metadata.get_default_partition.return_value = _default_partition()
 

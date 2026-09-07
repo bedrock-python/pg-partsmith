@@ -7,6 +7,7 @@ into one plain table.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -91,6 +92,45 @@ async def _default_with_rows(engine: AsyncEngine, table: str, *, months: tuple[i
 
 async def _count(engine: AsyncEngine, table: str) -> int:
     return int(await scalar(engine, f'SELECT count(*) FROM "{table}"'))  # noqa: S608
+
+
+async def _only_count(engine: AsyncEngine, table: str) -> int:
+    return int(await scalar(engine, f'SELECT count(*) FROM ONLY "{table}"'))  # noqa: S608
+
+
+# sync-mirror: skip
+class _Writer:
+    """The application the migration happens under: one insert into a window, over and over.
+
+    One statement that never changes, on its own connection, going as fast as
+    the locks let it. While the window's rows are moved out of DEFAULT these
+    inserts queue on the move's lock and land the moment it commits, which is
+    the race the move-and-attach exists to close.
+    """
+
+    def __init__(self, engine: AsyncEngine, table: str, *, month: int) -> None:
+        self._engine = engine
+        self._sql = text(
+            f'INSERT INTO "{table}" (created_at, payload) '  # noqa: S608
+            f"VALUES (make_timestamptz(2026, {month:d}, 15, 12, 0, 0, 'UTC'), 'live')"
+        )
+        self._stop = asyncio.Event()
+        self.written = 0
+
+    async def _write(self) -> None:
+        async with self._engine.connect() as base_conn:
+            conn = await base_conn.execution_options(isolation_level="AUTOCOMMIT")
+            while not self._stop.is_set():
+                await conn.execute(self._sql)
+                self.written += 1
+
+    async def __aenter__(self) -> _Writer:
+        self._writing = asyncio.create_task(self._write())
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self._stop.set()
+        await self._writing
 
 
 # ── partition_data ──────────────────────────────────────────────────────────────
@@ -718,18 +758,11 @@ async def test__ensure_partitions__default_replaced_before_a_failing_attach__row
     await _default_with_rows(db_engine, events, months=(3,), per_month=4)
     default = f"{events}_legacy"
     config = monthly_config(events, create_ahead=1)
-    original = PostgresPartitionRepository.attach_partition
-    attempts: list[str] = []
 
     async def failing(
         self: PostgresPartitionRepository, parent: str, name: str, bounds: object, **kwargs: object
-    ) -> None:
-        attempts.append(name)
-        if len(attempts) == 1:
-            # The real attach, which PostgreSQL refuses while DEFAULT holds the rows.
-            await original(self, parent, name, bounds, **kwargs)  # type: ignore[arg-type]
-            return
-        # The DEFAULT changes hands while its rows are out of it.
+    ) -> int:
+        # The DEFAULT changes hands while the bulk of its rows are out of it.
         async with db_engine.begin() as conn:
             await conn.execute(text(f'ALTER TABLE "{events}" DETACH PARTITION "{default}"'))
             await conn.execute(text(f'ALTER TABLE "{default}" RENAME TO "{default}_hijacked"'))
@@ -738,7 +771,7 @@ async def test__ensure_partitions__default_replaced_before_a_failing_attach__row
         raise SQLAlchemyError(msg)
 
     # Act / Assert
-    with patch.object(PostgresPartitionRepository, "attach_partition", failing), pytest.raises(SQLAlchemyError):
+    with patch.object(PostgresPartitionRepository, "reconcile_and_attach", failing), pytest.raises(SQLAlchemyError):
         await make_service(db_engine).ensure_partitions(config, [Period(year=2026, month=3)])
 
     # The rows are in the partition whose identity was verified, not in the stranger
@@ -1093,3 +1126,59 @@ async def test__move_rows__a_temporary_table_of_the_callers_own__is_left_alone(
         assert list(kept) == [999]
     finally:
         await engine.dispose()
+
+
+# ── attach under a live writer ──────────────────────────────────────────────────
+#
+# The window the application is inserting into is the one every live migration
+# has to attach, and moving its rows out of DEFAULT in one transaction and
+# attaching in another cannot do it: the writer refills the window in the gap
+# and PostgreSQL refuses the attach every time. Both movers put the last rows
+# and the attach under one lock.
+
+
+# sync-mirror: skip
+async def test__ensure_partitions__writer_filling_the_window__attaches_on_the_first_pass(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    """A tick attaches the window a writer keeps inserting into, and loses no row doing it."""
+    # Arrange: March's rows in DEFAULT, and an insert going in as fast as the locks allow
+    default = await _default_with_rows(db_engine, events, months=(3,), per_month=2000)
+    config = monthly_config(events, create_ahead=1)
+    march = f"{events}__2026_03"
+
+    # Act
+    async with _Writer(db_engine, events, month=3) as writer:
+        created = await make_service(db_engine).ensure_partitions(config, [Period(year=2026, month=3)])
+
+    # Assert: live on the first pass, with every row in exactly one place
+    assert writer.written, "the writer never got an insert in"
+    assert [info.relname for info in created] == [march]
+    assert await is_attached(db_engine, march)
+    assert await _only_count(db_engine, default) == 0
+    assert await _only_count(db_engine, march) == 2000 + writer.written
+    assert await _count(db_engine, events) == 2000 + writer.written
+
+
+# sync-mirror: skip
+async def test__partition_data__writer_filling_the_window__drains_it_without_raising(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    """The drain finishes a window under a live writer instead of ending on the attach."""
+    # Arrange: enough rows for several batches, and a writer adding more the whole time
+    default = await _default_with_rows(db_engine, events, months=(3,), per_month=2000)
+    config = monthly_config(events, create_ahead=1)
+    march = f"{events}__2026_03"
+
+    # Act
+    async with _Writer(db_engine, events, month=3) as writer:
+        result = await make_service(db_engine).partition_data(config, batch_rows=500)
+
+    # Assert
+    assert result.complete
+    assert result.issues == ()
+    assert result.partitions == (f"public.{march}",)
+    assert writer.written, "the writer never got an insert in"
+    assert await is_attached(db_engine, march)
+    assert await _only_count(db_engine, default) == 0
+    assert await _count(db_engine, events) == 2000 + writer.written

@@ -23,7 +23,15 @@ from pg_partsmith.entities import MaintenanceResult, PartitionInfo, TablePartiti
 from pg_partsmith.leaves import LocalLeaves
 from pg_partsmith.lifecycle import DetachMode, SqlPredicate
 from pg_partsmith.plan import PartitionBy
-from pg_partsmith.topology import ActualTree, FactKind, PartitionBounds, PartitionNode, PartitionType, RelationKind
+from pg_partsmith.topology import (
+    ActualTree,
+    FactKind,
+    PartitionBounds,
+    PartitionNode,
+    PartitionType,
+    RangeBounds,
+    RelationKind,
+)
 
 __all__ = [
     "LockManager",
@@ -236,6 +244,45 @@ class PartitionRepository(Protocol):
 
         Returns:
             Number of rows moved.
+        """
+        ...
+
+    def reconcile_and_attach(
+        self,
+        parent_name: str,
+        partition_name: str,
+        bounds: RangeBounds,
+        *,
+        key_columns: tuple[str, ...],
+        default_partition_name: str,
+        expected_oid: int | None = None,
+        expected_parent_oid: int | None = None,
+        expected_default_oid: int | None = None,
+    ) -> int:
+        """Take the window's last rows out of DEFAULT and attach, in one transaction.
+
+        The pair cannot be two transactions on a table that is being written
+        to: the move commits, the DEFAULT partition is free again, and a row
+        for the window lands in it before ``ATTACH`` scans -- which fails the
+        attach with the very conflict the move was clearing. An implementation
+        must hold one lock across both, and must roll the move back with a
+        failed attach.
+
+        Args:
+            parent_name: Partitioned relation to attach to.
+            partition_name: Table to attach.
+            bounds: The RANGE window the partition owns, and the rows to take.
+            key_columns: The parent's partition key, leading column first. Rows
+                with a NULL in a trailing column stay in DEFAULT, where
+                PostgreSQL routes them.
+            default_partition_name: Qualified name of DEFAULT partition.
+            expected_oid: The catalog identity of the partition, checked the
+                way ``attach_partition`` checks it.
+            expected_parent_oid: The catalog identity of the parent.
+            expected_default_oid: The catalog identity the rows must come from.
+
+        Returns:
+            Number of rows moved out of the DEFAULT partition.
         """
         ...
 

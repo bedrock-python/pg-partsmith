@@ -48,7 +48,12 @@ await maintainer.run_maintenance_safe(config)
 
 The tick creates the current month and the two after it. As each is attached, the rows
 of that month move out of `events_legacy` into it — ordinary DEFAULT reconciliation.
-From now on new rows land in real partitions; the old ones are still in the DEFAULT.
+The current month is the one the application is writing into, and it attaches on this
+first tick like the empty future ones: the bulk of its rows move first, then the rows
+that arrived while that ran move *and* the partition goes live in one transaction, under
+the lock `ATTACH` takes on the DEFAULT partition anyway. Inserts wait for that commit and
+are then routed into the new partition. From now on new rows land in real partitions; the
+old ones are still in the DEFAULT.
 
 ## 3. Drain the DEFAULT partition
 
@@ -65,7 +70,10 @@ Each call:
 3. moves the window's rows into it in batches of `batch_rows` — one
    `DELETE … RETURNING` / `INSERT` per batch, each committing on its own, so a row is in
    exactly one place at every commit point;
-4. attaches the partition once nothing of that window is left in DEFAULT;
+4. takes whatever landed during the last batch and attaches the partition, in one
+   transaction under the lock `ATTACH` needs anyway — so a window still being written to
+   is attached on the same pass as a quiet one, and the exclusive lock covers a tail and a
+   scan rather than a month;
 5. moves on to the next window, until DEFAULT holds only rows no window can take (rows
    with a NULL key), or `max_batches` is spent.
 
@@ -80,14 +88,18 @@ finds it, finishes it and attaches it.
     a partition cannot be attached while DEFAULT still holds rows for it. Run the drain in
     a maintenance window, or with small batches during a quiet hour and readers that can
     tolerate a month's rows appearing a little later. Rows already in real partitions, and
-    rows still in DEFAULT for other windows, stay visible throughout.
+    rows still in DEFAULT for other windows, stay visible throughout. The attach that ends
+    the window holds `ACCESS EXCLUSIVE` on the DEFAULT partition — readers and writers of
+    the *undrained* rows wait for it, for the length of the last batch's tail plus one
+    scan of DEFAULT.
 
 `partition_data` takes the table's lock, so it does not race the scheduled tick. It
-refuses a window it cannot create (an unmanaged partition overlaps it), and any move an
-incoming foreign key's `ON DELETE` action would corrupt, with a `move` issue and
-`complete=False` rather than loop. A window whose partition already exists *detached*
-with this library's marker — retention retired it, and late rows for it landed in
-DEFAULT — is filled and re-attached rather than given up on.
+refuses a window it cannot create (an unmanaged partition overlaps it), any move an
+incoming foreign key's `ON DELETE` action would corrupt, and a DEFAULT partition it could
+not clear, with a `move` issue and `complete=False` rather than loop — and never by
+raising at the caller. A window whose partition already exists *detached* with this
+library's marker — retention retired it, and late rows for it landed in DEFAULT — is
+filled and re-attached rather than given up on.
 
 ## 4. Afterwards
 
