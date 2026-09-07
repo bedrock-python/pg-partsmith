@@ -71,9 +71,9 @@ Each call:
    `DELETE … RETURNING` / `INSERT` per batch, each committing on its own, so a row is in
    exactly one place at every commit point;
 4. takes whatever landed during the last batch and attaches the partition, in one
-   transaction under the lock `ATTACH` needs anyway — so a window still being written to
-   is attached on the same pass as a quiet one, and the exclusive lock covers a tail and a
-   scan rather than a month;
+   transaction and under one lock — so a window still being written to is attached on the
+   same pass as a quiet one, and what the lock covers is a tail and a scan rather than a
+   month;
 5. moves on to the next window, until DEFAULT holds only rows no window can take (rows
    with a NULL key), or `max_batches` is spent.
 

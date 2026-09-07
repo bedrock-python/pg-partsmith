@@ -63,9 +63,9 @@ class DataMover:
         still in DEFAULT is created detached (subtree included), filled from
         DEFAULT in batches of ``batch_rows``, and attached once DEFAULT holds
         nothing more for it. The attach takes whatever arrived while the
-        batches ran in its own transaction, under the lock it needs anyway, so
-        the window a live writer is inserting into goes live on the same pass
-        as the quiet ones. A partition left detached when ``max_batches`` runs
+        batches ran in its own transaction and under one lock, so the window a
+        live writer is inserting into goes live on the same pass as the quiet
+        ones. A partition left detached when ``max_batches`` runs
         out is picked up and finished by the next call.
 
         A window that cannot be finished at all -- rows an incoming foreign
