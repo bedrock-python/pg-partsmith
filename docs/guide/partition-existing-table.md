@@ -116,6 +116,21 @@ DROP TABLE events_legacy;
 Without a DEFAULT partition, `DETACH … CONCURRENTLY` becomes available, which is what
 `DetachMode.AUTO` prefers.
 
+!!! note "A `serial` key's sequence still belongs to the old table"
+    `BIGSERIAL` makes the sequence **owned by** the column it was declared on, so after the
+    swap it belongs to `events_legacy` — while every partition's `id` default draws from it.
+    `DROP TABLE events_legacy` is refused for exactly that (`2BP01`, *other objects depend
+    on it*, listing one default per partition). Move the ownership to the live parent first:
+
+    ```sql
+    ALTER SEQUENCE events_id_seq OWNED BY events.id;
+    ```
+
+    Then the drop goes through and the ids carry on where they were. Do **not** reach for
+    `DROP TABLE … CASCADE` here: measured on 17, it takes the sequence with the table and
+    every default that drew from it, and the next insert fails
+    `null value in column "id" … violates not-null constraint`.
+
 ## The way back
 
 `unpartition` empties every partition into one plain table, oldest first, in the same
