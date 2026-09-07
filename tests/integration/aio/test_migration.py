@@ -115,6 +115,7 @@ class _Writer:
             f"VALUES (make_timestamptz(2026, {month:d}, 15, 12, 0, 0, 'UTC'), 'live')"
         )
         self._stop = asyncio.Event()
+        self._started = asyncio.Event()
         self.written = 0
 
     async def _write(self) -> None:
@@ -123,9 +124,13 @@ class _Writer:
             while not self._stop.is_set():
                 await conn.execute(self._sql)
                 self.written += 1
+                self._started.set()
 
     async def __aenter__(self) -> _Writer:
         self._writing = asyncio.create_task(self._write())
+        # The block must run against a writer that is already writing, not one
+        # that may not have had the loop yet.
+        await self._started.wait()
         return self
 
     async def __aexit__(self, *_exc: object) -> None:

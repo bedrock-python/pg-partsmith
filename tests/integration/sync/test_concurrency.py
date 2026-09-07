@@ -185,6 +185,7 @@ class _Writer:
             f"VALUES (make_timestamptz(2026, {month:d}, 15, 12, 0, 0, 'UTC'), 'live')"
         )
         self._stop = threading.Event()
+        self._started = threading.Event()
         self._thread = threading.Thread(target=self._write)
         self.written = 0
 
@@ -193,9 +194,13 @@ class _Writer:
             while not self._stop.is_set():
                 conn.execute(self._sql)
                 self.written += 1
+                self._started.set()
 
     def __enter__(self) -> _Writer:
         self._thread.start()
+        # The block must run against a writer that is already writing, not one
+        # that may not have been scheduled yet.
+        assert self._started.wait(timeout=30), "the writer thread never got an insert in"
         return self
 
     def __exit__(self, *_exc: object) -> None:
