@@ -14,7 +14,7 @@
 
 # The base images are written out rather than taken from build arguments:
 # Dependabot reads FROM lines, and a rebuild on a base-image fix is what it is for.
-FROM ghcr.io/astral-sh/uv:0.12.9 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.13 AS uv
 
 FROM python:3.14-slim-bookworm AS builder
 
