@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.5.1...pg-partsmith-v1.6.0) (2026-09-29)
+
+
+### Features
+
+* plan on the database's clock, not the process's ([#77](https://github.com/bedrock-python/pg-partsmith/issues/77)) ([e0c0192](https://github.com/bedrock-python/pg-partsmith/commit/e0c0192ec206b4470041c34f4dd838f458414cd0)), closes [#74](https://github.com/bedrock-python/pg-partsmith/issues/74)
+
 ## 1.6.0 — plans on the database's clock
 
 A plan is made against the database's clock, `now()`, unless the caller names an instant.
