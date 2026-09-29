@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from itertools import count
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
@@ -98,6 +98,7 @@ def metadata() -> MagicMock:
     metadata.get_relation_oid = AsyncMock(return_value=4242)
     metadata.get_unique_constraint_columns = AsyncMock(return_value=())
     metadata.get_key_high_water_mark = AsyncMock(return_value=None)
+    metadata.current_time = AsyncMock(return_value=datetime.now(UTC))
     return metadata
 
 
@@ -598,9 +599,8 @@ async def test__maintain__end_to_end__returns_counters_and_the_plan_it_executed(
     metadata.is_partition_attached.return_value = True
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        result = await service.maintain(config)
+    metadata.current_time.return_value = NOW
+    result = await service.maintain(config)
 
     # Assert
     assert result.success
@@ -640,9 +640,8 @@ async def test__maintain__continue_on_error__isolates_a_failed_create_and_still_
     repo.create_table_like.side_effect = SQLAlchemyError("create failed")
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        result = await service.maintain(config, continue_on_error=True)
+    metadata.current_time.return_value = NOW
+    result = await service.maintain(config, continue_on_error=True)
 
     # Assert
     assert result.success
@@ -682,9 +681,8 @@ async def test__maintain__hooks_given_to_the_service__reach_the_executor(
     service = PartitionLifecycleService(repo, metadata, locks, hooks=[_Hooks()])
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        await service.maintain(config)
+    metadata.current_time.return_value = NOW
+    await service.maintain(config)
 
     # Assert
     assert seen == ["events__2024_03"]
@@ -961,9 +959,8 @@ async def test__create_future_partitions__runs_only_the_creation_half_of_the_pla
     )
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        created = await service.create_future_partitions(config)
+    metadata.current_time.return_value = NOW
+    created = await service.create_future_partitions(config)
 
     # Assert
     assert [p.name for p in created] == ["events__2024_03"]
@@ -982,9 +979,8 @@ async def test__create_future_partitions__orphan_for_a_wanted_window__is_reattac
     metadata.get_relation_oid.return_value = 66
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        created = await service.create_future_partitions(config)
+    metadata.current_time.return_value = NOW
+    created = await service.create_future_partitions(config)
 
     # Assert
     assert created == []
@@ -1001,9 +997,8 @@ async def test__create_future_partitions__everything_exists__returns_nothing(
     metadata.get_actual_tree.return_value = _tree(_range_child("events__2024_03", "2024-03-01", "2024-04-01", oid=3))
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        created = await service.create_future_partitions(config)
+    metadata.current_time.return_value = NOW
+    created = await service.create_future_partitions(config)
 
     # Assert
     assert created == []
@@ -1033,9 +1028,8 @@ async def test__get_partitions_for_pruning__expired_members_first_then_orphans_p
     )
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        to_prune = await service.get_partitions_for_pruning(config)
+    metadata.current_time.return_value = NOW
+    to_prune = await service.get_partitions_for_pruning(config)
 
     # Assert -- the drop that follows January's detach is not listed twice
     assert [p.name for p in to_prune] == ["events__2024_01", "events__2023_12"]
@@ -1063,9 +1057,8 @@ async def test__get_partitions_for_pruning__nothing_expired__returns_empty(
     metadata.get_actual_tree.return_value = _tree(_range_child("events__2024_02", "2024-02-01", "2024-03-01", oid=2))
 
     # Act
-    with patch("pg_partsmith.aio.services.inspection.datetime") as clock:
-        clock.now.return_value = NOW
-        to_prune = await service.get_partitions_for_pruning(config)
+    metadata.current_time.return_value = NOW
+    to_prune = await service.get_partitions_for_pruning(config)
 
     # Assert
     assert to_prune == []

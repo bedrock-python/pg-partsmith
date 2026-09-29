@@ -376,6 +376,12 @@ PARTITION_UPPER_BOUND_SQL = r"""
       AND pt.partstrat = 'r'
 """
 
+# The database's clock. A plan is made against it unless the caller names an
+# instant: the process running maintenance can be wrong about the date without
+# anything else noticing, and retention decided on a clock ahead of the data's
+# drops partitions the data has not finished with.
+CURRENT_TIME_SQL = "SELECT now()"
+
 INSTANT_HAS_PASSED_SQL = """
     SELECT now() >= CAST(:upper_bound AS timestamptz) + make_interval(secs => :settle_seconds)
 """

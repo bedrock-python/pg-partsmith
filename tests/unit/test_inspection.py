@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
@@ -36,6 +36,7 @@ def metadata() -> MagicMock:
     metadata.get_actual_tree = AsyncMock(return_value=_tree())
     metadata.measure = AsyncMock(side_effect=lambda tree, **kwargs: tree)
     metadata.get_key_high_water_mark = AsyncMock(return_value=None)
+    metadata.current_time = AsyncMock(return_value=datetime.now(UTC))
     return metadata
 
 
@@ -241,16 +242,17 @@ async def test__inspect__nested_progression_level__measures_members_below_the_ro
 # ── context ─────────────────────────────────────────────────────────────────────
 
 
-async def test__context__no_instant_given__defaults_to_the_current_utc_time(inspector: PartitionInspector) -> None:
-    # Arrange
-    before = datetime.now(UTC)
+async def test__context__no_instant_given__plans_on_the_databases_clock(
+    inspector: PartitionInspector, metadata: MagicMock
+) -> None:
+    # Arrange -- a database whose clock disagrees with this process's
+    metadata.current_time.return_value = NOW
 
     # Act
     context = await inspector.context(_config())
 
     # Assert
-    assert context.now.tzinfo is UTC
-    assert before <= context.now <= datetime.now(UTC) + timedelta(seconds=1)
+    assert context.now == NOW
     assert context.mode is PlanMode.MAINTAIN
     assert context.cursors == {}
     assert context.explicit_windows == {}

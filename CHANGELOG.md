@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.6.0 — plans on the database's clock
+
+A plan is made against the database's clock, `now()`, unless the caller names an instant.
+It used to be made against the clock of the process running maintenance, and nothing
+compared the two: a container whose clock ran ahead decided retention for a date the data
+had not reached. With the container at June 2027 and the data at September 2026, one
+`apply --allow-destructive` detached and dropped every monthly partition, the current one
+included, and exited 0 ([#74](https://github.com/bedrock-python/pg-partsmith/issues/74)).
+pg_partman never had this problem, because it runs inside the database.
+
+`current_time()` is a method of `PartitionMetadataProvider` in both mirrors, and a provider
+of your own now has to answer it with the clock of the database it reads. `plan(now=...)`
+still plans against whatever instant it is given.
+
+Not moved yet: the instant a detach is stamped with, which the orphan grace period counts
+from, is still the process's, so a clock that is off moves the end of the grace period by
+as much. Moving the stamp changes the repository protocol and is its own change.
+
 ## [1.5.1](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.5.0...pg-partsmith-v1.5.1) (2026-09-07)
 
 

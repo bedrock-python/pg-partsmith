@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -34,7 +34,8 @@ from pg_partsmith.utils import DETACHED_AT_MARKER, orphan_table_comment
 def _make_engine(*values: object) -> MagicMock:
     """Build an engine mock where each ``conn.execute()`` call answers with the next value.
 
-    A list becomes ``result.fetchall()``; anything else becomes ``result.scalar()``.
+    A list becomes ``result.fetchall()``; anything else becomes ``result.scalar()`` and
+    ``result.scalar_one()``.
     An exception instance is raised by that call.
     """
     engine = MagicMock()
@@ -52,6 +53,7 @@ def _make_engine(*values: object) -> MagicMock:
             result.fetchall.return_value = value
         else:
             result.scalar.return_value = value
+            result.scalar_one.return_value = value
         results.append(result)
     conn.execute.side_effect = results
 
@@ -932,6 +934,20 @@ async def test__is_partition_attached__returns_the_catalog_answer(attached: bool
     # Act / Assert
     assert await provider.is_partition_attached("events", "events__2024_W12") is attached
     assert _conn(engine).execute.call_args.args[1] == {"table_name": '"events"', "partition_name": '"events__2024_W12"'}
+
+
+async def test__current_time__reads_the_databases_clock_in_utc() -> None:
+    # Arrange -- the server answers in its own session timezone
+    engine = _make_engine(datetime(2026, 9, 29, 15, 30, tzinfo=timezone(timedelta(hours=3))))
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    instant = await provider.current_time()
+
+    # Assert
+    assert instant == datetime(2026, 9, 29, 12, 30, tzinfo=UTC)
+    assert instant.tzinfo is UTC
+    assert _statements(engine) == ["SELECT now()"]
 
 
 @pytest.mark.parametrize("value,expected", [(4242, 4242), ("4242", 4242), (None, None)])

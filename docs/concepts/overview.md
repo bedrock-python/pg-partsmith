@@ -48,8 +48,8 @@ timezone, optionally over an encoded key (UUIDv7, epoch) through a codec.
 `NumericBoundaries` cuts an integer axis into fixed steps. `IntegerSequence` gives a
 sliding LIST one value per partition. Boundaries also decide the partition **names**.
 
-The **cursor** is "now" on the axis: the clock for time, the key's high-water mark for
-integers, the newest partition for a sliding list.
+The **cursor** is "now" on the axis: the database's clock for time, the key's high-water
+mark for integers, the newest partition for a sliding list.
 
 → [Boundaries, cursors and calendars](boundaries.md)
 

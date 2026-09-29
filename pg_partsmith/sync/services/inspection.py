@@ -19,7 +19,8 @@ class PartitionInspector:
 
     Two things beyond the tree itself: the *facts* the lifecycle policy asked
     for, gathered only for the relations a policy can decide over, and the
-    *cursor* of every integer axis -- the clock needs no query.
+    *cursors* -- the database's clock for a time axis, the high-water mark
+    for an integer axis that reads one.
     """
 
     def __init__(self, metadata: PartitionMetadataProvider) -> None:
@@ -62,8 +63,13 @@ class PartitionInspector:
         mode: PlanMode = PlanMode.MAINTAIN,
         explicit_windows: dict[str, tuple[Window, ...]] | None = None,
     ) -> PlanningContext:
-        """Resolve the clock and the cursors the plan is made against."""
-        instant = datetime.now(UTC) if now is None else now
+        """Resolve the clock and the cursors the plan is made against.
+
+        Without ``now`` the clock is the database's, not this process's: a
+        maintenance container whose clock runs ahead would otherwise expire
+        partitions the data has not finished with.
+        """
+        instant = self._metadata.current_time() if now is None else now
         if instant.tzinfo is None:
             instant = instant.replace(tzinfo=UTC)
 

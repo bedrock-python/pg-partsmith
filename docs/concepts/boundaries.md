@@ -7,7 +7,7 @@ partition for a window is called. Three implementations ship.
 
 | Boundaries | Axis | Window | Cursor |
 |---|---|---|---|
-| `TimeBoundaries` | instants | a calendar period | the clock |
+| `TimeBoundaries` | instants | a calendar period | the database's clock |
 | `NumericBoundaries` | integers | a fixed-width step | `max(key)` or the key's sequence |
 | `IntegerSequence` | integers | one value | the newest partition |
 
@@ -47,7 +47,9 @@ or a custom one. The calculator names partitions and renders their bounds:
 | `QUARTER` | `events__2026_q3` | |
 | `YEAR` | `events__2026` | |
 
-The cursor is the clock, read in the calendar's timezone.
+The cursor is the database's clock, `now()`, read in the calendar's timezone. It is the
+database's rather than the maintenance process's so that a container with a wrong clock
+cannot decide retention for a date the data has not reached.
 
 ### Timezones
 
@@ -152,7 +154,7 @@ timezone.
 
 | Axis | Cursor | Where it comes from |
 |---|---|---|
-| time | the current instant, in the calendar's zone | the clock (`now=` on `plan()` to override) |
+| time | the current instant, in the calendar's zone | the database's clock (`now=` on `plan()` to override) |
 | integer (`NumericBoundaries`) | the key's high-water mark | `max(key)` over the table, or the sequence |
 | integer (`IntegerSequence`) | the newest partition's value | the tree (`NEWEST_MEMBER`), or `max(key)` |
 
