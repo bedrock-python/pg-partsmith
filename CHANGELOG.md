@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.6.0...pg-partsmith-v1.6.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* bound how long an attach, a move or a detach waits for a lock ([#79](https://github.com/bedrock-python/pg-partsmith/issues/79)) ([43020f3](https://github.com/bedrock-python/pg-partsmith/commit/43020f39959988d089846d55b9ef80b15a95dc04)), closes [#75](https://github.com/bedrock-python/pg-partsmith/issues/75)
+
 ## 1.6.1 — a lock wait no longer holds every writer
 
 An attach, a row move and a blocking detach now run under `lock_timeout`:
