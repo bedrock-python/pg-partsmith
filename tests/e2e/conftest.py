@@ -18,7 +18,16 @@ import pytest
 from testcontainers.core.network import Network
 from testcontainers.postgres import PostgresContainer
 
-from tests.e2e.support import DB_ALIAS, DB_NAME, DB_PASSWORD, DB_USER, Image
+from tests.e2e.support import (
+    DB_ALIAS,
+    DB_NAME,
+    DB_PASSWORD,
+    DB_USER,
+    TLS_DB_ALIAS,
+    TLS_POSTGRES_COMMAND,
+    TLS_POSTGRES_IMAGE,
+    Image,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -68,6 +77,19 @@ def postgres(network: Network, postgres_image: str) -> Iterator[PostgresContaine
         PostgresContainer(postgres_image, username=DB_USER, password=DB_PASSWORD, dbname=DB_NAME)
         .with_network(network)
         .with_network_aliases(DB_ALIAS)
+    )
+    with container as running:
+        yield running
+
+
+@pytest.fixture(scope="session")
+def tls_postgres(network: Network) -> Iterator[PostgresContainer]:
+    """A database that speaks TLS: what a managed PostgreSQL looks like to ``sslmode=require``."""
+    container = (
+        PostgresContainer(TLS_POSTGRES_IMAGE, username=DB_USER, password=DB_PASSWORD, dbname=DB_NAME)
+        .with_command(TLS_POSTGRES_COMMAND)
+        .with_network(network)
+        .with_network_aliases(TLS_DB_ALIAS)
     )
     with container as running:
         yield running

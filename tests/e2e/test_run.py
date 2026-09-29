@@ -15,6 +15,7 @@ from tests.e2e.support import (
     DOCUMENT_PATH,
     INTERNAL_DSN,
     SLEEPING_HOOK,
+    TLS_DSN,
     expired_partition,
     finish,
     holds_advisory_lock,
@@ -173,6 +174,21 @@ def test__a_password_the_server_rejects__is_exit_5_and_not_a_traceback(image: Im
     assert outcome.code == 5
     assert "password authentication failed" in outcome.stderr
     assert "Traceback" not in outcome.stderr
+
+
+def test__a_dsn_asking_for_tls__plans_over_tls(image: Image, tls_postgres: PostgresContainer, tmp_path: Path) -> None:
+    # A DSN the way psql and managed providers write it, against an image that
+    # ships asyncpg alone. `require` refuses a connection that is not encrypted,
+    # so a plan at all is a plan made over TLS.
+    table = partitioned_table(tls_postgres)
+    document = write_document(tmp_path / "partitions.json", table=table)
+
+    outcome = image.run(
+        "plan", "-c", DOCUMENT_PATH, env={"PG_PARTSMITH_DSN": f"{TLS_DSN}?sslmode=require"}, mounts=_mounted(document)
+    )
+
+    assert outcome.code == 0, outcome.stderr
+    assert f"CREATE public.{table}__" in outcome.stdout
 
 
 # ── Hooks, stops and overlapping runs ─────────────────────────────────────────

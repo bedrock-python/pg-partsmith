@@ -69,6 +69,18 @@ arrive as files under `/run/secrets`.
 A DSN naming no driver (`postgresql://…`) is driven with asyncpg, which the `cli` extra
 installs. One that names its own (`postgresql+psycopg://…`) is left exactly as written.
 
+libpq's TLS parameters work in a DSN naming no driver the way psql reads them:
+`sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `sslcrl`, `sslpassword`, `sslnegotiation`
+and the protocol-version bounds are handed to asyncpg to parse itself, so a DSN copied from
+a managed PostgreSQL console works unchanged:
+
+```bash
+export PG_PARTSMITH_DSN='postgresql://app:secret@db.example.com/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem'
+```
+
+In a DSN that names `postgresql+asyncpg://` itself, TLS is SQLAlchemy's `?ssl=require`
+spelling, as it always was.
+
 ## Exit codes
 
 A CronJob and a CI step read the exit code and nothing else, so the codes are worth

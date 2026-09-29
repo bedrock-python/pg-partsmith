@@ -28,6 +28,16 @@ DB_ALIAS = "db"
 INTERNAL_DSN = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_ALIAS}:5432/{DB_NAME}"
 DOCUMENT_PATH = "/etc/partitions.json"
 
+# A server that speaks TLS. The Debian image ships a snakeoil certificate its
+# postgres user can read, so TLS is a command line away and needs no key of ours.
+TLS_DB_ALIAS = "tls-db"
+TLS_DSN = f"postgresql://{DB_USER}:{DB_PASSWORD}@{TLS_DB_ALIAS}:5432/{DB_NAME}"
+TLS_POSTGRES_IMAGE = "postgres:17"
+TLS_POSTGRES_COMMAND = (
+    "postgres -c ssl=on -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem "
+    "-c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key"
+)
+
 # A hook that holds the run -- and the table's lock -- for as long as a test
 # needs it held. The image has no `sleep`; it has the interpreter.
 SLEEPING_HOOK = ["/opt/venv/bin/python", "-c", "import time; time.sleep(120)"]
