@@ -16,6 +16,7 @@ has to know how the planner works.
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
+from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
 from pg_partsmith.boundaries import TimeBoundaries
@@ -435,6 +436,16 @@ class PartitionMetadataProvider(Protocol):
                 belongs to -- ``config.time_boundaries``. When given, its
                 timezone and codec read the bound instead of whatever the
                 provider was constructed with.
+        """
+        ...
+
+    async def current_time(self) -> datetime:
+        """The database's current time, timezone-aware.
+
+        What a plan is made against when the caller names no instant. A
+        provider answers with the clock of the database it reads, not the
+        process's: a maintenance process with a wrong clock would otherwise
+        decide retention for a date the data has not reached.
         """
         ...
 

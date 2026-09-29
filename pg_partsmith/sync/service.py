@@ -108,7 +108,7 @@ class PartitionLifecycleService:
             mode: What the plan is for: the scheduled tick (``MAINTAIN``),
                 converging the existing tree only (``RECONCILE``), or ensuring
                 specific windows exist (``EXPLICIT``, with ``windows``).
-            now: The instant to plan against; the current time by default.
+            now: The instant to plan against; the database's current time by default.
             windows: In ``EXPLICIT`` mode, the windows to ensure at each
                 progression level, keyed by leading column.
 

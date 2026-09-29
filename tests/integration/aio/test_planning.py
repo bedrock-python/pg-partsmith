@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -29,6 +30,7 @@ from tests.integration.aio.support import (
     relation_oid,
     relkind,
     run_maintenance,
+    scalar,
 )
 from tests.integration.nested_support import METRICS_TABLE_DDL, MONTHLY_TABLE_DDL, monthly_config, orphan_marker
 
@@ -52,6 +54,30 @@ async def table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
 async def metrics_table(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
     async for name in make_table(db_engine, METRICS_TABLE_DDL, prefix="metrics"):
         yield name
+
+
+# ── the clock ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.database_clock
+async def test__maintain__process_clock_years_ahead__retention_keeps_the_databases_current_month(
+    db_engine: AsyncEngine, table: str
+) -> None:
+    # Arrange -- the database's current month and the one after it; keep the newest two
+    config = monthly_config(table, create_ahead=1, retention=2)
+    await make_service(db_engine).maintain(config)
+    month = await scalar(db_engine, "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY_MM')")
+    current = f"{table}__{month}"
+    years_ahead = (datetime.now(UTC) + timedelta(days=3 * 365)).date().isoformat()
+
+    # Act -- a maintenance process whose clock is three years ahead of the database's
+    result = await run_maintenance(db_engine, config, at_time=years_ahead)
+
+    # Assert
+    assert await is_attached(db_engine, current)
+    assert (result.created_count, result.detached_count, result.dropped_count) == (0, 0, 0)
+    assert result.plan is not None
+    assert abs(result.plan.generated_at - await scalar(db_engine, "SELECT now()")) < timedelta(minutes=1)
 
 
 # ── plan() / apply() ────────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ maintainer.
 - The windows exist already. Check `service.inspect(config)`.
 - The creation rule is `CreateNextIf` and the newest partition does not satisfy it yet.
 - The cursor is not where you think: an integer axis reads `max(key)` — an empty table
-  starts at `origin`; a time axis reads the clock in the calendar's `tz`.
+  starts at `origin`; a time axis reads the database's clock in the calendar's `tz`.
 - The run was planned in `RECONCILE` mode (`reconcile()` creates nothing ahead).
 
 ## `range_overlap` — a wanted window overlaps a partition I did not configure

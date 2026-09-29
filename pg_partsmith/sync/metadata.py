@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from pg_partsmith.catalog_queries import (
+    CURRENT_TIME_SQL,
     INCOMING_FOREIGN_KEYS_SQL,
     INSTANT_HAS_PASSED_SQL,
     ORPHANS_SQL,
@@ -553,6 +554,19 @@ class PostgresMetadataProvider:
             result = conn.execute(text(RELATION_OID_SQL), {"name": to_regclass_argument(name)})
             value = result.scalar()
         return None if value is None else int(value)
+
+    def current_time(self) -> datetime:
+        """The database's current time, in UTC.
+
+        What a plan is made against when the caller names no instant. Reading
+        it here rather than off the process keeps a maintenance container with
+        a wrong clock from deciding retention for a date the data has not
+        reached.
+        """
+        with self._engine.connect() as conn:
+            result = conn.execute(text(CURRENT_TIME_SQL))
+            instant: datetime = result.scalar_one()
+        return instant.astimezone(UTC)
 
     def get_relation_kind(self, name: str) -> RelationKind | None:
         """What the relation holding ``name`` physically is, or None when there is none."""

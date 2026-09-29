@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -29,6 +30,7 @@ from tests.integration.sync.support import (
     relation_oid,
     relkind,
     run_maintenance,
+    scalar,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +51,30 @@ def table(sync_db_engine: Engine) -> Generator[str, None]:
 @pytest.fixture
 def metrics_table(sync_db_engine: Engine) -> Generator[str, None]:
     yield from make_table(sync_db_engine, METRICS_TABLE_DDL, prefix="metrics")
+
+
+# ── the clock ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.database_clock
+def test__maintain__process_clock_years_ahead__retention_keeps_the_databases_current_month(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange -- the database's current month and the one after it; keep the newest two
+    config = monthly_config(table, create_ahead=1, retention=2)
+    make_service(sync_db_engine).maintain(config)
+    month = scalar(sync_db_engine, "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY_MM')")
+    current = f"{table}__{month}"
+    years_ahead = (datetime.now(UTC) + timedelta(days=3 * 365)).date().isoformat()
+
+    # Act -- a maintenance process whose clock is three years ahead of the database's
+    result = run_maintenance(sync_db_engine, config, at_time=years_ahead)
+
+    # Assert
+    assert is_attached(sync_db_engine, current)
+    assert (result.created_count, result.detached_count, result.dropped_count) == (0, 0, 0)
+    assert result.plan is not None
+    assert abs(result.plan.generated_at - scalar(sync_db_engine, "SELECT now()")) < timedelta(minutes=1)
 
 
 # ── plan() / apply() ────────────────────────────────────────────────────────────
