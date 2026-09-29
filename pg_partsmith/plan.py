@@ -355,12 +355,14 @@ class CreatePartition(OperationBase):
 
     @property
     def capabilities(self) -> OperationCapabilities:
-        """Transactional; ATTACH takes SHARE UPDATE EXCLUSIVE on the parent."""
+        """Transactional; ATTACH takes SHARE UPDATE EXCLUSIVE on the parent, EXCLUSIVE when it clears DEFAULT."""
         return OperationCapabilities(
             transactional=True,
             lock="ACCESS SHARE on the template during CREATE; SHARE UPDATE EXCLUSIVE on the parent "
-            "and ACCESS EXCLUSIVE on the new partition (and on a DEFAULT sibling) during ATTACH; "
-            "SHARE ROW EXCLUSIVE on every table referencing the parent through a foreign key",
+            "and ACCESS EXCLUSIVE on the new partition (and on a DEFAULT sibling) during ATTACH -- "
+            "EXCLUSIVE on the parent instead, which holds off writes, when rows of the window are taken "
+            "out of a DEFAULT sibling in the attach's transaction; SHARE ROW EXCLUSIVE on every table "
+            "referencing the parent through a foreign key",
         )
 
     def count(self) -> int:
@@ -401,11 +403,13 @@ class AttachPartition(OperationBase):
 
     @property
     def capabilities(self) -> OperationCapabilities:
-        """Transactional; SHARE UPDATE EXCLUSIVE on the parent."""
+        """Transactional; SHARE UPDATE EXCLUSIVE on the parent, EXCLUSIVE when it clears DEFAULT."""
         return OperationCapabilities(
             transactional=True,
-            lock="SHARE UPDATE EXCLUSIVE on the parent; ACCESS EXCLUSIVE on the partition and on a DEFAULT "
-            "sibling; SHARE ROW EXCLUSIVE on every table referencing the parent through a foreign key",
+            lock="SHARE UPDATE EXCLUSIVE on the parent -- EXCLUSIVE, which holds off writes, when rows of the "
+            "window are taken out of a DEFAULT sibling in the attach's transaction; ACCESS EXCLUSIVE on the "
+            "partition and on a DEFAULT sibling; SHARE ROW EXCLUSIVE on every table referencing the parent "
+            "through a foreign key",
         )
 
 

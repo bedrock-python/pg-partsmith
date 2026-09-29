@@ -13,6 +13,7 @@ from uuid import uuid4
 import freezegun
 from sqlalchemy import text
 
+from pg_partsmith.constants import DEFAULT_DDL_LOCK_TIMEOUT_MS
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
@@ -59,10 +60,11 @@ def make_service(
     *,
     hooks: list[PartitionLifecycleHooks] | None = None,
     codec: RangeBoundaryCodec | None = None,
+    ddl_lock_timeout_ms: int = DEFAULT_DDL_LOCK_TIMEOUT_MS,
 ) -> PartitionLifecycleService:
     """Wire a lifecycle service over ``engine`` with the bundled PostgreSQL components."""
     return PartitionLifecycleService(
-        repo=PostgresPartitionRepository(engine),
+        repo=PostgresPartitionRepository(engine, ddl_lock_timeout_ms=ddl_lock_timeout_ms),
         metadata=PostgresMetadataProvider(engine, boundary_codec=codec),
         locks=PostgresAdvisoryLockManager(engine),
         hooks=hooks,

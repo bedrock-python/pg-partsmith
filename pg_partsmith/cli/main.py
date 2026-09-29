@@ -463,8 +463,10 @@ def _execute(invocation: _Invocation) -> ExitCode:
         # A refused connection surfaces as a bare OSError and a rejected
         # password as the driver's own error: both come before SQLAlchemy has
         # a DBAPI error to wrap. Reading the document is already behind
-        # ConfigError, so anything here is the database.
-        return _failed(f"database error: {exc}", ExitCode.CONNECTION)
+        # ConfigError, so anything here is the database. A TimeoutError is an
+        # OSError too, and the one asyncio.timeout raises has no message.
+        detail = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else type(exc).__name__)
+        return _failed(f"database error: {detail}", ExitCode.CONNECTION)
     except _StopSignalError as exc:
         word, code = _STOP_SIGNALS[exc.signum]
         return _failed(word, code)

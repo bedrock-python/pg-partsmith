@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from pg_partsmith.catalog_queries import SET_LOCK_TIMEOUT_SQL
 from pg_partsmith.exceptions import (
     DropRetryExhaustedError,
     PartitionAttachedError,
@@ -65,6 +66,7 @@ class PartitionRemover:
         *,
         engine: AsyncEngine,
         ddl_timeout: float,
+        lock_timeout_ms: int,
         drop_lock_timeout_ms: int,
         drop_max_retries: int,
         drop_retry_delay: float,
@@ -77,6 +79,7 @@ class PartitionRemover:
     ) -> None:
         self._engine = engine
         self._ddl_timeout = ddl_timeout
+        self._lock_timeout_ms = lock_timeout_ms
         self._drop_lock_timeout_ms = drop_lock_timeout_ms
         self._drop_max_retries = drop_max_retries
         self._drop_retry_delay = drop_retry_delay
@@ -142,6 +145,9 @@ class PartitionRemover:
         )
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
             try:
+                # The blocking form takes ACCESS EXCLUSIVE on the parent: every
+                # reader and writer of the table queues behind it while it waits.
+                await conn.execute(text(SET_LOCK_TIMEOUT_SQL), {"timeout": str(self._lock_timeout_ms)})
                 await self._lock_partition(conn, partition_name)
                 await self._ensure_still_the_partition(conn, table_name, partition_name, expected_oid)
                 await self._mark_orphaned(conn, table_name, partition_name)
@@ -484,10 +490,7 @@ class PartitionRemover:
         PostgreSQL happily drops even an attached partition via DROP TABLE.
         """
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
-            await conn.execute(
-                text("SELECT set_config('lock_timeout', :timeout, true)"),
-                {"timeout": str(self._drop_lock_timeout_ms)},
-            )
+            await conn.execute(text(SET_LOCK_TIMEOUT_SQL), {"timeout": str(self._drop_lock_timeout_ms)})
             # A foreign table cannot be LOCKed ("not supported for foreign
             # tables"); it holds no rows of its own, and DROP takes the lock
             # it needs on the catalog entry itself.

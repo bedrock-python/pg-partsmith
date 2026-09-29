@@ -503,6 +503,43 @@ def test__apply__already_exists_and_attached_with_other_bounds__records_topology
     assert repo.attach_partition.call_args.args[1] == "events__2024_05"
 
 
+def test__apply__attach_not_granted_its_lock_in_time__records_an_issue_and_the_next_operation_runs(
+    executor: PlanExecutor, repo: MagicMock
+) -> None:
+    # Arrange -- another session holds the table past the repository's lock_timeout
+    repo.attach_partition.side_effect = [_sqlstate_error("55P03", "canceling statement due to lock timeout"), None]
+    second = _create_op("events__2024_05", bounds=RangeBounds(from_value="2024-05-01", to_value="2024-06-01"))
+
+    # Act
+    result = executor.apply(_config(), _plan(_create_op(), second))
+
+    # Assert -- recorded in words a person can act on, and the run went on
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.CREATE]
+    assert result.issues[0].partition_name == "events__2024_04"
+    assert "ddl_lock_timeout_ms" in result.issues[0].error
+    assert result.created_count == 1
+    assert repo.attach_partition.call_count == 2
+
+
+def test__apply__detach_not_granted_its_lock_in_time__records_an_issue_and_skips_its_drop(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 77
+    metadata.is_partition_attached.return_value = True
+    repo.detach_partition.side_effect = _sqlstate_error("55P03", "canceling statement due to lock timeout")
+    drop = _drop_op("events__2024_03", oid=77, follows_detach=True)
+
+    # Act
+    result = executor.apply(_config(), _plan(_detach_op(), drop))
+
+    # Assert
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.DETACH]
+    assert "ddl_lock_timeout_ms" in result.issues[0].error
+    assert (result.detached_count, result.dropped_count) == (0, 0)
+    repo.drop_partition.assert_not_called()
+
+
 def test__apply__already_exists_attached_but_unreadable__records_topology_issue(
     executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
 ) -> None:

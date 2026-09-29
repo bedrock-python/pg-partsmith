@@ -165,7 +165,7 @@ plan for public.events at 2026-09-01T02:15:00+00:00
   DROP public.events__2025_08 (follows_detach)
 locks:
   CREATE public.events__2026_10
-    ACCESS SHARE on the template during CREATE; SHARE UPDATE EXCLUSIVE on the parent and ACCESS EXCLUSIVE on the new partition (and on a DEFAULT sibling) during ATTACH; SHARE ROW EXCLUSIVE on every table referencing the parent through a foreign key
+    ACCESS SHARE on the template during CREATE; SHARE UPDATE EXCLUSIVE on the parent and ACCESS EXCLUSIVE on the new partition (and on a DEFAULT sibling) during ATTACH -- EXCLUSIVE on the parent instead, which holds off writes, when rows of the window are taken out of a DEFAULT sibling in the attach's transaction; SHARE ROW EXCLUSIVE on every table referencing the parent through a foreign key
   DETACH public.events__2025_08 (outside a transaction block)
     SHARE UPDATE EXCLUSIVE on the parent (CONCURRENTLY), ACCESS EXCLUSIVE on the partition and, in the second transaction, on every table referencing the parent through a foreign key; ...
   DROP public.events__2025_08

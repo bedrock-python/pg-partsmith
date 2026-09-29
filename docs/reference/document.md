@@ -75,7 +75,7 @@ not two. `schema` is accepted as a spelling of `schema_name`, because that is wh
 `TablePartitionConfig` dumps.
 
 `runtime` takes one key per keyword of `PartitionToolkit.from_engine`:
-`marker_prefix`, `ddl_timezone`, `ddl_timeout_seconds`, `boundary_codec` (a name —
+`marker_prefix`, `ddl_timezone`, `ddl_timeout_seconds`, `ddl_lock_timeout_ms`, `boundary_codec` (a name —
 `uuidv7`, `epoch_seconds`, `epoch_milliseconds`), `lock_prefix`,
 `lock_min_interval_seconds`, `drop_allow_unmanaged`, `drop_lock_timeout_ms`,
 `drop_max_retries`, `drop_retry_delay`, `drop_max_backoff`.

@@ -20,8 +20,9 @@ from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from pg_partsmith.aio.services.execution import LOCK_NOT_GRANTED
 from pg_partsmith.boundaries import Window
-from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
+from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS, LOCK_NOT_AVAILABLE_SQLSTATE
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MigrationResult
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionTopologyError, RowMoveRefusedError
 from pg_partsmith.lifecycle import DropAfter
@@ -29,6 +30,7 @@ from pg_partsmith.plan import AttachPartition, CreatePartition, DetachPartition,
 from pg_partsmith.planner import to_maintenance_issue
 from pg_partsmith.scheme import RangePartitioning
 from pg_partsmith.topology import DefaultBounds, PartitionNode, RangeBounds, RelationKind
+from pg_partsmith.utils import pg_sqlstate
 
 if TYPE_CHECKING:
     from pg_partsmith.aio.protocols import PartitionMetadataProvider, PartitionRepository
@@ -132,6 +134,13 @@ class DataMover:
                 # window forever.
                 tally.issue(
                     default.name, f"rows for {boundaries.describe(window)} stay in {default.name}: {exc.detail}"
+                )
+                return tally.result(complete=False)
+            except Exception as exc:
+                if pg_sqlstate(exc) != LOCK_NOT_AVAILABLE_SQLSTATE:
+                    raise
+                tally.issue(
+                    default.name, f"rows for {boundaries.describe(window)} stay in {default.name}: {LOCK_NOT_GRANTED}"
                 )
                 return tally.result(complete=False)
             if not attached:

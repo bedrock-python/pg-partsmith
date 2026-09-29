@@ -23,6 +23,7 @@ MAX_HASH_KEYSPACE_LCM = 1 << 16
 # Repository defaults.
 DEFAULT_DDL_TIMEOUT_SECONDS = 30.0
 DEFAULT_DDL_TIMEZONE = "UTC"
+DEFAULT_DDL_LOCK_TIMEOUT_MS = 3000
 DEFAULT_DROP_LOCK_TIMEOUT_MS = 3000
 DEFAULT_DROP_MAX_RETRIES = 3
 DEFAULT_DROP_RETRY_DELAY = 0.5
@@ -41,6 +42,8 @@ PG_CHECK_VIOLATION = "23514"
 # with another worker): duplicate_table, duplicate_object, and wrong_object_type
 # (42809 is what PostgreSQL raises for "X is already a partition").
 ATTACH_CONFLICT_SQLSTATES = frozenset({"42P07", "42710", "42809"})
+# lock_not_available: what a statement raises when lock_timeout runs out.
+LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 
 # Rows one batch of partition_data / unpartition moves.
 DEFAULT_MOVE_BATCH_ROWS = 10_000

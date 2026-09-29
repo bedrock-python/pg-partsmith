@@ -442,6 +442,13 @@
           "title": "Ddl Timeout Seconds",
           "type": "number"
         },
+        "ddl_lock_timeout_ms": {
+          "default": 3000,
+          "description": "lock_timeout for an attach, a row move or a detach",
+          "minimum": 0,
+          "title": "Ddl Lock Timeout Ms",
+          "type": "integer"
+        },
         "boundary_codec": {
           "anyOf": [
             {

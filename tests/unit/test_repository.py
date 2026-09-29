@@ -200,6 +200,7 @@ def _move_statement_of(conn: AsyncMock) -> str:
 
 # The comment read every attach ends with: a re-attached relation must not keep the marker.
 _MARKER_LOOKUP = "SELECT obj_description(to_regclass(:partition_name), 'pg_class')"
+_LOCK_TIMEOUT = "SELECT set_config('lock_timeout', :timeout, true)"
 
 
 def _creates(conn: object) -> list[str]:
@@ -360,6 +361,7 @@ async def test__attach_partition__range_bounds__sets_the_ddl_timezone_then_attac
 
     # Assert
     assert _statements(conn) == [
+        _LOCK_TIMEOUT,
         "SET LOCAL TIME ZONE 'UTC'",
         "ALTER TABLE \"events\" ATTACH PARTITION \"events__2024_01\" FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
         _MARKER_LOOKUP,
@@ -377,7 +379,7 @@ async def test__attach_partition__custom_ddl_timezone__is_the_one_set() -> None:
     )
 
     # Assert
-    assert _statements(conn)[0] == "SET LOCAL TIME ZONE 'Europe/Moscow'"
+    assert _statements(conn)[1] == "SET LOCAL TIME ZONE 'Europe/Moscow'"
 
 
 async def test__attach_partition__no_ddl_timezone__attaches_without_touching_the_session() -> None:
@@ -390,8 +392,8 @@ async def test__attach_partition__no_ddl_timezone__attaches_without_touching_the
         "events", "events__2024_01", RangeBounds(from_value="2024-01-01", to_value="2024-02-01")
     )
 
-    # Assert -- the attach, then the marker lookup; no session setting
-    assert _statements(conn)[0].startswith("ALTER TABLE")
+    # Assert -- the lock timeout, the attach, then the marker lookup; no session timezone
+    assert _statements(conn)[1].startswith("ALTER TABLE")
     assert not any("TIME ZONE" in s for s in _statements(conn))
 
 
@@ -444,6 +446,7 @@ async def test__attach_partition__hash_bounds__renders_modulus_then_remainder_wi
 
     # Assert
     assert _statements(conn) == [
+        _LOCK_TIMEOUT,
         'ALTER TABLE "events__2026_w35" ATTACH PARTITION "events__2026_w35__h1" '
         "FOR VALUES WITH (MODULUS 4, REMAINDER 1)",
         _MARKER_LOOKUP,
@@ -460,6 +463,7 @@ async def test__attach_partition__list_bounds__quotes_values_and_keeps_null_a_ke
 
     # Assert
     assert _statements(conn) == [
+        _LOCK_TIMEOUT,
         "ALTER TABLE \"regions\" ATTACH PARTITION \"regions__eu\" FOR VALUES IN ('de', 'l''x', NULL)",
         _MARKER_LOOKUP,
     ]
@@ -486,7 +490,25 @@ async def test__attach_partition__default_bounds__renders_default() -> None:
     await repo.attach_partition("regions", "regions__other", DefaultBounds())
 
     # Assert
-    assert _statements(conn) == ['ALTER TABLE "regions" ATTACH PARTITION "regions__other" DEFAULT', _MARKER_LOOKUP]
+    assert _statements(conn) == [
+        _LOCK_TIMEOUT,
+        'ALTER TABLE "regions" ATTACH PARTITION "regions__other" DEFAULT',
+        _MARKER_LOOKUP,
+    ]
+
+
+async def test__attach_partition__waits_for_its_locks_at_most_ddl_lock_timeout_ms() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine, ddl_lock_timeout_ms=250)
+
+    # Act
+    await repo.attach_partition("regions", "regions__other", DefaultBounds())
+
+    # Assert -- set before anything else, for the whole transaction
+    bounded = next(call for call in conn.execute.call_args_list if str(call.args[0]) == _LOCK_TIMEOUT)
+    assert bounded.args[1] == {"timeout": "250"}
+    assert _statements(conn)[0] == _LOCK_TIMEOUT
 
 
 async def test__attach_partition__database_error__propagates() -> None:
@@ -519,7 +541,7 @@ async def test__reconcile_default_rows__names_the_columns_on_both_sides_and_retu
     # Assert
     assert moved == 42
     statements = _statements(conn)
-    assert statements[0] == "SET LOCAL TIME ZONE 'UTC'"
+    assert statements[:2] == [_LOCK_TIMEOUT, "SET LOCAL TIME ZONE 'UTC'"]
     assert _locks(conn) == [
         'LOCK TABLE "events_default" IN SHARE ROW EXCLUSIVE MODE',
         'LOCK TABLE "events__2024_04" IN SHARE ROW EXCLUSIVE MODE',
@@ -670,7 +692,7 @@ async def test__reconcile_and_attach__locks_the_parent_and_both_sides_then_moves
         'LOCK TABLE "events_default" IN ACCESS EXCLUSIVE MODE',
     ]
     statements = _statements(conn)
-    assert statements[0] == "SET LOCAL TIME ZONE 'UTC'"
+    assert statements[:2] == [_LOCK_TIMEOUT, "SET LOCAL TIME ZONE 'UTC'"]
     assert statements.index(_locks(conn)[-1]) < statements.index(_move_statement_of(conn))
     assert statements.index(_move_statement_of(conn)) < statements.index(_attach_statement(conn))
     assert _attach_statement(conn) == (
@@ -896,6 +918,21 @@ async def test__detach_partition__blocking_mode__runs_only_the_plain_form_in_a_t
     assert statements.index(_comment_statement(conn)) < len(statements) - 1
     assert engine.connect.call_count == 1
     assert engine.begin.call_count == 1
+
+
+async def test__detach_partition__blocking__waits_for_its_locks_at_most_ddl_lock_timeout_ms() -> None:
+    # Arrange
+    engine, conn = _engine()
+    repo = PostgresPartitionRepository(engine, ddl_lock_timeout_ms=250)
+
+    # Act
+    await repo.detach_partition("events", "events__2024_01", mode=DetachMode.BLOCKING)
+
+    # Assert -- bounded before the partition is locked, let alone detached
+    bounded = next(call for call in conn.execute.call_args_list if str(call.args[0]) == _LOCK_TIMEOUT)
+    assert bounded.args[1] == {"timeout": "250"}
+    statements = _statements(conn)
+    assert statements.index(_LOCK_TIMEOUT) < statements.index('LOCK TABLE "events__2024_01" IN ACCESS EXCLUSIVE MODE')
 
 
 @pytest.mark.parametrize("mode", [DetachMode.AUTO, DetachMode.BLOCKING])

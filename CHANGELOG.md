@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.6.1 — a lock wait no longer holds every writer
+
+An attach, a row move and a blocking detach now run under `lock_timeout`:
+`ddl_lock_timeout_ms` on the repository and under `runtime:` in the document, 3000 by
+default. Until now only a drop did. A statement waiting for a lock keeps its place in
+PostgreSQL's queue, and every writer of the table waits behind it: with a reader holding
+the table open, inserts stalled for the whole 30-second statement budget, and `apply` then
+ended with an empty `database error:` and exit 5
+([#75](https://github.com/bedrock-python/pg-partsmith/issues/75)). Now the step gives up
+after the timeout having changed nothing, it is recorded in `result.issues` —
+`partition_data` reports its window as not finished — the rest of the run goes on, and the
+next run tries again.
+
+`plan --locks` said the attach that clears a DEFAULT partition takes `SHARE UPDATE
+EXCLUSIVE` on the parent. It takes `EXCLUSIVE`, which holds off writes. That is deliberate,
+since 1.5.1, so that no writer is routed into DEFAULT between the move and the attach,
+and the plan now says so.
+
+A timeout that carries no message of its own is reported as `database error: timed out`
+instead of an empty line.
+
 ## [1.6.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.5.1...pg-partsmith-v1.6.0) (2026-09-29)
 
 

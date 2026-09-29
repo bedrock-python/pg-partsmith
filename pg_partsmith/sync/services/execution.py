@@ -23,7 +23,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pg_partsmith.boundaries import Window
-from pg_partsmith.constants import ATTACH_CONFLICT_SQLSTATES, DEFAULT_CONFLICT_MAX_RETRIES
+from pg_partsmith.constants import (
+    ATTACH_CONFLICT_SQLSTATES,
+    DEFAULT_CONFLICT_MAX_RETRIES,
+    LOCK_NOT_AVAILABLE_SQLSTATE,
+)
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MaintenanceResult, PartitionInfo
 from pg_partsmith.events import HookPhase, PartitionEvent
 from pg_partsmith.exceptions import (
@@ -57,6 +61,11 @@ if TYPE_CHECKING:
     from pg_partsmith.sync.protocols import PartitionMetadataProvider, PartitionRepository
 
 logger = logging.getLogger(__name__)
+
+LOCK_NOT_GRANTED = (
+    "a lock this step needs was not granted within ddl_lock_timeout_ms: another session holds the table; "
+    "nothing was changed, and the next run tries again"
+)
 
 
 @dataclass
@@ -156,6 +165,13 @@ class PlanExecutor:
                     extra={"partition_name": op.target, "detail": exc.detail},
                 )
             except Exception as exc:
+                if pg_sqlstate(exc) == LOCK_NOT_AVAILABLE_SQLSTATE:
+                    # Another session holds a lock this step needs, past the
+                    # repository's lock_timeout. The step changed nothing and
+                    # the next run tries it again; the rest of this run goes on.
+                    issues.append(MaintenanceIssue(step=step, error=LOCK_NOT_GRANTED, partition_name=op.target))
+                    logger.warning(LOCK_NOT_GRANTED, extra={"partition_name": op.target, "step": step.value})
+                    continue
                 if not continue_on_error:
                     raise
                 error = describe_exception(exc)

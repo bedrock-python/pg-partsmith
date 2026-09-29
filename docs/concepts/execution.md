@@ -126,6 +126,22 @@ never used. Lock contention is retried with exponential backoff
 (`drop_lock_timeout_ms`, `drop_max_retries`, `drop_retry_delay`, `drop_max_backoff` on the
 repository).
 
+## Waiting for a lock
+
+An attach, a row move and a blocking detach each run under `lock_timeout`
+(`ddl_lock_timeout_ms` on the repository, 3000 by default). A statement waiting for a lock
+keeps its place in PostgreSQL's queue, and every session that asks for a conflicting lock
+after it waits behind it; for the locks these steps take, that is every writer of the table.
+The move-and-attach holds `EXCLUSIVE` on the parent while it waits for the DEFAULT
+partition, so a reader holding the table for a minute would otherwise stop writes for that
+minute.
+
+Past the timeout the statement fails, its transaction rolls back having changed nothing,
+and the step is recorded in `result.issues` — `partition_data` reports the window as not
+finished. The run goes on with its other steps, and the next run tries again. A drop has
+its own timeout and retries (see [Drop](#drop)); `DETACH … CONCURRENTLY` does not hold up
+writers and runs without one.
+
 ## Lock levels, measured
 
 | Statement | Locks held |
@@ -149,6 +165,7 @@ it takes on `op.capabilities`.
 | What happened | Effect on the run |
 |---|---|
 | a topology conflict at execution time — a DEFAULT partition holding rows the attach could not take, a name taken by a relation with other bounds, a detach PostgreSQL refuses because rows are still referenced | recorded in `result.issues`; the run goes on |
+| a lock not granted within `ddl_lock_timeout_ms` — another session holds the table | recorded in `result.issues`; the step changed nothing, the next run tries it again, and the run goes on |
 | a `PlanStaleError` — the relation is not the one the plan saw | recorded as an issue with `continue_on_error`, otherwise raised |
 | any other error — a connection drop, a permission denied, a `before_*` hook raising | aborts the run, unless `continue_on_error`, in which case it is recorded and the next operation runs |
 | validation or lock failure | fatal, always |

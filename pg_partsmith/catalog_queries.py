@@ -376,6 +376,11 @@ PARTITION_UPPER_BOUND_SQL = r"""
       AND pt.partstrat = 'r'
 """
 
+# lock_timeout for the rest of the transaction. A statement waiting for a lock
+# sits in the lock queue, and every session that asks for a conflicting lock
+# after it -- each writer, for the locks DDL takes -- waits behind it.
+SET_LOCK_TIMEOUT_SQL = "SELECT set_config('lock_timeout', :timeout, true)"
+
 # The database's clock. A plan is made against it unless the caller names an
 # instant: the process running maintenance can be wrong about the date without
 # anything else noticing, and retention decided on a clock ahead of the data's

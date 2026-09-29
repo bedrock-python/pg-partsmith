@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pg_partsmith.constants import (
+    DEFAULT_DDL_LOCK_TIMEOUT_MS,
     DEFAULT_DDL_TIMEOUT_SECONDS,
     DEFAULT_DDL_TIMEZONE,
     DEFAULT_DROP_LOCK_TIMEOUT_MS,
@@ -48,6 +49,7 @@ class PostgresPartitionRepository:
         ddl_timezone: str | None = DEFAULT_DDL_TIMEZONE,
         ddl_timeout_seconds: float = DEFAULT_DDL_TIMEOUT_SECONDS,
         marker_prefix: str | None = None,
+        ddl_lock_timeout_ms: int = DEFAULT_DDL_LOCK_TIMEOUT_MS,
         drop_allow_unmanaged: bool = False,
         drop_lock_timeout_ms: int = DEFAULT_DROP_LOCK_TIMEOUT_MS,
         drop_max_retries: int = DEFAULT_DROP_MAX_RETRIES,
@@ -57,6 +59,7 @@ class PostgresPartitionRepository:
         marker_prefix = self._marker_prefix = orphan_comment_prefix(marker_prefix=marker_prefix)
         ddl_timeout_seconds = validate_ddl_timeout(ddl_timeout_seconds)
         self._ddl_timezone = validate_timezone(ddl_timezone)
+        ddl_lock_timeout_ms = validate_int(ddl_lock_timeout_ms, "ddl_lock_timeout_ms", min_val=0)
         drop_lock_timeout_ms = validate_int(drop_lock_timeout_ms, "drop_lock_timeout_ms", min_val=0)
         drop_max_retries = validate_int(drop_max_retries, "drop_max_retries", min_val=1)
         drop_retry_delay = validate_float(drop_retry_delay, "drop_retry_delay", min_val=0.0)
@@ -69,10 +72,12 @@ class PostgresPartitionRepository:
             ddl_timeout=ddl_timeout_seconds,
             ddl_timezone=self._ddl_timezone,
             marker_prefix=marker_prefix,
+            lock_timeout_ms=ddl_lock_timeout_ms,
         )
         self._remover = PartitionRemover(
             engine=engine,
             ddl_timeout=ddl_timeout_seconds,
+            lock_timeout_ms=ddl_lock_timeout_ms,
             drop_lock_timeout_ms=drop_lock_timeout_ms,
             drop_max_retries=drop_max_retries,
             drop_retry_delay=drop_retry_delay,

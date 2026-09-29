@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .boundaries import resolve_codec
 from .constants import (
     DEFAULT_CREATE_AHEAD_COUNT,
+    DEFAULT_DDL_LOCK_TIMEOUT_MS,
     DEFAULT_DDL_TIMEOUT_SECONDS,
     DEFAULT_DDL_TIMEZONE,
     DEFAULT_DROP_LOCK_TIMEOUT_MS,
@@ -189,6 +190,9 @@ class ToolkitOptions(BaseModel):
         description="Session timezone naive boundary literals are written and read in",
     )
     ddl_timeout_seconds: float = Field(default=DEFAULT_DDL_TIMEOUT_SECONDS, gt=0, description="Statement timeout")
+    ddl_lock_timeout_ms: int = Field(
+        default=DEFAULT_DDL_LOCK_TIMEOUT_MS, ge=0, description="lock_timeout for an attach, a row move or a detach"
+    )
     boundary_codec: str | None = Field(default=None, description="Codec name encoded bounds are read with")
     lock_prefix: str = Field(default=DEFAULT_LOCK_PREFIX, description="Prefix of the advisory lock keys")
     lock_min_interval_seconds: float = Field(

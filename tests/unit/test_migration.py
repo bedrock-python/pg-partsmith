@@ -118,6 +118,12 @@ def _plan(*operations: Any, findings: tuple[Finding, ...] = ()) -> MaintenancePl
     return MaintenancePlan(table_name=ROOT, generated_at=NOW, operations=tuple(operations), findings=findings)
 
 
+class _LockNotAvailableError(Exception):
+    """What a driver raises when lock_timeout runs out, whichever driver it is."""
+
+    sqlstate = "55P03"
+
+
 def _plans(*plans: MaintenancePlan) -> AsyncMock:
     return AsyncMock(side_effect=list(plans))
 
@@ -561,6 +567,36 @@ async def test__partition_data__move_refused_by_a_foreign_key_action__issue_and_
     assert not result.complete
     assert [issue.partition_name for issue in result.issues] == [DEFAULT]
     assert "ON DELETE CASCADE" in result.issues[0].error
+
+
+async def test__partition_data__a_lock_not_granted_in_time__issue_and_incomplete(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock
+) -> None:
+    # Arrange -- another session holds the table past the repository's lock_timeout
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    executor.create_partition.side_effect = _LockNotAvailableError("canceling statement due to lock timeout")
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act
+    result = await mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert -- the window is reported rather than raised, and the next run takes it
+    assert not result.complete
+    assert [issue.partition_name for issue in result.issues] == [DEFAULT]
+    assert "ddl_lock_timeout_ms" in result.issues[0].error
+
+
+async def test__partition_data__an_error_that_is_not_a_lock_timeout__propagates(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    executor.create_partition.side_effect = OSError("connection reset")
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act / Assert -- only a lock not granted in time is the window's to report
+    with pytest.raises(OSError, match="connection reset"):
+        await mover.partition_data(_config(), plan_for, batch_rows=10)
 
 
 async def test__unpartition__into_a_leaf_of_another_tree__refused(
