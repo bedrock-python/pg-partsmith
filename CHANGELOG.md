@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.6.3...pg-partsmith-v1.7.0) (2026-09-29)
+
+
+### Features
+
+* find and attach the partitions a stopped backfill left unattached ([#85](https://github.com/bedrock-python/pg-partsmith/issues/85)) ([cb9c85c](https://github.com/bedrock-python/pg-partsmith/commit/cb9c85cd6065b8ec9aeab4787212f3c2f1be9582)), closes [#76](https://github.com/bedrock-python/pg-partsmith/issues/76)
+
 ## 1.7.0 — rows a stopped backfill hid are found and attached
 
 A backfill moves a window's rows out of DEFAULT into a partition it attaches last. If the
