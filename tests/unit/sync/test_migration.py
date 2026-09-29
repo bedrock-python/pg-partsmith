@@ -94,8 +94,8 @@ def _config(**overrides: Any) -> TablePartitionConfig:
     return TablePartitionConfig(**fields)
 
 
-def _default_info() -> PartitionInfo:
-    return PartitionInfo(name=DEFAULT, partition_type=PartitionType.RANGE, is_default=True, parent_table=ROOT)
+def _default_info(*, oid: int | None = None) -> PartitionInfo:
+    return PartitionInfo(name=DEFAULT, partition_type=PartitionType.RANGE, is_default=True, parent_table=ROOT, oid=oid)
 
 
 def _window(month: int) -> Window:
@@ -116,6 +116,16 @@ def _create_op(month: int) -> CreatePartition:
 
 def _plan(*operations: Any, findings: tuple[Finding, ...] = ()) -> MaintenancePlan:
     return MaintenancePlan(table_name=ROOT, generated_at=NOW, operations=tuple(operations), findings=findings)
+
+
+def _fill_then(failure: BaseException) -> Any:
+    """An executor that fills the partition it was given, then fails to attach it."""
+
+    def create_partition(config: Any, plan: Any, op: Any, *, issues: Any, fill: Any = None) -> bool:
+        fill(op.target, 33)
+        raise failure
+
+    return create_partition
 
 
 class _LockNotAvailableError(Exception):
@@ -582,6 +592,102 @@ def test__partition_data__a_lock_not_granted_in_time__issue_and_incomplete(
     assert not result.complete
     assert [issue.partition_name for issue in result.issues] == [DEFAULT]
     assert "ddl_lock_timeout_ms" in result.issues[0].error
+
+
+def test__partition_data__attach_refused_after_the_fill__the_rows_go_back_to_default(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange -- the fill moves the window's rows, then the attach is not granted its lock
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    metadata.get_default_partition.return_value = _default_info(oid=9)
+    executor.create_partition.side_effect = _fill_then(
+        _LockNotAvailableError("canceling statement due to lock timeout")
+    )
+    repo.reconcile_default_rows.side_effect = [5, 5]  # the fill's one batch, then the way back
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act
+    result = mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert -- nothing is left where no query can see it, and the window is reported unfinished
+    back = repo.reconcile_default_rows.call_args.kwargs
+    assert (back["default_partition_name"], back["target_partition_name"]) == (f"{ROOT}__2026_03", DEFAULT)
+    assert (back["expected_source_oid"], back["expected_target_oid"]) == (33, 9)
+    assert not result.complete
+    assert result.rows_moved == 0
+    assert [issue.partition_name for issue in result.issues] == [DEFAULT]
+    assert f"stay in {DEFAULT}" in result.issues[0].error
+
+
+def test__partition_data__stopped_while_giving_rows_back__the_stop_is_not_swallowed(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange -- the run is stopped in the middle of the move back
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    metadata.get_default_partition.return_value = _default_info(oid=9)
+    executor.create_partition.side_effect = _fill_then(_LockNotAvailableError("lock timeout"))
+    repo.reconcile_default_rows.side_effect = [5, KeyboardInterrupt()]
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act / Assert -- a stop is a stop, not a row that could not be returned
+    with pytest.raises(KeyboardInterrupt):
+        mover.partition_data(_config(), plan_for, batch_rows=10)
+
+
+def test__partition_data__a_fill_that_moved_nothing__has_nothing_to_give_back(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange -- the attach fails after a fill that found no rows to move
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    metadata.get_default_partition.return_value = _default_info(oid=9)
+    executor.create_partition.side_effect = _fill_then(_LockNotAvailableError("lock timeout"))
+    repo.reconcile_default_rows.side_effect = [0]
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act
+    result = mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert -- the fill's one batch, and no move back
+    assert repo.reconcile_default_rows.call_count == 1
+    assert f"stay in {DEFAULT}" in result.issues[0].error
+
+
+def test__partition_data__rows_that_cannot_be_returned__the_report_says_where_they_are(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    metadata.get_default_partition.return_value = _default_info(oid=9)
+    executor.create_partition.side_effect = _fill_then(
+        _LockNotAvailableError("canceling statement due to lock timeout")
+    )
+    repo.reconcile_default_rows.side_effect = [5, OSError("connection reset")]
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act
+    result = mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert -- one report, and it names the table the rows are really in
+    assert result.rows_moved == 5
+    assert len(result.issues) == 1
+    assert f"are in {ROOT}__2026_03, which is not attached" in result.issues[0].error
+    assert "stay in" not in result.issues[0].error
+
+
+def test__partition_data__any_other_failure_after_the_fill__rows_go_back_and_the_error_propagates(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_leading_key_minimum.return_value = datetime(2026, 3, 5, tzinfo=UTC)
+    metadata.get_default_partition.return_value = _default_info(oid=9)
+    executor.create_partition.side_effect = _fill_then(OSError("connection reset"))
+    repo.reconcile_default_rows.side_effect = [5, 5]
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act / Assert
+    with pytest.raises(OSError, match="connection reset"):
+        mover.partition_data(_config(), plan_for, batch_rows=10)
+    assert repo.reconcile_default_rows.call_args.kwargs["target_partition_name"] == DEFAULT
 
 
 def test__partition_data__an_error_that_is_not_a_lock_timeout__propagates(

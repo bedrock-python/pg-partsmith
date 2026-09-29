@@ -190,6 +190,35 @@ async def test__partition_data__batch_budget__resumes_where_it_stopped(db_engine
     assert await _count(db_engine, events) == 25
 
 
+async def test__partition_data__attach_not_granted_its_lock__rows_stay_visible_and_the_next_run_finishes(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange -- a month in DEFAULT, and a reader holding the table while the backfill runs
+    default = await _default_with_rows(db_engine, events, months=(3,), per_month=25)
+    config = monthly_config(events, create_ahead=1)
+    service = make_service(db_engine, ddl_lock_timeout_ms=200)
+
+    async with db_engine.connect() as reader:
+        await reader.execute(text(f'SELECT count(*) FROM "{events}"'))  # noqa: S608
+
+        # Act
+        held = await service.partition_data(config, batch_rows=10)
+
+        # Assert -- the fill ran, the attach was refused, and the rows went back where readers see them
+        assert not held.complete
+        assert held.rows_moved == 0
+        assert await _count(db_engine, default) == 25
+        assert await _count(db_engine, events) == 25
+
+    freed = await service.partition_data(config, batch_rows=10)
+
+    assert freed.complete
+    assert freed.rows_moved == 25
+    assert await is_attached(db_engine, f"{events}__2026_03")
+    assert await _count(db_engine, default) == 0
+    assert await _count(db_engine, events) == 25
+
+
 async def test__partition_data__nested_scheme__rows_land_in_the_buckets(db_engine: AsyncEngine, tenants: str) -> None:
     # Arrange
     default = f"{tenants}_legacy"

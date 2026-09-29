@@ -80,7 +80,9 @@ Each call:
 `result.complete` says whether DEFAULT is drained; `result.partitions` lists what was
 created; `result.issues` explains anything that could not be handled. A call that runs out
 of budget mid-window leaves that partition detached and filled so far; the next call
-finds it, finishes it and attaches it.
+finds it, finishes it and attaches it. A window whose attach fails instead — refused, out
+of `ddl_lock_timeout_ms`, cut off by an error — has its rows moved back to DEFAULT, where
+readers see them and the next call takes the window again.
 
 !!! warning "What a batch cannot hide"
     While a window's rows are being moved, they sit in a partition that is not yet

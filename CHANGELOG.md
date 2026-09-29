@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.6.3 — a backfill that cannot attach gives the rows back
+
+`partition_data` moves a window's rows out of DEFAULT in batches, each committed on its own,
+into a partition it attaches last; until the attach, those rows are visible through no
+query. When the attach failed, the rows stayed in that detached table, and if the fill had
+already taken the last of them, nothing ever looked at the window again: the next
+`backfill` reported DEFAULT drained, `validate` said ok, and the rows were gone from every
+read. 1.6.1 made that easy to reach. Its lock timeout refuses an attach after 3 s instead of
+waiting out the 30-second budget, so a reader holding the table for a few seconds was
+enough, and the issue then claimed the rows stayed in DEFAULT and nothing had changed.
+
+Now whatever stops the attach, the rows the fill moved go back to DEFAULT, pinned to both
+tables' identities, and the issue is true: the rows are where readers see them, and the
+next run takes the window again. If they cannot be returned, the issue names the table they
+are in instead. A process killed between the fill and the attach can still leave them there,
+with nobody to move them back; finding and finishing such tables is
+[#76](https://github.com/bedrock-python/pg-partsmith/issues/76).
+
 ## [1.6.2](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.6.1...pg-partsmith-v1.6.2) (2026-09-29)
 
 

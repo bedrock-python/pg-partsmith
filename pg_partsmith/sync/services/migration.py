@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from pg_partsmith.boundaries import Window
@@ -33,7 +32,7 @@ from pg_partsmith.topology import DefaultBounds, PartitionNode, RangeBounds, Rel
 from pg_partsmith.utils import pg_sqlstate
 
 if TYPE_CHECKING:
-    from pg_partsmith.entities import TablePartitionConfig
+    from pg_partsmith.entities import PartitionInfo, TablePartitionConfig
     from pg_partsmith.sync.protocols import PartitionMetadataProvider, PartitionRepository
     from pg_partsmith.sync.services.execution import PlanExecutor
     from pg_partsmith.topology import ActualTree, DetachedPartition
@@ -119,12 +118,8 @@ class DataMover:
             moved_before = tally.rows_moved
             bounds = op.bounds
             assert isinstance(bounds, RangeBounds)
-            fill = partial(self._drain_window, default.name, root.key, bounds, batch_rows, tally)
             try:
-                if isinstance(op, CreatePartition):
-                    attached = self._executor.create_partition(config, plan, op, issues=tally.issues, fill=fill)
-                else:
-                    attached = self._executor.attach_partition(config, plan, op, issues=tally.issues, fill=fill)
+                attached = self._fill_and_attach(config, plan, op, default, root.key, bounds, batch_rows, tally)
             except (RowMoveRefusedError, PartitionTopologyError) as exc:
                 # A window this run cannot finish -- rows a foreign key holds
                 # down, a DEFAULT partition it could not clear, a name taken by
@@ -132,17 +127,11 @@ class DataMover:
                 # not for an exception: what stayed behind and why is on the
                 # result, and the loop stops rather than re-planning the same
                 # window forever.
-                tally.issue(
-                    default.name, f"rows for {boundaries.describe(window)} stay in {default.name}: {exc.detail}"
-                )
-                return tally.result(complete=False)
+                return tally.unfinished(default.name, boundaries.describe(window), exc.detail)
             except Exception as exc:
                 if pg_sqlstate(exc) != LOCK_NOT_AVAILABLE_SQLSTATE:
                     raise
-                tally.issue(
-                    default.name, f"rows for {boundaries.describe(window)} stay in {default.name}: {LOCK_NOT_GRANTED}"
-                )
-                return tally.result(complete=False)
+                return tally.unfinished(default.name, boundaries.describe(window), LOCK_NOT_GRANTED)
             if not attached:
                 logger.info(
                     "Batch budget exhausted; the partition stays detached until the next call",
@@ -169,6 +158,88 @@ class DataMover:
         if create is not None:
             return create
         return next((a for a in plan.attaches if isinstance(a.bounds, RangeBounds)), None)
+
+    def _fill_and_attach(
+        self,
+        config: TablePartitionConfig,
+        plan: MaintenancePlan,
+        op: CreatePartition | AttachPartition,
+        default: PartitionInfo,
+        key_columns: tuple[str, ...],
+        bounds: RangeBounds,
+        batch_rows: int,
+        tally: _Tally,
+    ) -> bool:
+        """Give the window its partition, filled from DEFAULT before it is attached.
+
+        Every batch of the fill commits on its own, but the rows it moves are
+        visible through the parent only once the partition is attached. When
+        the attach does not happen -- refused, out of lock_timeout, cut off --
+        they go back to DEFAULT: readers see them again, and the next run finds
+        the window where it looks for one, rather than in a detached table
+        nothing ever revisits.
+
+        Returns:
+            Whether the partition was attached. False when the batch budget ran
+            out first, which leaves it detached and part-filled on purpose.
+        """
+        filled: list[tuple[str, int | None]] = []
+        moved_before = tally.rows_moved
+
+        def fill(target: str, target_oid: int | None) -> bool:
+            filled.append((target, target_oid))
+            return self._drain_window(default.name, key_columns, bounds, batch_rows, tally, target, target_oid)
+
+        try:
+            if isinstance(op, CreatePartition):
+                return self._executor.create_partition(config, plan, op, issues=tally.issues, fill=fill)
+            return self._executor.attach_partition(config, plan, op, issues=tally.issues, fill=fill)
+        except BaseException:
+            if tally.rows_moved > moved_before:
+                (self._give_back(filled, default, key_columns, bounds, tally))
+            raise
+
+    def _give_back(
+        self,
+        filled: list[tuple[str, int | None]],
+        default: PartitionInfo,
+        key_columns: tuple[str, ...],
+        bounds: RangeBounds,
+        tally: _Tally,
+    ) -> None:
+        """Return the rows a fill moved to the DEFAULT partition they came from (best effort).
+
+        Both ends are pinned to the identities the fill used, so a relation
+        swapped in at either name neither gives nor receives them. A failure
+        is logged and the table the rows are left in is remembered for the
+        report, never raised: the attach's own error stays the one the caller
+        sees.
+        """
+        for target, target_oid in filled:
+            try:
+                returned = self._repo.reconcile_default_rows(
+                    default_partition_name=target,
+                    target_partition_name=default.name,
+                    key_columns=key_columns,
+                    from_value=bounds.from_value,
+                    to_value=bounds.to_value,
+                    expected_source_oid=target_oid,
+                    expected_target_oid=default.oid,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.exception(
+                    "Could not return the window's rows to DEFAULT; they are in a detached table",
+                    extra={"partition_name": target, "default_partition": default.name},
+                )
+                tally.stranded.append(target)
+            else:
+                tally.rows_moved -= returned
+                logger.warning(
+                    "The partition was not attached; its rows are back in DEFAULT",
+                    extra={"partition_name": target, "default_partition": default.name, "returned_rows": returned},
+                )
 
     def _drain_window(
         self,
@@ -396,6 +467,7 @@ class _Tally:
         self.batches = 0
         self.partitions: list[str] = []
         self.issues: list[MaintenanceIssue] = []
+        self.stranded: list[str] = []
 
     @property
     def exhausted(self) -> bool:
@@ -407,6 +479,18 @@ class _Tally:
 
     def issue(self, partition_name: str, error: str) -> None:
         self.issues.append(MaintenanceIssue(step=MaintenanceIssueStep.MOVE, error=error, partition_name=partition_name))
+
+    def unfinished(self, default_name: str, window: str, reason: str) -> MigrationResult:
+        """Report a window this run could not finish, saying where its rows are."""
+        if self.stranded:
+            where = (
+                f"are in {', '.join(self.stranded)}, which is not attached; they could not be returned to "
+                f"{default_name}, and no query through the parent sees them until it is attached"
+            )
+        else:
+            where = f"stay in {default_name}"
+        self.issue(default_name, f"rows for {window} {where}: {reason}")
+        return self.result(complete=False)
 
     def result(self, *, complete: bool) -> MigrationResult:
         return MigrationResult(

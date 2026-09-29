@@ -137,8 +137,10 @@ partition, so a reader holding the table for a minute would otherwise stop write
 minute.
 
 Past the timeout the statement fails, its transaction rolls back having changed nothing,
-and the step is recorded in `result.issues` — `partition_data` reports the window as not
-finished. The run goes on with its other steps, and the next run tries again. A drop has
+and the step is recorded in `result.issues`. The run goes on with its other steps, and the
+next run tries again. `partition_data` reports the window as not finished, and the rows its
+fill had already moved go back to DEFAULT: readers see them again, and the next call finds
+the window where it looks for one. A drop has
 its own timeout and retries (see [Drop](#drop)); `DETACH … CONCURRENTLY` does not hold up
 writers and runs without one.
 
