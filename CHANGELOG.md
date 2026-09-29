@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.3](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.6.2...pg-partsmith-v1.6.3) (2026-09-29)
+
+
+### Bug Fixes
+
+* a backfill that cannot attach gives the rows back to DEFAULT ([#83](https://github.com/bedrock-python/pg-partsmith/issues/83)) ([cee0f67](https://github.com/bedrock-python/pg-partsmith/commit/cee0f677c8d89eccbfa61677acef9df62c1cb7ad))
+
 ## 1.6.3 — a backfill that cannot attach gives the rows back
 
 `partition_data` moves a window's rows out of DEFAULT in batches, each committed on its own,
