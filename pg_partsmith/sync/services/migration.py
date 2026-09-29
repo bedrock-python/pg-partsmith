@@ -20,16 +20,17 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from pg_partsmith.boundaries import Window
-from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS, LOCK_NOT_AVAILABLE_SQLSTATE
+from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS, LOCK_NOT_AVAILABLE_SQLSTATE, PG_CHECK_VIOLATION
 from pg_partsmith.entities import MaintenanceIssue, MaintenanceIssueStep, MigrationResult
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionTopologyError, RowMoveRefusedError
 from pg_partsmith.lifecycle import DropAfter
 from pg_partsmith.plan import AttachPartition, CreatePartition, DetachPartition, DropPartition, MaintenancePlan, Reason
-from pg_partsmith.planner import to_maintenance_issue
+from pg_partsmith.planner import to_maintenance_issue, unattached_window
 from pg_partsmith.scheme import RangePartitioning
 from pg_partsmith.sync.services.execution import LOCK_NOT_GRANTED
+from pg_partsmith.sync.services.inspection import unattached_tables
 from pg_partsmith.topology import DefaultBounds, PartitionNode, RangeBounds, RelationKind
-from pg_partsmith.utils import pg_sqlstate
+from pg_partsmith.utils import is_default_partition_conflict, pg_sqlstate
 
 if TYPE_CHECKING:
     from pg_partsmith.entities import PartitionInfo, TablePartitionConfig
@@ -99,11 +100,17 @@ class DataMover:
         tally = _Tally(max_batches)
         while True:
             probe = self._metadata.get_leading_key_minimum(default.name, root.key)
-            if probe is None:
-                return tally.result(complete=True)
-
-            position = boundaries.decode(str(probe))
-            window = boundaries.window_at(probe if position is None else position)
+            stranded = probe is None
+            if stranded:
+                # DEFAULT is drained. A partition whose fill finished and whose
+                # attach never happened -- the process died in between -- holds
+                # its window's rows where no probe of DEFAULT will find them.
+                window = self._stranded_window(config)
+                if window is None:
+                    return tally.result(complete=True)
+            else:
+                position = boundaries.decode(str(probe))
+                window = boundaries.window_at(probe if position is None else position)
             plan = plan_for(window)
             tally.issues.extend(to_maintenance_issue(f) for f in plan.actionable_findings)
             op = self._window_operation(plan)
@@ -129,6 +136,15 @@ class DataMover:
                 # window forever.
                 return tally.unfinished(default.name, boundaries.describe(window), exc.detail)
             except Exception as exc:
+                if stranded and pg_sqlstate(exc) == PG_CHECK_VIOLATION and not is_default_partition_conflict(exc):
+                    # The table's own rows do not fit its window, so no fill of
+                    # this library's put them there: it only takes a window's rows.
+                    tally.issue(
+                        op.target,
+                        f"{op.target} holds rows outside {boundaries.describe(window)}, so it cannot become that "
+                        "window's partition; it was not left by a backfill, and it is left as it is",
+                    )
+                    return tally.result(complete=False)
                 if pg_sqlstate(exc) != LOCK_NOT_AVAILABLE_SQLSTATE:
                     raise
                 return tally.unfinished(default.name, boundaries.describe(window), LOCK_NOT_GRANTED)
@@ -140,7 +156,7 @@ class DataMover:
                 return tally.result(complete=False)
             tally.partitions.append(op.target)
 
-            if tally.rows_moved == moved_before:
+            if not stranded and tally.rows_moved == moved_before:
                 # The probe found a row this window's literals do not select
                 # -- a bound rendered in another timezone, say. Looping would
                 # create the same partition forever.
@@ -150,6 +166,11 @@ class DataMover:
                     f"bounds {bounds.from_value!r} .. {bounds.to_value!r}; left in place",
                 )
                 return tally.result(complete=False)
+
+    def _stranded_window(self, config: TablePartitionConfig) -> Window | None:
+        """The window of a partition a stopped fill left unattached with rows in it, if there is one."""
+        tables = unattached_tables(self._metadata, config)
+        return next((unattached_window(config, t.relname) for t in tables if t.holds_rows), None)
 
     @staticmethod
     def _window_operation(plan: MaintenancePlan) -> CreatePartition | AttachPartition | None:

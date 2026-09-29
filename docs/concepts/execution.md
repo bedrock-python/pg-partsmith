@@ -183,6 +183,7 @@ one of a small number of states, each of which the next run converges:
 | Cut off during | Left behind | Next run |
 |---|---|---|
 | creating a partition or its subtree | a detached, unmarked table, unreachable by writers | completes the subtree, attaches it |
+| a backfill, between the fill and the attach | a detached, unmarked table holding its window's rows, which DEFAULT no longer has | `plan` reports `unattached_rows`; `backfill` attaches it |
 | a detach | a marked table, attached or pending | finishes the detach (`FINALIZE` if pending), then proceeds |
 | a drop | either the table or nothing | drops it, or finds nothing to do |
 

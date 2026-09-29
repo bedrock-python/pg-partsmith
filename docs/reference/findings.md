@@ -30,6 +30,7 @@ issues too, with the exception's name in front of the message.
 | `detach_pending` | INFO | An interrupted `DETACH CONCURRENTLY`; the partition rejects its rows until finalized. `maintain()` completes it with `DETACH … FINALIZE` and re-plans in the same call. | Nothing; check that the run went through. |
 | `grace_pending` | INFO | A detached orphan still within its grace period. | Nothing. |
 | `drop_deferred` | INFO | An orphan past its grace whose drop condition does not hold yet. | Nothing. |
+| `unattached_rows` | WARNING | A table under a window's partition name holds rows but was never attached — a fill that stopped before its attach — so no query through the root sees them. | Run `backfill` (`partition_data`); it attaches the table. |
 
 ## Operation reasons
 

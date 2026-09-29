@@ -6,12 +6,13 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from pg_partsmith.boundaries import Axis, CursorSource, Window
-from pg_partsmith.planner import PlanMode, PlanningContext, fact_targets
+from pg_partsmith.planner import PlanMode, PlanningContext, fact_targets, unattached_window
+from pg_partsmith.scheme import RangePartitioning
 
 if TYPE_CHECKING:
     from pg_partsmith.aio.protocols import PartitionMetadataProvider
     from pg_partsmith.entities import TablePartitionConfig
-    from pg_partsmith.topology import ActualTree
+    from pg_partsmith.topology import ActualTree, UnattachedTable
 
 
 class PartitionInspector:
@@ -40,6 +41,9 @@ class PartitionInspector:
         tree = await self._metadata.get_actual_tree(config.qualified_name)
         if tree is None or not measure or not config.has_progression_level:
             return tree
+        unattached = await unattached_tables(self._metadata, config)
+        if unattached:
+            tree = tree.model_copy(update={"unattached": unattached})
 
         policy = config.lifecycle
         if not policy.needs_facts:
@@ -94,3 +98,26 @@ class PartitionInspector:
             mode=mode,
             explicit_windows=dict(explicit_windows or {}),
         )
+
+
+async def unattached_tables(
+    metadata: PartitionMetadataProvider, config: TablePartitionConfig
+) -> tuple[UnattachedTable, ...]:
+    """The tables named under the root and attached to nothing, ``holds_rows`` answered where it matters.
+
+    Only a name the root's scheme reads back as one of its windows is looked
+    into, so a table that merely shares the prefix -- the root's pre-migration
+    copy, say -- is never read and needs no grant. The question asked is
+    whether the table has a first row at all.
+    """
+    root = config.scheme
+    if not isinstance(root, RangePartitioning):
+        return ()
+    measured: list[UnattachedTable] = []
+    for table in await metadata.get_unattached_tables(config.qualified_name):
+        if unattached_window(config, table.relname) is None:
+            measured.append(table)
+            continue
+        first = await metadata.get_leading_key_minimum(table.name, root.key)
+        measured.append(table.model_copy(update={"holds_rows": first is not None}))
+    return tuple(measured)

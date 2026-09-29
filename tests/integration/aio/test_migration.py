@@ -25,6 +25,7 @@ from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import MaintenanceIssueStep, Period
 from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
+from pg_partsmith.plan import FindingReason
 from tests.integration.aio.support import (
     child_count,
     exec_sql,
@@ -217,6 +218,63 @@ async def test__partition_data__attach_not_granted_its_lock__rows_stay_visible_a
     assert await is_attached(db_engine, f"{events}__2026_03")
     assert await _count(db_engine, default) == 0
     assert await _count(db_engine, events) == 25
+
+
+async def test__partition_data__a_fill_the_process_died_after__is_reported_then_attached(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange -- March was filled and never attached: DEFAULT is empty, the rows sit in a
+    # standalone table under March's name. A table that only shares the prefix sits beside it.
+    await _default_with_rows(db_engine, events, months=(3,), per_month=0)
+    march = f"{events}__2026_03"
+    await exec_sql(db_engine, f'CREATE TABLE "{march}" (LIKE "{events}" INCLUDING ALL)')
+    await exec_sql(
+        db_engine,
+        f'INSERT INTO "{march}" (created_at, payload) '  # noqa: S608
+        "SELECT '2026-03-01 00:00+00'::timestamptz + g * interval '1 hour', 'x' FROM generate_series(0, 24) g",
+    )
+    await exec_sql(db_engine, f'CREATE TABLE "{events}__archive" (LIKE "{events}" INCLUDING ALL)')
+    await exec_sql(db_engine, f"INSERT INTO \"{events}__archive\" (created_at) VALUES ('2026-03-02')")  # noqa: S608
+    config = monthly_config(events, create_ahead=1)
+    service = make_service(db_engine)
+    now = datetime(2026, 8, 26, tzinfo=UTC)
+
+    # Act
+    before = await service.plan(config, now=now)
+    result = await service.partition_data(config)
+    after = await service.plan(config, now=now)
+
+    # Assert -- reported while hidden, attached by the backfill, and nothing else touched
+    assert [(f.partition_name, f.reason) for f in before.actionable_findings] == [
+        (f"public.{march}", FindingReason.UNATTACHED_ROWS)
+    ]
+    assert result.complete
+    assert result.partitions == (f"public.{march}",)
+    assert await is_attached(db_engine, march)
+    assert await _count(db_engine, events) == 25
+    assert after.actionable_findings == ()
+    assert not await is_attached(db_engine, f"{events}__archive")
+    assert await _count(db_engine, f"{events}__archive") == 1
+
+
+async def test__partition_data__a_window_named_table_with_other_rows__is_reported_and_left_alone(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange -- a table under March's name holding February's rows: not something a fill leaves
+    await _default_with_rows(db_engine, events, months=(3,), per_month=0)
+    march = f"{events}__2026_03"
+    await exec_sql(db_engine, f'CREATE TABLE "{march}" (LIKE "{events}" INCLUDING ALL)')
+    await exec_sql(db_engine, f"INSERT INTO \"{march}\" (created_at) VALUES ('2026-02-20 00:00+00')")  # noqa: S608
+
+    # Act
+    result = await make_service(db_engine).partition_data(monthly_config(events, create_ahead=1))
+
+    # Assert
+    assert not result.complete
+    assert [issue.partition_name for issue in result.issues] == [f"public.{march}"]
+    assert "holds rows outside 2026_03" in result.issues[0].error
+    assert not await is_attached(db_engine, march)
+    assert await _count(db_engine, march) == 1
 
 
 async def test__partition_data__nested_scheme__rows_land_in_the_buckets(db_engine: AsyncEngine, tenants: str) -> None:

@@ -44,6 +44,7 @@ __all__ = [
     "PartitionType",
     "RangeBounds",
     "RelationKind",
+    "UnattachedTable",
     "build_partition_tree",
     "hash_keyspace_covered",
     "missing_remainders",
@@ -379,18 +380,51 @@ class DetachedPartition(BaseModel):
         return relname or self.name
 
 
+class UnattachedTable(BaseModel):
+    """A table named under the root that is attached to nothing and carries no orphan marker.
+
+    A partition is created standalone and attached last, so this is what one
+    looks like in between -- and what it stays when whatever was filling it
+    stopped before the attach. Found by name, since no marker says whose it
+    is; only a name that is a window of the scheme makes it a partition at all.
+
+    Attributes:
+        name: Schema-qualified relation name.
+        oid: ``pg_class.oid``.
+        relkind: What the relation physically is.
+        holds_rows: Whether it holds any row. None until something looked,
+            which only happens for a name that is a window of the scheme.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: StrippedNonEmptyStr
+    oid: int | None = None
+    relkind: RelationKind = RelationKind.TABLE
+    holds_rows: bool | None = None
+
+    @property
+    def relname(self) -> str:
+        """Bare relation name without the schema qualifier."""
+        _, _, relname = self.name.rpartition(".")
+        return relname or self.name
+
+
 class ActualTree(BaseModel):
     """Everything below one root that maintenance may act on.
 
     Attributes:
         root: The partitioned table and its whole attached subtree.
         orphans: Marker-tagged detached tables whose marker names the root.
+        unattached: Tables named under the root, attached to nothing and
+            unmarked: partitions whose creation stopped before their attach.
     """
 
     model_config = ConfigDict(frozen=True)
 
     root: PartitionNode
     orphans: tuple[DetachedPartition, ...] = ()
+    unattached: tuple[UnattachedTable, ...] = ()
 
     def find(self, name: str) -> PartitionNode | None:
         """Return the attached node with schema-qualified ``name``, or None."""

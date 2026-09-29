@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from pg_partsmith.aio.services.inspection import PartitionInspector
+from pg_partsmith.aio.services.inspection import PartitionInspector, unattached_tables
 from pg_partsmith.boundaries import CursorSource, NumericBoundaries, TimeBoundaries, Window
 from pg_partsmith.entities import PartitionGranularity, PartitionNode, PartitionType, RangeBounds, TablePartitionConfig
 from pg_partsmith.lifecycle import (
@@ -23,7 +23,7 @@ from pg_partsmith.lifecycle import (
 )
 from pg_partsmith.planner import PlanMode
 from pg_partsmith.scheme import HashPartitioning, RangePartitioning
-from pg_partsmith.topology import ActualTree, DetachedPartition, FactKind
+from pg_partsmith.topology import ActualTree, DetachedPartition, FactKind, UnattachedTable
 
 NOW = datetime(2024, 3, 15, 12, 0, tzinfo=UTC)
 
@@ -33,6 +33,8 @@ NOW = datetime(2024, 3, 15, 12, 0, tzinfo=UTC)
 @pytest.fixture
 def metadata() -> MagicMock:
     metadata = MagicMock()
+    metadata.get_unattached_tables = AsyncMock(return_value=())
+    metadata.get_leading_key_minimum = AsyncMock(return_value=None)
     metadata.get_actual_tree = AsyncMock(return_value=_tree())
     metadata.measure = AsyncMock(side_effect=lambda tree, **kwargs: tree)
     metadata.get_key_high_water_mark = AsyncMock(return_value=None)
@@ -237,6 +239,69 @@ async def test__inspect__nested_progression_level__measures_members_below_the_ro
 
     # Assert
     assert metadata.measure.call_args.kwargs["targets"] == ("events__h0__2024_02",)
+
+
+# ── unattached tables ───────────────────────────────────────────────────────────
+
+
+async def test__unattached_tables__only_a_window_name_is_looked_into(metadata: MagicMock) -> None:
+    # Arrange -- March's table, one that merely shares the prefix, and one that looks like a window
+    # of another table whose name starts with the root's
+    march, archive = UnattachedTable(name="events__2024_03"), UnattachedTable(name="events__archive")
+    remote = UnattachedTable(name="events_remote__2024_03")
+    metadata.get_unattached_tables.return_value = (march, archive, remote)
+    metadata.get_leading_key_minimum.return_value = datetime(2024, 3, 5, tzinfo=UTC)
+
+    # Act
+    tables = await unattached_tables(metadata, _config())
+
+    # Assert -- the archive's rows are never read, so it needs no grant
+    assert [(t.name, t.holds_rows) for t in tables] == [
+        ("events__2024_03", True),
+        ("events__archive", None),
+        ("events_remote__2024_03", None),
+    ]
+    metadata.get_leading_key_minimum.assert_awaited_once_with("events__2024_03", ("created_at",))
+
+
+async def test__unattached_tables__an_empty_window_table__holds_no_rows(metadata: MagicMock) -> None:
+    # Arrange
+    metadata.get_unattached_tables.return_value = (UnattachedTable(name="events__2024_03"),)
+    metadata.get_leading_key_minimum.return_value = None
+
+    # Act
+    tables = await unattached_tables(metadata, _config())
+
+    # Assert
+    assert [t.holds_rows for t in tables] == [False]
+
+
+async def test__inspect__unattached_window_tables__are_on_the_tree(
+    inspector: PartitionInspector, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_actual_tree.return_value = _tree()
+    metadata.get_unattached_tables.return_value = (UnattachedTable(name="events__2024_03"),)
+    metadata.get_leading_key_minimum.return_value = datetime(2024, 3, 5, tzinfo=UTC)
+
+    # Act
+    tree = await inspector.inspect(_config())
+
+    # Assert
+    assert tree is not None
+    assert [(t.name, t.holds_rows) for t in tree.unattached] == [("events__2024_03", True)]
+
+
+async def test__unattached_tables__a_root_that_is_not_range__is_not_searched(metadata: MagicMock) -> None:
+    # Arrange
+    config = TablePartitionConfig(table_name="tasks", scheme=HashPartitioning(key="task_id", modulus=4))
+
+    # Act
+    tables = await unattached_tables(metadata, config)
+
+    # Assert
+    assert tables == ()
+    metadata.get_unattached_tables.assert_not_awaited()
 
 
 # ── context ─────────────────────────────────────────────────────────────────────

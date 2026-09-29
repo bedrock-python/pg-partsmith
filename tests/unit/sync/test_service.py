@@ -88,6 +88,7 @@ def repo() -> MagicMock:
 @pytest.fixture
 def metadata() -> MagicMock:
     metadata = MagicMock()
+    metadata.get_unattached_tables = MagicMock(return_value=())
     metadata.get_partition_type = MagicMock(return_value=PartitionType.RANGE)
     metadata.get_partition_columns = MagicMock(return_value=("created_at",))
     metadata.get_actual_tree = MagicMock(return_value=_tree())

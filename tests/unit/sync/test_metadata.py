@@ -25,6 +25,7 @@ from pg_partsmith.topology import (
     PartitionNode,
     RangeBounds,
     RelationKind,
+    UnattachedTable,
 )
 from pg_partsmith.utils import DETACHED_AT_MARKER, orphan_table_comment
 
@@ -454,6 +455,27 @@ def test__get_actual_tree__orphan_query__carries_a_marker_for_every_partitioned_
     orphan_call = _conn(engine).execute.call_args_list[1]
     assert "split_part(d.description" in str(orphan_call.args[0])
     assert orphan_call.args[1] == {"markers": ["myapp:parent=public.events", "myapp:parent=public.events__2024_02"]}
+
+
+def test__get_unattached_tables__rows__become_qualified_tables_and_the_unaddressable_are_left_out() -> None:
+    # Arrange
+    rows = [
+        _orphan_row("events__2024_03", None, oid=600),
+        _orphan_row("events__2024_04", None, oid=601, relkind="p"),
+        _orphan_row("events__2024_05", None, oid=602, schema="bad.schema"),
+    ]
+    engine = _make_engine(rows)
+    provider = PostgresMetadataProvider(engine, marker_prefix="acme:")
+
+    # Act
+    tables = provider.get_unattached_tables("events")
+
+    # Assert -- the root is resolved by the server, the marker prefix keeps orphans out
+    assert tables == (
+        UnattachedTable(name="public.events__2024_03", oid=600, relkind=RelationKind.TABLE),
+        UnattachedTable(name="public.events__2024_04", oid=601, relkind=RelationKind.PARTITIONED),
+    )
+    assert _conn(engine).execute.call_args.args[1] == {"table_name": '"events"', "marker_prefix": "acme:"}
 
 
 def test__get_actual_tree__orphans__are_parsed_with_their_detach_instant() -> None:
