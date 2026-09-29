@@ -369,7 +369,10 @@ lifecycle units — partitions directly under the root — never once per leaf o
     batch *and* goes live in one transaction, so a window the application is writing into
     is attached like any other; writers wait at the parent for that commit and are then
     routed into the new partition. A window that still cannot be attached comes back as a
-    `move` issue with `complete=False` — `partition_data` does not raise for it.
+    `move` issue with `complete=False`, its rows moved back to DEFAULT — `partition_data`
+    does not raise for it. If the process dies between the fill and the attach, the rows
+    stay in the unattached table: `plan` reports it as `unattached_rows`, and the next
+    `partition_data` attaches it once DEFAULT is drained.
 11. **Flat and composed spellings do not mix**, and `extra="forbid"` means a misspelled
     keyword raises rather than being ignored.
 12. **`schema=` goes in, `config.db_schema` comes out** — the field is aliased to avoid

@@ -26,6 +26,7 @@ from pg_partsmith.catalog_queries import (
     RELATION_OID_SQL,
     SEQUENCE_LAST_VALUE_SQL,
     TEXT_INSTANT_HAS_PASSED_SQL,
+    UNATTACHED_SQL,
     UNIQUE_CONSTRAINT_COLUMNS_SQL,
 )
 from pg_partsmith.entities import PartitionInfo, PartitionType
@@ -45,6 +46,7 @@ from pg_partsmith.topology import (
     PartitionNode,
     PartitionTreeRow,
     RelationKind,
+    UnattachedTable,
     build_partition_tree,
 )
 from pg_partsmith.utils import (
@@ -319,6 +321,37 @@ class PostgresMetadataProvider:
                 )
             )
         return tuple(orphans)
+
+    def get_unattached_tables(self, table_name: str) -> tuple[UnattachedTable, ...]:
+        """Tables named under ``table_name``, attached to nothing and carrying no orphan marker.
+
+        A partition is created standalone and attached last, so this is what
+        one looks like when whatever was filling it stopped first. Every table
+        in the root's schema whose name begins with the root's is a candidate;
+        which of them name a window is the scheme's call, and no row of any of
+        them is read here.
+        """
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(UNATTACHED_SQL),
+                {"table_name": to_regclass_argument(table_name), "marker_prefix": self._marker_prefix},
+            )
+            rows = result.fetchall()
+
+        tables: list[UnattachedTable] = []
+        for row in rows:
+            schema = coerce_str(row.partition_schema) or ""
+            relname = coerce_str(row.partition_name) or ""
+            if not is_addressable(schema, relname):
+                continue
+            tables.append(
+                UnattachedTable(
+                    name=qualify(schema, relname),
+                    oid=int(row.oid),
+                    relkind=RelationKind.from_relkind(coerce_str(row.relkind, encoding="ascii")),
+                )
+            )
+        return tuple(tables)
 
     def _measure(
         self,

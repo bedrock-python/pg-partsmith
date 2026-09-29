@@ -32,6 +32,7 @@ from pg_partsmith.topology import (
     PartitionType,
     RangeBounds,
     RelationKind,
+    UnattachedTable,
 )
 
 __all__ = [
@@ -436,6 +437,15 @@ class PartitionMetadataProvider(Protocol):
                 belongs to -- ``config.time_boundaries``. When given, its
                 timezone and codec read the bound instead of whatever the
                 provider was constructed with.
+        """
+        ...
+
+    def get_unattached_tables(self, table_name: str) -> tuple[UnattachedTable, ...]:
+        """Tables named under ``table_name``, attached to nothing and carrying no orphan marker.
+
+        The candidates for a partition whose creation stopped before its
+        attach: what a fill leaves behind when the process running it dies.
+        Nothing is read from them; which names are windows is the scheme's call.
         """
         ...
 

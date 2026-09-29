@@ -100,6 +100,19 @@ A partition was not created because part of its subtree could not be planned —
 refused, a group in conflict. Attaching a branch with a hole in its child set would reject
 rows, so the whole partition waits. The findings for the subtree say why.
 
+## `unattached_rows` — rows no query through the table sees
+
+```text
+[warning] unattached_rows: public.events__2026_03 holds rows of 2026_03 but is attached to nothing, so no query through public.events sees them; backfill (partition_data) attaches it.
+```
+
+A backfill creates a window's partition, moves the window's rows into it from DEFAULT and
+attaches it last. If the process died after the move and before the attach, the rows are in
+that table and nowhere else, and DEFAULT no longer holds anything that would bring a later
+backfill back to the window. Run `backfill`: once DEFAULT is drained it looks for exactly
+these tables and attaches them. Only a table whose name is the one the scheme gives that
+window under this root counts — its rows are never read otherwise.
+
 ## `grace_pending`, `drop_deferred` (INFO)
 
 A detached orphan waiting out its grace period, or one whose `DropAfter(when=…)`

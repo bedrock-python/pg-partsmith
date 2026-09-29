@@ -113,7 +113,7 @@ from .strategies import (
     YearPeriodCalculator,
     get_period_calculator,
 )
-from .topology import ActualTree, DetachedPartition, FactKind, PartitionFacts, RelationKind
+from .topology import ActualTree, DetachedPartition, FactKind, PartitionFacts, RelationKind, UnattachedTable
 from .utils import qualify, split_qualified_name
 
 __all__ = [
@@ -225,6 +225,7 @@ __all__ = [
     "TimezoneAwareCalculator",
     "ToolkitOptions",
     "UUIDv7BoundaryCodec",
+    "UnattachedTable",
     "UnmanagedPartitionDropError",
     "Unreferenced",
     "WeekPeriodCalculator",

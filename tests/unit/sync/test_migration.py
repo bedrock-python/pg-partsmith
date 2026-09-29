@@ -34,7 +34,7 @@ from pg_partsmith.plan import (
 )
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning
 from pg_partsmith.sync.services.migration import DataMover
-from pg_partsmith.topology import ActualTree, DetachedPartition, RelationKind
+from pg_partsmith.topology import ActualTree, DetachedPartition, RelationKind, UnattachedTable
 
 NOW = datetime(2026, 8, 28, tzinfo=UTC)
 ROOT = "public.events"
@@ -55,6 +55,7 @@ def repo() -> MagicMock:
 @pytest.fixture
 def metadata() -> MagicMock:
     metadata = MagicMock()
+    metadata.get_unattached_tables = MagicMock(return_value=())
     metadata.get_default_partition = MagicMock(return_value=_default_info())
     metadata.get_leading_key_minimum = MagicMock(return_value=None)
     metadata.get_actual_tree = MagicMock(return_value=None)
@@ -126,6 +127,12 @@ def _fill_then(failure: BaseException) -> Any:
         raise failure
 
     return create_partition
+
+
+class _CheckViolationError(Exception):
+    """What a driver raises when ATTACH finds a row outside the partition's bounds."""
+
+    sqlstate = "23514"
 
 
 class _LockNotAvailableError(Exception):
@@ -575,6 +582,60 @@ def test__partition_data__move_refused_by_a_foreign_key_action__issue_and_incomp
     assert not result.complete
     assert [issue.partition_name for issue in result.issues] == [DEFAULT]
     assert "ON DELETE CASCADE" in result.issues[0].error
+
+
+def test__partition_data__default_drained_and_a_window_left_unattached__finishes_that_window(
+    mover: DataMover, metadata: MagicMock, repo: MagicMock
+) -> None:
+    # Arrange -- DEFAULT is empty; March's table holds rows and was never attached
+    metadata.get_unattached_tables.side_effect = [(UnattachedTable(name=f"{ROOT}__2026_03"),), ()]
+    metadata.get_leading_key_minimum.side_effect = [None, datetime(2026, 3, 5, tzinfo=UTC), None]
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act
+    result = mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert -- March goes through the path a window out of DEFAULT takes, and then there is nothing left
+    assert result.complete
+    assert result.partitions == (f"{ROOT}__2026_03",)
+    assert result.issues == ()
+    assert plan_for.call_args.args[0] == _window(3)
+
+
+def test__partition_data__a_window_table_whose_rows_do_not_fit__is_left_as_it_is(
+    mover: DataMover, metadata: MagicMock, executor: MagicMock
+) -> None:
+    # Arrange -- March's name, rows that are not March's: no fill of ours put them there
+    metadata.get_unattached_tables.return_value = (UnattachedTable(name=f"{ROOT}__2026_03"),)
+    metadata.get_leading_key_minimum.side_effect = [None, datetime(2026, 2, 20, tzinfo=UTC)]
+    executor.create_partition.side_effect = _CheckViolationError(
+        f'partition constraint of relation "{ROOT}__2026_03" is violated by some row'
+    )
+    plan_for = _plans(_plan(_create_op(3)))
+
+    # Act
+    result = mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert -- reported, not raised, and not retried in a loop
+    assert not result.complete
+    assert [issue.partition_name for issue in result.issues] == [f"{ROOT}__2026_03"]
+    assert "holds rows outside 2026_03" in result.issues[0].error
+    assert executor.create_partition.call_count == 1
+
+
+def test__partition_data__default_drained_and_nothing_left_unattached__is_complete(
+    mover: DataMover, metadata: MagicMock
+) -> None:
+    # Arrange -- the fixture's defaults: an empty DEFAULT, nothing unattached
+    plan_for = _plans()
+
+    # Act
+    result = mover.partition_data(_config(), plan_for, batch_rows=10)
+
+    # Assert
+    assert result.complete
+    assert result.partitions == ()
+    plan_for.assert_not_called()
 
 
 def test__partition_data__a_lock_not_granted_in_time__issue_and_incomplete(

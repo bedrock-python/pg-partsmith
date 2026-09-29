@@ -160,6 +160,9 @@ class FindingReason(StrEnum):
         GRACE_PENDING: A detached orphan still within its grace period.
         DROP_DEFERRED: A detached orphan past its grace whose drop condition
             does not hold yet.
+        UNATTACHED_ROWS: A partition named for a window of the root holds rows
+            but was never attached -- a fill stopped before its attach -- so no
+            query through the root sees them. ``partition_data`` attaches it.
     """
 
     LEGACY_LEAF = "legacy_leaf"
@@ -182,6 +185,7 @@ class FindingReason(StrEnum):
     DETACH_PENDING = "detach_pending"
     GRACE_PENDING = "grace_pending"
     DROP_DEFERRED = "drop_deferred"
+    UNATTACHED_ROWS = "unattached_rows"
 
 
 # Reasons that describe a healthy, deliberate state (policy evolution, a

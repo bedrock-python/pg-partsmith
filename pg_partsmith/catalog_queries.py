@@ -125,6 +125,38 @@ ORPHANS_SQL = """
     ORDER BY ns.nspname, c.relname
 """
 
+# Tables in the root's schema whose names begin with the root's, attached to
+# nothing and carrying no orphan marker. A partition is created standalone and
+# attached last, so that is exactly what one looks like when whatever was
+# filling it stopped before the attach. The root itself is excluded, and which
+# of the rest are partitions at all is the scheme's call: their names are read
+# back against it, and no row of any of them is read here.
+UNATTACHED_SQL = """
+    SELECT
+        c.oid AS oid,
+        c.relkind AS relkind,
+        ns.nspname AS partition_schema,
+        c.relname AS partition_name
+    FROM pg_class root
+    JOIN pg_class c ON c.relnamespace = root.relnamespace
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    WHERE root.oid = to_regclass(:table_name)
+      AND c.oid <> root.oid
+      AND c.relkind IN ('r', 'p')
+      AND c.relispartition = false
+      AND left(c.relname, length(root.relname)) = root.relname
+      AND NOT EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = c.oid)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_description d
+          WHERE d.objoid = c.oid
+            AND d.classoid = 'pg_class'::regclass
+            AND d.objsubid = 0
+            AND left(d.description, length(:marker_prefix)) = :marker_prefix
+      )
+    ORDER BY c.relname
+"""
+
 # Size and row estimate of each relation in ``:oids``, subtree included.
 #
 # ``pg_total_relation_size`` of a partitioned relation is 0 -- it has no

@@ -75,7 +75,9 @@ Each call:
    same pass as a quiet one, and what the lock covers is a tail and a scan rather than a
    month;
 5. moves on to the next window, until DEFAULT holds only rows no window can take (rows
-   with a NULL key), or `max_batches` is spent.
+   with a NULL key), or `max_batches` is spent;
+6. with DEFAULT drained, attaches any window's partition a previous run filled and never
+   attached — the process died in between — which `plan` reports as `unattached_rows`.
 
 `result.complete` says whether DEFAULT is drained; `result.partitions` lists what was
 created; `result.issues` explains anything that could not be handled. A call that runs out

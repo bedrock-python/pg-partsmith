@@ -62,6 +62,7 @@ from pg_partsmith.topology import (
     PartitionType,
     RangeBounds,
     RelationKind,
+    UnattachedTable,
 )
 from pg_partsmith.utils import qualify, split_qualified_name
 
@@ -246,9 +247,12 @@ def _plan(
     root: PartitionNode,
     *,
     orphans: tuple[DetachedPartition, ...] = (),
+    unattached: tuple[UnattachedTable, ...] = (),
     context: PlanningContext | None = None,
 ) -> MaintenancePlan:
-    return plan_maintenance(config, ActualTree(root=root, orphans=orphans), context or _context())
+    return plan_maintenance(
+        config, ActualTree(root=root, orphans=orphans, unattached=unattached), context or _context()
+    )
 
 
 def _reasons(plan: MaintenancePlan) -> list[FindingReason]:
@@ -2461,3 +2465,53 @@ def test__plan_maintenance__records_the_configuration_it_planned_under() -> None
 
     # Assert: what makes a plan read back from a file answerable
     assert plan.config_fingerprint == config.fingerprint
+
+
+# ── Partitions whose attach never happened ──────────────────────────────────────
+
+
+def test__plan_maintenance__unattached_window_holding_rows__is_reported() -> None:
+    # Arrange -- March was filled and never attached
+    config = _config(lifecycle=_policy(creation=CreateAhead(count=2)))
+    root = _root(_month(2026, 8, oid=1), _month(2026, 9, oid=2))
+    march = UnattachedTable(name=f"{ROOT}__2026_03", holds_rows=True)
+
+    # Act
+    plan = _plan(config, root, unattached=(march,))
+
+    # Assert
+    assert [(f.partition_name, f.reason, f.severity) for f in plan.findings] == [
+        (march.name, FindingReason.UNATTACHED_ROWS, Severity.WARNING)
+    ]
+    assert "attached to nothing" in plan.findings[0].detail
+
+
+def test__plan_maintenance__unattached_tables_that_hide_nothing__are_not_reported() -> None:
+    # Arrange -- an empty one, one whose name is no window, and a look-alike of another table's
+    config = _config(lifecycle=_policy(creation=CreateAhead(count=2)))
+    root = _root(_month(2026, 8, oid=1), _month(2026, 9, oid=2))
+    tables = (
+        UnattachedTable(name=f"{ROOT}__2026_03", holds_rows=False),
+        UnattachedTable(name=f"{ROOT}__archive"),
+        UnattachedTable(name=f"{ROOT}_remote__2026_03", holds_rows=True),
+    )
+
+    # Act
+    plan = _plan(config, root, unattached=tables)
+
+    # Assert
+    assert plan.findings == ()
+
+
+def test__plan_maintenance__unattached_window_this_plan_creates__is_left_to_the_create() -> None:
+    # Arrange -- the executor attaches whatever it finds under a name it creates
+    config = _config(lifecycle=_policy(creation=CreateAhead(count=2)))
+    root = _root(_month(2026, 8, oid=1))
+    september = UnattachedTable(name=f"{ROOT}__2026_09", holds_rows=True)
+
+    # Act
+    plan = _plan(config, root, unattached=(september,))
+
+    # Assert
+    assert _targets(plan.creates) == [september.name]
+    assert plan.findings == ()

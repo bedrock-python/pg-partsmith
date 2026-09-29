@@ -127,6 +127,23 @@ def plan_maintenance(config: TablePartitionConfig, actual: ActualTree, context: 
     )
 
 
+def unattached_window(config: TablePartitionConfig, relname: str) -> Window | None:
+    """The root window ``relname`` is the partition for, or None.
+
+    The name has to read back as a window *and* be the very name the scheme
+    gives that window under this root: ``metrics_remote__2025_01`` beside
+    ``metrics`` reads as January, but it is not a partition of ``metrics``.
+    """
+    root = config.scheme
+    if not isinstance(root, RangePartitioning):
+        return None
+    boundaries = root.range_boundaries
+    window = boundaries.parse_child_name(relname)
+    if window is None or boundaries.child_name(config.table_name, window) != relname:
+        return None
+    return window
+
+
 def fact_targets(config: TablePartitionConfig, actual: ActualTree) -> tuple[str, ...]:
     """Names the lifecycle policy may need facts about.
 
@@ -228,6 +245,29 @@ class _Planner:
 
     def run(self) -> None:
         self._plan_level(self.config.scheme, self.actual.root, depth=0)
+        self._report_unattached()
+
+    def _report_unattached(self) -> None:
+        """A partition that was filled and never attached holds rows no query through the root sees.
+
+        Not when this plan creates the window anyway: the executor finds the
+        table under that name and attaches it.
+        """
+        root = self.config.scheme
+        if not isinstance(root, RangePartitioning):
+            return
+        boundaries = root.range_boundaries
+        planned = {op.target.rpartition(".")[2] for op in self.creates}
+        for table in self.actual.unattached:
+            window = unattached_window(self.config, table.relname)
+            if not table.holds_rows or window is None or table.relname in planned:
+                continue
+            self._record(
+                table.name,
+                FindingReason.UNATTACHED_ROWS,
+                f"{table.name} holds rows of {boundaries.describe(window)} but is attached to nothing, so no query "
+                f"through {self.config.qualified_name} sees them; backfill (partition_data) attaches it.",
+            )
 
     # ── Dispatch ────────────────────────────────────────────────────────────────
 

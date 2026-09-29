@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.7.0 — rows a stopped backfill hid are found and attached
+
+A backfill moves a window's rows out of DEFAULT into a partition it attaches last. If the
+process died after the move and before the attach, the rows sat in a table no query
+through the parent sees, DEFAULT held nothing that would bring a later backfill back to the
+window, and `plan` and `validate` both said the table was fine
+([#76](https://github.com/bedrock-python/pg-partsmith/issues/76)). 1.6.3 covered an attach
+that fails; this covers a process that never gets to fail.
+
+`plan` now reports such a table as `unattached_rows`, a WARNING, so `plan --check` exits 3
+and `apply` carries it in `result.issues`. `partition_data` — `backfill` — attaches it once
+DEFAULT is drained, through the same path a window out of DEFAULT takes. A table counts
+only when its name is the very name the scheme gives a window under this root:
+`metrics_remote__2025_01` beside `metrics` reads as January, and is not a partition of it.
+Its rows are read only after that, so a table that merely shares the prefix is never read
+and needs no grant. `validate` is unchanged: it checks the document against the table's
+shape, not the table's contents.
+
+`get_unattached_tables(table_name)` is a method of `PartitionMetadataProvider` in both
+mirrors, answering with the tables named under the root, attached to nothing and carrying
+no orphan marker; a provider of your own now has to answer it. `ActualTree.unattached` and
+`UnattachedTable` carry what it found.
+
 ## [1.6.3](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.6.2...pg-partsmith-v1.6.3) (2026-09-29)
 
 
