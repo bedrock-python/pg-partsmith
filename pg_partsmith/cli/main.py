@@ -50,6 +50,7 @@ from .loader import (
     DSN_FILE_ENV_VAR,
     ConfigError,
     async_url,
+    asyncpg_connect_args,
     load_document,
     load_plans,
     load_python_hooks,
@@ -555,9 +556,9 @@ async def _run(invocation: _Invocation) -> CommandResult:
     document = load_document(invocation.config)
     _check_python_hooks(document, invocation.config)
     configs = select_configs(document, invocation.tables)
-    url = async_url(resolve_dsn(document, override=invocation.dsn))
+    dsn = resolve_dsn(document, override=invocation.dsn)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(async_url(dsn), connect_args=asyncpg_connect_args(dsn))
     try:
         try:
             hooks = _hooks(

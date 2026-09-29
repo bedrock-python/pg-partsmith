@@ -27,6 +27,7 @@ from pg_partsmith.cli.loader import (
     DSN_FILE_ENV_VAR,
     ConfigError,
     async_url,
+    asyncpg_connect_args,
     load_document,
     load_plans,
     load_python_hooks,
@@ -220,6 +221,33 @@ def test__async_url__a_dsn_naming_its_driver__is_left_exactly_as_it_is() -> None
     # Whoever wrote +psycopg installed psycopg on purpose.
     assert async_url("postgresql+psycopg://app@host/db") == "postgresql+psycopg://app@host/db"
     assert async_url("not a url") == "not a url"
+
+
+def test__async_url__libpq_tls_parameters__leave_the_url_and_the_rest_stays_as_written() -> None:
+    # Arrange
+    dsn = "postgresql://app@db/app?application_name=x&sslmode=verify-full&sslrootcert=/ca.pem&options=-c%20a%3Db"
+
+    # Act / Assert
+    assert async_url(dsn) == "postgresql+asyncpg://app@db/app?application_name=x&options=-c%20a%3Db"
+    assert async_url("postgresql://app@db/app?sslmode=require") == "postgresql+asyncpg://app@db/app"
+
+
+def test__asyncpg_connect_args__carries_the_tls_parameters_in_a_dsn_asyncpg_parses() -> None:
+    # Arrange
+    dsn = "postgresql://app:s3cr%40t@db:5432/app?sslmode=verify-full&connect_timeout=5&sslrootcert=/ca.pem"
+
+    # Act / Assert
+    assert asyncpg_connect_args(dsn) == {"dsn": "postgresql://?sslmode=verify-full&sslrootcert=/ca.pem"}
+
+
+def test__asyncpg_connect_args__nothing_to_carry__is_empty() -> None:
+    # Act / Assert -- no TLS parameters, and a DSN that names its own driver keeps its own
+    assert asyncpg_connect_args("postgresql://app@db/app?application_name=x") == {}
+    assert asyncpg_connect_args("postgresql+asyncpg://app@db/app?ssl=require") == {}
+    assert (
+        async_url("postgresql+asyncpg://app@db/app?sslmode=require")
+        == "postgresql+asyncpg://app@db/app?sslmode=require"
+    )
 
 
 # ── Narrowing to tables ─────────────────────────────────────────────────────────
@@ -774,8 +802,8 @@ def _stoppable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, signum: int) -> 
     config = _write(tmp_path, "partitions.json", json.dumps(payload))
     engines: list[_Recording] = []
 
-    def recording(url: str) -> _Recording:
-        engine = _Recording(cli.create_async_engine.__wrapped__(url))  # type: ignore[attr-defined]
+    def recording(url: str, **kwargs: Any) -> _Recording:
+        engine = _Recording(cli.create_async_engine.__wrapped__(url, **kwargs))  # type: ignore[attr-defined]
         engines.append(engine)
         return engine
 

@@ -26,6 +26,7 @@ __all__ = [
     "DSN_FILE_ENV_VAR",
     "ConfigError",
     "async_url",
+    "asyncpg_connect_args",
     "load_document",
     "load_plans",
     "load_python_hooks",
@@ -130,19 +131,74 @@ def _dsn_from_file() -> str | None:
         raise ConfigError(msg) from exc
 
 
+# libpq's TLS parameters. asyncpg reads every one of them the way libpq does,
+# but only from a DSN it parses itself: SQLAlchemy hands the parameters of its
+# URL to asyncpg.connect() as keywords, and asyncpg has no keyword by these
+# names -- a DSN copied from psql with ?sslmode=require failed with a TypeError.
+_LIBPQ_TLS_PARAMETERS = frozenset(
+    {
+        "sslmode",
+        "sslcert",
+        "sslkey",
+        "sslrootcert",
+        "sslcrl",
+        "sslpassword",
+        "sslnegotiation",
+        "ssl_min_protocol_version",
+        "ssl_max_protocol_version",
+    }
+)
+
+
 def async_url(dsn: str) -> str:
     """The DSN with an async driver named, since that is what the CLI drives.
 
     ``postgresql://…`` means psycopg2 to SQLAlchemy, which cannot be driven
     asynchronously; a DSN that already names its driver is left exactly as it
     is, so ``postgresql+psycopg://`` keeps working for whoever installed it.
+    libpq's TLS parameters leave the URL on the way, for
+    :func:`asyncpg_connect_args` to hand to asyncpg.
+    """
+    rewritten = _asyncpg_rewrite(dsn)
+    if rewritten is None:
+        return dsn
+    rest, _ = rewritten
+    return f"postgresql+asyncpg://{rest}"
+
+
+def asyncpg_connect_args(dsn: str) -> dict[str, Any]:
+    """The ``connect_args`` that carry a DSN's libpq TLS parameters to asyncpg.
+
+    They travel as a DSN of their own, ``postgresql://?sslmode=…``, which
+    asyncpg parses the way libpq would -- ``sslrootcert`` and the rest
+    included -- while host, user and database still come from the URL.
+    Empty when the DSN names its own driver or carries no TLS parameters.
+    """
+    rewritten = _asyncpg_rewrite(dsn)
+    if rewritten is None or not rewritten[1]:
+        return {}
+    return {"dsn": "postgresql://?" + "&".join(rewritten[1])}
+
+
+def _asyncpg_rewrite(dsn: str) -> tuple[str, list[str]] | None:
+    """Split a DSN the CLI will hand to asyncpg: the rest, and its TLS query parameters.
+
+    None for a DSN that is not rewritten -- one naming its driver, or not a
+    ``postgresql://`` URL at all. Parameters are split as written, never
+    decoded and encoded again, so everything that stays reads exactly as it did.
     """
     scheme, separator, rest = dsn.partition("://")
-    if not separator or "+" in scheme:
-        return dsn
-    if scheme in {"postgresql", "postgres"}:
-        return f"postgresql+asyncpg://{rest}"
-    return dsn
+    if not separator or "+" in scheme or scheme not in {"postgresql", "postgres"}:
+        return None
+    base, question, query = rest.partition("?")
+    if not question:
+        return rest, []
+    kept: list[str] = []
+    tls: list[str] = []
+    for parameter in query.split("&"):
+        name = parameter.partition("=")[0]
+        (tls if name in _LIBPQ_TLS_PARAMETERS else kept).append(parameter)
+    return (f"{base}?{'&'.join(kept)}" if kept else base), tls
 
 
 def select_configs(document: PartitionsDocument, tables: tuple[str, ...]) -> tuple[TablePartitionConfig, ...]:

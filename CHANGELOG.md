@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.6.2 — a DSN with sslmode
+
+A `postgresql://` DSN carrying `?sslmode=require` crashed the CLI before it connected:
+`TypeError: connect() got an unexpected keyword argument 'sslmode'`
+([#73](https://github.com/bedrock-python/pg-partsmith/issues/73)). The CLI drives such a
+DSN with asyncpg, and SQLAlchemy hands the URL's parameters to `asyncpg.connect()` as
+keywords; asyncpg reads `sslmode`, `sslrootcert` and the rest of libpq's TLS parameters
+only from a DSN it parses itself. They now travel to it as one, so a DSN copied from psql
+or a managed PostgreSQL console works as written, `sslrootcert` included. Everything else
+in the DSN stays exactly as it was.
 ## [1.6.1](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.6.0...pg-partsmith-v1.6.1) (2026-09-29)
 
 
