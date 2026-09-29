@@ -138,14 +138,14 @@ Drop rules: `DropAfter(grace: timedelta = 0, when: predicate | None = None)`;
 ## Repository and metadata provider
 
 `PostgresPartitionRepository(engine, *, ddl_timezone="UTC", ddl_timeout_seconds=30,
-marker_prefix=None, drop_allow_unmanaged=False, drop_lock_timeout_ms=3000,
+ddl_lock_timeout_ms=3000, marker_prefix=None, drop_allow_unmanaged=False, drop_lock_timeout_ms=3000,
 drop_max_retries=3, drop_retry_delay=0.5, drop_max_backoff=300)`.
 
 `PostgresMetadataProvider(engine, *, marker_prefix=None, boundary_codec=None,
 ddl_timezone=None)`.
 
 `PartitionToolkit.from_engine(engine, *, hooks=None, locks=None, marker_prefix=None,
-ddl_timezone="UTC", ddl_timeout_seconds=30, boundary_codec=None, lock_prefix="partitioner",
+ddl_timezone="UTC", ddl_timeout_seconds=30, ddl_lock_timeout_ms=3000, boundary_codec=None, lock_prefix="partitioner",
 lock_min_interval_seconds=0, drop_allow_unmanaged=False, drop_lock_timeout_ms=3000,
 drop_max_retries=3, drop_retry_delay=0.5, drop_max_backoff=300)` builds all of them around
 one engine and returns them as `repo` / `metadata` / `locks` / `service` / `maintainer`,

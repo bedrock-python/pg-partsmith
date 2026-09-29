@@ -24,7 +24,9 @@ class AuditedRepository(PostgresPartitionRepository):
 ```
 
 Tuning knobs on the constructor: `ddl_timezone` (the session timezone `ATTACH` runs
-under, `"UTC"` by default), `ddl_timeout_seconds`, `marker_prefix`, the drop retry
+under, `"UTC"` by default), `ddl_timeout_seconds`, `ddl_lock_timeout_ms` (how long an
+attach, a row move or a blocking detach waits for a lock, while writers queue behind it),
+`marker_prefix`, the drop retry
 settings (`drop_lock_timeout_ms`, `drop_max_retries`, `drop_retry_delay`,
 `drop_max_backoff`), and `drop_allow_unmanaged` (leave it off).
 

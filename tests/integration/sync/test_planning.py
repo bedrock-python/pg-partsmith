@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -75,6 +76,38 @@ def test__maintain__process_clock_years_ahead__retention_keeps_the_databases_cur
     assert (result.created_count, result.detached_count, result.dropped_count) == (0, 0, 0)
     assert result.plan is not None
     assert abs(result.plan.generated_at - scalar(sync_db_engine, "SELECT now()")) < timedelta(minutes=1)
+
+
+# ── waiting for locks ───────────────────────────────────────────────────────────
+
+
+def test__apply__a_reader_holds_the_table__the_attach_gives_up_within_the_lock_timeout(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange -- August's rows sit in DEFAULT, and a reader has the whole table open
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    exec_sql(sync_db_engine, f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2026-08-10', 'x')")  # noqa: S608
+    config = monthly_config(table, create_ahead=1)
+    service = make_service(sync_db_engine, ddl_lock_timeout_ms=200)
+    now = datetime.fromisoformat(NOW).replace(tzinfo=UTC)
+
+    with sync_db_engine.connect() as reader:
+        reader.execute(text(f'SELECT count(*) FROM "{table}"'))  # noqa: S608
+        started = time.monotonic()
+
+        # Act
+        held = service.apply(config, service.plan(config, now=now))
+        waited = time.monotonic() - started
+
+    # Assert -- it gave up in about the lock timeout rather than the 30-second
+    # statement budget, and said why; with the reader gone the next run finishes
+    assert waited < 5
+    assert held.issues
+    assert all("ddl_lock_timeout_ms" in issue.error for issue in held.issues)
+    freed = service.apply(config, service.plan(config, now=now))
+    assert freed.issues == ()
+    assert is_attached(sync_db_engine, f"{table}__2026_08")
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{table}_default"') == 0  # noqa: S608
 
 
 # ── plan() / apply() ────────────────────────────────────────────────────────────

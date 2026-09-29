@@ -1064,6 +1064,22 @@ def test__apply__a_connection_the_server_dropped__is_still_exit_5(
     assert capsys.readouterr().err == "pg-partsmith: database error: server closed the connection unexpectedly\n"
 
 
+def test__apply__a_timeout_with_no_message__says_it_timed_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Arrange: what asyncio.timeout raises carries no message of its own
+    payload = {**DOCUMENT, "dsn": "postgresql+asyncpg://nobody@127.0.0.1:1/none"}
+    config = _write(tmp_path, "partitions.json", json.dumps(payload))
+    monkeypatch.setattr(cli, "run_apply", AsyncMock(side_effect=TimeoutError()))
+
+    # Act
+    code = main(["apply", "-c", str(config)])
+
+    # Assert
+    assert code == ExitCode.CONNECTION
+    assert capsys.readouterr().err == "pg-partsmith: database error: timed out\n"
+
+
 class _AdaptedError(Exception):
     """What the asyncpg dialect raises: the SQLSTATE as an attribute, the driver's error as the cause."""
 

@@ -18,6 +18,7 @@ from pg_partsmith.aio.maintainer import PartitionMaintainer
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.aio.service import PartitionLifecycleService
+from pg_partsmith.constants import DEFAULT_DDL_LOCK_TIMEOUT_MS
 from pg_partsmith.utils import quote_identifier
 from tests.integration.nested_support import (
     CHILD_BOUNDS_SQL,
@@ -59,10 +60,11 @@ def make_service(
     *,
     hooks: list[PartitionLifecycleHooks] | None = None,
     codec: RangeBoundaryCodec | None = None,
+    ddl_lock_timeout_ms: int = DEFAULT_DDL_LOCK_TIMEOUT_MS,
 ) -> PartitionLifecycleService:
     """Wire a lifecycle service over ``engine`` with the bundled PostgreSQL components."""
     return PartitionLifecycleService(
-        repo=PostgresPartitionRepository(engine),
+        repo=PostgresPartitionRepository(engine, ddl_lock_timeout_ms=ddl_lock_timeout_ms),
         metadata=PostgresMetadataProvider(engine, boundary_codec=codec),
         locks=PostgresAdvisoryLockManager(engine),
         hooks=hooks,

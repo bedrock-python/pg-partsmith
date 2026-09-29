@@ -150,7 +150,7 @@ The sync twin is the same text with `sqlalchemy.create_engine`, `pg_partsmith.sy
 Constructor options worth knowing:
 
 * `PostgresPartitionRepository(engine, *, ddl_timezone="UTC", ddl_timeout_seconds=30.0,
-  marker_prefix=None, drop_allow_unmanaged=False, drop_lock_timeout_ms=3000,
+  ddl_lock_timeout_ms=3000, marker_prefix=None, drop_allow_unmanaged=False, drop_lock_timeout_ms=3000,
   drop_max_retries=3, drop_retry_delay=0.5, drop_max_backoff=300.0)`
 * `PostgresMetadataProvider(engine, *, marker_prefix=None, boundary_codec=None, ddl_timezone=None)`
 * `PostgresAdvisoryLockManager(engine, prefix="partitioner", acquire_min_interval_seconds=0.0)`

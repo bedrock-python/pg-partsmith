@@ -211,6 +211,15 @@ race (benign) or a conflict (`name_unusable`); a relation that vanished between 
 apply is skipped; a detach already pending on another connection is retried next tick.
 Seen directly only when calling the repository yourself.
 
+## `a lock this step needs was not granted within ddl_lock_timeout_ms`
+
+An issue on the result, not an exception: an attach, a row move or a blocking detach
+waited `ddl_lock_timeout_ms` for a lock another session holds — usually a long
+transaction reading or writing the table — and gave up rather than keep every writer
+waiting behind it. Nothing was changed; the next run tries again. If it keeps happening,
+find the transaction in `pg_stat_activity`. Raising the setting trades the chance of
+getting the lock for how long writes can stall.
+
 ## `DropRetryExhaustedError`
 
 The drop could not take its lock within `drop_max_retries` attempts — a long transaction

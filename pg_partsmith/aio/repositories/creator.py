@@ -18,7 +18,9 @@ from pg_partsmith.catalog_queries import (
     RELATION_IDENTITY_COLUMNS_SQL,
     RELATION_PRIVILEGES_SQL,
     SEQUENCE_PARAMETERS_SQL,
+    SET_LOCK_TIMEOUT_SQL,
 )
+from pg_partsmith.constants import DEFAULT_DDL_LOCK_TIMEOUT_MS
 from pg_partsmith.exceptions import (
     PartitionAlreadyExistsError,
     PartitionNotFoundError,
@@ -62,12 +64,19 @@ class PartitionCreator:
     """Helper for partition creation, attachment and row movement."""
 
     def __init__(
-        self, *, engine: AsyncEngine, ddl_timeout: float, ddl_timezone: str | None, marker_prefix: str | None = None
+        self,
+        *,
+        engine: AsyncEngine,
+        ddl_timeout: float,
+        ddl_timezone: str | None,
+        marker_prefix: str | None = None,
+        lock_timeout_ms: int = DEFAULT_DDL_LOCK_TIMEOUT_MS,
     ) -> None:
         self._engine = engine
         self._ddl_timeout = ddl_timeout
         self._ddl_timezone = ddl_timezone
         self._marker_prefix = marker_prefix
+        self._lock_timeout_ms = lock_timeout_ms
 
     async def create_table_like(
         self,
@@ -282,6 +291,7 @@ class PartitionCreator:
             **values,
         )
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            await self._bound_lock_waits(conn)
             if isinstance(bounds, RangeBounds) and self._ddl_timezone is not None:
                 await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             await self._require_oid(conn, parent_name, expected_parent_oid)
@@ -393,6 +403,7 @@ class PartitionCreator:
         """
         condition = _window_condition("reconcile_default_rows", key_columns, from_value, to_value)
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            await self._bound_lock_waits(conn)
             # Boundary literals must be interpreted in the same timezone ATTACH uses,
             # otherwise a non-UTC server timezone moves the wrong row range.
             if self._ddl_timezone is not None:
@@ -479,6 +490,7 @@ class PartitionCreator:
             **values,
         )
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            await self._bound_lock_waits(conn)
             if self._ddl_timezone is not None:
                 await conn.execute(text(f"SET LOCAL TIME ZONE {quote_literal(self._ddl_timezone)}"))
             await self._lock_for_attach(conn, parent_name, partition_name, default_partition_name)
@@ -517,6 +529,7 @@ class PartitionCreator:
                 fire on the rows as they leave ``source_name``.
         """
         async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            await self._bound_lock_waits(conn)
             await self._lock_for_move(conn, source_name, target_name)
             await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
             return await self._move(conn, source_name, target_name, condition=None, limit=limit)
@@ -531,6 +544,17 @@ class PartitionCreator:
         """
         await conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
         return await self._move(conn, source_name, target_name, condition=None, limit=None)
+
+    async def _bound_lock_waits(self, conn: AsyncConnection) -> None:
+        """Wait at most ``lock_timeout_ms`` for each lock this transaction takes.
+
+        A statement waiting for a lock holds its place in the queue, and every
+        writer that arrives after it waits behind it: a reader holding the
+        table for a minute would otherwise stop every write for that minute.
+        Past the timeout the statement fails with ``55P03`` and the transaction
+        rolls back, having changed nothing.
+        """
+        await conn.execute(text(SET_LOCK_TIMEOUT_SQL), {"timeout": str(self._lock_timeout_ms)})
 
     async def _lock_for_move(self, conn: AsyncConnection, *names: str) -> None:
         """Take SHARE ROW EXCLUSIVE on every local relation involved in a move.
