@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.7.0...pg-partsmith-v1.7.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* a blocking detach locks the parent first, so a reader cannot deadlock it ([#87](https://github.com/bedrock-python/pg-partsmith/issues/87)) ([660e005](https://github.com/bedrock-python/pg-partsmith/commit/660e005fd17a92670f999eb17428d082bf70221e))
+
 ## 1.7.1 — retention no longer deadlocks against a reader
 
 A blocking detach, the one retention runs on a table with a DEFAULT partition, locked the
