@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.7.1...pg-partsmith-v1.7.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* a backfilled window always attaches with writers held at the parent ([#89](https://github.com/bedrock-python/pg-partsmith/issues/89)) ([b1260c1](https://github.com/bedrock-python/pg-partsmith/commit/b1260c1a8bcdd6388c3836d57eb548f8fe5959bb))
+
 ## 1.7.2 — a backfill's last attach no longer rejects a live insert
 
 The attach that ends a backfilled window is documented to hold writers at the parent, and
