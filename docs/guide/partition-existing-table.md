@@ -90,8 +90,10 @@ readers see them and the next call takes the window again.
     While a window's rows are being moved, they sit in a partition that is not yet
     attached and are **invisible through the parent**. PostgreSQL leaves no other order —
     a partition cannot be attached while DEFAULT still holds rows for it. Run the drain in
-    a maintenance window, or with small batches during a quiet hour and readers that can
-    tolerate a month's rows appearing a little later. Rows already in real partitions, and
+    a maintenance window, or during a quiet hour with readers that can tolerate a month's
+    rows appearing a little later. The gap runs from the window's first batch to its
+    attach, so larger batches shorten it ([measured](cli.md#adopting-a-table-full-of-data)).
+    Rows already in real partitions, and
     rows still in DEFAULT for other windows, stay visible throughout. The attach that ends
     a window blocks writers at the parent and holds `ACCESS EXCLUSIVE` on the DEFAULT
     partition, for the length of the last batch's tail plus one scan of DEFAULT — so

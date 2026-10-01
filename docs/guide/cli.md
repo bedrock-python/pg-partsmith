@@ -330,10 +330,22 @@ until pg-partsmith backfill -c partitions.yaml --max-batches 50; do sleep 60; do
 
 Two things to know before running it on a busy table. It takes the table's maintenance
 lock for the duration of each call, so a scheduled `apply` will decline while it runs
-(exit `6`), which is the lock doing its job. And a window's rows are invisible through
-the parent between the moment they leave DEFAULT and the moment the partition is attached
-— PostgreSQL will not attach a partition while DEFAULT still holds rows for it, so there
-is no order that keeps them visible throughout. `--batch-rows` bounds how long that is.
+(exit `6`), which is the lock doing its job. And a window's rows are out of sight through
+the parent from the moment its first batch commits until the partition is attached —
+PostgreSQL will not attach a partition while DEFAULT still holds rows for it, so there is
+no order that keeps them visible throughout.
+
+Each batch commits on its own, so that gap is the time the whole window takes to move:
+fewer, larger batches shorten it, and a batch at least as large as the window leaves only
+the attach. What smaller batches keep short is each statement, and with it how long DEFAULT
+is held and how much one transaction writes. Run `apply` once before the first `backfill`:
+the current month is then attached, and new rows stop landing in DEFAULT behind the batches.
+
+Measured on Outpost's schema (PostgreSQL 17, 300,000 rows per table in DEFAULT, a writer
+inserting 20 rows a second into the current month, `apply` first): with the default 10,000
+rows per batch a month's rows were out of sight for up to 0.42 s and inserts waited at most
+128 ms; with batches larger than a month, out of sight for about 30 ms, and inserts waited
+up to 247 ms.
 
 ## Commands around the lifecycle
 
