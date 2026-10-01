@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.7.1 — retention no longer deadlocks against a reader
+
+A blocking detach, the one retention runs on a table with a DEFAULT partition, locked the
+partition and then waited for the parent. A query through the parent locks the parent and
+then its partitions, so a reader that took the parent in between waited for the partition
+while the detach waited for the parent, and PostgreSQL ended one of them with `deadlock
+detected` after a second. Under steady reads that was a likely outcome, not a rare one:
+it was found against Outpost's schema with one reader counting the table in a loop, and
+the reader was the one that failed. The detach now takes `ACCESS EXCLUSIVE` on the parent
+alone first, the lock `DETACH` takes anyway, and then the partition, the order readers and
+PostgreSQL's own `DETACH` use. Readers wait for it as they always did; none fails.
+
 ## [1.7.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.6.3...pg-partsmith-v1.7.0) (2026-09-29)
 
 

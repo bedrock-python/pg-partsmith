@@ -148,6 +148,7 @@ class PartitionRemover:
                 # The blocking form takes ACCESS EXCLUSIVE on the parent: every
                 # reader and writer of the table queues behind it while it waits.
                 await conn.execute(text(SET_LOCK_TIMEOUT_SQL), {"timeout": str(self._lock_timeout_ms)})
+                await self._lock_parent(conn, table_name)
                 await self._lock_partition(conn, partition_name)
                 await self._ensure_still_the_partition(conn, table_name, partition_name, expected_oid)
                 await self._mark_orphaned(conn, table_name, partition_name)
@@ -161,8 +162,19 @@ class PartitionRemover:
                     raise domain_exc from exc
                 raise
 
+    async def _lock_parent(self, conn: AsyncConnection, table_name: str) -> None:
+        """ACCESS EXCLUSIVE on the parent alone -- what the blocking DETACH takes anyway, taken first.
+
+        A query through the parent locks the parent and then its partitions.
+        Taking the partition first would let a reader get the parent in between
+        and then wait for the partition while this transaction waits for the
+        parent, a deadlock PostgreSQL ends by failing one of them. ``ONLY``
+        leaves the other partitions to the readers.
+        """
+        await conn.execute(build_ddl_statement("LOCK TABLE ONLY {parent} IN ACCESS EXCLUSIVE MODE", parent=table_name))
+
     async def _lock_partition(self, conn: AsyncConnection, partition_name: str) -> None:
-        """ACCESS EXCLUSIVE on the partition -- what the blocking DETACH takes anyway, taken first.
+        """ACCESS EXCLUSIVE on the partition -- what the blocking DETACH takes anyway, taken early.
 
         Under it the identity check, the marker and the statement see one
         relation. A foreign table cannot be locked and is checked unlocked.

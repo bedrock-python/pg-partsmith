@@ -152,7 +152,7 @@ writers and runs without one.
 | `ATTACH PARTITION` | `SHARE UPDATE EXCLUSIVE` on the parent, `ACCESS EXCLUSIVE` on the child and on a DEFAULT sibling; `SHARE ROW EXCLUSIVE` on tables referencing the parent through a foreign key |
 | the reconciling row move ([DEFAULT reconciliation](#default-reconciliation), step 1) | `SHARE ROW EXCLUSIVE` on the DEFAULT partition and on the child: writers of DEFAULT wait, readers do not |
 | the move-and-attach ([DEFAULT reconciliation](#default-reconciliation), step 2) | `EXCLUSIVE` on the parent (one level above `ATTACH`'s own, so no writer is mid-routing), then `ATTACH`'s `ACCESS EXCLUSIVE` on the partition and the DEFAULT sibling — all taken before the move |
-| `DETACH PARTITION` (plain) | `ACCESS EXCLUSIVE` on parent, partition, and every table referencing the parent |
+| `DETACH PARTITION` (plain) | `ACCESS EXCLUSIVE` on parent, partition, and every table referencing the parent; the parent is locked first, as a query through it does, so a reader waits rather than deadlocks |
 | `DETACH PARTITION … CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` on the parent; `ACCESS EXCLUSIVE` on the partition and, in its second transaction, on referencing tables |
 | `DROP TABLE` of a detached table | `ACCESS EXCLUSIVE` on that table only |
 | `COMMENT ON` | `SHARE UPDATE EXCLUSIVE` on the table |

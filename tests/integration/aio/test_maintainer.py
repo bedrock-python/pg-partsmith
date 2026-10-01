@@ -522,6 +522,49 @@ async def test__maintainer__pinned_concurrent_detach__a_swap_cannot_slip_in_whil
 
 
 # sync-mirror: skip
+async def test__detach_partition__blocking_next_to_a_reader_of_the_parent__neither_deadlocks(
+    db_engine: AsyncEngine, partitioned_table: str
+) -> None:
+    """A query through the parent locks the parent and then its partitions; the detach must too.
+
+    The reader below holds the parent and has yet to reach the partition, which
+    is where a SELECT through the parent is while it locks the relations it
+    plans over. A detach that locked the partition first would hold it while
+    waiting for the parent, the reader would wait for the partition, and
+    PostgreSQL would end one of them with a deadlock.
+    """
+    # Arrange: April attached, and a reader holding the parent
+    config = monthly_config(partitioned_table, create_ahead=1, retention=12)
+    with freezegun.freeze_time("2026-04-15"):
+        await PartitionMaintainer(PartitionLifecycleService(*_make_components(db_engine))).run_maintenance(config)
+    april = f"{partitioned_table}__2026_04"
+    repo = PostgresPartitionRepository(db_engine)
+
+    async with db_engine.connect() as reader:
+        await reader.execute(text(f'LOCK TABLE ONLY "{partitioned_table}" IN ACCESS SHARE MODE'))
+        detach = asyncio.create_task(
+            repo.detach_partition(f"public.{partitioned_table}", f"public.{april}", mode=DetachMode.BLOCKING)
+        )
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if await scalar(
+                db_engine,
+                "SELECT count(*) FROM pg_locks WHERE NOT granted AND relation = to_regclass(:parent)",
+                parent=partitioned_table,
+            ):
+                break
+
+        # Act: the reader goes on to the partition and finishes
+        rows = await reader.scalar(text(f'SELECT count(*) FROM "{april}"'))  # noqa: S608
+        await reader.commit()
+    await detach
+
+    # Assert
+    assert rows == 0
+    assert not await is_attached(db_engine, april)
+
+
+# sync-mirror: skip
 async def test__detach_partition__pinned_and_timing_out__the_statement_is_cancelled_not_left_running(
     db_engine: AsyncEngine, partitioned_table: str
 ) -> None:
