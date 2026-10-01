@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.7.2 — a backfill's last attach no longer rejects a live insert
+
+The attach that ends a backfilled window is documented to hold writers at the parent, and
+when rows had arrived in DEFAULT during the fill it did. When none had, it ran a plain
+`ATTACH` first, which does not: an insert into that window that got past the parent while
+the attach was in flight chose DEFAULT from the tree as it was, queued on DEFAULT's lock,
+and was then rejected by the constraint the attach had just narrowed, `new row for
+relation ... violates partition constraint`. The current month, the one the application
+is writing into, is exactly such a window. Found against Outpost's schema with a writer at
+20 inserts a second: two inserts failed in one `backfill`. A window filled from DEFAULT now
+always attaches the documented way, writers held at the parent and whatever arrived after
+the last batch taken with it.
+
 ## [1.7.1](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.7.0...pg-partsmith-v1.7.1) (2026-10-01)
 
 

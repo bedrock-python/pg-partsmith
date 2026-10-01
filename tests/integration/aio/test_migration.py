@@ -22,6 +22,7 @@ from testcontainers.postgres import PostgresContainer
 from pg_partsmith.aio.hooks import BasePartitionLifecycleHooks
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
+from pg_partsmith.aio.repositories.creator import PartitionCreator
 from pg_partsmith.entities import MaintenanceIssueStep, Period
 from pg_partsmith.events import PartitionEvent
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
@@ -218,6 +219,65 @@ async def test__partition_data__attach_not_granted_its_lock__rows_stay_visible_a
     assert await is_attached(db_engine, f"{events}__2026_03")
     assert await _count(db_engine, default) == 0
     assert await _count(db_engine, events) == 25
+
+
+# sync-mirror: skip
+async def test__partition_data__an_insert_arriving_during_the_attach__lands_in_the_new_partition(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    """The attach that ends a window keeps writers out at the parent, even with nothing left to move.
+
+    An insert that got past the parent while the attach was in flight would
+    have chosen DEFAULT from the tree as it was, queued on DEFAULT's lock, and
+    been rejected by the constraint the attach had just narrowed.
+    """
+    # Arrange: March in DEFAULT, and the window's attach held open once it has run
+    default = await _default_with_rows(db_engine, events, months=(3,), per_month=10)
+    config = monthly_config(events, create_ahead=1)
+    march = f"{events}__2026_03"
+    attaching = asyncio.Event()
+    release = asyncio.Event()
+    original = PartitionCreator._clear_orphan_marker
+
+    async def held_open(self: PartitionCreator, conn: object, partition_name: str) -> None:
+        attaching.set()
+        await release.wait()
+        await original(self, conn, partition_name)  # type: ignore[arg-type]
+
+    async def insert_into_march() -> None:
+        await attaching.wait()
+        await exec_sql(
+            db_engine,
+            f'INSERT INTO "{events}" (created_at, payload) '  # noqa: S608
+            "VALUES (make_timestamptz(2026, 3, 15, 12, 0, 0, 'UTC'), 'live')",
+        )
+
+    async def release_once_the_insert_waits() -> None:
+        await attaching.wait()
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if await scalar(
+                db_engine,
+                "SELECT count(*) FROM pg_locks WHERE NOT granted "
+                "AND relation IN (to_regclass(:parent), to_regclass(:default))",
+                parent=events,
+                default=default,
+            ):
+                break
+        release.set()
+
+    # Act
+    with patch.object(PartitionCreator, "_clear_orphan_marker", held_open):
+        result, _, _ = await asyncio.gather(
+            make_service(db_engine).partition_data(config),
+            insert_into_march(),
+            release_once_the_insert_waits(),
+        )
+
+    # Assert
+    assert result.complete
+    assert await _only_count(db_engine, default) == 0
+    assert await _count(db_engine, march) == 11
 
 
 async def test__partition_data__a_fill_the_process_died_after__is_reported_then_attached(

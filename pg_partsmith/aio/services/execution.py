@@ -304,6 +304,7 @@ class PlanExecutor:
             key_columns=op.key_columns,
             expected_oid=target_oid,
             expected_parent_oid=expected_parent_oid,
+            filled=fill is not None,
         )
 
         if op.counts_as == "created":
@@ -437,7 +438,13 @@ class PlanExecutor:
         info = _attach_info(config, op)
         await self._fire(HookPhase.BEFORE_ATTACH, config, info, op)
         await self._attach_with_reconcile(
-            config, op.parent_name, op.target, op.bounds, key_columns=op.key_columns, expected_oid=op.oid
+            config,
+            op.parent_name,
+            op.target,
+            op.bounds,
+            key_columns=op.key_columns,
+            expected_oid=op.oid,
+            filled=fill is not None,
         )
         tally.attached += 1
         await self._fire(HookPhase.AFTER_ATTACH, config, info.model_copy(update={"is_attached": True}), op)
@@ -453,6 +460,7 @@ class PlanExecutor:
         key_columns: tuple[str, ...],
         expected_oid: int | None = None,
         expected_parent_oid: int | None = None,
+        filled: bool = False,
     ) -> None:
         """Attach a partition, moving DEFAULT rows out of the way for a RANGE window.
 
@@ -466,6 +474,13 @@ class PlanExecutor:
         The bulk of the window is moved before that, in the reconcile's own
         lighter transaction, so what the exclusive lock covers is the rows
         that arrived while it ran, plus the scan.
+
+        A window just filled from DEFAULT (``filled``) skips the plain attempt.
+        Its rows were written into DEFAULT until moments ago, so writers may be
+        routing into it now, and a plain ``ATTACH`` leaves them free to get past
+        the parent, choose DEFAULT from the tree as it was, and be rejected by
+        the constraint the attach narrows. ``reconcile_and_attach`` holds them
+        at the parent instead, and takes whatever landed after the last batch.
 
         If the attach ultimately fails after rows were reconciled out of the
         DEFAULT partition, the moved rows are returned to DEFAULT (best effort)
@@ -481,6 +496,8 @@ class PlanExecutor:
         reconciled_from: tuple[str, int | None] | None = None
         window = bounds if isinstance(bounds, RangeBounds) else None
         default_partition: PartitionInfo | None = None
+        if filled and window is not None:
+            default_partition = await self._metadata.get_default_partition(parent_name)
 
         for attempt in range(1, DEFAULT_CONFLICT_MAX_RETRIES + 1):
             try:
