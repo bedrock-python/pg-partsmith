@@ -113,6 +113,34 @@ async def test__apply__a_reader_holds_the_table__the_attach_gives_up_within_the_
     assert await scalar(db_engine, f'SELECT count(*) FROM "{table}_default"') == 0  # noqa: S608
 
 
+# ── rows in DEFAULT ─────────────────────────────────────────────────────────────
+
+
+async def test__plan__a_row_dated_before_every_partition__is_reported_until_backfill_moves_it(
+    db_engine: AsyncEngine, table: str
+) -> None:
+    # Arrange -- adopted, and then an event dated over a year back lands in DEFAULT
+    await exec_sql(db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    config = monthly_config(table, create_ahead=1)
+    service = make_service(db_engine)
+    now = datetime.fromisoformat(NOW).replace(tzinfo=UTC)
+    await service.apply(config, await service.plan(config, now=now))
+    await exec_sql(db_engine, f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2025-06-15', 'late')")  # noqa: S608
+
+    # Act
+    before = await service.plan(config, now=now)
+    moved = await service.partition_data(config)
+    after = await service.plan(config, now=now)
+
+    # Assert
+    assert [(f.partition_name, f.reason, f.severity) for f in before.findings] == [
+        (f"public.{table}_default", FindingReason.ROWS_IN_DEFAULT, Severity.WARNING)
+    ]
+    assert moved.rows_moved == 1
+    assert after.findings == ()
+    assert await is_attached(db_engine, f"{table}__2025_06")
+
+
 # ── plan() / apply() ────────────────────────────────────────────────────────────
 
 

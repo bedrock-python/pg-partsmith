@@ -22,7 +22,7 @@ from pg_partsmith.lifecycle import (
 )
 from pg_partsmith.planner import PlanMode
 from pg_partsmith.scheme import HashPartitioning, RangePartitioning
-from pg_partsmith.sync.services.inspection import PartitionInspector, unattached_tables
+from pg_partsmith.sync.services.inspection import PartitionInspector, default_earliest, unattached_tables
 from pg_partsmith.topology import ActualTree, DetachedPartition, FactKind, UnattachedTable
 
 NOW = datetime(2024, 3, 15, 12, 0, tzinfo=UTC)
@@ -302,6 +302,53 @@ def test__unattached_tables__a_root_that_is_not_range__is_not_searched(metadata:
     # Assert
     assert tables == ()
     metadata.get_unattached_tables.assert_not_called()
+
+
+# ── rows in DEFAULT ─────────────────────────────────────────────────────────────
+
+
+def _default() -> PartitionNode:
+    return PartitionNode(name="events_default", parent_name="events", level=1, bounds={"kind": "default"})  # type: ignore[arg-type]
+
+
+def test__inspect__default_partition_with_rows__its_earliest_key_is_on_the_tree(
+    inspector: PartitionInspector, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_actual_tree.return_value = _tree(_default())
+    metadata.get_leading_key_minimum.return_value = datetime(2023, 6, 15, tzinfo=UTC)
+
+    # Act
+    tree = inspector.inspect(_config())
+
+    # Assert
+    assert tree is not None
+    assert tree.default_earliest == datetime(2023, 6, 15, tzinfo=UTC)
+    metadata.get_leading_key_minimum.assert_called_once_with("events_default", ("created_at",))
+
+
+def test__default_earliest__no_default_partition__nothing_is_read(metadata: MagicMock) -> None:
+    # Arrange
+    tree = _tree(_child("events__2024_02", "2024-02-01", "2024-03-01"))
+
+    # Act
+    earliest = default_earliest(metadata, _config(), tree)
+
+    # Assert
+    assert earliest is None
+    metadata.get_leading_key_minimum.assert_not_called()
+
+
+def test__default_earliest__a_root_that_is_not_range__is_not_read(metadata: MagicMock) -> None:
+    # Arrange
+    config = TablePartitionConfig(table_name="tasks", scheme=HashPartitioning(key="task_id", modulus=4))
+
+    # Act
+    earliest = default_earliest(metadata, config, _tree(_default()))
+
+    # Assert
+    assert earliest is None
+    metadata.get_leading_key_minimum.assert_not_called()
 
 
 # ── context ─────────────────────────────────────────────────────────────────────

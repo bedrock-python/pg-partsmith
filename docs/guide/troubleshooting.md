@@ -113,6 +113,21 @@ backfill back to the window. Run `backfill`: once DEFAULT is drained it looks fo
 these tables and attaches them. Only a table whose name is the one the scheme gives that
 window under this root counts — its rows are never read otherwise.
 
+## `rows_in_default` — rows no maintenance run will reach
+
+```text
+[warning] rows_in_default: public.events_default holds rows of 2025_06, a window behind the cursor that no partition of public.events covers, so no maintenance run will reach them, retention included; backfill (partition_data) moves them into partitions of their own.
+```
+
+Creation walks forward from the cursor, so a row in DEFAULT from a window before it stays
+there: no `apply` creates that window again, and retention, which drops partitions, never
+sees it. Two ways to get there: an adoption whose history `backfill` has not moved yet, and
+an application that writes its own key values — an event dated last year, say — after the
+table was adopted. Run `backfill`; it creates the window's partition and moves the rows,
+and retention then treats that partition like any other. The finding names the earliest such
+window. Rows of a window the same plan creates are left to its attach, and rows dated ahead
+of the cursor to the run that reaches them, so neither is reported.
+
 ## `grace_pending`, `drop_deferred` (INFO)
 
 A detached orphan waiting out its grace period, or one whose `DropAfter(when=…)`

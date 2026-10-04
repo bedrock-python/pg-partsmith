@@ -110,6 +110,34 @@ def test__apply__a_reader_holds_the_table__the_attach_gives_up_within_the_lock_t
     assert scalar(sync_db_engine, f'SELECT count(*) FROM "{table}_default"') == 0  # noqa: S608
 
 
+# ── rows in DEFAULT ─────────────────────────────────────────────────────────────
+
+
+def test__plan__a_row_dated_before_every_partition__is_reported_until_backfill_moves_it(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange -- adopted, and then an event dated over a year back lands in DEFAULT
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    config = monthly_config(table, create_ahead=1)
+    service = make_service(sync_db_engine)
+    now = datetime.fromisoformat(NOW).replace(tzinfo=UTC)
+    service.apply(config, service.plan(config, now=now))
+    exec_sql(sync_db_engine, f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2025-06-15', 'late')")  # noqa: S608
+
+    # Act
+    before = service.plan(config, now=now)
+    moved = service.partition_data(config)
+    after = service.plan(config, now=now)
+
+    # Assert
+    assert [(f.partition_name, f.reason, f.severity) for f in before.findings] == [
+        (f"public.{table}_default", FindingReason.ROWS_IN_DEFAULT, Severity.WARNING)
+    ]
+    assert moved.rows_moved == 1
+    assert after.findings == ()
+    assert is_attached(sync_db_engine, f"{table}__2025_06")
+
+
 # ── plan() / apply() ────────────────────────────────────────────────────────────
 
 

@@ -31,6 +31,7 @@ issues too, with the exception's name in front of the message.
 | `grace_pending` | INFO | A detached orphan still within its grace period. | Nothing. |
 | `drop_deferred` | INFO | An orphan past its grace whose drop condition does not hold yet. | Nothing. |
 | `unattached_rows` | WARNING | A table under a window's partition name holds rows but was never attached — a fill that stopped before its attach — so no query through the root sees them. | Run `backfill` (`partition_data`); it attaches the table. |
+| `rows_in_default` | WARNING | The root's DEFAULT partition holds rows of a window behind the cursor that has no partition: history not yet moved, or a row written with a key no partition covers. No maintenance run reaches them, retention included. | Run `backfill` (`partition_data`). |
 
 ## Operation reasons
 

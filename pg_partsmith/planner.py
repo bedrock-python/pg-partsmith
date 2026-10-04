@@ -246,6 +246,7 @@ class _Planner:
     def run(self) -> None:
         self._plan_level(self.config.scheme, self.actual.root, depth=0)
         self._report_unattached()
+        self._report_rows_in_default()
 
     def _report_unattached(self) -> None:
         """A partition that was filled and never attached holds rows no query through the root sees.
@@ -268,6 +269,37 @@ class _Planner:
                 f"{table.name} holds rows of {boundaries.describe(window)} but is attached to nothing, so no query "
                 f"through {self.config.qualified_name} sees them; backfill (partition_data) attaches it.",
             )
+
+    def _report_rows_in_default(self) -> None:
+        """Rows in the root's DEFAULT partition from a window behind the cursor that has no partition.
+
+        History an adoption has not moved yet, or a row written with a key
+        that no partition covers. Creation walks forward from the cursor, so
+        nothing would ever come back for them, retention included. Rows of a
+        window this plan creates are moved by its attach, and rows at or past
+        the cursor by a later one, so the earliest row is the one that decides.
+        """
+        earliest = self.actual.default_earliest
+        root = self.config.scheme
+        default = next((child for child in self.actual.root.children if child.is_default), None)
+        if earliest is None or default is None or not isinstance(root, RangePartitioning):
+            return
+        boundaries = root.range_boundaries
+        position = boundaries.decode(str(earliest))
+        window = boundaries.window_at(earliest if position is None else position)
+        cursor = self.ctx.now if boundaries.axis is Axis.TIME else self.ctx.cursors.get(root.key[0])
+        if cursor is not None and not window < boundaries.window_at(cursor):
+            return
+        planned = {op.target.rpartition(".")[2] for op in self.creates}
+        if boundaries.child_name(self.config.table_name, window) in planned:
+            return
+        self._record(
+            default.name,
+            FindingReason.ROWS_IN_DEFAULT,
+            f"{default.name} holds rows of {boundaries.describe(window)}, a window behind the cursor that no "
+            f"partition of {self.config.qualified_name} covers, so no maintenance run will reach them, retention "
+            "included; backfill (partition_data) moves them into partitions of their own.",
+        )
 
     # ── Dispatch ────────────────────────────────────────────────────────────────
 
