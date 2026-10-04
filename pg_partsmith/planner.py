@@ -281,10 +281,8 @@ class _Planner:
         """
         earliest = self.actual.default_earliest
         root = self.config.scheme
-        if earliest is None or not isinstance(root, RangePartitioning):
-            return
         default = next((child for child in self.actual.root.children if child.is_default), None)
-        if default is None:
+        if earliest is None or default is None or not isinstance(root, RangePartitioning):
             return
         boundaries = root.range_boundaries
         position = boundaries.decode(str(earliest))

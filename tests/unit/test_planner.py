@@ -2561,3 +2561,17 @@ def test__plan_maintenance__default_holding_rows_past_the_cursor__is_left_to_a_l
 
     # Assert
     assert plan.findings == ()
+
+
+def test__plan_maintenance__default_holding_rows_of_a_past_window_this_plan_names__is_left_to_the_attach() -> None:
+    # Arrange -- ensure_partitions for June 2025, whose rows sit in DEFAULT
+    config = _config(lifecycle=_policy(creation=CreateAhead(count=2)))
+    root = _root(_month(2026, 8, oid=1), _month(2026, 9, oid=2), _default())
+    context = _context(mode=PlanMode.EXPLICIT, explicit_windows={"created_at": (_window(2025, 6),)})
+
+    # Act
+    plan = _plan(config, root, default_earliest=datetime(2025, 6, 15, tzinfo=UTC), context=context)
+
+    # Assert
+    assert _targets(plan.creates) == [f"{ROOT}__2025_06"]
+    assert plan.findings == ()
