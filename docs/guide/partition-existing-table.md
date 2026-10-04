@@ -79,6 +79,8 @@ Each call:
 6. with DEFAULT drained, attaches any window's partition a previous run filled and never
    attached — the process died in between — which `plan` reports as `unattached_rows`.
 
+Until DEFAULT is drained, `plan` reports what is left in it as `rows_in_default`.
+
 `result.complete` says whether DEFAULT is drained; `result.partitions` lists what was
 created; `result.issues` explains anything that could not be handled. A call that runs out
 of budget mid-window leaves that partition detached and filled so far; the next call

@@ -248,11 +248,11 @@ def _plan(
     *,
     orphans: tuple[DetachedPartition, ...] = (),
     unattached: tuple[UnattachedTable, ...] = (),
+    default_earliest: Any = None,
     context: PlanningContext | None = None,
 ) -> MaintenancePlan:
-    return plan_maintenance(
-        config, ActualTree(root=root, orphans=orphans, unattached=unattached), context or _context()
-    )
+    actual = ActualTree(root=root, orphans=orphans, unattached=unattached, default_earliest=default_earliest)
+    return plan_maintenance(config, actual, context or _context())
 
 
 def _reasons(plan: MaintenancePlan) -> list[FindingReason]:
@@ -2514,4 +2514,50 @@ def test__plan_maintenance__unattached_window_this_plan_creates__is_left_to_the_
 
     # Assert
     assert _targets(plan.creates) == [september.name]
+    assert plan.findings == ()
+
+
+# ── Rows in the DEFAULT partition ───────────────────────────────────────────────
+
+
+def _default() -> PartitionNode:
+    return PartitionNode(name=f"{ROOT}_default", parent_name=ROOT, bounds=DefaultBounds())
+
+
+def test__plan_maintenance__default_holding_rows_behind_the_cursor__is_reported() -> None:
+    # Arrange -- an event dated June 2025 landed in DEFAULT after adoption
+    config = _config(lifecycle=_policy(creation=CreateAhead(count=2)))
+    root = _root(_month(2026, 8, oid=1), _month(2026, 9, oid=2), _default())
+
+    # Act
+    plan = _plan(config, root, default_earliest=datetime(2025, 6, 15, tzinfo=UTC))
+
+    # Assert
+    assert [(f.partition_name, f.reason, f.severity) for f in plan.findings] == [
+        (f"{ROOT}_default", FindingReason.ROWS_IN_DEFAULT, Severity.WARNING)
+    ]
+    assert "backfill" in plan.findings[0].detail
+
+
+def test__plan_maintenance__default_holding_rows_of_a_window_this_plan_creates__is_left_to_the_attach() -> None:
+    # Arrange -- adoption: this month's rows are in DEFAULT, and the plan creates this month
+    config = _config(lifecycle=_policy(creation=CreateAhead(count=2)))
+
+    # Act
+    plan = _plan(config, _root(_default()), default_earliest=datetime(2026, 8, 3, tzinfo=UTC))
+
+    # Assert
+    assert f"{ROOT}__2026_08" in _targets(plan.creates)
+    assert plan.findings == ()
+
+
+def test__plan_maintenance__default_holding_rows_past_the_cursor__is_left_to_a_later_run() -> None:
+    # Arrange -- a row dated next spring; creation reaches its window as the cursor gets there
+    config = _config(lifecycle=_policy(creation=CreateAhead(count=2)))
+    root = _root(_month(2026, 8, oid=1), _month(2026, 9, oid=2), _default())
+
+    # Act
+    plan = _plan(config, root, default_earliest=datetime(2027, 3, 1, tzinfo=UTC))
+
+    # Assert
     assert plan.findings == ()

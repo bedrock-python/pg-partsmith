@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pg_partsmith.boundaries import Axis, CursorSource, Window
 from pg_partsmith.planner import PlanMode, PlanningContext, fact_targets, unattached_window
@@ -44,6 +44,9 @@ class PartitionInspector:
         unattached = unattached_tables(self._metadata, config)
         if unattached:
             tree = tree.model_copy(update={"unattached": unattached})
+        earliest = default_earliest(self._metadata, config, tree)
+        if earliest is not None:
+            tree = tree.model_copy(update={"default_earliest": earliest})
 
         policy = config.lifecycle
         if not policy.needs_facts:
@@ -98,6 +101,22 @@ class PartitionInspector:
             mode=mode,
             explicit_windows=dict(explicit_windows or {}),
         )
+
+
+def default_earliest(metadata: PartitionMetadataProvider, config: TablePartitionConfig, tree: ActualTree) -> Any:
+    """The smallest leading-key value in the root's DEFAULT partition among rows whose whole key is set.
+
+    A row with a NULL in the key is routed to DEFAULT on purpose and stays
+    there; any other row belongs to a window that has no partition. One
+    index probe when the key is indexed.
+    """
+    root = config.scheme
+    if not isinstance(root, RangePartitioning):
+        return None
+    default = next((child for child in tree.root.children if child.is_default), None)
+    if default is None:
+        return None
+    return metadata.get_leading_key_minimum(default.name, root.key)
 
 
 def unattached_tables(metadata: PartitionMetadataProvider, config: TablePartitionConfig) -> tuple[UnattachedTable, ...]:

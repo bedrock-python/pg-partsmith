@@ -347,6 +347,12 @@ rows per batch a month's rows were out of sight for up to 0.42 s and inserts wai
 128 ms; with batches larger than a month, out of sight for about 30 ms, and inserts waited
 up to 247 ms.
 
+Until `backfill` has moved the history, `plan` reports it as `rows_in_default` and `apply`
+exits `3` with the same finding. Once it has, the finding means rows arrived in DEFAULT
+later: an application that writes its own key values can date a row before every partition.
+If yours does, schedule `backfill` ahead of `apply`; with DEFAULT empty it does nothing and
+exits `0`.
+
 ## Commands around the lifecycle
 
 A document can name a command, or a block of Python, to run before a drop, after a

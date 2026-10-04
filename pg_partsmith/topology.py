@@ -23,7 +23,7 @@ import re
 from collections.abc import Collection, Sequence
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -418,6 +418,10 @@ class ActualTree(BaseModel):
         orphans: Marker-tagged detached tables whose marker names the root.
         unattached: Tables named under the root, attached to nothing and
             unmarked: partitions whose creation stopped before their attach.
+        default_earliest: The smallest leading-key value among the rows of the
+            root's DEFAULT partition whose whole partition key is set: where
+            its rows of windows with no partition begin. None when it holds
+            none, or when nobody looked.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -425,6 +429,7 @@ class ActualTree(BaseModel):
     root: PartitionNode
     orphans: tuple[DetachedPartition, ...] = ()
     unattached: tuple[UnattachedTable, ...] = ()
+    default_earliest: Any = None
 
     def find(self, name: str) -> PartitionNode | None:
         """Return the attached node with schema-qualified ``name``, or None."""

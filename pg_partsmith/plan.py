@@ -163,6 +163,10 @@ class FindingReason(StrEnum):
         UNATTACHED_ROWS: A partition named for a window of the root holds rows
             but was never attached -- a fill stopped before its attach -- so no
             query through the root sees them. ``partition_data`` attaches it.
+        ROWS_IN_DEFAULT: The root's DEFAULT partition holds rows of windows that
+            have no partition: history not yet moved, or rows written with a key
+            outside every partition. Retention never reaches them;
+            ``partition_data`` moves them into partitions of their own.
     """
 
     LEGACY_LEAF = "legacy_leaf"
@@ -186,6 +190,7 @@ class FindingReason(StrEnum):
     GRACE_PENDING = "grace_pending"
     DROP_DEFERRED = "drop_deferred"
     UNATTACHED_ROWS = "unattached_rows"
+    ROWS_IN_DEFAULT = "rows_in_default"
 
 
 # Reasons that describe a healthy, deliberate state (policy evolution, a

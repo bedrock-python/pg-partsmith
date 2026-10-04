@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * a backfilled window always attaches with writers held at the parent ([#89](https://github.com/bedrock-python/pg-partsmith/issues/89)) ([b1260c1](https://github.com/bedrock-python/pg-partsmith/commit/b1260c1a8bcdd6388c3836d57eb548f8fe5959bb))
 
+## 1.8.0 — rows in DEFAULT that no run would reach are reported
+
+An application that writes its own key values can put a row into DEFAULT after the table
+was adopted: an event dated last year lands there because no partition covers it. Creation
+walks forward from the cursor, so nothing ever came back for it. `plan` said there was
+nothing to do, `plan --check` exited 0, and retention could not drop what was never in a
+partition. Found by Outpost's maintainer: its publish API accepts a client-supplied `time`.
+
+`plan` now reports such rows as `rows_in_default`, a WARNING, so `plan --check` exits 3 and
+`apply` carries it in `result.issues`; `backfill` moves them into a partition of their own.
+What decides is the earliest row in DEFAULT: one in a window the same plan creates is moved
+by its attach, and one dated ahead of the cursor by the run that gets there, so neither is
+reported. During an adoption the history waiting for `backfill` is reported the same way,
+until it has moved. `ActualTree.default_earliest` carries the earliest key, read with the
+same index probe `partition_data` uses.
+
 ## 1.7.2 — a backfill's last attach no longer rejects a live insert
 
 The attach that ends a backfilled window is documented to hold writers at the parent, and
