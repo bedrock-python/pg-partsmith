@@ -3,11 +3,17 @@ name: Docs
 on:
   push:
     branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
   pages: write
   id-token: write
+
+# Two quick pushes must not race each other onto Pages.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -15,10 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
+      # --locked: fail when uv.lock is out of date with pyproject.toml.
       - run: uv sync --locked --no-dev --group docs
       - run: cp CHANGELOG.md docs/changelog.md
-      - run: uv run zensical build --clean
-      - run: uv run python scripts/emit_markdown.py
+      # --no-dev on `uv run` too: without it the implicit sync reinstalls the
+      # whole dev group just to build docs.
+      - run: uv run --no-dev --group docs zensical build --clean
+      - run: uv run --no-dev --group docs python scripts/emit_markdown.py
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site

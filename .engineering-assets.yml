@@ -1,0 +1,7 @@
+# This repository's choices about the files of the engineering-assets hub,
+# bedrock-python/engineering-assets, which subscribes it. version: 1 is the
+# format; packs would add packs, ignore keeps paths out of the sync.
+version: 1
+ignore:
+  # This repository adds the docker ecosystem for the image it publishes.
+  - .github/dependabot.yml
