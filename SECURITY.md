@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.5.x   | ✅ the current release; fixes ship as the next patch or minor |
-| older   | ❌ upgrade to the current release first |
+| The latest minor release | ✅ fixes ship as its next patch, or as the next minor |
+| Older releases | ❌ upgrade to the latest release first |
 
 The library, the command line and the container image share one version number, so a fix
 reaches all three in the same release.
