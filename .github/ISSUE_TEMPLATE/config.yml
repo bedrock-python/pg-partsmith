@@ -1,5 +1,1 @@
 blank_issues_enabled: false
-contact_links:
-  - name: Question or discussion
-    url: https://github.com/bedrock-python/pg-partsmith/discussions
-    about: Ask a question or start a discussion about pg-partsmith

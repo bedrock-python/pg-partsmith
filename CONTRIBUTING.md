@@ -52,7 +52,10 @@ Breaking changes: add `!` after the type (`feat!:`) or include a `BREAKING CHANG
 4. Run `make check && make test-unit` locally
 5. Open a PR against `master`
 
-Update `CHANGELOG.md` under `[Unreleased]` for any user-visible change.
+A user-visible change adds its own section to `CHANGELOG.md` in the same pull request:
+`## x.y.z — <one-line headline>` at the top of the entries, right under the introduction,
+with `x.y.z` the version it will ship in. Say what changed for the user and what they have
+to do about it; release-please lists the commits itself (see Releasing below).
 
 ## The agents page
 
@@ -192,5 +195,7 @@ is denied.
   `bump-minor-pre-major` is on).
 - To force a specific version, add a `Release-As: x.y.z` footer to a commit — this is how
   1.0.0 is cut.
-- Keep the hand-written `[Unreleased]` notes in `CHANGELOG.md` for the parts release-please
-  cannot write (upgrade notes, behaviour changes); they are folded into the release section.
+- release-please writes its own `## [x.y.z](…)` section of `CHANGELOG.md` from the commit
+  titles and puts it above the hand-written `## x.y.z — …` section of the same version;
+  never edit its sections. The hand-written one carries what it cannot write: the
+  behaviour change and the upgrade notes.

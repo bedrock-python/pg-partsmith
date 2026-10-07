@@ -54,9 +54,9 @@ def pytest_configure(config: pytest.Config) -> None:
     """Tweak settings for marker-targeted runs.
 
     When running *only* integration tests (typically `pytest -m integration`),
-    relax the coverage threshold. Coverage is already enforced by the unit test
-    run; integration tests are primarily about behavioural correctness with a
-    real database.
+    relax the coverage threshold. The 90% gate is enforced on a run of both
+    suites together, by `make test` and by the integration job in CI; the unit
+    test run has no threshold.
     """
     markexpr = getattr(config.option, "markexpr", "") or ""
     if "integration" in markexpr and "unit" not in markexpr:
