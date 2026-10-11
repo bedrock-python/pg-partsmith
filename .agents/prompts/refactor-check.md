@@ -9,4 +9,4 @@ Answer these questions before you change the structure of code. If an answer is 
 5. **Reach.** Does it stay inside the code the task is about? Shared modules, public interfaces and changes across many files need their owners' agreement.
 6. **Timing.** Will it collide with open pull requests or a release in progress?
 
-When you go ahead, keep refactoring commits apart from behaviour changes, run the tests after every step, and explain in the pull request what moved where and why behaviour is unchanged.
+When you go ahead, keep refactoring commits apart from behaviour changes, run the tests after every step, and explain in the pull request what moved where and why behaviour is unchanged. Before you open it, check the refactoring commits with `.agents/prompts/pure-refactor.md`.

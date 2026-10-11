@@ -13,11 +13,16 @@ Instructions for AI coding agents working in this repository. People may find th
 ## How to work
 
 - Make the smallest change that solves the task. Do not rename, reformat or restructure code you were not asked to touch; suggest it separately.
+- Before you add a public name, parameter, option, configuration key, file or dependency, know what problem it solves now. Do not add things because they might be useful later.
+- Prefer the simplest explicit version: a plain function over a class, a concrete class over an interface that nothing else implements.
+- Fail loudly. Stop with an error on input or state you did not expect; do not swallow errors or fall back to a default that hides the problem.
+- Keep each decision in one place. When the same condition shows up in several places, make the decision once and let the rest of the code follow its outcome.
+- Fix the cause, not the symptom. If a fix has to work around bad data, find out what produced the data.
 - Follow the conventions of the surrounding code rather than your own preferences.
 - Keep changes reviewable: one purpose per commit and per pull request.
 - Change behaviour together with its tests. A bug fix starts with a test that fails without the fix.
 - Before you call a task done, run the format, lint and test commands from the profile, or those you found in the repository, and report what you ran and what it printed. Never say a check passed if you did not run it.
-- Update the documentation and the changelog when something users can see changes.
+- Keep the documentation true. Update the documentation and the changelog when something users can see changes; search the docs and examples for what you renamed, removed or changed, and fix them in the same change.
 - Use the standard library and the dependencies the project already has. Adding a dependency is a decision for people: ask first.
 - When the guidelines in `.agents/guidelines/` cover what you are doing, follow them.
 
@@ -36,3 +41,4 @@ This file and some others come from your organisation's engineering-assets hub, 
 
 - Reviewing a change: follow `.agents/prompts/review.md`.
 - Before refactoring: answer `.agents/prompts/refactor-check.md`.
+- Checking that a change keeps behaviour, such as a refactoring: follow `.agents/prompts/pure-refactor.md`.
