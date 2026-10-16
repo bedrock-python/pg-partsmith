@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.3](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.8.2...pg-partsmith-v1.8.3) (2026-10-16)
+
+
+### Bug Fixes
+
+* a refused detach no longer starts the drop grace ([#112](https://github.com/bedrock-python/pg-partsmith/issues/112)) ([fdbfb81](https://github.com/bedrock-python/pg-partsmith/commit/fdbfb81e65b3f31b8bc96a65452fdf81525889cb)), closes [#105](https://github.com/bedrock-python/pg-partsmith/issues/105)
+
 ## [1.8.2](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.8.1...pg-partsmith-v1.8.2) (2026-10-16)
 
 
