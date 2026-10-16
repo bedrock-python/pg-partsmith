@@ -8,15 +8,16 @@ refused detach that does get planned is an issue, not the end of the run.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
 
 from pg_partsmith.entities import MaintenanceIssueStep
-from pg_partsmith.lifecycle import AllOf, CreateAhead, ExpireIf, KeepNewest, LifecyclePolicy, Unreferenced
+from pg_partsmith.lifecycle import AllOf, CreateAhead, DropAfter, ExpireIf, KeepNewest, LifecyclePolicy, Unreferenced
 from pg_partsmith.topology import FactKind
+from pg_partsmith.utils import parse_orphan_comment
 from tests.integration.aio.support import (
     exec_sql,
     is_attached,
@@ -25,6 +26,7 @@ from tests.integration.aio.support import (
     range_children_of,
     run_maintenance,
     scalar,
+    table_comment,
 )
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
 
@@ -158,3 +160,36 @@ async def test__without_unreferenced__refused_detach_is_an_issue_and_the_run_goe
     assert not await is_attached(db_engine, f"{events}__2026_07")
     assert set(await range_children_of(db_engine, events)) == {f"{events}__2026_06", f"{events}__2026_08"}
     assert await scalar(db_engine, f'SELECT count(*) FROM "{refs}"') == 1  # noqa: S608
+
+
+async def test__refused_detach__leaves_no_marker_and_the_later_detach_stamps_its_own_instant(
+    db_engine: AsyncEngine, events: str, refs: str
+) -> None:
+    """A refused detach records no detach, so the drop grace counts from the detach that happens."""
+    # Arrange -- June is referenced and carries a comment of its own; detached tables wait a month
+    await _seed(db_engine, events, refs)
+    june = f"{events}__2026_06"
+    await exec_sql(db_engine, f"COMMENT ON TABLE \"{june}\" IS 'june archive'")
+    config = monthly_config(
+        events,
+        lifecycle=LifecyclePolicy(
+            creation=CreateAhead(count=1), retention=KeepNewest(count=1), drop=DropAfter(grace=timedelta(days=30))
+        ),
+    )
+    refused = await run_maintenance(db_engine, config, at_time="2026-08-26")
+    comment_after_refusal = await table_comment(db_engine, june)
+
+    # Act -- the reference goes, and a run two days later detaches June
+    await exec_sql(db_engine, f'DELETE FROM "{refs}"')  # noqa: S608
+    detached = await run_maintenance(db_engine, config, at_time="2026-08-28")
+
+    # Assert
+    assert [issue.step for issue in refused.issues] == [MaintenanceIssueStep.DETACH]
+    assert comment_after_refusal == "june archive"
+    assert detached.detached_count == 1
+    assert not await is_attached(db_engine, june)
+    comment = await table_comment(db_engine, june)
+    marker = parse_orphan_comment(comment)
+    assert marker is not None
+    assert marker[1] == datetime(2026, 8, 28, tzinfo=UTC)
+    assert (comment or "").endswith("june archive")
