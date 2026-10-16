@@ -6,8 +6,8 @@ many places, and how to keep replicas from colliding.
 ## What to call
 
 `PartitionMaintainer.run_maintenance_safe(config)` is the entry point for anything
-scheduled: it plans and applies under the table's lock and **never raises** — a failure
-comes back on `result.error`.
+scheduled: it plans and applies under the table's lock and **does not raise errors** — a
+failure comes back on `result.error`. Cancellation propagates (see [Cancellation](#cancellation)).
 
 ```python
 from pg_partsmith.aio import PartitionMaintainer
@@ -175,5 +175,8 @@ drop is revalidated against the catalog before it runs. The lock saves wasted wo
 
 A run cancelled mid-way — a pod killed, a task cancelled — leaves at most a detached,
 unattached table (attach is the last step) or a marked, half-detached partition; the next
-tick converges both. `run_maintenance_safe()` reports the cancellation on `result.error`
-and returns normally; `run_maintenance()` re-raises it.
+tick converges both. Both `run_maintenance()` and `run_maintenance_safe()` let the
+cancellation propagate, after logging it, so a timeout around a run raises `TimeoutError`
+and a cancelled task ends cancelled. A lost Redis lease is the exception: the lock stops
+the run itself and reports it as `LockLostError`, which `run_maintenance_safe()` returns on
+`result.error`.

@@ -115,6 +115,21 @@ class LockAcquisitionError(PartitionError):
         self.reason = reason
 
 
+class LockLostError(PartitionError):
+    """Raised when a held lock is lost mid-run and the run is stopped because of it.
+
+    The Redis lock renews its lease while a run holds it; when a renewal fails
+    or finds another holder, the run cannot go on safely and is stopped. This
+    is that stop, reported as an error of the run rather than as a cancellation
+    nobody asked for.
+    """
+
+    def __init__(self, table_name: str, reason: str) -> None:
+        super().__init__(f"Lost the lock for table {table_name} mid-run: {reason}")
+        self.table_name = table_name
+        self.reason = reason
+
+
 class DropRetryExhaustedError(PartitionError):
     """Raised when all drop_partition retry attempts are exhausted.
 

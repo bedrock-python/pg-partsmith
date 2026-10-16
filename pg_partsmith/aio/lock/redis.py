@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from pg_partsmith.constants import DEFAULT_LOCK_PREFIX
-from pg_partsmith.exceptions import LockAcquisitionError
+from pg_partsmith.exceptions import LockAcquisitionError, LockLostError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -77,7 +77,10 @@ class RedisDistributedLockManager:
     The renewal interval is ``ttl_seconds // 3`` (with random jitter to avoid
     thundering herds). If renewal fails — e.g. Redis is unreachable or another
     holder takes over — the watchdog logs a warning and cancels the holder
-    task, forcing the maintenance run to stop (fail-safe).
+    task, forcing the maintenance run to stop (fail-safe). The lock scope turns
+    that cancellation into :class:`~pg_partsmith.exceptions.LockLostError`, so
+    the run ends with an error rather than as if someone had cancelled it; a
+    cancellation from outside still propagates as one.
 
     For production use you may want to subclass and override ``acquire_lock``
     to use Redlock or another algorithm with stronger guarantees.
@@ -186,11 +189,20 @@ class RedisDistributedLockManager:
             if holder_task is None:
                 raise RuntimeError("Could not determine current asyncio task")
 
+            lost: list[str] = []
             watchdog = asyncio.create_task(
-                self._renewal_watchdog(key, token, table_name, holder_task),
+                self._renewal_watchdog(key, token, table_name, holder_task, lost),
                 name=f"redis-lock-watchdog:{key}",
             )
-            yield
+            try:
+                yield
+            except asyncio.CancelledError:
+                # The watchdog cancelled us because the lease went. When that is
+                # the only cancellation pending, it is an error of the run, not a
+                # request to stop: take it back and say what happened.
+                if lost and holder_task.uncancel() == 0:
+                    raise LockLostError(table_name, lost[0]) from None
+                raise
         finally:
             try:
                 if watchdog is not None:
@@ -221,8 +233,9 @@ class RedisDistributedLockManager:
         token: str,
         table_name: str,
         holder_task: asyncio.Task[Any],
+        lost: list[str],
     ) -> None:
-        """Periodically extend the lock TTL until cancelled or renewal fails."""
+        """Periodically extend the lock TTL until cancelled or renewal fails; ``lost`` gets the reason."""
         while True:
             jitter = random.uniform(*_RENEW_JITTER_RANGE)  # noqa: S311
             await asyncio.sleep(self._renew_interval * jitter)
@@ -231,14 +244,14 @@ class RedisDistributedLockManager:
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except (OSError, ConnectionError, TimeoutError, RuntimeError) as exc:
-                self._fail_holder(holder_task, key, table_name, "recoverable error", exc)
+                self._fail_holder(holder_task, key, table_name, "recoverable error", exc, lost)
                 return
             except Exception as exc:
-                self._fail_holder(holder_task, key, table_name, "unexpected exception", exc)
+                self._fail_holder(holder_task, key, table_name, "unexpected exception", exc, lost)
                 return
 
             if not renewed:
-                self._fail_holder(holder_task, key, table_name, "lock lost", None)
+                self._fail_holder(holder_task, key, table_name, "lock lost", None, lost)
                 return
 
     def _fail_holder(
@@ -248,8 +261,9 @@ class RedisDistributedLockManager:
         table_name: str,
         reason: str,
         exc: Exception | None,
+        lost: list[str],
     ) -> None:
-        """Log the renewal failure and cancel the holder task (fail-safe)."""
+        """Log the renewal failure, record why, and cancel the holder task (fail-safe)."""
         extra: dict[str, str] = {"table_name": table_name, "key": key, "reason": reason}
         if exc is not None:
             extra["error"] = str(exc)
@@ -264,6 +278,7 @@ class RedisDistributedLockManager:
                 extra=extra,
             )
         if not holder_task.done():
+            lost.append(reason)
             holder_task.cancel()
 
     async def _cancel_watchdog(self, watchdog: asyncio.Task[None]) -> None:

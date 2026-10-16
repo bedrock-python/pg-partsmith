@@ -284,21 +284,14 @@ def test__run_maintenance_safe__service_raises__returns_failure_result(config: T
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt("operator interrupted run"), SystemExit(1)])
-def test__run_maintenance_safe__system_signal__returns_failure_result(
-    config: TablePartitionConfig, error: BaseException
-) -> None:
-    # Arrange -- the sync analog of a cancelled task: captured into ``result.error``
+def test__run_maintenance_safe__request_to_stop__propagates(config: TablePartitionConfig, error: BaseException) -> None:
+    # Arrange
     service = _make_service(side_effect=error)
     maintainer = PartitionMaintainer(service)
 
-    # Act
-    result = maintainer.run_maintenance_safe(config)
-
-    # Assert
-    assert result.success is False
-    assert result.error is not None
-    assert type(error).__name__ in result.error
-    assert result.duration_ms >= 0
+    # Act / Assert
+    with pytest.raises(type(error)):
+        maintainer.run_maintenance_safe(config)
 
 
 # ── maintain_partitions ─────────────────────────────────────────────────────────
