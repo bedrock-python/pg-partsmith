@@ -15,7 +15,7 @@ from testcontainers.postgres import PostgresContainer
 
 from pg_partsmith.entities import MaintenanceIssueStep
 from pg_partsmith.exceptions import PlanStaleError
-from pg_partsmith.lifecycle import CreateAhead, DetachMode, KeepNewest, LifecyclePolicy
+from pg_partsmith.lifecycle import AllOf, CreateAhead, DetachMode, ExpireIf, KeepNewest, LifecyclePolicy, Unreferenced
 from pg_partsmith.plan import FindingReason, MaintenancePlan, OperationKind, Reason, Severity
 from pg_partsmith.planner import PlanMode
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
@@ -136,6 +136,35 @@ def test__plan__a_row_dated_before_every_partition__is_reported_until_backfill_m
     assert moved.rows_moved == 1
     assert after.findings == ()
     assert is_attached(sync_db_engine, f"{table}__2025_06")
+
+
+def test__plan__a_policy_that_needs_facts__still_reports_rows_no_run_would_reach(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange -- a past row in DEFAULT and a filled window table nobody attached, under the
+    # retention rule the foreign-key guide recommends, which reads a fact
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    lifecycle = LifecyclePolicy(
+        creation=CreateAhead(count=1),
+        retention=ExpireIf(when=AllOf(members=(KeepNewest(count=12), Unreferenced()))),
+    )
+    config = monthly_config(table, lifecycle=lifecycle)
+    service = make_service(sync_db_engine)
+    now = datetime.fromisoformat(NOW).replace(tzinfo=UTC)
+    service.apply(config, service.plan(config, now=now))
+    exec_sql(sync_db_engine, f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2025-06-15', 'late')")  # noqa: S608
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}__2025_01" (LIKE "{table}" INCLUDING DEFAULTS)')
+    exec_sql(sync_db_engine, f"INSERT INTO \"{table}__2025_01\" (created_at, payload) VALUES ('2025-01-15', 'x')")  # noqa: S608
+
+    # Act
+    plan = service.plan(config, now=now)
+
+    # Assert
+    assert config.lifecycle.needs_facts
+    assert {(f.partition_name, f.reason) for f in plan.findings} == {
+        (f"public.{table}_default", FindingReason.ROWS_IN_DEFAULT),
+        (f"public.{table}__2025_01", FindingReason.UNATTACHED_ROWS),
+    }
 
 
 # ── plan() / apply() ────────────────────────────────────────────────────────────

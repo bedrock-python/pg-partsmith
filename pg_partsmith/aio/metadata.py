@@ -226,7 +226,9 @@ class PostgresMetadataProvider:
         orphans = tuple(
             o.model_copy(update={"facts": measured[o.name]}) if o.name in measured else o for o in tree.orphans
         )
-        return ActualTree(root=root, orphans=orphans)
+        # A copy, not a new tree: whatever else inspection put on it -- unattached
+        # tables, the earliest row in DEFAULT -- belongs to the plan as much as the facts.
+        return tree.model_copy(update={"root": root, "orphans": orphans})
 
     async def get_partition_tree(self, table_name: str) -> PartitionNode | None:
         """Return the tree rooted at ``table_name``, without orphans.

@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * a backfilled window always attaches with writers held at the parent ([#89](https://github.com/bedrock-python/pg-partsmith/issues/89)) ([b1260c1](https://github.com/bedrock-python/pg-partsmith/commit/b1260c1a8bcdd6388c3836d57eb548f8fe5959bb))
 
+## 1.8.1 — the two findings survive a policy that reads facts
+
+`unattached_rows` (1.7.0) and `rows_in_default` (1.8.0) went missing whenever the lifecycle
+policy needed facts — `Unreferenced()`, `SizeAbove`, `RowsAbove`, a SQL predicate, including
+the `ExpireIf(when=AllOf(members=(KeepNewest(...), Unreferenced())))` the foreign-key guide
+recommends. `measure()` rebuilt the tree from its root and orphans and dropped everything else
+inspection had put on it, so `plan`, `plan --check` and `apply` were silent about exactly the
+states those findings exist for. It now returns a copy with the facts added
+([#108](https://github.com/bedrock-python/pg-partsmith/issues/108)).
+
 ## 1.8.0 — rows in DEFAULT that no run would reach are reported
 
 An application that writes its own key values can put a row into DEFAULT after the table
