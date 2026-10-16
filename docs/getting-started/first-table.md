@@ -241,14 +241,13 @@ plan for public.events at 2027-09-15T03:00:00+00:00
   CREATE public.events__2027_11 (create_ahead)
   DETACH public.events__2026_08 (retention_expired)
   DETACH public.events__2026_09 (retention_expired)
-  DROP public.events__2026_08 (follows_detach)
-  DROP public.events__2026_09 (follows_detach)
 ```
 
-Two things to notice. Retirement is a **detach** followed by a **drop**, two separate
-statements: the partition leaves the parent first, and only a table that is detached is
-ever dropped. And `events__2026_10` survives: the twelve newest months, counted back from
-September 2027, are October 2026 through September 2027.
+Two things to notice. Retirement is a **detach**, and the **drop** comes later: the
+partition leaves the parent first, and only a table that is detached is ever dropped —
+by default a week after its detach (see step 9). And `events__2026_10` survives: the
+twelve newest months, counted back from September 2027, are October 2026 through
+September 2027.
 
 After `apply()`:
 
@@ -261,14 +260,17 @@ events  partitioned table  PARTITION BY RANGE (created_at)
 ```
 
 (Only three months were ever created between the two runs, which is why the table looks
-sparse. A daily tick fills the calendar continuously.)
+sparse. A daily tick fills the calendar continuously. The two detached months are still in
+the database, outside the parent, until their week is up.)
 
-## 9. A week between detach and drop
+## 9. Between detach and drop
 
-Dropping in the same run as the detach is the default. Most teams want a pause — to
-export the partition, to be able to put it back. That is the `drop` half of a lifecycle
-policy. The flat fields you used so far are sugar for a scheme and a policy; spell the
-policy out to change it:
+A detached partition waits a week before it is dropped — a pause to export it, or to put
+it back if the retention was wrong. That is the `drop` half of a lifecycle policy, and the
+flat fields you used so far leave it at its default. The flat fields are sugar for a
+scheme and a policy; spell the policy out to choose the pause yourself (`DropAfter()`
+drops in the same run as the detach, `DropNever()` leaves detached tables to someone
+else):
 
 ```python
 from datetime import timedelta
@@ -325,8 +327,8 @@ meantime, a marked table whose month is wanted is *re-attached* rather than recr
 ## What you have learned
 
 - A configuration is a **scheme** (monthly partitions of `created_at`) plus a **lifecycle
-  policy** (three ahead, twelve kept, drop a week after detach). The flat fields are sugar
-  for both.
+  policy** (three ahead, twelve kept, drop a week after detach — the default). The flat
+  fields are sugar for both.
 - `plan()` is read-only and explains itself; `apply()` runs the plan under a lock.
 - Retirement is detach, then drop; grace periods live on the marker.
 - Findings are the planner telling you what it chose not to do, and why.

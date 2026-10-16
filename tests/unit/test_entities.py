@@ -137,7 +137,7 @@ def test__config__neither_scheme_nor_partition_column__rejected() -> None:
         TablePartitionConfig(table_name="events")
 
 
-def test__config__flat_defaults__six_ahead_twelve_kept_and_dropped_at_once() -> None:
+def test__config__flat_defaults__six_ahead_twelve_kept_and_dropped_after_a_week() -> None:
     # Arrange / Act
     config = _flat()
 
@@ -148,7 +148,7 @@ def test__config__flat_defaults__six_ahead_twelve_kept_and_dropped_at_once() -> 
         creation=CreateAhead(count=6),
         retention=KeepNewest(count=12),
         detach=DetachMode.AUTO,
-        drop=DropAfter(grace=timedelta(0)),
+        drop=DropAfter(grace=timedelta(days=7)),
     )
 
 

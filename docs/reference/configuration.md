@@ -10,7 +10,7 @@ Types are the accepted inputs; defaults are what you get when the field is omitt
 | `schema` | `str` | `None` | Schema of the parent table; read back as `db_schema`. Recommended. |
 | `table_name` | `str` | required | The parent table, lowercase, at most 63 bytes minus the scheme's longest suffix. |
 | `scheme` | `RangePartitioning \| ListPartitioning \| HashPartitioning` | from the flat fields | The root level and everything below it. |
-| `lifecycle` | `LifecyclePolicy` | `CreateAhead(count=6)`, `KeepNewest(count=12)`, `DetachMode.AUTO`, `DropAfter()` | When partitions of the progression level are created, detached and dropped. |
+| `lifecycle` | `LifecyclePolicy` | `CreateAhead(count=6)`, `KeepNewest(count=12)`, `DetachMode.AUTO`, `DropAfter(grace=timedelta(days=7))` | When partitions of the progression level are created, detached and dropped. |
 | `leaves` | `LocalLeaves \| ForeignLeaves` | `LocalLeaves()` | What kind of relation the leaves are. |
 
 Flat fields, accepted instead of `scheme` / `lifecycle` for a time-partitioned RANGE root:
@@ -103,7 +103,7 @@ literals.
 | `creation` | `CreateAhead \| CreateUntil \| CreateNextIf` | `CreateAhead(count=6)` | which windows must exist ahead of the cursor |
 | `retention` | any predicate | `KeepNewest(count=12)` | when a window behind the cursor has expired |
 | `detach` | `DetachMode` | `AUTO` | `AUTO`, `CONCURRENT`, `BLOCKING` |
-| `drop` | `DropAfter \| DropNever` | `DropAfter()` | what happens after the detach |
+| `drop` | `DropAfter \| DropNever` | `DropAfter(grace=timedelta(days=7))` | what happens after the detach; `DropAfter()` drops in the same run |
 
 Creation rules: `CreateAhead(count ≥ 1)`; `CreateUntil(position)` — a `datetime`, an
 `int`, or their string forms; `CreateNextIf(when)` — a predicate over the newest

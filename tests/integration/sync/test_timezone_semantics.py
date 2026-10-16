@@ -19,6 +19,7 @@ from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.sync.service import PartitionLifecycleService
 from pg_partsmith.topology import RangeBounds
 from pg_partsmith.utils import qualify
+from tests.integration.nested_support import drops_at_once
 
 pytestmark = pytest.mark.integration
 
@@ -80,6 +81,7 @@ def _partition_bound_expr(engine: Engine, partition: str) -> str:
     return str(expr)
 
 
+@drops_at_once
 def _moscow_config(table_relname: str, *, retention: int = 12) -> TablePartitionConfig:
     return TablePartitionConfig(
         schema="public",

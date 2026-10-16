@@ -813,7 +813,7 @@ def test__detach_mode__values__spell_the_three_modes() -> None:
 # ── LifecyclePolicy ─────────────────────────────────────────────────────────────
 
 
-def test__lifecycle_policy__defaults__create_ahead_keep_newest_auto_detach_immediate_drop() -> None:
+def test__lifecycle_policy__defaults__create_ahead_keep_newest_auto_detach_drop_after_a_week() -> None:
     # Arrange / Act
     policy = LifecyclePolicy()
 
@@ -821,7 +821,7 @@ def test__lifecycle_policy__defaults__create_ahead_keep_newest_auto_detach_immed
     assert policy.creation == CreateAhead(count=DEFAULT_CREATE_AHEAD_COUNT)
     assert policy.retention == KeepNewest(count=DEFAULT_RETENTION_COUNT)
     assert policy.detach is DetachMode.AUTO
-    assert policy.drop == DropAfter()
+    assert policy.drop == DropAfter(grace=timedelta(days=7))
     assert policy.required_facts == frozenset()
     assert policy.sql_predicates == ()
     assert policy.needs_facts is False

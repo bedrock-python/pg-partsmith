@@ -6,7 +6,9 @@ DDL counter that both the aio and sync suites drive through their own engine.
 
 from __future__ import annotations
 
+import functools
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import event
@@ -19,7 +21,15 @@ from pg_partsmith.boundaries import (
     UUIDv7BoundaryCodec,
 )
 from pg_partsmith.entities import PartitionGranularity, TablePartitionConfig
-from pg_partsmith.lifecycle import CreateAhead, CreateNextIf, KeepBehind, KeepNewest, LifecyclePolicy, SqlPredicate
+from pg_partsmith.lifecycle import (
+    CreateAhead,
+    CreateNextIf,
+    DropAfter,
+    KeepBehind,
+    KeepNewest,
+    LifecyclePolicy,
+    SqlPredicate,
+)
 from pg_partsmith.partition_bounds import parse_range_boundaries
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning
 from pg_partsmith.utils import orphan_table_comment
@@ -294,6 +304,26 @@ NO_CONSTRAINT_TABLE_DDL = """
 # ── Config builders ─────────────────────────────────────────────────────────────
 
 
+def drops_at_once(build: Callable[..., TablePartitionConfig]) -> Callable[..., TablePartitionConfig]:
+    """Keep the immediate drop these suites were written against.
+
+    Since 1.9.0 a policy that names no drop keeps a detached partition for a week.
+    The suites here are about detaching and dropping, not about the grace, so the
+    builders spell out ``DropAfter()``; a test about the grace passes ``drop=``
+    in its own ``lifecycle``, which is left as it is.
+    """
+
+    @functools.wraps(build)
+    def builder(*args: Any, **kwargs: Any) -> TablePartitionConfig:
+        config = build(*args, **kwargs)
+        if "drop" in config.lifecycle.model_fields_set:
+            return config
+        return config.model_copy(update={"lifecycle": config.lifecycle.model_copy(update={"drop": DropAfter()})})
+
+    return builder
+
+
+@drops_at_once
 def nested_config(
     table_name: str,
     *,
@@ -321,6 +351,7 @@ def nested_config(
     )
 
 
+@drops_at_once
 def list_config(
     table_name: str,
     *,
@@ -347,6 +378,7 @@ def list_config(
     )
 
 
+@drops_at_once
 def hash_root_config(
     table_name: str,
     *,
@@ -361,11 +393,13 @@ def hash_root_config(
     )
 
 
+@drops_at_once
 def tasks_config(table_name: str, *, modulus: int = 8) -> TablePartitionConfig:
     """Build the Hatchet-style root HASH configuration over ``task_id``."""
     return TablePartitionConfig(table_name=table_name, scheme=HashPartitioning(key="task_id", modulus=modulus))
 
 
+@drops_at_once
 def list_root_config(
     table_name: str,
     *,
@@ -383,6 +417,7 @@ def list_root_config(
     )
 
 
+@drops_at_once
 def tiered_config(table_name: str, *, create_ahead: int = 2, retention: int = 2) -> TablePartitionConfig:
     """Build a LIST(tier) → RANGE(created_at) configuration: a monthly lifecycle inside each group."""
     return TablePartitionConfig(
@@ -398,6 +433,7 @@ def tiered_config(table_name: str, *, create_ahead: int = 2, retention: int = 2)
     )
 
 
+@drops_at_once
 def queue_config(
     table_name: str,
     *,
@@ -414,6 +450,7 @@ def queue_config(
     )
 
 
+@drops_at_once
 def sliding_list_config(
     table_name: str,
     *,
@@ -432,6 +469,7 @@ def sliding_list_config(
     )
 
 
+@drops_at_once
 def glitchtip_config(
     table_name: str,
     *,
@@ -451,6 +489,7 @@ def glitchtip_config(
     )
 
 
+@drops_at_once
 def composite_config(
     table_name: str,
     *,
@@ -469,6 +508,7 @@ def composite_config(
     )
 
 
+@drops_at_once
 def nullable_composite_config(
     table_name: str,
     *,
@@ -479,6 +519,7 @@ def nullable_composite_config(
     return composite_config(table_name, create_ahead=create_ahead, retention=retention)
 
 
+@drops_at_once
 def flat_config(table_name: str, *, create_ahead: int = 1, retention: int = 12) -> TablePartitionConfig:
     """Build the classic one-leaf-per-week configuration."""
     return TablePartitionConfig(
@@ -490,6 +531,7 @@ def flat_config(table_name: str, *, create_ahead: int = 1, retention: int = 12) 
     )
 
 
+@drops_at_once
 def monthly_config(
     table_name: str,
     *,

@@ -17,6 +17,7 @@ from pg_partsmith.aio.service import PartitionLifecycleService
 from pg_partsmith.entities import PartitionGranularity, Period, TablePartitionConfig
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.topology import RangeBounds
+from tests.integration.nested_support import drops_at_once
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -99,7 +100,7 @@ class PartitioningScenarioBuilder:
         metadata = PostgresMetadataProvider(self._engine)
         locks = PostgresAdvisoryLockManager(self._engine)
 
-        config = TablePartitionConfig(
+        config = drops_at_once(TablePartitionConfig)(
             table_name=self._table_name,
             partition_column="created_at",
             granularity=self._granularity,

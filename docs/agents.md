@@ -358,9 +358,10 @@ lifecycle units — partitions directly under the root — never once per leaf o
    (recorded as an issue under `continue_on_error=True`).
 7. **`create_ahead_count` and `retention_count` include the current period.**
    `create_ahead_count=3` means this month and the next two.
-8. **The default lifecycle drops.** `DropAfter()` has a zero grace, so an expired partition
-   is detached and dropped in the same run. Choose `DropAfter(grace=…)` or `DropNever()`
-   consciously.
+8. **The default lifecycle drops a week after the detach.** A policy that names no `drop`
+   keeps an expired partition detached for seven days, where it can be inspected or
+   re-attached, then drops it. `DropAfter()` (zero grace) drops in the same run as the
+   detach; `DropNever()` leaves detached tables to someone else. Choose consciously.
 9. **`lifecycle` is meaningless for a scheme with no progression level** — a root
    `HashPartitioning` or a static `ListPartitioning` has a fixed set of partitions, and the
    policy is ignored rather than obeyed.

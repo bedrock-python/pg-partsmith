@@ -25,7 +25,7 @@ from typing import Annotated, Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .boundaries import Axis, RangeBoundaries, Window
-from .constants import DEFAULT_CREATE_AHEAD_COUNT, DEFAULT_RETENTION_COUNT
+from .constants import DEFAULT_CREATE_AHEAD_COUNT, DEFAULT_DROP_GRACE_DAYS, DEFAULT_RETENTION_COUNT
 from .topology import FactKind, PartitionFacts, PartitionNode
 from .types import NonNegativeInt, PositiveInt
 
@@ -776,7 +776,10 @@ class LifecyclePolicy(BaseModel):
         creation: Which windows ahead of the cursor must exist.
         retention: When a window behind the cursor has expired.
         detach: How an expired partition is detached.
-        drop: What happens to it afterwards.
+        drop: What happens to it afterwards. Unless the policy says otherwise, it
+            stays detached for a week, where it can still be inspected or
+            re-attached, and is dropped after that. ``DropAfter()`` drops in the
+            same run as the detach; ``DropNever()`` leaves it alone.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -784,7 +787,7 @@ class LifecyclePolicy(BaseModel):
     creation: CreationPolicy = Field(default_factory=CreateAhead)
     retention: RetentionPolicy = Field(default_factory=KeepNewest)
     detach: DetachMode = DetachMode.AUTO
-    drop: DropPolicy = Field(default_factory=DropAfter)
+    drop: DropPolicy = Field(default_factory=lambda: DropAfter(grace=timedelta(days=DEFAULT_DROP_GRACE_DAYS)))
 
     @property
     def required_facts(self) -> frozenset[FactKind]:

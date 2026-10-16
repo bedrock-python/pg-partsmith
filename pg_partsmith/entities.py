@@ -238,7 +238,9 @@ class TablePartitionConfig(BaseModel):
         )
 
     The ordinary time-partitioned table keeps its flat spelling, which is sugar
-    for exactly that::
+    for exactly that. Neither names a drop, so an expired partition stays
+    detached for a week before it is dropped; pass ``drop=`` in a
+    ``LifecyclePolicy`` to choose otherwise::
 
         TablePartitionConfig(
             table_name="events",

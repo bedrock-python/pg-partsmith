@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * a backfilled window always attaches with writers held at the parent ([#89](https://github.com/bedrock-python/pg-partsmith/issues/89)) ([b1260c1](https://github.com/bedrock-python/pg-partsmith/commit/b1260c1a8bcdd6388c3836d57eb548f8fe5959bb))
 
+## 1.9.0 — an expired partition stays detached for a week by default
+
+A policy that named no drop — every flat config (`create_ahead_count`, `retention_count`),
+every bare `TablePartitionConfig(...)` and every YAML table without `drop:` — got
+`DropAfter()` with no grace, so an expired partition was detached and dropped in the same
+run. A wrong `retention_count` or granularity lost the data on the first scheduled run, with
+no window to notice ([#106](https://github.com/bedrock-python/pg-partsmith/issues/106)).
+
+**What changes:** when the policy names no drop it is now `DropAfter(grace=timedelta(days=7))`.
+An expired partition stays detached for a week, where it can be inspected or re-attached,
+and the first run after that drops it. Disk is freed a week later than before.
+
+**What stays:** an explicit `DropAfter()` keeps its zero grace, so a configuration that asked
+for the immediate drop keeps it. `DropNever()` is unchanged.
+
 ## 1.8.3 — a refused detach no longer starts the drop grace
 
 A `DETACH … CONCURRENTLY` writes the orphan marker, with its `detached-at` instant, in a

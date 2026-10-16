@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pg_partsmith.lifecycle import CreateNextIf, DetachMode, KeepNewest, LifecyclePolicy, SqlPredicate
+from pg_partsmith.lifecycle import CreateNextIf, DetachMode, DropAfter, KeepNewest, LifecyclePolicy, SqlPredicate
 from pg_partsmith.plan import FindingReason, Reason
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
@@ -206,4 +206,5 @@ def test__sliding_list_config__is_state_driven() -> None:
     assert config.lifecycle == LifecyclePolicy(
         creation=CreateNextIf(when=SqlPredicate(sql="SELECT count(*) >= 3 FROM {partition}")),
         retention=KeepNewest(count=2),
+        drop=DropAfter(),
     )

@@ -46,8 +46,11 @@ def _document(tmp_path: Path, table: str, dsn: str, *, retention: int = 12, hook
                 "schema": schema or None,
                 "partition_column": "created_at",
                 "granularity": "month",
-                "create_ahead_count": 2,
-                "retention_count": retention,
+                "lifecycle": {
+                    "creation": {"kind": "create_ahead", "count": 2},
+                    "retention": {"kind": "keep_newest", "count": retention},
+                    "drop": {"kind": "drop_after", "grace": "P0D"},
+                },
             }
         ],
     }
