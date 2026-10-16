@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.8.1...pg-partsmith-v1.8.2) (2026-10-16)
+
+
+### Bug Fixes
+
+* cancellation propagates from run_maintenance_safe ([#110](https://github.com/bedrock-python/pg-partsmith/issues/110)) ([fd857b4](https://github.com/bedrock-python/pg-partsmith/commit/fd857b4e583240268214908614f86be9fbaa1a4b)), closes [#107](https://github.com/bedrock-python/pg-partsmith/issues/107)
+
 ## [1.8.1](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.8.0...pg-partsmith-v1.8.1) (2026-10-16)
 
 
