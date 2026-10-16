@@ -229,6 +229,7 @@ def orphan_comment(
     detached_at: datetime | None,
     existing_comment: str | None,
     marker_prefix: str | None = None,
+    keep_instant: bool = True,
 ) -> str:
     """Compose the whole COMMENT for a table this library detached.
 
@@ -236,13 +237,14 @@ def orphan_comment(
     written; line two records the detach instant; whatever comment the table
     carried before is kept below them. Re-marking an already marked table keeps
     the instant it already carries, so a repeated detach does not restart a
-    grace period.
+    grace period -- unless ``keep_instant`` is off, for a marker whose instant
+    records no detach at all.
     """
     marker = orphan_table_comment(parent_table, marker_prefix=marker_prefix)
     lines = [marker]
 
     parsed = parse_orphan_comment(existing_comment, marker_prefix=marker_prefix)
-    if parsed is not None and parsed[1] is not None:
+    if keep_instant and parsed is not None and parsed[1] is not None:
         detached_at = parsed[1]
     if detached_at is not None:
         lines.append(f"{DETACHED_AT_MARKER}{detached_at.astimezone(UTC).isoformat()}")

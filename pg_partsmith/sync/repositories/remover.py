@@ -24,6 +24,7 @@ from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.utils import (
     build_ddl_statement,
     coerce_str,
+    comment_without_markers,
     orphan_comment,
     parse_orphan_comment,
     pg_sqlstate,
@@ -301,6 +302,7 @@ class PartitionRemover:
         try:
             return self._run_concurrent_detach(table_name, partition_name)
         except (SQLAlchemyError, OSError, TimeoutError) as exc:
+            self._unmark_if_refused(exc, partition_name, None)
             return self._classify_concurrent_failure(exc, table_name, partition_name, fallback=fallback)
 
     def _detach_concurrently_pinned(
@@ -331,6 +333,7 @@ class PartitionRemover:
                 statement_pid=lambda: pid_box[0],
             )
         except (SQLAlchemyError, OSError, TimeoutError) as exc:
+            self._unmark_if_refused(exc, partition_name, expected_oid)
             return self._classify_concurrent_failure(exc, table_name, partition_name, fallback=fallback)
 
     def _run_concurrent_detach(
@@ -348,16 +351,61 @@ class PartitionRemover:
                 if pid_box is not None:
                     backend = (conn.execute(text("SELECT pg_backend_pid()"))).scalar()
                     pid_box[0] = None if backend is None else int(backend)
-                already_marked = (
-                    conn.execute(
-                        text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
-                        {"partition_name": to_regclass_argument(partition_name)},
-                    )
-                ).scalar()
-                if parse_orphan_comment(coerce_str(already_marked), marker_prefix=self._marker_prefix) is None:
-                    self._mark_orphaned(conn, table_name, partition_name)
+                self._mark_orphaned(conn, table_name, partition_name)
                 conn.execute(stmt)
                 return True
+
+    def _unmark_if_refused(self, exc: Exception, partition_name: str, expected_oid: int | None) -> None:
+        """Take the marker back off a partition PostgreSQL refused to detach.
+
+        The marker went on in its own committed transaction before the
+        statement, so a refusal leaves an attached partition saying it was
+        detached. Only the marker lines go; the comment the table had before
+        stays. Best effort: the refusal is what the caller reports, and a
+        marker left behind is harmless because the next detach stamps its own
+        instant (see :meth:`_mark_orphaned`).
+        """
+        if pg_sqlstate(exc) not in {"55006", "23503"}:
+            return
+        try:
+            with self._engine.begin() as conn:
+                apply_local_statement_timeout(conn, self._ddl_timeout)
+                conn.execute(text(SET_LOCK_TIMEOUT_SQL), {"timeout": str(self._lock_timeout_ms)})
+                foreign = _relkind(conn, partition_name) == "f"
+                if not foreign:
+                    # What COMMENT takes anyway, taken first, so the checks below see one relation.
+                    conn.execute(
+                        build_ddl_statement(
+                            "LOCK TABLE ONLY {partition} IN SHARE UPDATE EXCLUSIVE MODE", partition=partition_name
+                        )
+                    )
+                self._ensure_expected_oid(conn, partition_name, expected_oid)
+                if not _plainly_attached(conn, partition_name):
+                    return
+                existing = coerce_str(
+                    (
+                        conn.execute(
+                            text("SELECT obj_description(to_regclass(:partition_name), 'pg_class')"),
+                            {"partition_name": to_regclass_argument(partition_name)},
+                        )
+                    ).scalar()
+                )
+                if parse_orphan_comment(existing, marker_prefix=self._marker_prefix) is None:
+                    return
+                rest = comment_without_markers(existing, marker_prefix=self._marker_prefix)
+                relation = "FOREIGN TABLE" if foreign else "TABLE"
+                if rest:
+                    stmt = build_ddl_statement(
+                        f"COMMENT ON {relation} {{partition}} IS [comment]", partition=partition_name, comment=rest
+                    )
+                else:
+                    stmt = build_ddl_statement(f"COMMENT ON {relation} {{partition}} IS NULL", partition=partition_name)
+                conn.execute(stmt)
+        except (SQLAlchemyError, OSError, TimeoutError, PlanStaleError) as cleanup_exc:
+            logger.warning(
+                "Could not take the orphan marker back off a partition whose detach was refused",
+                extra={"partition_name": partition_name, "error": str(cleanup_exc)},
+            )
 
     def _classify_concurrent_failure(
         self, exc: Exception, table_name: str, partition_name: str, *, fallback: bool
@@ -399,6 +447,11 @@ class PartitionRemover:
         Written *before* the DETACH so an interrupted run leaves a marked table
         rather than an unmarked one that orphan discovery would never see.
 
+        An instant the table already carries is kept while it is detached or its
+        detach is pending. On a partition that is still plainly attached it is
+        what a refused ``DETACH … CONCURRENTLY`` left behind, not a detach, so
+        this detach records its own.
+
         Args:
             stamp_now: Record the current instant as the detach time. Off for
                 adoption, where the table was detached at an unknown time.
@@ -417,6 +470,7 @@ class PartitionRemover:
             detached_at=instant,
             existing_comment=existing_comment,
             marker_prefix=self._marker_prefix,
+            keep_instant=not (stamp_now and _plainly_attached(conn, partition_name)),
         )
         if new_comment == existing_comment:
             return
@@ -619,3 +673,12 @@ class PartitionRemover:
 def _relkind(conn: Connection, name: str) -> str | None:
     """``pg_class.relkind`` of the relation holding ``name``, or None when there is none."""
     return relation_kind(conn, name)
+
+
+def _plainly_attached(conn: Connection, name: str) -> bool:
+    """Whether the relation is attached to a parent with no detach pending."""
+    result = conn.execute(
+        text("SELECT NOT inhdetachpending FROM pg_inherits WHERE inhrelid = to_regclass(:name)"),
+        {"name": to_regclass_argument(name)},
+    )
+    return bool(result.scalar())
