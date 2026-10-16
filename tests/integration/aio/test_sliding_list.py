@@ -14,7 +14,7 @@ import pytest_asyncio
 
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
-from pg_partsmith.lifecycle import CreateNextIf, DetachMode, KeepNewest, LifecyclePolicy, SqlPredicate
+from pg_partsmith.lifecycle import CreateNextIf, DetachMode, DropAfter, KeepNewest, LifecyclePolicy, SqlPredicate
 from pg_partsmith.plan import FindingReason, Reason
 from pg_partsmith.topology import ListBounds
 from tests.integration.aio.support import (
@@ -210,4 +210,5 @@ def test__sliding_list_config__is_state_driven() -> None:
     assert config.lifecycle == LifecyclePolicy(
         creation=CreateNextIf(when=SqlPredicate(sql="SELECT count(*) >= 3 FROM {partition}")),
         retention=KeepNewest(count=2),
+        drop=DropAfter(),
     )

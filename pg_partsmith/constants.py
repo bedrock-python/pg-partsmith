@@ -3,6 +3,8 @@
 # Default configuration values.
 DEFAULT_CREATE_AHEAD_COUNT = 6
 DEFAULT_RETENTION_COUNT = 12
+# How long an expired partition stays detached, and can be re-attached, when the policy names no drop.
+DEFAULT_DROP_GRACE_DAYS = 7
 
 # PostgreSQL limits.
 MAX_IDENTIFIER_LENGTH = 63

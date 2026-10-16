@@ -181,15 +181,22 @@ def write_document(
     dsn: str | None = None,
     hooks: Mapping[str, Any] | None = None,
 ) -> Path:
-    """One table, monthly, two partitions ahead: the document the guides start from, as JSON."""
+    """One table, monthly, two partitions ahead, as JSON.
+
+    Expired partitions are dropped in the run that detaches them, as these tests
+    expect; without ``drop`` a detached partition would wait a week.
+    """
     payload: dict[str, Any] = {
         "tables": [
             {
                 "table_name": table,
                 "partition_column": "created_at",
                 "granularity": "month",
-                "create_ahead_count": 2,
-                "retention_count": retention,
+                "lifecycle": {
+                    "creation": {"kind": "create_ahead", "count": 2},
+                    "retention": {"kind": "keep_newest", "count": retention},
+                    "drop": {"kind": "drop_after", "grace": "P0D"},
+                },
             }
         ]
     }

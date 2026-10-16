@@ -28,6 +28,7 @@ from pg_partsmith.exceptions import InvalidPartitionConfigError, PartitionAlread
 from pg_partsmith.lifecycle import (
     CreateAhead,
     DetachMode,
+    DropAfter,
     ExpireIf,
     KeepBehind,
     LifecyclePolicy,
@@ -124,6 +125,11 @@ def config() -> TablePartitionConfig:
         create_ahead_count=1,
         retention_count=2,
     )
+
+
+def _dropping_at_once(config: TablePartitionConfig) -> TablePartitionConfig:
+    """The fixture's policy, but dropping in the same run as the detach."""
+    return config.model_copy(update={"lifecycle": config.lifecycle.model_copy(update={"drop": DropAfter()})})
 
 
 def _nested_config() -> TablePartitionConfig:
@@ -591,6 +597,7 @@ async def test__maintain__end_to_end__returns_counters_and_the_plan_it_executed(
     service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange -- January is expired, February current-ish, March missing; an orphan is past its grace
+    config = _dropping_at_once(config)
     metadata.get_actual_tree.return_value = _tree(
         _range_child("events__2024_01", "2024-01-01", "2024-02-01", oid=1),
         _range_child("events__2024_02", "2024-02-01", "2024-03-01", oid=2),
@@ -635,6 +642,7 @@ async def test__maintain__continue_on_error__isolates_a_failed_create_and_still_
     service: PartitionLifecycleService, repo: MagicMock, metadata: MagicMock, config: TablePartitionConfig
 ) -> None:
     # Arrange
+    config = _dropping_at_once(config)
     metadata.get_actual_tree.return_value = _tree(_range_child("events__2024_01", "2024-01-01", "2024-02-01", oid=1))
     metadata.get_relation_oid.return_value = 1
     metadata.is_partition_attached.return_value = True

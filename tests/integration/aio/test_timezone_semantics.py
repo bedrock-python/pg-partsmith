@@ -20,6 +20,7 @@ from pg_partsmith.boundaries import TimeBoundaries
 from pg_partsmith.entities import PartitionGranularity, Period, TablePartitionConfig
 from pg_partsmith.topology import RangeBounds
 from pg_partsmith.utils import qualify
+from tests.integration.nested_support import drops_at_once
 
 pytestmark = pytest.mark.integration
 
@@ -81,6 +82,7 @@ async def _partition_bound_expr(engine: AsyncEngine, partition: str) -> str:
     return str(expr)
 
 
+@drops_at_once
 def _moscow_config(table_relname: str, *, retention: int = 12) -> TablePartitionConfig:
     return TablePartitionConfig(
         schema="public",

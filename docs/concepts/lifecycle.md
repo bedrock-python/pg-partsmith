@@ -138,8 +138,8 @@ referencing rows are gone. See [Handle foreign keys](../guide/foreign-keys.md).
 
 | Rule | Effect |
 |---|---|
-| `DropAfter()` (default: no grace) | dropped in the same run as the detach |
-| `DropAfter(grace=timedelta(days=7))` | kept detached for a week, then dropped. The detach instant is recorded on the table's marker; an orphan marked by an older version, or adopted, has no instant and is treated as past its grace |
+| `DropAfter()` (no grace) | dropped in the same run as the detach |
+| `DropAfter(grace=timedelta(days=7))` (the default when the policy names no drop) | kept detached for a week, then dropped. The detach instant is recorded on the table's marker; an orphan marked by an older version, or adopted, has no instant and is treated as past its grace |
 | `DropAfter(grace=…, when=predicate)` | dropped only once the grace has passed *and* the predicate holds — "not while bigger than 150 GB on a weekday" is a `Callback` over the size fact |
 | `DropNever()` | detached partitions are left alone; something else owns the drop — an archive pipeline, a DBA. They are never re-attached, and a wanted window whose name such a table holds is reported (`name_unusable`), not recreated over it |
 
