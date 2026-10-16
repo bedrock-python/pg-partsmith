@@ -7,7 +7,7 @@ import pytest
 
 from pg_partsmith.aio.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.aio.lock.redis import RedisDistributedLockManager
-from pg_partsmith.exceptions import LockAcquisitionError
+from pg_partsmith.exceptions import LockAcquisitionError, LockLostError
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
@@ -525,6 +525,54 @@ async def test__redis_lock__watchdog_returns_zero__cancels_holder_task_and_logs_
     ]
     assert len(warnings) == 1
     assert logger.warning.call_args.kwargs["extra"]["table_name"] == "test"
+
+
+def _lease_lost_manager() -> RedisDistributedLockManager:
+    redis = MagicMock()
+    redis.set = AsyncMock(return_value=True)
+    redis.register_script.side_effect = [AsyncMock(return_value=1), AsyncMock(return_value=0)]  # unlock, renew
+    with patch("pg_partsmith.aio.lock.redis._redis_available", True):
+        return RedisDistributedLockManager(redis, ttl_seconds=3)
+
+
+async def test__redis_lock__lease_lost__the_run_ends_with_lock_lost_error_not_a_cancellation() -> None:
+    # Arrange
+    manager = _lease_lost_manager()
+
+    # Act
+    with pytest.raises(LockLostError, match="lock lost"):
+        async with manager.acquire_lock("test"):
+            await asyncio.sleep(5)
+
+    # Assert -- the cancellation the lock caused was taken back
+    task = asyncio.current_task()
+    assert task is not None
+    assert task.cancelling() == 0
+
+
+async def test__redis_lock__lease_lost_and_cancelled_from_outside__the_cancellation_wins() -> None:
+    # Arrange -- someone else cancels the task in the same moment the lease goes
+    manager = _lease_lost_manager()
+    original = RedisDistributedLockManager._fail_holder
+
+    def fail_and_cancel_from_outside(
+        self: RedisDistributedLockManager, holder_task: asyncio.Task[object], *args: object
+    ) -> None:
+        original(self, holder_task, *args)  # type: ignore[arg-type]
+        holder_task.cancel()
+
+    async def hold() -> None:
+        async with manager.acquire_lock("test"):
+            await asyncio.sleep(5)
+
+    # Act
+    with patch.object(RedisDistributedLockManager, "_fail_holder", fail_and_cancel_from_outside):
+        task = asyncio.create_task(hold())
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Assert
+    assert task.cancelled()
 
 
 async def test__redis_lock__unlock_raises__logs_warning_without_reraise() -> None:

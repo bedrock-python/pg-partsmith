@@ -281,36 +281,53 @@ async def test__run_maintenance_safe__service_raises__returns_failure_result(con
     assert result.duration_ms >= 0
 
 
-async def test__run_maintenance_safe__cancelled_error__returns_failure_result(config: TablePartitionConfig) -> None:
-    # Arrange
-    service = _make_service(side_effect=asyncio.CancelledError("lock watchdog cancelled run"))
-    maintainer = PartitionMaintainer(service)
-
-    # Act
-    result = await maintainer.run_maintenance_safe(config)
-
-    # Assert
-    assert result.success is False
-    assert result.error is not None
-    assert "CancelledError" in result.error
-    assert result.duration_ms >= 0
-
-
-@pytest.mark.parametrize("error", [KeyboardInterrupt("operator interrupted"), SystemExit(1)])
-async def test__run_maintenance_safe__system_signal__returns_failure_result(
+@pytest.mark.parametrize(
+    "error", [asyncio.CancelledError("stop"), KeyboardInterrupt("operator interrupted"), SystemExit(1)]
+)
+async def test__run_maintenance_safe__request_to_stop__propagates(
     config: TablePartitionConfig, error: BaseException
 ) -> None:
     # Arrange
     service = _make_service(side_effect=error)
     maintainer = PartitionMaintainer(service)
 
+    # Act / Assert
+    with pytest.raises(type(error)):
+        await maintainer.run_maintenance_safe(config)
+
+
+def _slow_service() -> MagicMock:
+    async def maintain_lifecycle(*_args: object, **_kwargs: object) -> MaintenanceResult:
+        await asyncio.sleep(5)
+        return MaintenanceResult()
+
+    service = MagicMock()
+    service.maintain_lifecycle = maintain_lifecycle
+    return service
+
+
+async def test__run_maintenance_safe__inside_asyncio_timeout__the_timeout_fires(config: TablePartitionConfig) -> None:
+    # Arrange
+    maintainer = PartitionMaintainer(_slow_service())
+
+    # Act / Assert
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await maintainer.run_maintenance_safe(config)
+
+
+async def test__run_maintenance_safe__task_cancelled__the_task_ends_cancelled(config: TablePartitionConfig) -> None:
+    # Arrange
+    task = asyncio.create_task(PartitionMaintainer(_slow_service()).run_maintenance_safe(config))
+    await asyncio.sleep(0.05)
+
     # Act
-    result = await maintainer.run_maintenance_safe(config)
+    task.cancel()
 
     # Assert
-    assert result.success is False
-    assert result.error is not None
-    assert type(error).__name__ in result.error
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
 
 
 async def test__run_maintenance_safe__redis_watchdog_cancels_task__returns_failure_result(
@@ -337,10 +354,10 @@ async def test__run_maintenance_safe__redis_watchdog_cancels_task__returns_failu
     # Act
     result = await maintainer.run_maintenance_safe(config)
 
-    # Assert
+    # Assert -- the lost lease ends the run as an error of the run, not as a cancellation
     assert result.success is False
     assert result.error is not None
-    assert "CancelledError" in result.error
+    assert result.error.startswith("LockLostError")
     assert unlock_script.called
 
 

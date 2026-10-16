@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * a backfilled window always attaches with writers held at the parent ([#89](https://github.com/bedrock-python/pg-partsmith/issues/89)) ([b1260c1](https://github.com/bedrock-python/pg-partsmith/commit/b1260c1a8bcdd6388c3836d57eb548f8fe5959bb))
 
+## 1.8.2 — cancellation stops a run_maintenance_safe
+
+`run_maintenance_safe()` caught `asyncio.CancelledError`, `KeyboardInterrupt` and `SystemExit`
+and returned them on `result.error`, so the tools asyncio stops work with did nothing to it:
+`asyncio.timeout()` never raised, a cancelled task did not end cancelled, and a shutdown that
+cancels its tasks saw a completed run
+([#107](https://github.com/bedrock-python/pg-partsmith/issues/107)). They now propagate from
+both mirrors, after `run_maintenance()` has logged them; every `Exception` still lands on
+`result.error`.
+
+A Redis lock whose lease is lost mid-run used to stop the run by cancelling it, and that
+cancellation was what reached `result.error`. The lock now takes its own cancellation back and
+raises `LockLostError`, a `PartitionError`, so a lost lease is still reported on the result. If
+the task was cancelled from outside at the same moment, the cancellation wins.
+
 ## 1.8.1 — the two findings survive a policy that reads facts
 
 `unattached_rows` (1.7.0) and `rows_in_default` (1.8.0) went missing whenever the lifecycle

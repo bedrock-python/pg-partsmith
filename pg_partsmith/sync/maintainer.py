@@ -151,12 +151,13 @@ class PartitionMaintainer:
         skip_drop: bool = False,
         continue_on_error: bool = False,
     ) -> MaintenanceResult:
-        """Run maintenance and always return ``MaintenanceResult``, never raise.
+        """Run maintenance and return ``MaintenanceResult`` instead of raising an error.
 
-        Scheduler-friendly wrapper around :meth:`run_maintenance`. Any exception
-        — including ``KeyboardInterrupt`` — is captured and reported via
-        ``result.error``; the ``duration_ms`` field always reflects the elapsed
-        time even on failure.
+        Scheduler-friendly wrapper around :meth:`run_maintenance`. Every
+        ``Exception`` is captured and reported via ``result.error``;
+        ``duration_ms`` reflects the elapsed time even on failure. A request to
+        stop is not an error: ``KeyboardInterrupt`` and ``SystemExit``
+        propagate, so Ctrl+C and ``sys.exit()`` end the process as usual.
 
         Args:
             config: Table partitioning configuration.
@@ -178,8 +179,6 @@ class PartitionMaintainer:
                 skip_drop=skip_drop,
                 continue_on_error=continue_on_error,
             )
-        except (KeyboardInterrupt, SystemExit) as e:
-            return MaintenanceResult(duration_ms=elapsed_ms(start_time), error=describe_exception(e))
         except Exception as e:
             return MaintenanceResult(duration_ms=elapsed_ms(start_time), error=describe_exception(e))
 

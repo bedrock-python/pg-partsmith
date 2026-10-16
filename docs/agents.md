@@ -283,8 +283,10 @@ Every method takes the `TablePartitionConfig` as its first argument.
 | `drop_detached_partitions(config, partition_names)` | no | yes | `int` |
 
 `maintain_lifecycle` is the same method as `maintain`. `PartitionMaintainer(service)` adds
-`run_maintenance(...)` and `run_maintenance_safe(...)` — same keywords; the *safe* one never
-raises and reports the failure on `result.error` instead, which is what a scheduler wants.
+`run_maintenance(...)` and `run_maintenance_safe(...)` — same keywords; the *safe* one does
+not raise errors and reports them on `result.error` instead, which is what a scheduler wants.
+Cancellation, `KeyboardInterrupt` and `SystemExit` propagate from both; a lost Redis lease is an
+error (`LockLostError`).
 
 `PlanMode` is `MAINTAIN` (the tick), `RECONCILE` (converge only, create nothing ahead) or
 `EXPLICIT` (only the windows named in `windows=`).

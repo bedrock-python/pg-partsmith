@@ -172,8 +172,12 @@ it takes on `op.capabilities`.
 | any other error — a connection drop, a permission denied, a `before_*` hook raising | aborts the run, unless `continue_on_error`, in which case it is recorded and the next operation runs |
 | validation or lock failure | fatal, always |
 
-`PartitionMaintainer.run_maintenance_safe()` catches everything, cancellation included,
-and reports it on `result.error`.
+`PartitionMaintainer.run_maintenance_safe()` catches every error and reports it on
+`result.error`. A request to stop is not an error: `asyncio.CancelledError`,
+`KeyboardInterrupt` and `SystemExit` propagate, so `asyncio.timeout()`, `task.cancel()` and
+a shutdown that cancels its tasks behave as they do everywhere else. A Redis lock whose lease
+is lost mid-run stops the run with `LockLostError`, which is an error and lands on
+`result.error`.
 
 ## What an interruption leaves behind
 

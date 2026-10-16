@@ -8,8 +8,8 @@ replicas from colliding, and a result you can alert on.
 ## 1. The maintainer
 
 `PartitionMaintainer` wraps the service for schedulers: `run_maintenance_safe()` plans and
-applies under the table's lock, times the run, and **never raises** — whatever happens
-comes back in the result.
+applies under the table's lock, times the run, and **does not raise errors** — whatever goes
+wrong comes back in the result. Cancellation is not an error and propagates.
 
 ```python
 from pg_partsmith.aio import PartitionMaintainer
@@ -225,8 +225,8 @@ assert not plan.actionable_findings, plan.describe()
 
 ## What you have learned
 
-- `PartitionMaintainer.run_maintenance_safe()` is the entry point for a scheduler: it never
-  raises, and everything is on the result.
+- `PartitionMaintainer.run_maintenance_safe()` is the entry point for a scheduler: errors come
+  back on the result, and cancellation propagates.
 - One tick per table per replica; the loser of the lock skips, and that is fine.
 - `error` is the run, `issues` is what needs a human, `plan.findings` is the full account.
 
