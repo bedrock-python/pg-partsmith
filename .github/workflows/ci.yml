@@ -304,7 +304,10 @@ jobs:
         with:
           fail-on-severity: high
 
-  # Sentinel job — use this as the single required status check in branch protection.
+  # Sentinel job — the single required status check in the master ruleset. A job
+  # counts only when it succeeded: "skipped" means the work did not happen. A job
+  # skipped by design (one that runs on pull requests only, say) goes in MAY_SKIP
+  # by its job id, and only those may end skipped.
   all-checks-passed:
     name: All checks passed
     if: always()
@@ -312,9 +315,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          MAY_SKIP: '["dependency-review"]'
         run: |
-          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more required checks failed."
+          NOT_PASSED=$(jq -r --argjson skip "$MAY_SKIP" '
+            to_entries[]
+            | select((.value.result == "success" or (.value.result == "skipped" and (.key | IN($skip[])))) | not)
+            | "\(.key): \(.value.result)"' <<< "$NEEDS")
+          if [ -n "$NOT_PASSED" ]; then
+            echo "Not passed:"
+            echo "$NOT_PASSED"
             exit 1
           fi
           echo "All checks passed."
