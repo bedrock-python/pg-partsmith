@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.8.3...pg-partsmith-v1.9.0) (2026-10-16)
+
+
+### Features
+
+* an expired partition stays detached for a week unless the policy names a drop ([#113](https://github.com/bedrock-python/pg-partsmith/issues/113)) ([680954d](https://github.com/bedrock-python/pg-partsmith/commit/680954d17fc1601580aae1d781ec317c7998298d))
+
 ## [1.8.3](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.8.2...pg-partsmith-v1.8.3) (2026-10-16)
 
 
