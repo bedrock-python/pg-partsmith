@@ -457,7 +457,7 @@ hooks:
 Either way, `apply` needs `--allow-hooks`, and the document declaring hooks is refused
 without it — see [Commands around the lifecycle](hooks-in-config.md). The bash scripts
 under `examples/hooks/` are for a host that has bash; a team that wants them in the image
-builds its own from `python:3.14-slim` with `pip install "pg-partsmith[cli]"`.
+builds its own from `python:3.15-slim` with `pip install "pg-partsmith[cli]"`.
 
 ## CI
 
@@ -475,7 +475,7 @@ works, every table it describes is partitioned the way it claims.
 ```yaml
 # GitLab CI
 validate-partitions:
-  image: python:3.14-slim
+  image: python:3.15-slim
   before_script:
     - pip install --quiet "pg-partsmith[cli]"
   script:

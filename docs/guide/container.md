@@ -23,7 +23,7 @@ Two stages, and only the second one ships.
 
 The runtime base is [distroless](https://github.com/GoogleContainerTools/distroless)
 `cc-debian12`: glibc, OpenSSL, CA certificates, a timezone database, and nothing else.
-**No shell, no package manager, no pip.** Onto that go a Python 3.14 interpreter with a
+**No shell, no package manager, no pip.** Onto that go a Python 3.15 interpreter with a
 pruned standard library (no IDE, no Tk, no test suite, no REPL modules), one virtualenv
 installed from `uv.lock` — the versions the test suite ran against, never whatever the
 index served on build day — and exactly the five shared libraries the extension modules
@@ -42,7 +42,7 @@ Because there is no shell, the two things a wrapper used to do are flags:
 textfile), and `apply --ok-if-locked` makes a held lock exit `0` (an init container). A
 command hook inside this image is a binary, or a Python file run as
 `["/opt/venv/bin/python", "/opt/hooks/export.py"]` — not a shell script. A team that
-needs bash in the image builds one line of its own: `FROM python:3.14-slim` and
+needs bash in the image builds one line of its own: `FROM python:3.15-slim` and
 `pip install "pg-partsmith[cli]"`.
 
 ## Inputs
