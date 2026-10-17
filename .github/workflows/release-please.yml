@@ -12,7 +12,31 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      # A pull request opened or updated with GITHUB_TOKEN does not get a CI run
+      # that ever starts, so the release PR could not pass its required check
+      # until a person closed and reopened it. A token of the org's release App
+      # starts CI like anyone else's push. Until the App is set up, GITHUB_TOKEN
+      # is used and the run says so. Setup, once per org:
+      # https://github.com/bedrock-python/python-library-template#the-release-app
+      - name: Token from the release App
+        id: app
+        if: vars.RELEASE_PLEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_PLEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: No release App
+        if: steps.app.outcome == 'skipped'
+        run: >-
+          echo "::warning::RELEASE_PLEASE_APP_CLIENT_ID is not set, so the release PR
+          is opened with GITHUB_TOKEN and CI will not run on it: close and reopen it
+          right before merging."
+
       - uses: googleapis/release-please-action@v5
         with:
+          token: ${{ steps.app.outputs.token || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json

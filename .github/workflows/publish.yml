@@ -1,9 +1,14 @@
 name: Publish
 
+# What reaches PyPI is decided here and in the `pypi` environment, which
+# setup_repo.py makes deployable from master only. Both triggers run with
+# master as their ref, so the checks below are always master's own; a run from
+# any other branch is refused the environment before it can publish.
 on:
   workflow_run:
     workflows: ["Release Please"]
     types: [completed]
+  # A manual publish, from master: gh workflow run publish.yml -f tag=<tag>
   workflow_dispatch:
     inputs:
       tag:
@@ -19,34 +24,113 @@ env:
 
 jobs:
   check:
-    name: Check release tag
+    name: Check release
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'master')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read   # the CI run on the released commit
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_sha }}
-          fetch-tags: true
+          fetch-depth: 0   # master's history and every tag
 
-      - name: Resolve tag
-        id: tag
+      # The tag names a commit; it is never the ref this run starts from. It has
+      # to be on master, and the version it carries has to be the one committed
+      # in __version__.py -- the artifacts are built from that file, so a tag
+      # that disagrees with it is a mistake to stop on, not to paper over.
+      - name: Resolve the release tag
+        id: release
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUSHED_SHA: ${{ github.event.workflow_run.head_sha }}
+          # Both tag conventions, the component-prefixed one and the bare one,
+          # so a Release Please config change cannot silently stop publishing.
+          TAG_PATTERN: '^(pg-partsmith-)?v[0-9][0-9A-Za-z.+-]*$'
+          TAG_PREFIX: "pg-partsmith-"
+          VERSION_FILE: "pg_partsmith/__version__.py"
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "$REF" != refs/heads/master ]; then
+              echo "::error::Publish from master, not $REF: gh workflow run publish.yml --ref master -f tag=<tag>"
+              exit 1
+            fi
+            if [[ ! "$INPUT_TAG" =~ $TAG_PATTERN ]]; then
+              echo "::error::'$INPUT_TAG' is not a release tag of this project"
+              exit 1
+            fi
+            TAG=$INPUT_TAG
+            if ! SHA=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}"); then
+              echo "::error::There is no tag $TAG"
+              exit 1
+            fi
           else
-            TAG=$(git tag --points-at HEAD | grep -E '^pg-partsmith-v' | head -1)
-            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            SHA=$PUSHED_SHA
+            TAG=$(git tag --points-at "$SHA" | grep -E "$TAG_PATTERN" | head -1 || true)
             if [ -z "$TAG" ]; then
-              echo "No release tag on this commit — skipping publish."
-            else
-              echo "Will publish $TAG"
+              echo "No release tag on $SHA, nothing to publish."
+              exit 0
             fi
           fi
+
+          if ! git merge-base --is-ancestor "$SHA" origin/master; then
+            echo "::error::$TAG points at $SHA, which is not on master"
+            exit 1
+          fi
+
+          VERSION=${TAG#"$TAG_PREFIX"}
+          VERSION=${VERSION#v}
+          COMMITTED=$(git show "$SHA:$VERSION_FILE" | sed -n 's/^__version__ = "\([^"]*\)".*/\1/p')
+          if [ "$COMMITTED" != "$VERSION" ]; then
+            echo "::error::$TAG is version $VERSION, but $VERSION_FILE at $SHA says '$COMMITTED'"
+            exit 1
+          fi
+
+          echo "Will publish $TAG ($SHA)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # Release Please and CI start from the same push, and Release Please is
+      # done minutes earlier: without this wait a release is uploaded before CI
+      # has said anything about the commit being released. A version on PyPI
+      # cannot be replaced. If CI failed, fix or re-run it, then re-run this.
+      - name: Wait for CI on the released commit
+        if: steps.release.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          runs="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=master"
+          RUN=
+          for _ in 1 2 3 4 5 6; do
+            RUN=$(gh api "$runs" --jq '.workflow_runs[0].id // empty' || true)
+            [ -n "$RUN" ] && break
+            sleep 20
+          done
+          if [ -z "$RUN" ]; then
+            echo "::error::No CI run for $SHA on master"
+            exit 1
+          fi
+          echo "Waiting for $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN"
+          until [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN" --jq .status)" = completed ]; do
+            sleep 20
+          done
+          CONCLUSION=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN" --jq .conclusion)
+          if [ "$CONCLUSION" != success ]; then
+            echo "::error::CI on $SHA ended '$CONCLUSION'"
+            exit 1
+          fi
+          echo "CI passed on $SHA"
 
   # The image first, on each architecture natively: built, made to say the
   # version it is about to be tagged with, scanned, and pushed by digest --
@@ -71,15 +155,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.check.outputs.tag }}
+          ref: ${{ needs.check.outputs.sha }}
 
       # The library, the CLI and the image carry the same number, always. It
       # comes off the tag here so the label, the tags and `--version` inside the
-      # container cannot disagree.
+      # container cannot disagree; `check` has already matched the tag against
+      # __version__.py. Either tag convention, as `check` accepts both.
       - name: Resolve version
         id: version
         run: |
-          VERSION="${TAG#pg-partsmith-v}"
+          VERSION="${TAG#pg-partsmith-}"
+          VERSION="${VERSION#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "minor=${VERSION%.*}" >> "$GITHUB_OUTPUT"
         env:
@@ -154,17 +240,26 @@ jobs:
       contents: read
       id-token: write   # Trusted Publisher (PyPI OIDC)
     steps:
+      # The commit check resolved, not the tag: a tag moved since then changes nothing.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.check.outputs.tag }}
+          ref: ${{ needs.check.outputs.sha }}
 
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv build
-      # --check-url: a run repeated after a failure further down skips what is
-      # already on the index instead of failing on it, and carries on to the tags.
+      # PEP 740 provenance. uv publish uploads attestations but does not make
+      # them: this signs each distribution with the job's OIDC identity
+      # (Sigstore) into <file>.publish.attestation, and PyPI rejects an upload
+      # whose attestation does not match the Trusted Publisher.
+      - run: uvx --from 'pypi-attestations>=0.0.30' pypi-attestations sign dist/*.whl dist/*.tar.gz
+      # No file arguments: uv's default, dist/*, takes in the .attestation files
+      # too; naming the distributions would upload them without their
+      # attestations. --check-url: a run repeated after a failure further down
+      # skips what is already on the index instead of failing on it, and
+      # carries on to the tags.
       - run: uv publish --check-url https://pypi.org/simple/pg-partsmith/
 
   # One index over both architectures' images, under the exact tag, the minor
@@ -235,7 +330,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.check.outputs.tag }}
+          ref: ${{ needs.check.outputs.sha }}
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
