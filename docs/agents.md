@@ -78,7 +78,7 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   by `validate`. No sandbox is claimed. Hooks never fire during `plan`. See
   `guide/hooks-in-config.md`.
 * The same CLI ships as `ghcr.io/bedrock-python/pg-partsmith:<version>` with the command
-  as its entrypoint: distroless, Python 3.14, no shell, no pip, UID 65532, signed, with an
+  as its entrypoint: distroless, Python 3.15, no shell, no pip, UID 65532, signed, with an
   SBOM and provenance; tags are the exact version, a moving minor and `latest` for the newest release. See
   `guide/container.md` for the image and `guide/running.md` for every harness: plain
   Docker, Compose (`docker compose run`, `service_completed_successfully`, a cron

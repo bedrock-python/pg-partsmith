@@ -16,7 +16,7 @@
 # Dependabot reads FROM lines, and a rebuild on a base-image fix is what it is for.
 FROM ghcr.io/astral-sh/uv:0.13.1 AS uv
 
-FROM python:3.14-slim-bookworm AS builder
+FROM python:3.15-slim-bookworm AS builder
 
 # binutils for strip; nothing else is installed into the image being built.
 RUN apt-get update -qq \
