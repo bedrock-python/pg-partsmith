@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.9.0...pg-partsmith-v1.10.0) (2026-10-17)
+
+
+### Features
+
+* Python 3.15 is supported, and the image runs on it ([#121](https://github.com/bedrock-python/pg-partsmith/issues/121)) ([59695e1](https://github.com/bedrock-python/pg-partsmith/commit/59695e133a565966d5232e68e93c31d904144220))
+
 ## [1.9.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.8.3...pg-partsmith-v1.9.0) (2026-10-16)
 
 
