@@ -1,0 +1,5 @@
+# libssl3 3.0.20-1~deb12u2 comes from gcr.io/distroless/cc-debian12:nonroot, which has not
+# been rebuilt with Debian's fix (3.0.22-1~deb12u2) yet. Nothing in this image can patch it:
+# distroless has no package manager. Remove this line once the base image ships the fix;
+# the expiry makes the scan fail again on its own if it is forgotten.
+CVE-2026-84782 exp:2026-11-10
