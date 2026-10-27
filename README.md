@@ -32,6 +32,32 @@ Three ways in, one version number:
 > docs page is also served as raw Markdown at its own URL, and a **Copy page** button at
 > the top of each one hands it straight to a chat window.
 
+## When to use it, and when not
+
+pg-partsmith is for native PostgreSQL partitioning whose lifecycle (create ahead, expire,
+detach, drop) should run from your own code or deploy: a Python service, a CronJob, a CI
+step. It runs in production at its maintainer's company.
+
+Something else is probably the better fit when:
+
+- **pg_partman already works for you.** It is mature, lives in the database and serves any
+  client language. pg-partsmith is worth it when you can't install an extension, want
+  maintenance outside the database, or want to read a plan before any DDL runs.
+  [Migrating from pg_partman](https://bedrock-python.github.io/pg-partsmith/guide/migration/)
+  maps its settings one to one.
+- **You want time-series features, not partitions.** TimescaleDB hypertables come with
+  compression and continuous aggregates. pg-partsmith manages plain declarative partitions
+  and nothing else.
+- **You are on Django and only need time-based range partitions.**
+  [django-postgres-extra](https://github.com/SectorLabs/django-postgres-extra)'s
+  partitioning manager already fits Django migrations. pg-partsmith starts paying off with
+  other shapes (UUIDv7 or integer keys, hash or list under a period) or when you want a plan
+  before apply.
+- **The table is small, or nothing in it ever expires.** Partitioning has costs of its own:
+  more work for the planner, and the partition key in every unique constraint. A plain table
+  with an index and a batched `DELETE` may be all you need.
+- **Your PostgreSQL is older than 15.** It is not supported.
+
 ## Features
 
 - **Any topology** — `RANGE(time)`, `RANGE(id)`, root `HASH`, root `LIST`, a sliding

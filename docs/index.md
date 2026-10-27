@@ -68,6 +68,27 @@ result = await service.apply(config, plan)   # takes the table's lock, runs the 
   scheduler, PostgreSQL advisory or Redis locks, hooks for archiving, Pydantic
   configuration that round-trips through JSON and environment variables.
 
+It runs in production at its maintainer's company.
+
+## When something else fits better
+
+- **pg_partman already works for you.** It is mature, lives in the database and serves any
+  client language. pg-partsmith is worth it when you can't install an extension, want
+  maintenance outside the database, or want to read a plan before any DDL runs.
+  [Migrating from pg_partman](guide/migration.md) maps its settings one to one.
+- **You want time-series features, not partitions.** TimescaleDB hypertables come with
+  compression and continuous aggregates. pg-partsmith manages plain declarative partitions
+  and nothing else.
+- **You are on Django and only need time-based range partitions.**
+  [django-postgres-extra](https://github.com/SectorLabs/django-postgres-extra)'s
+  partitioning manager already fits Django migrations. pg-partsmith starts paying off with
+  other shapes (UUIDv7 or integer keys, hash or list under a period) or when you want a plan
+  before apply.
+- **The table is small, or nothing in it ever expires.** Partitioning has costs of its own:
+  more work for the planner, and the partition key in every unique constraint. A plain table
+  with an index and a batched `DELETE` may be all you need.
+- **Your PostgreSQL is older than 15.** It is not supported.
+
 ## Where to start
 
 <div class="grid cards" markdown>
