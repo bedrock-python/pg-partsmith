@@ -161,7 +161,7 @@ jobs:
       - name: A PostgreSQL server of the runner's own
         if: matrix.server
         id: postgres
-        uses: ikalnytskyi/action-setup-postgres@v8
+        uses: ikalnytskyi/action-setup-postgres@v9
         with:
           postgres-version: ${{ matrix.server }}
           username: partsmith
