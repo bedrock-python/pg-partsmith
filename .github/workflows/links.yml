@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # docs/changelog.md is made by the docs build and ignored by git, but
+      # pages link to it.
+      - run: cp CHANGELOG.md docs/changelog.md
       - uses: lycheeverse/lychee-action@v2
         with:
           args: >-
