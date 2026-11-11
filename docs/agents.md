@@ -212,8 +212,9 @@ TablePartitionConfig(
 ```
 
 `LifecyclePolicy()` with no arguments is `CreateAhead(6)`, `KeepNewest(12)`,
-`DetachMode.AUTO`, `DropAfter(grace=timedelta(0))` — **it detaches and drops in the same
-run.** Pass `drop=DropNever()` if detached tables should be kept.
+`DetachMode.AUTO`, `DropAfter(grace=timedelta(days=7))`: **an expired partition stays
+detached for a week, then is dropped** (rule 8). `DropAfter()` with no grace drops in the
+same run as the detach; pass `drop=DropNever()` if detached tables should be kept.
 
 ### Levels
 
