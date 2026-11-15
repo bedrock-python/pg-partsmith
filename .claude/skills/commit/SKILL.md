@@ -5,6 +5,8 @@ disable-model-invocation: true
 argument-hint: "[what to commit, or a hint for the message]"
 ---
 
+If the repository has `.agents/skills/implement/` (the `workflow` pack), follow `.agents/skills/commit/SKILL.md` with the request "$ARGUMENTS" instead of the steps below.
+
 Commit $ARGUMENTS. With nothing named, commit what is staged; if nothing is staged, ask what to include.
 
 1. Read the commit conventions in `.agents/project.md`. If it names none, use Conventional Commits: `type(scope): summary` in the imperative, at most 72 characters, and a body that says why.
