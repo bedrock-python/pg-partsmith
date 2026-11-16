@@ -7,8 +7,9 @@ Instructions for AI coding agents working in this repository. People may find th
 1. Read `.agents/project.md`, the project profile. It has the commands to install, format, lint, test and run the project, the issue tracker, the branch and commit conventions, and the language of pull requests. Where it differs from this file, the profile wins: it is this repository's own.
 
    The profile may still be the hub's blank skeleton, or leave a fact out. Then find the fact in the repository: the commands in the build and dependency files (`Makefile`, `pyproject.toml`, `package.json`, `go.mod` and the like), the CI workflows, `CONTRIBUTING.md` and the README; the default branch and the commit style in git (`git symbolic-ref refs/remotes/origin/HEAD`, `git log`). Tell the user which facts you found and where, never invent a command you did not find, and offer to write them into the profile in a pull request of its own.
-2. Read the code you are about to change and the code that calls it. Do not guess what a function does from its name.
-3. If the task is unclear, or turns out bigger than it looked, stop and ask. Say what you understood and what you plan to do.
+2. If the repository has `CONTRIBUTING.md`, read it and follow it: the team's rules for code, git and pull requests, which go beyond "How to work" below.
+3. Read the code you are about to change and the code that calls it. Do not guess what a function does from its name.
+4. If the task is unclear, or turns out bigger than it looked, stop and ask. Say what you understood and what you plan to do.
 
 ## How to work
 
@@ -37,8 +38,18 @@ Instructions for AI coding agents working in this repository. People may find th
 
 This file and some others come from your organisation's engineering-assets hub, which updates them through pull requests. Keep facts about this project in `.agents/project.md`, which belongs to this repository. If a shared file does not suit this repository, change it here: it then becomes this repository's own and the hub stops updating it. To stop receiving a file altogether, list it under `ignore` in the opt-in file (`.engineering-assets.yml`).
 
+## Repository knowledge
+
+If the repository has `.agents/knowledge/`, it holds what agents learned here and would otherwise ask again: which services, resources and teams are for what, how to reach the environments, the team's decisions, work in progress, silent traps. Start from its `INDEX.md` and from your own gitignored `local.md`, whose path `python .agents/knowledge/index.py --local` prints (`python3` where `python` is not on the path); read, verify and record entries as its `README.md` says.
+
+## Workflows
+
+If the repository has `.agents/skills/implement/` (the `workflow` pack), the skills in `.agents/skills/` are the workflows: a task in the code follows `implement` (from understanding it to the report), and `new-branch`, `commit`, `pr` and `spec` run when the user asks for them.
+
 ## Prompts
 
 - Reviewing a change: follow `.agents/prompts/review.md`.
 - Before refactoring: answer `.agents/prompts/refactor-check.md`.
 - Checking that a change keeps behaviour, such as a refactoring: follow `.agents/prompts/pure-refactor.md`.
+
+If the repository has `.agents/review/`, a review and a check that a change keeps behaviour follow `.agents/review/README.md` instead: an AI review by directions that the author runs before a pull request. Run it yourself once the last change of a task is committed (where you do not commit on your own, ask the user to commit first), settle its findings with the user, and only then call the task done or open the pull request.

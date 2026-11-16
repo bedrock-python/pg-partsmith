@@ -5,6 +5,8 @@ disable-model-invocation: true
 argument-hint: "<issue or short description>"
 ---
 
+If the repository has `.agents/skills/implement/` (the `workflow` pack), follow `.agents/skills/new-branch/SKILL.md` with the request "$ARGUMENTS" instead of the steps below.
+
 Create a branch for: $ARGUMENTS
 
 1. Read the branch convention and the default branch in `.agents/project.md`. If it names no convention, use `<type>/<issue>-<short-description>` in lowercase with hyphens, such as `fix/123-empty-email`.

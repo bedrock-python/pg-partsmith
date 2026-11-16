@@ -1,0 +1,4 @@
+# local/ stays on this machine: AI review records (local/reviews/), experiments,
+# one-off scripts, notes. Only this file is committed.
+*
+!.gitignore

@@ -5,6 +5,8 @@ disable-model-invocation: true
 argument-hint: "<feature, change or issue>"
 ---
 
+If the repository has `.agents/skills/implement/` (the `workflow` pack), follow `.agents/skills/spec/SKILL.md` with the request "$ARGUMENTS" instead of the steps below.
+
 Write a spec for: $ARGUMENTS
 
 1. Read `.agents/project.md` and the code the change will touch. Ask the user for what the repository cannot tell you: goals, constraints, deadlines.
