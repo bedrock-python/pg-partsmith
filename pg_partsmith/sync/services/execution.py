@@ -157,7 +157,7 @@ class PlanExecutor:
                         continue
                     if self.drop_single_partition(config, op) is not None:
                         tally.dropped += 1
-                else:
+                else:  # pragma: no cover - _step_of has refused an unknown operation already
                     assert_never(op)
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -888,7 +888,7 @@ def _step_of(op: Operation) -> MaintenanceIssueStep:
         return MaintenanceIssueStep.TRUNCATE
     if isinstance(op, DropPartition):
         return MaintenanceIssueStep.DROP
-    assert_never(op)
+    assert_never(op)  # pragma: no cover - the plan's discriminated union admits no other kind
 
 
 def _attached_info(config: TablePartitionConfig, op: DetachPartition | TruncatePartition) -> PartitionInfo:

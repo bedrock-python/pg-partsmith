@@ -255,7 +255,7 @@ class PartitionRemover:
     async def _ensure_truncate_reaches_nothing_else(self, conn: AsyncConnection, partition_name: str) -> None:
         """Refuse a subtree holding a foreign table, and a partition a foreign key reaches."""
         value = (await conn.execute(text(RELATION_OID_SQL), {"name": to_regclass_argument(partition_name)})).scalar()
-        if value is None:
+        if value is None:  # pragma: no cover - the relation was locked one statement ago
             raise PartitionNotFoundError(partition_name)
         oid = int(value)
 
