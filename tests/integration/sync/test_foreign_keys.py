@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pg_partsmith.entities import MaintenanceIssueStep
+from pg_partsmith.boundaries import TimeBoundaries
+from pg_partsmith.entities import MaintenanceIssueStep, PartitionGranularity, TablePartitionConfig
 from pg_partsmith.lifecycle import (
     AllOf,
     CreateAhead,
@@ -25,10 +26,12 @@ from pg_partsmith.lifecycle import (
     Unreferenced,
 )
 from pg_partsmith.plan import FindingReason
+from pg_partsmith.scheme import HashPartitioning, RangePartitioning
 from pg_partsmith.topology import FactKind
 from pg_partsmith.utils import parse_orphan_comment
-from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
+from tests.integration.nested_support import MONTHLY_TABLE_DDL, TIMESTAMP_TABLE_DDL, monthly_config
 from tests.integration.sync.support import (
+    count_ddl,
     exec_sql,
     is_attached,
     make_service,
@@ -44,8 +47,6 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
-    from pg_partsmith.entities import TablePartitionConfig
-
 pytestmark = pytest.mark.integration
 
 NOW = "2026-08-26"
@@ -54,6 +55,12 @@ NOW = "2026-08-26"
 @pytest.fixture
 def events(sync_db_engine: Engine) -> Generator[str, None]:
     yield from make_table(sync_db_engine, MONTHLY_TABLE_DDL, prefix="fk")
+
+
+@pytest.fixture
+def hashed(sync_db_engine: Engine) -> Generator[str, None]:
+    """A monthly RANGE root whose windows are HASH branches by tenant."""
+    yield from make_table(sync_db_engine, TIMESTAMP_TABLE_DDL, prefix="fkh")
 
 
 @pytest.fixture
@@ -182,7 +189,7 @@ def test__without_unreferenced__refused_detach_is_an_issue_and_the_run_goes_on(
     assert scalar(sync_db_engine, f'SELECT count(*) FROM "{refs}"') == 1  # noqa: S608
 
 
-def test__expire_truncate__parent_referenced_by_a_foreign_key__a_warning_and_the_rows_stay(
+def test__expire_truncate__parent_referencing_tables_a_foreign_key__a_warning_and_the_rows_stay(
     sync_db_engine: Engine, events: str, refs: str
 ) -> None:
     # Arrange -- June is referenced, July is not; PostgreSQL refuses TRUNCATE of either,
@@ -258,6 +265,105 @@ def test__expire_truncate__self_referencing_key_on_the_parent__blocks_every_part
     assert [f.partition_name for f in blocked] == [f"public.{events}__2026_06", f"public.{events}__2026_07"]
     assert f"(public.{events})" in blocked[0].detail
     assert scalar(sync_db_engine, f'SELECT count(*) FROM "{events}"') == 2  # noqa: S608
+
+
+def _emptying_hashed(table: str) -> TablePartitionConfig:
+    return TablePartitionConfig(
+        table_name=table,
+        scheme=RangePartitioning(
+            key="created_at",
+            boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH),
+            child=HashPartitioning(key="tenant_id", modulus=2),
+        ),
+        lifecycle=LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(1), expire=ExpireAction.TRUNCATE),
+    )
+
+
+def _fill_hashed_june(engine: Engine, table: str) -> None:
+    """June as a branch of two buckets, with rows in both."""
+    run_maintenance(engine, _emptying_hashed(table), at_time="2026-06-15")
+    exec_sql(
+        engine,
+        f"INSERT INTO \"{table}\" (tenant_id, created_at) SELECT g, '2026-06-10' FROM generate_series(1, 20) g",  # noqa: S608
+    )
+
+
+def test__expire_truncate__key_pointing_at_one_bucket__blocks_the_whole_branch(
+    sync_db_engine: Engine, hashed: str
+) -> None:
+    # Arrange -- the key reaches one leaf below the expired June branch, and TRUNCATE of the branch reaches it too
+    _fill_hashed_june(sync_db_engine, hashed)
+    leaf_refs = f"{hashed}_leaf_refs"
+    exec_sql(
+        sync_db_engine,
+        f'CREATE TABLE "{leaf_refs}" (event_id BIGINT, tenant_id BIGINT, created_at TIMESTAMPTZ, '
+        f"FOREIGN KEY (event_id, tenant_id, created_at) "
+        f'REFERENCES "{hashed}__2026_06__h0" (id, tenant_id, created_at))',
+    )
+    try:
+        # Act
+        result = run_maintenance(sync_db_engine, _emptying_hashed(hashed), at_time=NOW)
+    finally:
+        exec_sql(sync_db_engine, f'DROP TABLE "{leaf_refs}"')
+
+    # Assert
+    assert result.success
+    plan = result.maintenance_plan
+    assert plan is not None
+    assert plan.truncates == ()
+    blocked = [f for f in plan.findings if f.reason is FindingReason.TRUNCATE_BLOCKED]
+    assert [f.partition_name for f in blocked] == [f"public.{hashed}__2026_06"]
+    assert f"(public.{leaf_refs})" in blocked[0].detail
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{hashed}"') == 20  # noqa: S608
+
+
+def test__expire_truncate__expired_branch__emptied_whole_then_left_alone(sync_db_engine: Engine, hashed: str) -> None:
+    # Arrange
+    _fill_hashed_june(sync_db_engine, hashed)
+    config = _emptying_hashed(hashed)
+    june = f"{hashed}__2026_06"
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{june}__h0"') > 0  # noqa: S608
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{june}__h1"') > 0  # noqa: S608
+
+    # Act
+    result = run_maintenance(sync_db_engine, config, at_time=NOW)
+    with count_ddl(sync_db_engine) as counter:
+        again = run_maintenance(sync_db_engine, config, at_time=NOW)
+
+    # Assert -- one statement for the branch, every bucket empty and still in place; then nothing to do
+    assert result.truncated_count == 1
+    assert is_attached(sync_db_engine, june)
+    assert is_attached(sync_db_engine, f"{june}__h0")
+    assert is_attached(sync_db_engine, f"{june}__h1")
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{june}"') == 0  # noqa: S608
+    assert counter.statements == []
+    assert again.maintenance_plan is not None
+    assert [(f.reason, f.partition_name) for f in again.maintenance_plan.findings] == [
+        (FindingReason.EXPIRED_EMPTY, f"public.{hashed}")
+    ]
+
+
+def test__expire_truncate__a_partition_referencing_itself__is_still_emptied(
+    sync_db_engine: Engine, events: str
+) -> None:
+    # Arrange -- a key from June to June: the truncate empties both sides of it, so PostgreSQL allows it
+    _june_and_july(sync_db_engine, events)
+    june = f"{events}__2026_06"
+    exec_sql(sync_db_engine, f'ALTER TABLE "{events}" ADD COLUMN parent_id BIGINT, ADD COLUMN parent_at TIMESTAMPTZ')
+    exec_sql(
+        sync_db_engine,
+        f'ALTER TABLE "{june}" ADD FOREIGN KEY (parent_id, parent_at) REFERENCES "{june}" (id, created_at)',
+    )
+
+    # Act
+    result = run_maintenance(sync_db_engine, _emptying_in_place(events), at_time=NOW)
+
+    # Assert
+    assert result.issues == ()
+    assert result.maintenance_plan is not None
+    assert [op.target for op in result.maintenance_plan.truncates] == [f"public.{june}", f"public.{events}__2026_07"]
+    assert result.truncated_count == 2
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{events}"') == 0  # noqa: S608
 
 
 def test__expire_truncate__key_added_after_the_plan__an_issue_and_the_run_goes_on(

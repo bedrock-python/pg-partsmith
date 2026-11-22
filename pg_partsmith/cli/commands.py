@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from pg_partsmith.aio import PartitionToolkit, PartitionValidationService
 from pg_partsmith.constants import DEFAULT_MOVE_BATCH_ROWS
 from pg_partsmith.exceptions import InvalidPartitionConfigError
-from pg_partsmith.plan import MaintenancePlan, OperationKind
+from pg_partsmith.plan import MaintenancePlan
 
 from .exit_codes import ExitCode
 from .loader import ConfigError
@@ -178,7 +178,7 @@ async def run_apply(
         if plans is not None:
             plan = _plan_for(config, plans)
             if not allow_destructive:
-                plan = plan.without(OperationKind.DETACH, OperationKind.TRUNCATE, OperationKind.DROP)
+                plan = plan.without(*{op.kind for op in plan.operations if op.is_destructive})
             result = await kit.service.apply(
                 config, plan, continue_on_error=continue_on_error, allow_config_drift=allow_config_drift
             )

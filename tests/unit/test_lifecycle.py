@@ -847,7 +847,7 @@ def test__lifecycle_policy__expire_truncate__asks_whether_a_partition_is_empty_a
     policy = LifecyclePolicy(retention=KeepFor(timedelta(days=365)), expire=ExpireAction.TRUNCATE)
 
     # Act / Assert
-    assert policy.required_facts == frozenset({FactKind.EMPTY, FactKind.REFERENCED_BY})
+    assert policy.required_facts == frozenset({FactKind.EMPTY, FactKind.REFERENCING_TABLES})
     assert policy.needs_facts is True
 
 
@@ -856,7 +856,7 @@ def test__lifecycle_policy__expire_truncate__keeps_the_facts_the_rules_ask_for()
     policy = LifecyclePolicy(retention=ExpireIf(when=SizeAbove(bytes=1)), expire=ExpireAction.TRUNCATE)
 
     # Act / Assert
-    assert policy.required_facts == frozenset({FactKind.SIZE, FactKind.EMPTY, FactKind.REFERENCED_BY})
+    assert policy.required_facts == frozenset({FactKind.SIZE, FactKind.EMPTY, FactKind.REFERENCING_TABLES})
 
 
 def test__lifecycle_policy__expire__spelled_as_a_document_writes_it() -> None:

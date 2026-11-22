@@ -22,7 +22,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 from pg_partsmith.boundaries import Window
 from pg_partsmith.constants import (
@@ -109,10 +109,12 @@ class PlanExecutor:
         A topology conflict discovered while executing -- a DEFAULT sibling
         holding rows, a name held by a relation with other bounds, a detach
         PostgreSQL refuses because rows of another table still reference the
-        partition -- is recorded as an issue and never aborts the run: one odd
-        partition must not stop every other one from being maintained. Any
-        other failure aborts the run unless ``continue_on_error`` is set, in
-        which case it is recorded and the next operation runs.
+        partition, a truncate the repository refuses because a foreign key or a
+        foreign table reached the partition after the plan was made -- is
+        recorded as an issue and never aborts the run: one odd partition must
+        not stop every other one from being maintained. Any other failure
+        aborts the run unless ``continue_on_error`` is set, in which case it is
+        recorded and the next operation runs.
 
         Args:
             config: The configuration the plan was made from.
@@ -145,7 +147,7 @@ class PlanExecutor:
                     detached.add(op.target)
                     tally.detached += 1
                 elif isinstance(op, TruncatePartition):
-                    await self.truncate_single_partition(config, op)
+                    await self._truncate(config, op)
                     tally.truncated += 1
                 elif isinstance(op, DropPartition):
                     if op.follows_detach and op.target not in detached:
@@ -156,6 +158,8 @@ class PlanExecutor:
                         continue
                     if await self.drop_single_partition(config, op) is not None:
                         tally.dropped += 1
+                else:
+                    assert_never(op)
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except PartitionTopologyError as exc:
@@ -745,30 +749,19 @@ class PlanExecutor:
             PlanStaleError: If the relation is no longer the one the plan saw,
                 or is no longer attached.
         """
-        await self._require_same_relation(op.target, op.oid)
-        if not await self._metadata.is_partition_attached(op.parent_name, op.target):
-            raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
-
+        await self._require_still_attached(op)
         info = _attached_info(config, op)
         await self._fire(HookPhase.BEFORE_DETACH, config, info, op)
         await self._repo.detach_partition(op.parent_name, op.target, mode=op.mode, expected_oid=op.oid)
         await self._fire(HookPhase.AFTER_DETACH, config, info.model_copy(update={"is_attached": False}), op)
 
-    async def truncate_single_partition(self, config: TablePartitionConfig, op: TruncatePartition) -> None:
+    async def _truncate(self, config: TablePartitionConfig, op: TruncatePartition) -> None:
         """Empty one expired partition in place, running the truncate hooks around it.
 
-        Extension point for callers that manage partitions one at a time.
         Identity is checked here, before the hooks run, and again by the
         repository under the truncate's own lock, as for a detach.
-
-        Raises:
-            PlanStaleError: If the relation is no longer the one the plan saw,
-                or is no longer attached.
         """
-        await self._require_same_relation(op.target, op.oid)
-        if not await self._metadata.is_partition_attached(op.parent_name, op.target):
-            raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
-
+        await self._require_still_attached(op)
         info = _attached_info(config, op)
         await self._fire(HookPhase.BEFORE_TRUNCATE, config, info, op)
         await self._repo.truncate_partition(op.parent_name, op.target, expected_oid=op.oid)
@@ -799,6 +792,17 @@ class PlanExecutor:
             return None
         await self._fire(HookPhase.AFTER_DROP, config, info, op)
         return drained
+
+    async def _require_still_attached(self, op: DetachPartition | TruncatePartition) -> None:
+        """Refuse to detach or empty a relation the plan did not see, or one no longer attached.
+
+        Raises:
+            PlanStaleError: If the relation is no longer the one the plan saw,
+                or is no longer attached to the parent the plan named.
+        """
+        await self._require_same_relation(op.target, op.oid)
+        if not await self._metadata.is_partition_attached(op.parent_name, op.target):
+            raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
 
     async def _require_same_relation(self, name: str, expected_oid: int | None) -> None:
         """Refuse to act on a relation the plan did not see."""
@@ -893,7 +897,9 @@ def _step_of(op: Operation) -> MaintenanceIssueStep:
         return MaintenanceIssueStep.DETACH
     if isinstance(op, TruncatePartition):
         return MaintenanceIssueStep.TRUNCATE
-    return MaintenanceIssueStep.DROP
+    if isinstance(op, DropPartition):
+        return MaintenanceIssueStep.DROP
+    assert_never(op)
 
 
 def _attached_info(config: TablePartitionConfig, op: DetachPartition | TruncatePartition) -> PartitionInfo:

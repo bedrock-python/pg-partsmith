@@ -330,7 +330,7 @@ class OperationBase(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def is_destructive(self) -> bool:
-        """True for operations that remove a partition from service."""
+        """True for operations that take a partition out of service or destroy its rows."""
         return False
 
     def describe(self) -> str:

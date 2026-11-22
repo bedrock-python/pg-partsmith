@@ -199,7 +199,7 @@ class FactKind(StrEnum):
         EMPTY: Whether no leaf of the relation's subtree has a heap page, which
             is what ``TRUNCATE`` leaves behind. Read from the catalog, never by
             scanning the table.
-        REFERENCED_BY: Which other tables reference the relation, or anything
+        REFERENCING_TABLES: Which other tables reference the relation, or anything
             above or below it in the tree, through a foreign key. PostgreSQL
             refuses ``TRUNCATE`` of such a relation whether or not a row is
             actually referenced.
@@ -209,7 +209,7 @@ class FactKind(StrEnum):
     ROWS = "rows"
     REFERENCES = "references"
     EMPTY = "empty"
-    REFERENCED_BY = "referenced_by"
+    REFERENCING_TABLES = "referencing_tables"
 
 
 class PartitionFacts(BaseModel):
@@ -228,7 +228,7 @@ class PartitionFacts(BaseModel):
         empty: Whether no leaf of the subtree has a heap page: emptied by
             ``TRUNCATE``, vacuumed down to nothing, or never written to. None
             when not measured.
-        referenced_by: Schema-qualified names of the other tables whose foreign
+        referencing_tables: Schema-qualified names of the other tables whose foreign
             keys reach the relation, empty when there are none. None when not
             measured.
         predicates: Result of each :class:`~pg_partsmith.lifecycle.SqlPredicate`
@@ -241,7 +241,7 @@ class PartitionFacts(BaseModel):
     row_estimate: NonNegativeInt | None = None
     referenced: bool | None = None
     empty: bool | None = None
-    referenced_by: tuple[str, ...] | None = None
+    referencing_tables: tuple[str, ...] | None = None
     predicates: dict[str, bool] = Field(default_factory=dict)
 
 

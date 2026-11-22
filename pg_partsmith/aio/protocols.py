@@ -202,12 +202,17 @@ class PartitionRepository(Protocol):
             partition_name: Partition table name.
             expected_oid: The catalog identity the caller decided on, checked
                 under the truncate's own lock. When the relation now holding
-                the name has another, or is no longer attached to
-                ``parent_name``, nothing is emptied.
+                the name has another, nothing is emptied; nor is it when the
+                relation is not attached to ``parent_name``, whatever this is.
 
         Raises:
             PartitionNotFoundError: If partition doesn't exist.
-            PlanStaleError: If the relation is not the one ``expected_oid`` named.
+            PlanStaleError: If the relation is not the one ``expected_oid`` named,
+                or is not attached to ``parent_name``.
+            PartitionTopologyError: If its subtree holds a foreign table, or a
+                foreign key of another table reaches it (``truncate_blocked``);
+                nothing is emptied. The executor records this as an issue and
+                the run goes on, where any other error aborts it.
         """
         ...
 

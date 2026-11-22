@@ -246,6 +246,21 @@ REFERENCING_TABLES_SQL = """
     GROUP BY root.oid
 """
 
+# The foreign tables in a relation's subtree, the relation itself included.
+#
+# ``pg_partition_tree`` lists every member whatever its name, where the tree the
+# planner reads leaves out a child whose name has a dot in it. ``TRUNCATE`` of a
+# partitioned table reaches its foreign partitions too, and a foreign data
+# wrapper that supports it empties the remote table.
+FOREIGN_TABLES_IN_SUBTREE_SQL = """
+    SELECT quote_ident(ns.nspname) || '.' || quote_ident(c.relname) AS name
+    FROM pg_partition_tree(CAST(:oid AS oid)) pt
+    JOIN pg_class c ON c.oid = pt.relid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    WHERE c.relkind = 'f'
+    ORDER BY 1
+"""
+
 # A relation's live column names, in its own physical order.
 #
 # Two partitions of the same table always share column *names*, but not

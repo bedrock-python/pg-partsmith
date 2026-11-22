@@ -821,7 +821,9 @@ class LifecyclePolicy(BaseModel):
         tables reference it, since ``TRUNCATE`` refuses a referenced table.
         """
         truncating = (
-            frozenset({FactKind.EMPTY, FactKind.REFERENCED_BY}) if self.expire is ExpireAction.TRUNCATE else frozenset()
+            frozenset({FactKind.EMPTY, FactKind.REFERENCING_TABLES})
+            if self.expire is ExpireAction.TRUNCATE
+            else frozenset()
         )
         return self.creation.required_facts | self.retention.required_facts | self.drop.required_facts | truncating
 

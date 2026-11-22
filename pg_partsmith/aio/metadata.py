@@ -387,7 +387,7 @@ class PostgresMetadataProvider:
                         heaps[int(row.oid)] = int(row.heap_bytes or 0)
 
         referencing: dict[int, tuple[str, ...]] = {}
-        if FactKind.REFERENCED_BY in facts:
+        if FactKind.REFERENCING_TABLES in facts:
             async with self._engine.connect() as conn:
                 result = await conn.execute(text(REFERENCING_TABLES_SQL), {"oids": list(oids.values())})
                 for row in result.fetchall():
@@ -419,7 +419,7 @@ class PostgresMetadataProvider:
                 row_estimate=rows if FactKind.ROWS in facts else None,
                 referenced=referenced_here,
                 empty=heaps.get(oid, 0) == 0 if FactKind.EMPTY in facts else None,
-                referenced_by=referencing.get(oid, ()) if FactKind.REFERENCED_BY in facts else None,
+                referencing_tables=referencing.get(oid, ()) if FactKind.REFERENCING_TABLES in facts else None,
                 predicates=answers,
             )
         return measured

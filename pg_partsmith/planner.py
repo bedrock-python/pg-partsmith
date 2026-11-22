@@ -724,32 +724,46 @@ class _Planner:
     ) -> None:
         """Plan emptying an expired member in place, or say why it is not.
 
+        The subtree is looked at before emptiness: a foreign table has no heap
+        pages of its own, so a branch whose only rows are remote reads as empty.
+
         Facts that were not measured -- a tree handed in without them -- plan
-        the truncate: it is harmless on an empty table, and PostgreSQL refuses
-        it outright on a referenced one, so guessing wrong loses nothing.
+        the truncate: it is harmless on an empty table, and the repository
+        refuses a referenced one under its lock, so guessing wrong loses nothing.
         """
         assert member.window is not None  # managed members always carry one
+        subtree = member.node.walk()
+        foreign = [n.name for n in subtree if n.is_foreign]
+        if foreign:
+            self._record(
+                member.node.name,
+                FindingReason.TRUNCATE_BLOCKED,
+                f"{member.node.name} expired, but its subtree holds a foreign table ({', '.join(foreign)}), and "
+                "TRUNCATE would empty the remote table behind it; it is left as it is.",
+            )
+            return
+        if any(n.has_unaddressable_children for n in subtree):
+            # The tree leaves such a child out, so what it is cannot be read off it.
+            self._record(
+                member.node.name,
+                FindingReason.TRUNCATE_BLOCKED,
+                f"{member.node.name} expired, but its subtree has a child whose name cannot be addressed by "
+                "qualified-name DDL, so whether TRUNCATE would reach a foreign table cannot be told; it is left "
+                "as it is.",
+            )
+            return
+
         facts = candidate.facts
         if facts.empty:
             kept_empty.append(member)
             return
 
-        foreign = [n.name for n in member.node.walk() if n.is_foreign]
-        if foreign:
-            self._record(
-                member.node.name,
-                FindingReason.TRUNCATE_BLOCKED,
-                f"{member.node.name} expired and holds rows, but its subtree holds a foreign table "
-                f"({', '.join(foreign)}), and TRUNCATE would empty the remote table behind it; it is left as it is.",
-            )
-            return
-
-        if facts.referenced_by:
+        if facts.referencing_tables:
             self._record(
                 member.node.name,
                 FindingReason.TRUNCATE_BLOCKED,
                 f"{member.node.name} expired and holds rows, but another table references it through a foreign "
-                f"key ({', '.join(facts.referenced_by)}), and PostgreSQL refuses TRUNCATE of a referenced table "
+                f"key ({', '.join(facts.referencing_tables)}), and PostgreSQL refuses TRUNCATE of a referenced table "
                 "without CASCADE, which this library never issues; drop the foreign key, or expire by detaching "
                 "with Unreferenced().",
             )

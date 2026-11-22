@@ -1499,8 +1499,8 @@ def test__plan_maintenance__plan__records_the_cursors_it_was_made_against() -> N
 
 # ── Emptying expired partitions in place ────────────────────────────────────────
 
-HOLDS_ROWS = PartitionFacts(empty=False, referenced_by=())
-EMPTIED = PartitionFacts(empty=True, referenced_by=())
+HOLDS_ROWS = PartitionFacts(empty=False, referencing_tables=())
+EMPTIED = PartitionFacts(empty=True, referencing_tables=())
 
 
 def _truncating(retention: Any = None, **overrides: Any) -> TablePartitionConfig:
@@ -1633,10 +1633,10 @@ def test__plan_maintenance__expire_truncate__everything_emptied__the_next_plan_i
     assert "keeps 1 expired partition attached" in plan.findings[0].detail
 
 
-def test__plan_maintenance__expire_truncate__referenced_by_a_foreign_key__a_warning_and_nothing_planned() -> None:
+def test__plan_maintenance__expire_truncate__referencing_tables_a_foreign_key__a_warning_and_nothing_planned() -> None:
     # Arrange: a key on the parent is cloned onto every partition, so TRUNCATE is refused rows or no rows
     config = _truncating(KeepNewest(count=1))
-    referenced = PartitionFacts(empty=False, referenced_by=("public.audit", "public.refunds"))
+    referenced = PartitionFacts(empty=False, referencing_tables=("public.audit", "public.refunds"))
     root = _root(_month(2026, 7, oid=7, facts=referenced), _month(2026, 8, oid=8, facts=referenced))
 
     # Act
@@ -1656,7 +1656,7 @@ def test__plan_maintenance__expire_truncate__referenced_but_already_empty__nothi
     # Arrange
     config = _truncating(KeepNewest(count=1))
     root = _root(
-        _month(2026, 7, oid=7, facts=PartitionFacts(empty=True, referenced_by=("public.audit",))),
+        _month(2026, 7, oid=7, facts=PartitionFacts(empty=True, referencing_tables=("public.audit",))),
         _month(2026, 8, oid=8),
     )
 
@@ -1668,27 +1668,38 @@ def test__plan_maintenance__expire_truncate__referenced_but_already_empty__nothi
     assert _reasons(plan) == [FindingReason.EXPIRED_EMPTY]
 
 
-def test__plan_maintenance__expire_truncate__foreign_table_in_the_subtree__a_warning_and_nothing_planned() -> None:
-    # Arrange: an expired branch with a foreign bucket someone attached -- TRUNCATE would empty the remote table
-    config = _config(
-        _range_level(_hash_level(modulus=2)),
-        lifecycle=_policy(retention=KeepNewest(count=1), expire=ExpireAction.TRUNCATE),
-    )
+def _expired_july_branch(*buckets: PartitionNode, facts: PartitionFacts, **overrides: Any) -> PartitionNode:
+    """July 2026 as a HASH branch with the given buckets."""
     from_value, to_value = MONTHS.literals(_window(2026, 7))
-    july = f"{ROOT}__2026_07"
-    branch = PartitionNode(
-        name=july,
+    return PartitionNode(
+        name=f"{ROOT}__2026_07",
         oid=7,
         parent_name=ROOT,
         level=1,
         bounds=RangeBounds(from_value=from_value, to_value=to_value),
         partition_type=PartitionType.HASH,
         partition_columns=("tenant_id",),
-        children=(
-            _bucket(july, 2, 0, level=2),
-            _bucket(july, 2, 1, level=2, relkind=RelationKind.FOREIGN),
-        ),
-        facts=HOLDS_ROWS,
+        children=buckets,
+        facts=facts,
+        **overrides,
+    )
+
+
+JULY = f"{ROOT}__2026_07"
+
+
+@pytest.mark.parametrize("facts", [HOLDS_ROWS, EMPTIED], ids=["local-rows", "local-leaves-empty"])
+def test__plan_maintenance__expire_truncate__foreign_table_in_the_subtree__a_warning_and_nothing_planned(
+    facts: PartitionFacts,
+) -> None:
+    # Arrange: a foreign bucket someone attached -- TRUNCATE would empty the remote table. It has no heap
+    # pages of its own, so with empty local leaves the branch reads as empty; it must not count as emptied.
+    config = _config(
+        _range_level(_hash_level(modulus=2)),
+        lifecycle=_policy(retention=KeepNewest(count=1), expire=ExpireAction.TRUNCATE),
+    )
+    branch = _expired_july_branch(
+        _bucket(JULY, 2, 0, level=2), _bucket(JULY, 2, 1, level=2, relkind=RelationKind.FOREIGN), facts=facts
     )
     root = _root(branch, _branch((2, 0), (2, 1)))
 
@@ -1698,7 +1709,26 @@ def test__plan_maintenance__expire_truncate__foreign_table_in_the_subtree__a_war
     # Assert
     assert plan.is_noop
     assert _reasons(plan) == [FindingReason.TRUNCATE_BLOCKED]
-    assert f"its subtree holds a foreign table ({july}__h1)" in plan.findings[0].detail
+    assert plan.findings[0].severity is Severity.WARNING
+    assert f"its subtree holds a foreign table ({JULY}__h1)" in plan.findings[0].detail
+
+
+def test__plan_maintenance__expire_truncate__a_child_the_tree_cannot_show__a_warning_and_nothing_planned() -> None:
+    # Arrange: a bucket named with a dot is left out of the tree, so whether it is foreign cannot be read
+    config = _config(
+        _range_level(_hash_level(modulus=2)),
+        lifecycle=_policy(retention=KeepNewest(count=1), expire=ExpireAction.TRUNCATE),
+    )
+    branch = _expired_july_branch(_bucket(JULY, 2, 0, level=2), facts=EMPTIED, has_unaddressable_children=True)
+    root = _root(branch, _branch((2, 0), (2, 1)))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert plan.is_noop
+    assert _reasons(plan) == [FindingReason.TRUNCATE_BLOCKED]
+    assert "cannot be addressed by qualified-name DDL" in plan.findings[0].detail
 
 
 def test__plan_maintenance__expire_truncate__expired_branch__emptied_as_one_unit_and_left_unrepaired() -> None:
@@ -1727,6 +1757,24 @@ def test__plan_maintenance__expire_truncate__expired_branch__emptied_as_one_unit
 
     # Assert
     assert [(op.kind, op.target) for op in plan.operations] == [(OperationKind.TRUNCATE, july)]
+
+
+def test__plan_maintenance__expire_truncate__the_measured_size__travels_with_the_truncate() -> None:
+    # Arrange: what the plan and the hooks report about the rows that are about to go
+    config = _truncating(ExpireIf(when=SizeAbove(bytes=100)))
+    root = _root(
+        _month(
+            2026, 7, oid=7, facts=PartitionFacts(size_bytes=4096, row_estimate=12, empty=False, referencing_tables=())
+        ),
+        _month(2026, 8, oid=8),
+    )
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    (truncate,) = plan.truncates
+    assert (truncate.size_bytes, truncate.row_estimate) == (4096, 12)
 
 
 def test__plan_maintenance__expire_truncate__facts_not_measured__the_truncate_is_planned() -> None:

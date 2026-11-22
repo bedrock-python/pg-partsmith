@@ -1423,7 +1423,7 @@ def test__measure__empty_requested__read_from_the_heap_bytes_of_the_same_facts_q
     assert measured.orphans[0].facts == PartitionFacts(empty=False)
 
 
-def test__measure__referenced_by_requested__one_query_naming_the_referencing_tables() -> None:
+def test__measure__referencing_tables_requested__one_query_naming_the_referencing_tables() -> None:
     # Arrange: two keys reach January; nothing reaches the orphan
     engine = _make_engine([SimpleNamespace(oid=101, referencing=["public.refunds", "public.audit"])])
     provider = PostgresMetadataProvider(engine)
@@ -1432,12 +1432,12 @@ def test__measure__referenced_by_requested__one_query_naming_the_referencing_tab
     measured = provider.measure(
         _sample_tree(),
         targets=("public.events__2024_01", "public.events__2023_12"),
-        facts=frozenset({FactKind.REFERENCED_BY}),
+        facts=frozenset({FactKind.REFERENCING_TABLES}),
     )
 
     # Assert
     assert _conn(engine).execute.call_count == 1
     assert "pg_partition_tree" in _statements(engine)[0]
     assert _conn(engine).execute.call_args.args[1] == {"oids": [101, 500]}
-    assert measured.root.children[0].facts == PartitionFacts(referenced_by=("public.audit", "public.refunds"))
-    assert measured.orphans[0].facts == PartitionFacts(referenced_by=())
+    assert measured.root.children[0].facts == PartitionFacts(referencing_tables=("public.audit", "public.refunds"))
+    assert measured.orphans[0].facts == PartitionFacts(referencing_tables=())
