@@ -227,6 +227,3 @@ def test__drop_partition__expected_oid_of_another_relation__refused_and_the_tabl
     # The right identity still drops it
     repo.drop_partition(name, expected_oid=real_oid)
     assert not metadata.partition_exists(name)
-
-
-# ── retry on lock contention ──────────────────────────────────────────────────────

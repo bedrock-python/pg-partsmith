@@ -279,12 +279,6 @@ def test__maintainer__run_maintenance_safe__never_raises_and_reports_the_error(
     assert result.created_count == 0
 
 
-# ── Two maintainers on the same table ────────────────────────────────────────────
-
-
-# ── An interrupted DETACH CONCURRENTLY ──────────────────────────────────────────
-
-
 # ── A hook must not be able to redirect a detach ────────────────────────────────
 
 
