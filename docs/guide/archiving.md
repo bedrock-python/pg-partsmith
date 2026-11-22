@@ -19,7 +19,7 @@ member of a root `HASH` or `LIST`:
 | `after_attach(event)` | after it is attached and taking rows again |
 | `before_detach(event)` | before detaching — the data is still reachable through the parent |
 | `after_detach(event)` | after a successful detach — the table exists, standalone |
-| `before_truncate(event)` | before an expired partition is emptied in place (`expire=truncate`), the last chance to read its rows |
+| `before_truncate(event)` | before an expired partition is emptied in place (`expire=truncate`); it is still attached and takes writes until the truncate locks it, so a row written after the hook read it is emptied unread |
 | `after_truncate(event)` | after it is emptied; it is still attached |
 | `before_drop(event)` | before the table is dropped — the last chance to read it |
 | `after_drop(event)` | after the table is gone |

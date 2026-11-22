@@ -66,12 +66,12 @@ finding, or a gap filled inside an existing branch), `attach`, `detach`, `trunca
 |---|---|---|
 | `InvalidPartitionConfigError` | `plan()` and everything over it | the configuration does not match the table, or PostgreSQL would refuse it |
 | `LockAcquisitionError` | `apply()`, `maintain()`, the movers | another maintainer holds the table's lock |
-| `PartitionTopologyError` | recorded as an issue | a topology conflict met while executing |
+| `PartitionTopologyError` | recorded as an issue | a topology conflict met while executing, such as a foreign key added after the plan to a partition it empties (`truncate_blocked`) |
 | `PartitionReferencedError` | recorded as an issue | a detach PostgreSQL refused because rows are still referenced |
 | `RowMoveRefusedError` | recorded as an issue | a row move an incoming foreign key's `ON DELETE` action would corrupt |
 | `PlanStaleError` | detach, truncate and drop | the relation is not the one the plan decided about |
 | `PartitionAlreadyExistsError` | `create_table_like` | the name is taken (handled by the executor as a race or a conflict) |
-| `PartitionNotFoundError` | detach, moves | the relation does not exist |
+| `PartitionNotFoundError` | detach, truncate, moves | the relation does not exist |
 | `PartitionAttachedError` | `drop_partition`, `adopt_partition` | the table is still attached |
 | `PartitionDetachInProgressError` | detach | another detach of the partition is pending |
 | `UnmanagedPartitionDropError` | `drop_partition` | the table carries no marker |

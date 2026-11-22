@@ -114,6 +114,13 @@ fact reads. The integration suite asserts the writer half on every run: a trunca
 behind a reader of the expired partition holds no lock on the parent, and inserts through
 the parent into the current month go through while it waits.
 
+Logical replication carries the `TRUNCATE` of a partition (measured on 17.11, 2026-11-22,
+publisher and subscriber in two containers): with `CREATE PUBLICATION p FOR TABLE ev` and its
+defaults (`pubtruncate = true`, `publish_via_partition_root = false`), `TRUNCATE ev_10` on
+the publisher emptied `ev_10` on the subscriber, 100 rows to 0. After
+`ALTER PUBLICATION p SET (publish = 'insert, update, delete')` the same statement left the
+subscriber's 100 rows in place. `DETACH` and `DROP` are DDL and never replicate.
+
 ## Foreign tables
 
 - `CREATE FOREIGN TABLE … PARTITION OF parent` and `ATTACH PARTITION` of a foreign table are

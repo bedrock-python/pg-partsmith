@@ -194,9 +194,19 @@ Emptiness is read from the catalog, never by scanning, so a second run issues no
 row written into the window later makes the partition non-empty, and the next run empties
 it again. PostgreSQL refuses `TRUNCATE` of a partition any foreign key reaches, whether or
 not a row is actually referenced, so one foreign key on the parent blocks every partition:
-expire such a table by detaching, with `Unreferenced()` in the retention rule. `TRUNCATE` of
-a foreign table empties the remote table behind it, so `ForeignLeaves` with
-`expire=TRUNCATE` is refused when the configuration is built.
+expire such a table by detaching, with `Unreferenced()` in the retention rule. A key added
+after the plan was made is found under the truncate's own lock and recorded as an issue, and
+the run goes on. `TRUNCATE` of a foreign table empties the remote table behind it, so
+`ForeignLeaves` with `expire=TRUNCATE` is refused when the configuration is built.
+
+Logical replication carries a `TRUNCATE`, where it never carries a `DETACH` or a `DROP`. A
+publication publishes truncates unless told otherwise, so a subscriber of the table, an
+archive that keeps more history say, loses the emptied partition's rows too. If it has to
+keep them, leave `truncate` out of that publication:
+
+```sql
+ALTER PUBLICATION archive SET (publish = 'insert, update, delete');
+```
 
 An emptied partition is never taken out of the tree, and the `expired_empty` finding is how
 you see the set grow. To retire them, switch `expire` back to `detach`: retention still says
@@ -205,7 +215,10 @@ they expired, so the next run detaches them and the drop rule takes over. `detac
 detaching policy left in their grace period.
 
 `before_truncate` and `after_truncate` fire around the statement, and `on_event` sees both
-(see [Archive before dropping](../guide/archiving.md#the-hooks)). `apply` without
+(see [Archive before dropping](../guide/archiving.md#the-hooks)). The partition still takes
+writes while `before_truncate` runs, so a row written into the expired window after the
+hook read it is emptied unread; an export that must see every row stops those writes, or
+the table expires by detaching. `apply` without
 `--allow-destructive` withholds truncates like detaches and drops, and
 `maintain(skip_detach=True)` leaves them out.
 

@@ -10,17 +10,19 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.catalog_queries import SET_LOCK_TIMEOUT_SQL
+from pg_partsmith.catalog_queries import REFERENCING_TABLES_SQL, RELATION_OID_SQL, SET_LOCK_TIMEOUT_SQL
 from pg_partsmith.exceptions import (
     DropRetryExhaustedError,
     PartitionAttachedError,
     PartitionDetachInProgressError,
     PartitionNotFoundError,
     PartitionReferencedError,
+    PartitionTopologyError,
     PlanStaleError,
     UnmanagedPartitionDropError,
 )
 from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.plan import FindingReason
 from pg_partsmith.utils import (
     build_ddl_statement,
     coerce_str,
@@ -206,6 +208,11 @@ class PartitionRemover:
         rather than queue every later query on it behind the wait; the identity
         and attachment checks then see the relation the statement empties.
 
+        PostgreSQL refuses ``TRUNCATE`` of a partition any foreign key reaches,
+        whether or not a row is referenced. The planner keeps such partitions
+        out of the plan; a key added since the plan was made is found here,
+        under the lock, which adding a key would have to wait for.
+
         Args:
             table_name: The parent it is attached to.
             partition_name: The partition to empty.
@@ -216,6 +223,8 @@ class PartitionRemover:
             PlanStaleError: If the relation holding the name is not the one
                 ``expected_oid`` identifies, or is not attached to
                 ``table_name`` any more.
+            PartitionTopologyError: If another table references the partition
+                through a foreign key; nothing is emptied.
         """
         with self._engine.begin() as conn:
             apply_local_statement_timeout(conn, self._ddl_timeout)
@@ -225,11 +234,27 @@ class PartitionRemover:
                     build_ddl_statement("LOCK TABLE {partition} IN ACCESS EXCLUSIVE MODE", partition=partition_name)
                 )
                 self._ensure_still_the_partition(conn, table_name, partition_name, expected_oid)
+                referencing = self._referencing_tables(conn, partition_name)
+                if referencing:
+                    detail = (
+                        f"{partition_name} was not emptied: another table references it through a foreign key "
+                        f"({', '.join(referencing)}), and PostgreSQL refuses TRUNCATE of a referenced table without "
+                        "CASCADE, which this library never issues."
+                    )
+                    raise PartitionTopologyError(partition_name, FindingReason.TRUNCATE_BLOCKED.value, detail)
                 conn.execute(build_ddl_statement("TRUNCATE TABLE {partition}", partition=partition_name))
             except (SQLAlchemyError, OSError, TimeoutError) as exc:
                 if pg_sqlstate(exc) == "42P01":
                     raise PartitionNotFoundError(partition_name) from exc
                 raise
+
+    def _referencing_tables(self, conn: Connection, partition_name: str) -> tuple[str, ...]:
+        """The other tables whose foreign keys reach the partition, as ``FactKind.REFERENCED_BY`` reads them."""
+        oid = (conn.execute(text(RELATION_OID_SQL), {"name": to_regclass_argument(partition_name)})).scalar()
+        if oid is None:
+            return ()
+        result = conn.execute(text(REFERENCING_TABLES_SQL), {"oids": [int(oid)]})
+        return tuple(sorted(str(name) for row in result.fetchall() for name in row.referencing or ()))
 
     def adopt(self, table_name: str, partition_name: str) -> bool:
         """Stamp the orphan marker on a detached table this library did not detach.

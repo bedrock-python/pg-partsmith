@@ -81,14 +81,26 @@ def _keep_unreferenced(table: str, *, keep: int = 1) -> TablePartitionConfig:
     )
 
 
-async def _seed(engine: AsyncEngine, events: str, refs: str) -> None:
-    """June and July partitions with one row each; June's row is referenced."""
+async def _june_and_july(engine: AsyncEngine, events: str) -> None:
+    """June and July partitions with one row each."""
     config = monthly_config(events, create_ahead=1)
     await run_maintenance(engine, config, at_time="2026-06-15")
     await run_maintenance(engine, config, at_time="2026-07-15")
     await exec_sql(engine, f"INSERT INTO \"{events}\" (id, created_at, payload) VALUES (1, '2026-06-10', 'june')")  # noqa: S608
     await exec_sql(engine, f"INSERT INTO \"{events}\" (id, created_at, payload) VALUES (2, '2026-07-10', 'july')")  # noqa: S608
+
+
+async def _seed(engine: AsyncEngine, events: str, refs: str) -> None:
+    """June and July partitions with one row each; June's row is referenced."""
+    await _june_and_july(engine, events)
     await exec_sql(engine, f"INSERT INTO \"{refs}\" VALUES (1, '2026-06-10')")  # noqa: S608
+
+
+def _emptying_in_place(table: str) -> TablePartitionConfig:
+    return monthly_config(
+        table,
+        lifecycle=LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(1), expire=ExpireAction.TRUNCATE),
+    )
 
 
 async def test__unreferenced__referenced_partition_is_kept_and_the_other_expires(
@@ -178,10 +190,7 @@ async def test__expire_truncate__parent_referenced_by_a_foreign_key__a_warning_a
     # Arrange -- June is referenced, July is not; PostgreSQL refuses TRUNCATE of either,
     # because the key on the parent is cloned onto every partition
     await _seed(db_engine, events, refs)
-    config = monthly_config(
-        events,
-        lifecycle=LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(1), expire=ExpireAction.TRUNCATE),
-    )
+    config = _emptying_in_place(events)
 
     # Act
     result = await run_maintenance(db_engine, config, at_time=NOW)
@@ -198,6 +207,90 @@ async def test__expire_truncate__parent_referenced_by_a_foreign_key__a_warning_a
     assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.RECONCILE] * 2
     assert await scalar(db_engine, f'SELECT count(*) FROM "{events}"') == 2  # noqa: S608
     assert await is_attached(db_engine, f"{events}__2026_06")
+
+
+async def test__expire_truncate__key_pointing_at_one_partition__blocks_that_partition_only(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange -- a key on June itself, none on the parent
+    await _june_and_july(db_engine, events)
+    june_refs = f"{events}_june_refs"
+    await exec_sql(
+        db_engine,
+        f'CREATE TABLE "{june_refs}" (event_id BIGINT, created_at TIMESTAMPTZ, '
+        f'FOREIGN KEY (event_id, created_at) REFERENCES "{events}__2026_06" (id, created_at))',
+    )
+    try:
+        # Act
+        result = await run_maintenance(db_engine, _emptying_in_place(events), at_time=NOW)
+    finally:
+        await exec_sql(db_engine, f'DROP TABLE "{june_refs}"')
+
+    # Assert -- July is emptied, June keeps its row and says why
+    plan = result.maintenance_plan
+    assert plan is not None
+    assert [op.target for op in plan.truncates] == [f"public.{events}__2026_07"]
+    blocked = [f for f in plan.findings if f.reason is FindingReason.TRUNCATE_BLOCKED]
+    assert [f.partition_name for f in blocked] == [f"public.{events}__2026_06"]
+    assert f"(public.{june_refs})" in blocked[0].detail
+    assert result.truncated_count == 1
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{events}"') == 1  # noqa: S608
+
+
+async def test__expire_truncate__self_referencing_key_on_the_parent__blocks_every_partition(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange -- the referencing side is the parent itself, which the truncate of a partition does not empty
+    await _june_and_july(db_engine, events)
+    await exec_sql(
+        db_engine,
+        f'ALTER TABLE "{events}" ADD COLUMN parent_id BIGINT, ADD COLUMN parent_at TIMESTAMPTZ, '
+        f'ADD FOREIGN KEY (parent_id, parent_at) REFERENCES "{events}" (id, created_at)',
+    )
+
+    # Act
+    result = await run_maintenance(db_engine, _emptying_in_place(events), at_time=NOW)
+
+    # Assert
+    assert result.success
+    plan = result.maintenance_plan
+    assert plan is not None
+    assert plan.truncates == ()
+    blocked = [f for f in plan.findings if f.reason is FindingReason.TRUNCATE_BLOCKED]
+    assert [f.partition_name for f in blocked] == [f"public.{events}__2026_06", f"public.{events}__2026_07"]
+    assert f"(public.{events})" in blocked[0].detail
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{events}"') == 2  # noqa: S608
+
+
+async def test__expire_truncate__key_added_after_the_plan__an_issue_and_the_run_goes_on(
+    db_engine: AsyncEngine, events: str
+) -> None:
+    # Arrange -- planned with nothing referencing the table, then a key on the parent appears
+    await _june_and_july(db_engine, events)
+    config = _emptying_in_place(events)
+    service = make_service(db_engine)
+    plan = await service.plan(config, now=datetime.fromisoformat(NOW).replace(tzinfo=UTC))
+    assert len(plan.truncates) == 2
+    late_refs = f"{events}_late_refs"
+    await exec_sql(
+        db_engine,
+        f'CREATE TABLE "{late_refs}" (event_id BIGINT, created_at TIMESTAMPTZ, '
+        f'FOREIGN KEY (event_id, created_at) REFERENCES "{events}" (id, created_at))',
+    )
+    try:
+        # Act
+        result = await service.apply(config, plan)
+    finally:
+        await exec_sql(db_engine, f'DROP TABLE "{late_refs}"')
+
+    # Assert -- found under the truncate's lock, recorded, and nothing emptied
+    assert result.truncated_count == 0
+    assert [(issue.step, issue.partition_name) for issue in result.issues] == [
+        (MaintenanceIssueStep.TRUNCATE, f"public.{events}__2026_06"),
+        (MaintenanceIssueStep.TRUNCATE, f"public.{events}__2026_07"),
+    ]
+    assert f"(public.{late_refs})" in result.issues[0].error
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{events}"') == 2  # noqa: S608
 
 
 async def test__refused_detach__leaves_no_marker_and_the_later_detach_stamps_its_own_instant(

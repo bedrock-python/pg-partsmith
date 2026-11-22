@@ -18,6 +18,7 @@ from pg_partsmith.exceptions import (
     PartitionDetachInProgressError,
     PartitionNotFoundError,
     PartitionReferencedError,
+    PartitionTopologyError,
     PlanStaleError,
     RowMoveRefusedError,
     UnmanagedPartitionDropError,
@@ -40,6 +41,7 @@ class _Catalog:
 
     exists: object = True
     attached_to: object = None
+    referencing: list[str] = field(default_factory=list)
     comment: object = None
     oid: object = 4242
     fqn: str | None = "public.events"
@@ -117,6 +119,8 @@ def _answer(catalog: _Catalog, sql: str) -> MagicMock:
                 raise error  # type: ignore[misc]
     if "inhdetachpending" in sql:
         return _scalar(catalog.detach_pending)
+    if "array_agg(DISTINCT quote_ident" in sql:
+        return _rows([SimpleNamespace(oid=4242, referencing=list(catalog.referencing))] if catalog.referencing else [])
     if "confdeltype IN" in sql:
         return _rows(list(catalog.destructive_fks))
     if "attidentity IN" in sql:
@@ -1062,14 +1066,26 @@ def test__truncate_partition__table_missing__raises_partition_not_found() -> Non
     assert excinfo.value.partition_name == "events__2024_01"
 
 
-def test__truncate_partition__refused_by_the_server__propagates() -> None:
-    # Arrange -- a foreign key the plan did not know about: PostgreSQL's own refusal stands
-    refusal = _sqlstate_error("0A000", "cannot truncate a table referenced in a foreign key constraint")
-    engine, _ = _engine(_Catalog(failures={"TRUNCATE": refusal}))
+def test__truncate_partition__referenced_since_the_plan__a_topology_error_and_nothing_is_emptied() -> None:
+    # Arrange -- a foreign key added after the plan was made, found under the truncate's own lock
+    engine, conn = _engine(_Catalog(oid=4242, attached_to=True, referencing=["public.refunds"]))
     repo = PostgresPartitionRepository(engine)
 
     # Act / Assert
-    with pytest.raises(SQLAlchemyError, match="referenced in a foreign key"):
+    with pytest.raises(PartitionTopologyError) as excinfo:
+        repo.truncate_partition("events", "events__2024_01", expected_oid=4242)
+    assert excinfo.value.reason == "truncate_blocked"
+    assert "(public.refunds)" in excinfo.value.detail
+    assert not any(s.startswith("TRUNCATE") for s in _statements(conn))
+
+
+def test__truncate_partition__refused_by_the_server__propagates() -> None:
+    # Arrange
+    engine, _ = _engine(_Catalog(failures={"TRUNCATE": _sqlstate_error("42501", "permission denied")}))
+    repo = PostgresPartitionRepository(engine)
+
+    # Act / Assert
+    with pytest.raises(SQLAlchemyError, match="permission denied"):
         repo.truncate_partition("events", "events__2024_01")
 
 

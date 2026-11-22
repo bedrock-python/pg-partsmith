@@ -416,6 +416,9 @@ class PartitionLifecycleService:
     async def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Return the partitions a maintenance run would detach or drop, oldest first.
 
+        A partition the policy empties in place (``expire=truncate``) is neither,
+        and is not listed: :meth:`maintain` empties it.
+
         Returns:
             Attached partitions retention has expired, followed by detached
             orphans past their grace.

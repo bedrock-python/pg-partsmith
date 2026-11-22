@@ -1562,6 +1562,63 @@ def test__plan_maintenance__expire_truncate__already_empty__no_operation_and_one
     assert plan.findings[0].severity is Severity.INFO
 
 
+def test__plan_maintenance__expire_truncate__the_oldest_named__whatever_the_order_of_the_tree() -> None:
+    # Arrange: the catalog lists children by name, which is not always the order of their windows
+    config = _truncating(KeepNewest(count=1))
+    root = _root(
+        _month(2026, 6, oid=6, facts=EMPTIED),
+        _month(2025, 11, oid=11, facts=EMPTIED),
+        _month(2026, 8, oid=8, facts=HOLDS_ROWS),
+    )
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert "the oldest public.events__2025_11;" in plan.findings[0].detail
+
+
+def test__plan_maintenance__expire_truncate__a_nested_level__emptied_under_its_own_parent() -> None:
+    # Arrange: LIST groups over monthly windows; each group's windows expire on their own
+    config = _config(
+        _list_level(child=_range_level()),
+        table_name="regions",
+        lifecycle=_policy(retention=KeepNewest(count=1), expire=ExpireAction.TRUNCATE),
+    )
+    eu = PartitionNode(
+        name="public.regions__eu",
+        parent_name="public.regions",
+        bounds=ListBounds(values=("de", "fr")),
+        partition_type=PartitionType.RANGE,
+        partition_columns=("created_at",),
+        children=(
+            _month(2026, 6, parent="public.regions__eu", oid=6, facts=EMPTIED),
+            _month(2026, 7, parent="public.regions__eu", oid=7, facts=HOLDS_ROWS),
+            _month(2026, 8, parent="public.regions__eu", oid=8),
+        ),
+    )
+    us = PartitionNode(
+        name="public.regions__us",
+        parent_name="public.regions",
+        bounds=ListBounds(values=("us",)),
+        partition_type=PartitionType.RANGE,
+        partition_columns=("created_at",),
+        children=(_month(2026, 8, parent="public.regions__us", oid=18),),
+    )
+    root = _root(eu, us, name="public.regions", partition_type=PartitionType.LIST, columns=("region",))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert [(op.target, op.parent_name) for op in plan.truncates] == [
+        ("public.regions__eu__2026_07", "public.regions__eu")
+    ]
+    assert [(f.reason, f.partition_name) for f in plan.findings] == [
+        (FindingReason.EXPIRED_EMPTY, "public.regions__eu")
+    ]
+
+
 def test__plan_maintenance__expire_truncate__everything_emptied__the_next_plan_is_a_noop() -> None:
     # Arrange
     config = _truncating(KeepNewest(count=1))

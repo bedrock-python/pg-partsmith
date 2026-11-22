@@ -303,8 +303,12 @@ def test__expire_truncate__waiting_for_a_reader_of_the_partition__writers_to_the
         )
 
         # Act: a live writer goes through the parent into August while the truncate waits
-        with _Writer(sync_db_engine, table, month=8) as writer:
-            time.sleep(0.5)
+        insert = text(f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2026-08-20', 'live')")  # noqa: S608
+        with sync_db_engine.connect() as writer:
+            writer.execute(text("SET lock_timeout = '1s'"))
+            for _ in range(10):
+                writer.execute(insert)
+            writer.commit()
         still_waiting = not applying.done()
         reader.rollback()
         result = applying.result(timeout=60)
@@ -314,4 +318,4 @@ def test__expire_truncate__waiting_for_a_reader_of_the_partition__writers_to_the
     assert still_waiting
     assert result.truncated_count == 1
     assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{june}"')) == 0  # noqa: S608
-    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{august}"')) == writer.written  # noqa: S608
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{august}"')) == 10  # noqa: S608
