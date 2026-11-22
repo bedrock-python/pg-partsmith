@@ -189,7 +189,7 @@ def test__without_unreferenced__refused_detach_is_an_issue_and_the_run_goes_on(
     assert scalar(sync_db_engine, f'SELECT count(*) FROM "{refs}"') == 1  # noqa: S608
 
 
-def test__expire_truncate__parent_referencing_tables_a_foreign_key__a_warning_and_the_rows_stay(
+def test__expire_truncate__parent_referenced_by_a_foreign_key__a_warning_and_the_rows_stay(
     sync_db_engine: Engine, events: str, refs: str
 ) -> None:
     # Arrange -- June is referenced, July is not; PostgreSQL refuses TRUNCATE of either,

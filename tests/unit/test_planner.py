@@ -1633,7 +1633,7 @@ def test__plan_maintenance__expire_truncate__everything_emptied__the_next_plan_i
     assert "keeps 1 expired partition attached" in plan.findings[0].detail
 
 
-def test__plan_maintenance__expire_truncate__referencing_tables_a_foreign_key__a_warning_and_nothing_planned() -> None:
+def test__plan_maintenance__expire_truncate__referenced_by_a_foreign_key__a_warning_and_nothing_planned() -> None:
     # Arrange: a key on the parent is cloned onto every partition, so TRUNCATE is refused rows or no rows
     config = _truncating(KeepNewest(count=1))
     referenced = PartitionFacts(empty=False, referencing_tables=("public.audit", "public.refunds"))
