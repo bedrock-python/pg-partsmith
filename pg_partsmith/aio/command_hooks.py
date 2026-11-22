@@ -52,7 +52,7 @@ class CommandHooks(BasePartitionLifecycleHooks):
     """Runs one configured command per phase, with the event as JSON on stdin.
 
     Overrides :meth:`on_event` alone rather than one method per phase: the
-    phase is in the event, and a dispatch table reads better than eight
+    phase is in the event, and a dispatch table reads better than ten
     delegating methods that would each have to be added to again. The
     per-phase methods come from the no-op base, which the executor calls after
     this one.

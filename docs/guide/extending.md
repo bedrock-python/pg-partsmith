@@ -25,7 +25,8 @@ class AuditedRepository(PostgresPartitionRepository):
 
 Tuning knobs on the constructor: `ddl_timezone` (the session timezone `ATTACH` runs
 under, `"UTC"` by default), `ddl_timeout_seconds`, `ddl_lock_timeout_ms` (how long an
-attach, a row move or a blocking detach waits for a lock, while writers queue behind it),
+attach, a row move, a blocking detach or a truncate waits for a lock, while what needs that
+lock queues behind it),
 `marker_prefix`, the drop retry
 settings (`drop_lock_timeout_ms`, `drop_max_retries`, `drop_retry_delay`,
 `drop_max_backoff`), and `drop_allow_unmanaged` (leave it off).
@@ -100,7 +101,7 @@ tables named under the root and attached to nothing, and `current_time`, the
 database's clock a plan is made against when the caller names no instant.
 
 `measure` answers the facts it is asked for. A policy with `expire=ExpireAction.TRUNCATE`
-asks for `FactKind.EMPTY` and `FactKind.REFERENCED_BY`; a provider that leaves them
+asks for `FactKind.EMPTY` and `FactKind.REFERENCING_TABLES`; a provider that leaves them
 unanswered gets every expired partition truncated on every run, empty or not, and a
 referenced one refused by the repository at execution time instead of reported in the plan.
 

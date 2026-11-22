@@ -128,10 +128,11 @@ repository).
 
 ## Waiting for a lock
 
-An attach, a row move and a blocking detach each run under `lock_timeout`
+An attach, a row move, a blocking detach and a truncate each run under `lock_timeout`
 (`ddl_lock_timeout_ms` on the repository, 3000 by default). A statement waiting for a lock
 keeps its place in PostgreSQL's queue, and every session that asks for a conflicting lock
-after it waits behind it; for the locks these steps take, that is every writer of the table.
+after it waits behind it; for the locks the first three take, that is every writer of the
+table, and for a truncate every query that has to lock the partition it empties.
 The move-and-attach holds `EXCLUSIVE` on the parent while it waits for the DEFAULT
 partition, so a reader holding the table for a minute would otherwise stop writes for that
 minute.

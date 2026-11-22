@@ -33,7 +33,7 @@ issues too, with the exception's name in front of the message.
 | `unattached_rows` | WARNING | A table under a window's partition name holds rows but was never attached — a fill that stopped before its attach — so no query through the root sees them. | Run `backfill` (`partition_data`); it attaches the table. |
 | `rows_in_default` | WARNING | The root's DEFAULT partition holds rows of a window behind the cursor that has no partition: history not yet moved, or a row written with a key no partition covers. No maintenance run reaches them, retention included. | Run `backfill` (`partition_data`). |
 | `expired_empty` | INFO | Expired partitions a policy empties in place (`expire=truncate`) that are already empty and stay attached. One finding per parent, with the count and the oldest. | Nothing. Switch `expire` to `detach` to retire them. |
-| `truncate_blocked` | WARNING | An expired partition holding rows that cannot be emptied in place: another table references it through a foreign key, which `TRUNCATE` refuses without `CASCADE` whether or not a row is referenced, or its subtree holds a foreign table, whose `TRUNCATE` would empty the remote table. | Drop the foreign key, or expire by detaching with `Unreferenced()`. |
+| `truncate_blocked` | WARNING | An expired partition that cannot be emptied in place: it holds rows and another table references it through a foreign key, which `TRUNCATE` refuses without `CASCADE` whether or not a row is referenced; or its subtree holds a foreign table, whose `TRUNCATE` would empty the remote table, or a child whose name the tree cannot show. | Drop the foreign key, or expire by detaching with `Unreferenced()`; take the foreign table out, or detach. |
 
 ## Operation reasons
 

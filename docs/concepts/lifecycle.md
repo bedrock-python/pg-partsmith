@@ -106,7 +106,7 @@ progression levels and their detached orphans — in one query for sizes and row
 `EXISTS` per incoming foreign key for references, one query per `SqlPredicate` and
 candidate. The numbers appear on the plan (`size_bytes`, `row_estimate`). A policy that
 empties partitions in place also asks whether each one is empty already (`FactKind.EMPTY`,
-in the same query as sizes) and which tables reference it (`FactKind.REFERENCED_BY`, one
+in the same query as sizes) and which tables reference it (`FactKind.REFERENCING_TABLES`, one
 catalog query).
 
 A policy decides *eligibility*; it never executes DDL. Ownership, safety and locking stay
@@ -173,31 +173,44 @@ In a document it is `expire: truncate` beside `retention` in the table's `lifecy
 
 Choose it when the set of partitions should not change: the table keeps a partition for
 every window it ever had, and whatever reads the tree sees the same one before and after a
-run. It is also lighter on the parent. `TRUNCATE` takes `ACCESS EXCLUSIVE` on the
-partition and the relations below it and nothing on the parent, so inserts and pruned
-reads that go to other partitions do not wait for it. A blocking detach, the only kind
+run. `TRUNCATE` takes `ACCESS EXCLUSIVE` on the partition and the relations below it and
+nothing on the parent, so inserts into other partitions, and reads pruned at plan time
+(constant bounds on the key), do not wait for it. A blocking detach, the only kind
 PostgreSQL allows once the parent has a DEFAULT partition, holds `ACCESS EXCLUSIVE` on the
-parent and on the DEFAULT partition while it runs. Both were measured on PostgreSQL 15 to
-18 (see [PostgreSQL semantics](../design/postgresql-semantics.md)). A query that has to
-read the partition being emptied, an unpruned scan of the parent included, still waits for
-it, and the truncate waits at most `ddl_lock_timeout_ms` for its lock before it gives up
-until the next run.
+parent and on the DEFAULT partition while it runs, so against that the truncate is much
+lighter. Both were measured on PostgreSQL 15 to 18 (see
+[PostgreSQL semantics](../design/postgresql-semantics.md)).
+
+A read the planner cannot prune until it runs locks every partition of the parent first:
+`WHERE created_at >= now() - interval '1 day'`, a generic prepared plan, an unpruned scan.
+Such a read waits whenever the truncate holds its lock or is queued for it, and the truncate
+queues for as long as anything else reads the expired partition: a report, a `pg_dump`, a
+session idle in a transaction that scanned the parent. It gives up after
+`ddl_lock_timeout_ms` (3 s by default) and tries again on the next run, so that is how long
+such reads can stall on each run. Measured on 17 and 18 with a reader holding the expired
+partition, a `now()`-relative read of the current month took 2.7 s behind the queued
+truncate. A concurrent detach, which `DetachMode.AUTO` runs on a parent without a DEFAULT
+partition, takes only `SHARE UPDATE EXCLUSIVE` on the parent and the same read took 2 ms;
+an insert into the current month took under 2 ms either way. A table read mostly through
+such queries is better off detaching, or with a smaller `ddl_lock_timeout_ms`.
 
 | The expired partition | What the plan does |
 |---|---|
-| holds rows | `TruncatePartition` (kind `truncate`, reason `retention_expired`) |
+| has a foreign table in its subtree, or a child the tree cannot show (a name with a dot in it) | nothing; a `truncate_blocked` WARNING |
 | is empty already: no leaf has a heap page | nothing; one `expired_empty` INFO finding per parent counts them |
 | holds rows, and another table references it through a foreign key | nothing; a `truncate_blocked` WARNING names the referencing tables |
-| holds rows, and its subtree holds a foreign table | nothing; a `truncate_blocked` WARNING |
+| holds rows | `TruncatePartition` (kind `truncate`, reason `retention_expired`) |
 
 Emptiness is read from the catalog, never by scanning, so a second run issues no DDL. A
 row written into the window later makes the partition non-empty, and the next run empties
 it again. PostgreSQL refuses `TRUNCATE` of a partition any foreign key reaches, whether or
 not a row is actually referenced, so one foreign key on the parent blocks every partition:
-expire such a table by detaching, with `Unreferenced()` in the retention rule. A key added
-after the plan was made is found under the truncate's own lock and recorded as an issue, and
-the run goes on. `TRUNCATE` of a foreign table empties the remote table behind it, so
-`ForeignLeaves` with `expire=TRUNCATE` is refused when the configuration is built.
+expire such a table by detaching, with `Unreferenced()` in the retention rule. `TRUNCATE`
+of a partitioned table reaches its foreign partitions too, and empties the remote tables
+behind them, so a subtree holding one is never emptied, whether or not its local leaves
+hold rows; `ForeignLeaves` with `expire=TRUNCATE` is refused when the configuration is
+built. A foreign key or a foreign table that appears after the plan was made is found under
+the truncate's own lock and recorded as an issue, and the run goes on.
 
 Logical replication carries a `TRUNCATE`, where it never carries a `DETACH` or a `DROP`. A
 publication publishes truncates unless told otherwise, so a subscriber of the table, an
@@ -209,8 +222,15 @@ ALTER PUBLICATION archive SET (publish = 'insert, update, delete');
 ```
 
 An emptied partition is never taken out of the tree, and the `expired_empty` finding is how
-you see the set grow. To retire them, switch `expire` back to `detach`: retention still says
-they expired, so the next run detaches them and the drop rule takes over. `detach` and
+you see the set grow. It costs: a daily table that keeps a year has about 370 partitions
+under detach and about 2 000 after five and a half years under truncate. Measured on 17
+with a primary key and two indexes on each partition, a `now()`-relative count went from
+12 ms over 408 partitions to 45 to 55 ms over 2 000 (308 ms as the first query of a new
+connection), taking 8 005 relation locks instead of 1 637; a read with constant bounds stayed
+at 0.1 ms. Planning slows too: at 2 000 partitions the facts query takes about 250 ms and the
+referencing-tables query 150 to 280 ms. To retire them, switch `expire` back to `detach`:
+retention still says they expired, so the next run detaches them and the drop rule takes
+over. `detach` and
 `drop` keep governing the detached tables that already exist, such as the ones an earlier
 detaching policy left in their grace period.
 
@@ -218,9 +238,14 @@ detaching policy left in their grace period.
 (see [Archive before dropping](../guide/archiving.md#the-hooks)). The partition still takes
 writes while `before_truncate` runs, so a row written into the expired window after the
 hook read it is emptied unread; an export that must see every row stops those writes, or
-the table expires by detaching. `apply` without
-`--allow-destructive` withholds truncates like detaches and drops, and
-`maintain(skip_detach=True)` leaves them out.
+the table expires by detaching. `apply` without `--allow-destructive` withholds truncates
+like detaches and drops, and `maintain(skip_detach=True)` leaves them out.
+
+Emptying a partition needs the `TRUNCATE` privilege on it and on every leaf below it, which
+their owner has. `ALTER TABLE <parent> OWNER TO` does not reach partitions that already
+exist, so a role that owns the parent cannot empty the partitions another role created
+before it: grant it `TRUNCATE` on them, or make it their owner. See
+[Installation](../getting-started/installation.md).
 
 ## One policy, every progression level
 

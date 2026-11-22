@@ -506,5 +506,7 @@ one table needs a run of its own.
 
 See [the image page](container.md#what-this-container-can-do-to-your-database): a role
 of its own, `USAGE, CREATE` on the schema for creations, ownership of the parent for
-detaches and drops. A monitoring-only deployment (`plan`, `inspect`, `validate`) needs
+detaches and drops, and for a table that empties expired partitions in place the
+`TRUNCATE` privilege on its partitions, which owning the parent does not give on
+partitions another role created. A monitoring-only deployment (`plan`, `inspect`, `validate`) needs
 none of the write grants.

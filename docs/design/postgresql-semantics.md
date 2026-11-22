@@ -98,13 +98,22 @@ A monthly parent `ev` with `ev_10`, `ev_11`, `ev_12` and a DEFAULT partition, on
 held open in a transaction while a second session looks at `pg_locks` and a third writes
 with `lock_timeout = 1s`. All four versions agreed:
 
-| Held open | Locks it holds | Insert through `ev` into another partition | Pruned read of another partition |
+| Held open | Locks it holds | Insert through `ev` into another partition | Read of another partition, pruned at plan time |
 |---|---|---|---|
 | `TRUNCATE ev_10` | `ACCESS EXCLUSIVE` and `SHARE` on `ev_10`, `ACCESS EXCLUSIVE` on its indexes; nothing on `ev` | done in about 1 ms | done in about 1 ms |
 | `ALTER TABLE ev DETACH PARTITION ev_11` (blocking, forced by the DEFAULT) | `ACCESS EXCLUSIVE` on `ev`, `ev_11`, its indexes and `ev_default` | `55P03` after the 1 s timeout | `55P03` after the 1 s timeout |
 
 An insert routed into `ev_10` itself waits for the truncate, as any query that reads `ev_10`
-does. `TRUNCATE` of a sub-partitioned branch takes `ACCESS EXCLUSIVE` on the branch and on
+does. So does a read pruned only when it runs, since it locks every partition first: with
+the truncate held open, `WHERE ts >= now() - interval '1 day'` hit the 1 s `lock_timeout`
+too (measured on 17.11).
+
+The same holds while the truncate is only queued. Measured on 17.11 and 18.7, 2026-11-23: a
+session that has read the expired partition keeps its transaction open, the truncate
+queues for its lock under `lock_timeout = 3000ms`, and 0.3 s later a `now()`-relative read
+of the current month took 2.7 s, until the truncate gave up with `55P03`. An insert into the
+current month took 1.6 ms. With a concurrent detach queued behind the same reader instead,
+the same read took 2 ms and the insert 1.8 ms. `TRUNCATE` of a sub-partitioned branch takes `ACCESS EXCLUSIVE` on the branch and on
 every leaf below it, and still nothing on the root.
 
 After `TRUNCATE` the main fork of every leaf is 0 bytes (`pg_relation_size`), while each
@@ -194,7 +203,7 @@ referenced. Because the FK on the parent is cloned onto every partition with `co
 pointing at that partition, one FK on the parent blocks the truncate of every partition,
 empty ones included. A self-referencing FK on the parent blocks it too, since its
 referencing side is the parent, outside the truncation. An FK pointing directly at one
-partition blocks only that one. The `REFERENCED_BY` fact asks the same question of
+partition blocks only that one. The `REFERENCING_TABLES` fact asks the same question of
 `pg_constraint` (keys into the relation's subtree whose referencing side is outside it), and
 the planner turns a positive answer into a `truncate_blocked` finding instead of a statement
 that can only fail.
