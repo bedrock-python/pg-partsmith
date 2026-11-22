@@ -170,6 +170,7 @@ uv run ruff check --fix tests/integration/sync && uv run ruff format tests/integ
 A test that drives two coroutines at once cannot be mirrored mechanically: put a
 `# sync-mirror: skip` line right above it and write its thread-based twin in
 `tests/integration/sync/test_concurrency.py`, the one hand-written module of that suite.
+`tests/integration/aio/test_cli.py` has no sync twin: the CLI runs the aio service itself.
 `tests/unit/sync/` mirrors `tests/unit/` by hand — only the modules touching the aio package
 have a sync twin.
 

@@ -130,7 +130,7 @@ def _without_skipped(lines: list[str]) -> list[str]:
 
 
 def _without_empty_sections(lines: list[str]) -> list[str]:
-    """Drop a section heading, with the comment under it, when every test of its section was skipped."""
+    """Drop a section heading, and the comments under it, when no code is left in its section."""
     kept: list[str] = []
     i = 0
     while i < len(lines):
