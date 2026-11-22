@@ -154,6 +154,7 @@ writers and runs without one.
 | the move-and-attach ([DEFAULT reconciliation](#default-reconciliation), step 2) | `EXCLUSIVE` on the parent (one level above `ATTACH`'s own, so no writer is mid-routing), then `ATTACH`'s `ACCESS EXCLUSIVE` on the partition and the DEFAULT sibling — all taken before the move |
 | `DETACH PARTITION` (plain) | `ACCESS EXCLUSIVE` on parent, partition, and every table referencing the parent; the parent is locked first, as a query through it does, so a reader waits rather than deadlocks |
 | `DETACH PARTITION … CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` on the parent; `ACCESS EXCLUSIVE` on the partition and, in its second transaction, on referencing tables |
+| `TRUNCATE` of an expired partition (`expire=truncate`) | `ACCESS EXCLUSIVE` on the partition and every relation below it; nothing on the parent, so writers to the other partitions do not wait |
 | `DROP TABLE` of a detached table | `ACCESS EXCLUSIVE` on that table only |
 | `COMMENT ON` | `SHARE UPDATE EXCLUSIVE` on the table |
 | the catalog reads (tree, orphans, sizes, estimates) | no relation lock: the tree is walked over `pg_inherits`, not with `pg_partition_tree()`, which would take `ACCESS SHARE` on every member — and omit a partition whose `DETACH CONCURRENTLY` was interrupted |
@@ -189,11 +190,12 @@ one of a small number of states, each of which the next run converges:
 | creating a partition or its subtree | a detached, unmarked table, unreachable by writers | completes the subtree, attaches it |
 | a backfill, between the fill and the attach | a detached, unmarked table holding its window's rows, which DEFAULT no longer has | `plan` reports `unattached_rows`; `backfill` attaches it |
 | a detach | a marked table, attached or pending | finishes the detach (`FINALIZE` if pending), then proceeds |
+| a truncate | the partition with its rows, or empty: it is one transaction | empties it, or finds it empty |
 | a drop | either the table or nothing | drops it, or finds nothing to do |
 
 ## Hooks
 
-Eight hooks fire around create, attach, detach and drop, once per **lifecycle unit** — the partition
+Ten hooks fire around create, attach, detach, truncate and drop, once per **lifecycle unit** — the partition
 under the root, never per leaf of its subtree — and once per member of a root `HASH` or
 `LIST`. A `before_*` hook that raises aborts that operation (the partition comes back on
 the next run); an `after_*` hook that raises is logged and re-raised — the operation has

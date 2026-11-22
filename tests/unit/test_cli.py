@@ -51,6 +51,7 @@ from pg_partsmith.plan import (
     MaintenancePlan,
     Reason,
     Severity,
+    TruncatePartition,
 )
 from pg_partsmith.topology import RangeBounds
 
@@ -450,6 +451,9 @@ def _destructive_plan() -> MaintenancePlan:
                 bounds=RangeBounds(from_value="2026-09-01", to_value="2026-10-01"),
                 reason=Reason.CREATE_AHEAD,
             ),
+            TruncatePartition(
+                target="public.events__2025_09", parent_name="public.events", reason=Reason.RETENTION_EXPIRED, oid=8
+            ),
             DropPartition(target="public.events__2025_08", reason=Reason.GRACE_ELAPSED, oid=7),
         ),
     )
@@ -468,7 +472,7 @@ async def test__apply__by_default__withholds_every_destructive_operation() -> No
     assert "--allow-destructive" in result.render(output="human")
 
 
-async def test__apply__allow_destructive__carries_the_drop_out_too() -> None:
+async def test__apply__allow_destructive__carries_the_truncate_and_the_drop_out_too() -> None:
     # Arrange
     kit = _applying_kit()
 
@@ -477,7 +481,7 @@ async def test__apply__allow_destructive__carries_the_drop_out_too() -> None:
 
     # Assert
     applied = kit.service.apply.await_args.args[1]
-    assert [op.kind.value for op in applied.operations] == ["create", "drop"]
+    assert [op.kind.value for op in applied.operations] == ["create", "truncate", "drop"]
 
 
 async def test__apply__without_a_plan_file__plans_and_applies_under_one_lock() -> None:
@@ -682,8 +686,10 @@ def test__describe_locks__names_the_heaviest_lock_of_every_top_level_operation()
     assert lines[0] == "locks:"
     assert lines[1].startswith("  CREATE public.events__2026_09")
     assert "SHARE UPDATE EXCLUSIVE on the parent" in lines[2]
-    assert lines[3].startswith("  DROP public.events__2025_08")
-    assert "ACCESS EXCLUSIVE on the dropped table only" in lines[4]
+    assert lines[3] == "  TRUNCATE public.events__2025_09"
+    assert "nothing on the parent" in lines[4]
+    assert lines[5].startswith("  DROP public.events__2025_08")
+    assert "ACCESS EXCLUSIVE on the dropped table only" in lines[6]
 
 
 def test__describe_locks__an_operation_that_cannot_run_in_a_transaction__says_so() -> None:

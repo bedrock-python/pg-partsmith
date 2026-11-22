@@ -1,16 +1,17 @@
 # Lifecycle policies
 
 A scheme says *what* partitions exist; a `LifecyclePolicy` says *when* the partitions of
-a progression level are created, detached and dropped. It has four parts:
+a progression level are created, detached and dropped. It has five parts:
 
 ```python
 from datetime import timedelta
 
-from pg_partsmith import CreateAhead, DetachMode, DropAfter, KeepNewest, LifecyclePolicy
+from pg_partsmith import CreateAhead, DetachMode, DropAfter, ExpireAction, KeepNewest, LifecyclePolicy
 
 LifecyclePolicy(
     creation=CreateAhead(count=3),               # which windows must exist ahead of the cursor
     retention=KeepNewest(count=12),              # when a window behind the cursor has expired
+    expire=ExpireAction.DETACH,                  # detach an expired partition, or empty it in place
     detach=DetachMode.AUTO,                      # how an expired partition is detached
     drop=DropAfter(grace=timedelta(days=7)),     # what happens to it afterwards
 )
@@ -40,7 +41,8 @@ Ahead of the cursor, the **creation** rule decides which windows must exist. Beh
 the **retention** rule decides which have expired. The cursor's own window and everything
 ahead of it receive rows and are never expired, whatever the rule says. An expired
 partition is **detached** — it leaves the parent but keeps its data — and then, once the
-**drop** rule allows, dropped.
+**drop** rule allows, dropped. A policy can [empty it in place](#empty-in-place-instead-of-detaching)
+instead, and leave it attached.
 
 ## Creation
 
@@ -102,7 +104,10 @@ with `KeepNewest` never pays for `pg_total_relation_size`.
 Facts are gathered only for the partitions a policy can decide over — the members of
 progression levels and their detached orphans — in one query for sizes and rows, one
 `EXISTS` per incoming foreign key for references, one query per `SqlPredicate` and
-candidate. The numbers appear on the plan (`size_bytes`, `row_estimate`).
+candidate. The numbers appear on the plan (`size_bytes`, `row_estimate`). A policy that
+empties partitions in place also asks whether each one is empty already (`FactKind.EMPTY`,
+in the same query as sizes) and which tables reference it (`FactKind.REFERENCED_BY`, one
+catalog query).
 
 A policy decides *eligibility*; it never executes DDL. Ownership, safety and locking stay
 with the core, which is what keeps a user predicate from turning into an accidental
@@ -150,6 +155,59 @@ retention grows again before the grace runs out and the orphan's window is wante
 comes off in the attach's transaction, so a later detach starts a fresh grace period. Under
 `DropNever` orphans belong to whatever process the policy hands them to and are never
 brought back.
+
+## Empty in place instead of detaching
+
+`expire=ExpireAction.TRUNCATE` keeps an expired partition attached and empties it with
+`TRUNCATE`, subtree included:
+
+```python
+from datetime import timedelta
+
+from pg_partsmith import ExpireAction, KeepFor, LifecyclePolicy
+
+LifecyclePolicy(retention=KeepFor(timedelta(days=365)), expire=ExpireAction.TRUNCATE)
+```
+
+In a document it is `expire: truncate` beside `retention` in the table's `lifecycle`.
+
+Choose it when the set of partitions should not change: the table keeps a partition for
+every window it ever had, and whatever reads the tree sees the same one before and after a
+run. It is also lighter on the parent. `TRUNCATE` takes `ACCESS EXCLUSIVE` on the
+partition and the relations below it and nothing on the parent, so inserts and pruned
+reads that go to other partitions do not wait for it. A blocking detach, the only kind
+PostgreSQL allows once the parent has a DEFAULT partition, holds `ACCESS EXCLUSIVE` on the
+parent and on the DEFAULT partition while it runs. Both were measured on PostgreSQL 15 to
+18 (see [PostgreSQL semantics](../design/postgresql-semantics.md)). A query that has to
+read the partition being emptied, an unpruned scan of the parent included, still waits for
+it, and the truncate waits at most `ddl_lock_timeout_ms` for its lock before it gives up
+until the next run.
+
+| The expired partition | What the plan does |
+|---|---|
+| holds rows | `TruncatePartition` (kind `truncate`, reason `retention_expired`) |
+| is empty already: no leaf has a heap page | nothing; one `expired_empty` INFO finding per parent counts them |
+| holds rows, and another table references it through a foreign key | nothing; a `truncate_blocked` WARNING names the referencing tables |
+| holds rows, and its subtree holds a foreign table | nothing; a `truncate_blocked` WARNING |
+
+Emptiness is read from the catalog, never by scanning, so a second run issues no DDL. A
+row written into the window later makes the partition non-empty, and the next run empties
+it again. PostgreSQL refuses `TRUNCATE` of a partition any foreign key reaches, whether or
+not a row is actually referenced, so one foreign key on the parent blocks every partition:
+expire such a table by detaching, with `Unreferenced()` in the retention rule. `TRUNCATE` of
+a foreign table empties the remote table behind it, so `ForeignLeaves` with
+`expire=TRUNCATE` is refused when the configuration is built.
+
+An emptied partition is never taken out of the tree, and the `expired_empty` finding is how
+you see the set grow. To retire them, switch `expire` back to `detach`: retention still says
+they expired, so the next run detaches them and the drop rule takes over. `detach` and
+`drop` keep governing the detached tables that already exist, such as the ones an earlier
+detaching policy left in their grace period.
+
+`before_truncate` and `after_truncate` fire around the statement, and `on_event` sees both
+(see [Archive before dropping](../guide/archiving.md#the-hooks)). `apply` without
+`--allow-destructive` withholds truncates like detaches and drops, and
+`maintain(skip_detach=True)` leaves them out.
 
 ## One policy, every progression level
 

@@ -67,7 +67,8 @@ Something else is probably the better fit when:
   integers, your own codec); fixed-width integer windows for id-partitioned queues
 - **Lifecycle policies** — create ahead by count, until a horizon or when the newest
   partition says so; expire by count, age or distance, or by a predicate (size, rows,
-  foreign-key references, SQL); detach now, drop after a grace period
+  foreign-key references, SQL); detach now, drop after a grace period, or empty in place
+  and leave the partition attached
 - **Leaf backends** — local tables with a tablespace, storage parameters and the parent's
   grants, or foreign tables on an FDW server (`postgres_fdw`, ClickHouse)
 - **Batched data movement** — drain a DEFAULT partition into lifecycle partitions
@@ -86,7 +87,7 @@ Something else is probably the better fit when:
   CronJob / init container, CI and systemd
 - **Examples that are tested** — every document under `examples/` validates in CI, the hook
   scripts parse, and `pg-partsmith schema` gives an editor the JSON Schema
-- **Hooks, locks, schemas** — eight lifecycle hooks, in Python or as commands named in a
+- **Hooks, locks, schemas** — ten lifecycle hooks, in Python or as commands named in a
   config file; PostgreSQL advisory or Redis locks; schema-qualified everything
 - **Type-safe, tested** — Pydantic models, full mypy, real PostgreSQL 15 through 18 via testcontainers
 
@@ -294,6 +295,7 @@ planned and the size the policy measured, when it asked for one.
 | `before_create` / `after_create` | around the creation of a partition directly under the root (its subtree included) |
 | `before_attach` / `after_attach` | around bringing a detached partition back into the tree |
 | `before_detach` / `after_detach` | around a detach |
+| `before_truncate` / `after_truncate` | around emptying an expired partition in place (`expire=truncate`) |
 | `before_drop` / `after_drop` | around a drop — `before_drop` is the last chance to read the data |
 | `on_event` | every one of the above, for an audit trail or metrics in one method |
 

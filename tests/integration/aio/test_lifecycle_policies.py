@@ -7,6 +7,7 @@ come back.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING
 import freezegun
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
@@ -27,6 +29,7 @@ from pg_partsmith.lifecycle import (
     DetachMode,
     DropAfter,
     DropNever,
+    ExpireAction,
     ExpireIf,
     KeepFor,
     KeepNewest,
@@ -36,7 +39,7 @@ from pg_partsmith.lifecycle import (
     SqlPredicate,
     WindowAgeAbove,
 )
-from pg_partsmith.plan import FindingReason, Reason
+from pg_partsmith.plan import FindingReason, OperationKind, Reason
 from pg_partsmith.utils import DETACHED_AT_MARKER
 from tests.integration.aio.support import (
     count_ddl,
@@ -634,6 +637,155 @@ async def test__keep_for__expires_windows_that_ended_more_than_the_age_ago(db_en
         f"{table}__2026_07",
         f"{table}__2026_08",
     }
+
+
+# ── Emptying expired partitions in place ────────────────────────────────────────
+
+
+def _truncating(retention: KeepFor | KeepNewest) -> LifecyclePolicy:
+    return LifecyclePolicy(creation=CreateAhead(count=1), retention=retention, expire=ExpireAction.TRUNCATE)
+
+
+async def test__expire_truncate__a_year_old_partition__emptied_in_place_and_left_attached(
+    db_engine: AsyncEngine, table: str
+) -> None:
+    # Arrange: the reporter's setup -- a year of retention, and a DEFAULT partition, which
+    # would force a detach into its blocking form
+    july = await _seed_month(db_engine, table, 2025, 7, rows=40)
+    await _seed_month(db_engine, table, 2026, 8, rows=5)
+    await exec_sql(db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    oid_before = await relation_oid(db_engine, july)
+    config = monthly_config(table, lifecycle=_truncating(KeepFor(age=timedelta(days=365))))
+
+    # Act
+    result = await run_maintenance(db_engine, config, at_time=NOW)
+
+    # Assert: the same table, still attached and now empty; nothing else touched
+    assert result.issues == ()
+    assert (result.truncated_count, result.detached_count, result.dropped_count) == (1, 0, 0)
+    assert await is_attached(db_engine, july)
+    assert await relation_oid(db_engine, july) == oid_before
+    assert await table_comment(db_engine, july) is None
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{july}"') == 0  # noqa: S608
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{table}"') == 5  # noqa: S608
+    assert set(await range_children_of(db_engine, table)) == {july, f"{table}__2026_08"}
+
+
+async def test__expire_truncate__second_run__issues_no_ddl_and_reports_what_it_keeps(
+    db_engine: AsyncEngine, table: str
+) -> None:
+    # Arrange: one run has emptied July 2025 already
+    await _seed_month(db_engine, table, 2025, 7, rows=40)
+    await _seed_month(db_engine, table, 2026, 8, rows=5)
+    config = monthly_config(table, lifecycle=_truncating(KeepFor(age=timedelta(days=365))))
+    await run_maintenance(db_engine, config, at_time=NOW)
+
+    # Act
+    with count_ddl(db_engine) as counter:
+        result = await run_maintenance(db_engine, config, at_time=NOW)
+
+    # Assert
+    assert counter.statements == []
+    assert result.truncated_count == 0
+    assert result.maintenance_plan is not None
+    assert [(f.reason, f.partition_name) for f in result.maintenance_plan.findings] == [
+        (FindingReason.EXPIRED_EMPTY, f"public.{table}")
+    ]
+    assert result.issues == ()
+
+
+async def test__expire_truncate__a_late_row_in_an_emptied_partition__emptied_again(
+    db_engine: AsyncEngine, table: str
+) -> None:
+    # Arrange: emptied once, then a late write lands in the expired window
+    june = await _seed_month(db_engine, table, 2026, 6, rows=10)
+    await _seed_month(db_engine, table, 2026, 8)
+    config = monthly_config(table, lifecycle=_truncating(KeepNewest(count=1)))
+    await run_maintenance(db_engine, config, at_time=NOW)
+    await exec_sql(db_engine, f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2026-06-20', 'late')")  # noqa: S608
+
+    # Act
+    result = await run_maintenance(db_engine, config, at_time=NOW)
+
+    # Assert
+    assert result.truncated_count == 1
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{june}"') == 0  # noqa: S608
+
+
+# sync-mirror: skip
+async def test__expire_truncate__waiting_for_a_reader_of_the_partition__writers_to_the_others_go_through(
+    db_engine: AsyncEngine, table: str
+) -> None:
+    """The truncate locks the expired partition and nothing above it.
+
+    A reader of the expired partition makes the truncate wait for its lock. That wait is
+    where a blocking detach would already hold the parent in ACCESS EXCLUSIVE, with every
+    writer queued behind it; here the writers keep landing in the current month.
+    """
+    # Arrange: June expired with rows, August current, and a DEFAULT, so a detach would be the blocking form
+    june = await _seed_month(db_engine, table, 2026, 6, rows=10)
+    august = await _seed_month(db_engine, table, 2026, 8)
+    await exec_sql(db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    config = monthly_config(table, lifecycle=_truncating(KeepNewest(count=1)))
+    service = make_service(db_engine, ddl_lock_timeout_ms=30_000)
+    plan = await service.plan(config, now=datetime(2026, 8, 26, tzinfo=UTC))
+    assert [op.kind for op in plan.operations] == [OperationKind.TRUNCATE]
+    insert = text(f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2026-08-20', 'live')")  # noqa: S608
+
+    async with db_engine.connect() as reader:
+        await reader.execute(text(f'SELECT count(*) FROM "{june}"'))  # noqa: S608
+        applying = asyncio.create_task(service.apply(config, plan))
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            waiting = await scalar(
+                db_engine,
+                "SELECT pid FROM pg_locks WHERE NOT granted AND relation = to_regclass(:name)",
+                name=june,
+            )
+            if waiting is not None:
+                break
+        else:
+            pytest.fail("the truncate never queued for the lock on June")
+        held_on_parent = await scalar(
+            db_engine,
+            "SELECT count(*) FROM pg_locks WHERE pid = :pid AND relation = to_regclass(:name)",
+            pid=waiting,
+            name=table,
+        )
+
+        # Act: a live writer goes through the parent into August while the truncate waits
+        async with db_engine.connect() as writer:
+            await writer.execute(text("SET lock_timeout = '1s'"))
+            for _ in range(10):
+                await writer.execute(insert)
+            await writer.commit()
+        still_waiting = not applying.done()
+        await reader.rollback()
+    result = await applying
+
+    # Assert
+    assert held_on_parent == 0
+    assert still_waiting
+    assert result.truncated_count == 1
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{june}"') == 0  # noqa: S608
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{august}"') == 10  # noqa: S608
+
+
+async def test__expire_truncate__switched_back_to_detach__the_emptied_partitions_are_retired(
+    db_engine: AsyncEngine, table: str
+) -> None:
+    # Arrange: what replaces a later drop -- retention still says they expired
+    june = await _seed_month(db_engine, table, 2026, 6, rows=10)
+    await _seed_month(db_engine, table, 2026, 8)
+    await run_maintenance(db_engine, monthly_config(table, lifecycle=_truncating(KeepNewest(count=1))), at_time=NOW)
+    detaching = LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(count=1), drop=DropAfter())
+
+    # Act
+    result = await run_maintenance(db_engine, monthly_config(table, lifecycle=detaching), at_time=NOW)
+
+    # Assert
+    assert (result.detached_count, result.dropped_count) == (1, 1)
+    assert await relkind(db_engine, june) is None
 
 
 # ── Orphans that come back ──────────────────────────────────────────────────────

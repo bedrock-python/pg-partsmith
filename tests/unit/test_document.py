@@ -12,6 +12,7 @@ from pg_partsmith.boundaries import UUIDv7BoundaryCodec
 from pg_partsmith.document import PartitionsDocument, PartitionTableSpec, ToolkitOptions
 from pg_partsmith.entities import PartitionGranularity
 from pg_partsmith.events import HookPhase
+from pg_partsmith.lifecycle import ExpireAction
 
 
 def _document(**overrides: Any) -> dict[str, Any]:
@@ -124,6 +125,21 @@ def test__table__schema__is_accepted_as_the_configuration_spells_it() -> None:
     assert spec.to_config().qualified_name == "public.events"
 
 
+def test__table__lifecycle_emptying_expired_partitions_in_place__spelled_as_the_policy_dumps() -> None:
+    # Arrange / Act: the reporter's policy, written in a file -- keep a year, then empty in place
+    spec = PartitionTableSpec.model_validate(
+        {
+            "table_name": "events",
+            "partition_column": "created_at",
+            "granularity": "day",
+            "lifecycle": {"retention": {"kind": "keep_for", "age": "P365D"}, "expire": "truncate"},
+        }
+    )
+
+    # Assert
+    assert spec.to_config().lifecycle.expire is ExpireAction.TRUNCATE
+
+
 def test__document__version__is_the_one_this_release_reads() -> None:
     # Arrange / Act / Assert
     assert PartitionsDocument.model_validate(_document()).version == 1
@@ -191,6 +207,24 @@ def test__hooks__commands__come_back_in_lifecycle_order() -> None:
     assert document.hooks is not None
     assert [phase.value for phase in document.hooks.commands()] == ["after_create", "before_drop"]
     assert document.hooks.commands()[HookPhase.BEFORE_DROP] == ("/bin/archive", "--to", "s3")
+
+
+def test__hooks__truncate_phases__run_between_the_detach_and_the_drop_ones() -> None:
+    # Arrange / Act
+    document = PartitionsDocument.model_validate(
+        _document(
+            hooks={
+                "after_drop": ["/bin/notify"],
+                "before_truncate": {"python": "log.info('emptying %s', event.partition.name)"},
+                "after_truncate": ["/bin/notify", "emptied"],
+            }
+        )
+    )
+
+    # Assert
+    assert document.hooks is not None
+    assert [phase.value for phase in document.hooks.actions()] == ["before_truncate", "after_truncate", "after_drop"]
+    assert document.hooks.commands()[HookPhase.AFTER_TRUNCATE] == ("/bin/notify", "emptied")
 
 
 def test__hooks__a_misspelled_phase__is_refused_where_it_is_written() -> None:

@@ -196,11 +196,20 @@ class FactKind(StrEnum):
         REFERENCES: Whether a row of another table references a row of the
             relation through a foreign key -- the condition PostgreSQL itself
             imposes on ``DETACH PARTITION``.
+        EMPTY: Whether no leaf of the relation's subtree has a heap page, which
+            is what ``TRUNCATE`` leaves behind. Read from the catalog, never by
+            scanning the table.
+        REFERENCED_BY: Which other tables reference the relation, or anything
+            above or below it in the tree, through a foreign key. PostgreSQL
+            refuses ``TRUNCATE`` of such a relation whether or not a row is
+            actually referenced.
     """
 
     SIZE = "size"
     ROWS = "rows"
     REFERENCES = "references"
+    EMPTY = "empty"
+    REFERENCED_BY = "referenced_by"
 
 
 class PartitionFacts(BaseModel):
@@ -216,6 +225,12 @@ class PartitionFacts(BaseModel):
         referenced: Whether any row of another table references a row of the
             relation through a foreign key on the relation or on its parent.
             None when not measured.
+        empty: Whether no leaf of the subtree has a heap page: emptied by
+            ``TRUNCATE``, vacuumed down to nothing, or never written to. None
+            when not measured.
+        referenced_by: Schema-qualified names of the other tables whose foreign
+            keys reach the relation, empty when there are none. None when not
+            measured.
         predicates: Result of each :class:`~pg_partsmith.lifecycle.SqlPredicate`
             evaluated against the relation, keyed by the predicate's id.
     """
@@ -225,6 +240,8 @@ class PartitionFacts(BaseModel):
     size_bytes: NonNegativeInt | None = None
     row_estimate: NonNegativeInt | None = None
     referenced: bool | None = None
+    empty: bool | None = None
+    referenced_by: tuple[str, ...] | None = None
     predicates: dict[str, bool] = Field(default_factory=dict)
 
 

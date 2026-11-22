@@ -25,6 +25,7 @@ from pg_partsmith.plan import (
     PartitionBy,
     Reason,
     Severity,
+    TruncatePartition,
     validate_plan_for_config,
 )
 from pg_partsmith.topology import DefaultBounds, HashBounds, ListBounds, PartitionType, RangeBounds
@@ -45,6 +46,7 @@ INFORMATIONAL = {
     FindingReason.DETACH_PENDING,
     FindingReason.GRACE_PENDING,
     FindingReason.DROP_DEFERRED,
+    FindingReason.EXPIRED_EMPTY,
 }
 
 
@@ -111,7 +113,20 @@ def _drop(name: str = f"{ROOT}__2026_04", *, follows_detach: bool = True) -> Dro
     )
 
 
-def _plan(*operations: CreatePartition | AttachPartition | DetachPartition | DropPartition) -> MaintenancePlan:
+def _truncate(name: str = f"{ROOT}__2026_05") -> TruncatePartition:
+    return TruncatePartition(
+        target=name,
+        oid=5,
+        parent_name=ROOT,
+        bounds=RangeBounds(from_value="2026-05-01", to_value="2026-06-01"),
+        reason=Reason.RETENTION_EXPIRED,
+        detail="2026_05 expired under 'keep newest 3'; emptied in place",
+    )
+
+
+def _plan(
+    *operations: CreatePartition | AttachPartition | DetachPartition | TruncatePartition | DropPartition,
+) -> MaintenancePlan:
     return MaintenancePlan(table_name=ROOT, generated_at=NOW, operations=operations)
 
 
@@ -497,6 +512,48 @@ def test__drop_partition__capabilities__transactional_and_destructive() -> None:
     assert drop.is_destructive is True
 
 
+def test__truncate_partition__capabilities__transactional_destructive_and_nothing_on_the_parent() -> None:
+    # Arrange / Act
+    truncate = _truncate()
+
+    # Assert: measured on PostgreSQL 15 to 18, a TRUNCATE of a leaf holds the leaf and its indexes only
+    assert truncate.capabilities == OperationCapabilities(
+        transactional=True,
+        lock="ACCESS EXCLUSIVE on the partition and every relation below it; nothing on the parent, so writers "
+        "to the other partitions do not wait",
+    )
+    assert truncate.kind is OperationKind.TRUNCATE
+    assert truncate.is_destructive is True
+    assert truncate.describe() == f"TRUNCATE {ROOT}__2026_05 (retention_expired)"
+
+
+def test__truncate_partition__round_trip__read_back_under_its_kind() -> None:
+    # Arrange
+    plan = _plan(_create(), _truncate(), _drop(f"{ROOT}__2026_01", follows_detach=False))
+
+    # Act
+    dumped = json.loads(plan.model_dump_json(by_alias=True))
+    restored = MaintenancePlan.model_validate(dumped)
+
+    # Assert
+    assert [op["kind"] for op in dumped["operations"]] == ["create", "truncate", "drop"]
+    assert dumped["operations"][1]["is_destructive"] is True
+    assert restored == plan
+    assert restored.truncates == (_truncate(),)
+
+
+def test__without__truncate__removes_the_truncates_and_nothing_else() -> None:
+    # Arrange
+    plan = _plan(_create(), _detach(), _truncate(), _drop())
+
+    # Act
+    filtered = plan.without(OperationKind.TRUNCATE)
+
+    # Assert
+    assert [op.kind for op in filtered.operations] == [OperationKind.CREATE, OperationKind.DETACH, OperationKind.DROP]
+    assert filtered.truncates == ()
+
+
 def test__operation_capabilities__defaults__transactional_with_no_lock_named() -> None:
     # Arrange / Act / Assert
     assert OperationCapabilities() == OperationCapabilities(transactional=True, lock="")
@@ -585,9 +642,9 @@ def test__partition_by__no_columns_allowed_but_blank_column_rejected() -> None:
         PartitionBy(method=PartitionType.LIST, columns=(" ",))
 
 
-def test__operation_kind__values__spell_the_four_ddl_families() -> None:
+def test__operation_kind__values__spell_the_five_ddl_families() -> None:
     # Arrange / Act / Assert
-    assert [kind.value for kind in OperationKind] == ["create", "attach", "detach", "drop"]
+    assert [kind.value for kind in OperationKind] == ["create", "attach", "detach", "truncate", "drop"]
 
 
 def test__create_and_attach_capabilities__name_the_locks_on_referencing_tables() -> None:

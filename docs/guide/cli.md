@@ -259,7 +259,8 @@ pg-partsmith apply -c partitions.yaml --allow-destructive    # …and retire wha
 ```
 
 **Destructive operations are withheld unless you ask for them.** Without
-`--allow-destructive`, `apply` creates and re-attaches, and detaches and drops nothing.
+`--allow-destructive`, `apply` creates and re-attaches, and detaches, truncates and drops
+nothing.
 That is deliberate: the safe behaviour is the default one rather than a second mode
 somebody has to remember to select, and it is exactly what an init container wants —
 create the partitions the application is about to write into, retire nothing at startup.

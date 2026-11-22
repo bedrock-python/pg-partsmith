@@ -167,6 +167,19 @@ class PostgresPartitionRepository:
         """
         await self._remover.detach(parent_name, partition_name, mode=mode, expected_oid=expected_oid)
 
+    async def truncate_partition(
+        self,
+        parent_name: str,
+        partition_name: str,
+        *,
+        expected_oid: int | None = None,
+    ) -> None:
+        """Empty an attached partition in place, subtree included.
+
+        See :meth:`PartitionRemover.truncate`.
+        """
+        await self._remover.truncate(parent_name, partition_name, expected_oid=expected_oid)
+
     async def drop_partition(
         self, partition_name: str, *, expected_oid: int | None = None, drain_into: str | None = None
     ) -> int:

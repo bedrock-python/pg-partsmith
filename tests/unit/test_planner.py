@@ -24,6 +24,7 @@ from pg_partsmith.lifecycle import (
     DetachMode,
     DropAfter,
     DropNever,
+    ExpireAction,
     ExpireIf,
     KeepBehind,
     KeepFor,
@@ -48,6 +49,7 @@ from pg_partsmith.plan import (
     PartitionBy,
     Reason,
     Severity,
+    TruncatePartition,
 )
 from pg_partsmith.planner import PlanMode, PlanningContext, fact_targets, plan_maintenance, to_maintenance_issue
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning
@@ -86,10 +88,12 @@ def _policy(
     retention: Any = None,
     drop: DropAfter | DropNever | None = None,
     detach: DetachMode = DetachMode.AUTO,
+    expire: ExpireAction = ExpireAction.DETACH,
 ) -> LifecyclePolicy:
     return LifecyclePolicy(
         creation=creation if creation is not None else CreateAhead(count=1),
         retention=retention if retention is not None else KeepNewest(count=12),
+        expire=expire,
         detach=detach,
         drop=drop if drop is not None else DropAfter(),
     )
@@ -1491,6 +1495,235 @@ def test__plan_maintenance__plan__records_the_cursors_it_was_made_against() -> N
     # Assert
     assert plan.cursors == {"msg_id": 1_250_000}
     assert plan.generated_at == NOW
+
+
+# ── Emptying expired partitions in place ────────────────────────────────────────
+
+HOLDS_ROWS = PartitionFacts(empty=False, referenced_by=())
+EMPTIED = PartitionFacts(empty=True, referenced_by=())
+
+
+def _truncating(retention: Any = None, **overrides: Any) -> TablePartitionConfig:
+    policy = _policy(retention=retention or KeepNewest(count=2), expire=ExpireAction.TRUNCATE, **overrides)
+    return _config(lifecycle=policy)
+
+
+def test__plan_maintenance__expire_truncate__a_year_old_partition_is_emptied_in_place_not_detached() -> None:
+    # Arrange: the reporter's policy -- keep a year, then empty the partition and leave it attached
+    config = _truncating(KeepFor(timedelta(days=365)))
+    root = _root(
+        _month(2025, 7, oid=7, facts=HOLDS_ROWS),
+        _month(2025, 9, oid=9, facts=HOLDS_ROWS),
+        _month(2026, 8, oid=8, facts=HOLDS_ROWS),
+    )
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert: July 2025 ended more than a year ago, September 2025 did not
+    assert plan.operations == (
+        TruncatePartition(
+            target=f"{ROOT}__2025_07",
+            oid=7,
+            parent_name=ROOT,
+            bounds=RangeBounds(from_value="2025-07-01", to_value="2025-08-01"),
+            reason=Reason.RETENTION_EXPIRED,
+            detail="2025_07 expired under 'keep for 365 days, 0:00:00'; emptied in place",
+        ),
+    )
+    assert plan.detaches == ()
+    assert plan.drops == ()
+    assert plan.findings == ()
+
+
+def test__plan_maintenance__expire_truncate__already_empty__no_operation_and_one_finding_for_the_parent() -> None:
+    # Arrange: May and June were emptied by an earlier run; July holds rows again
+    config = _truncating(KeepNewest(count=1))
+    root = _root(
+        _month(2026, 5, oid=5, facts=EMPTIED),
+        _month(2026, 6, oid=6, facts=EMPTIED),
+        _month(2026, 7, oid=7, facts=HOLDS_ROWS),
+        _month(2026, 8, oid=8, facts=HOLDS_ROWS),
+    )
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert _targets(plan.truncates) == [f"{ROOT}__2026_07"]
+    assert plan.findings == (
+        Finding(
+            partition_name=ROOT,
+            reason=FindingReason.EXPIRED_EMPTY,
+            detail=f"{ROOT} keeps 2 expired partitions attached and empty, the oldest {ROOT}__2026_05; emptying "
+            "in place never takes a partition out of the tree, and expire=detach retires them.",
+        ),
+    )
+    assert plan.findings[0].severity is Severity.INFO
+
+
+def test__plan_maintenance__expire_truncate__everything_emptied__the_next_plan_is_a_noop() -> None:
+    # Arrange
+    config = _truncating(KeepNewest(count=1))
+    root = _root(_month(2026, 7, oid=7, facts=EMPTIED), _month(2026, 8, oid=8, facts=HOLDS_ROWS))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert plan.is_noop
+    assert _reasons(plan) == [FindingReason.EXPIRED_EMPTY]
+    assert "keeps 1 expired partition attached" in plan.findings[0].detail
+
+
+def test__plan_maintenance__expire_truncate__referenced_by_a_foreign_key__a_warning_and_nothing_planned() -> None:
+    # Arrange: a key on the parent is cloned onto every partition, so TRUNCATE is refused rows or no rows
+    config = _truncating(KeepNewest(count=1))
+    referenced = PartitionFacts(empty=False, referenced_by=("public.audit", "public.refunds"))
+    root = _root(_month(2026, 7, oid=7, facts=referenced), _month(2026, 8, oid=8, facts=referenced))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert plan.is_noop
+    assert _reasons(plan) == [FindingReason.TRUNCATE_BLOCKED]
+    finding = plan.findings[0]
+    assert finding.partition_name == f"{ROOT}__2026_07"
+    assert finding.severity is Severity.WARNING
+    assert "references it through a foreign key (public.audit, public.refunds)" in finding.detail
+    assert "Unreferenced()" in finding.detail
+
+
+def test__plan_maintenance__expire_truncate__referenced_but_already_empty__nothing_to_report_but_the_count() -> None:
+    # Arrange
+    config = _truncating(KeepNewest(count=1))
+    root = _root(
+        _month(2026, 7, oid=7, facts=PartitionFacts(empty=True, referenced_by=("public.audit",))),
+        _month(2026, 8, oid=8),
+    )
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert plan.is_noop
+    assert _reasons(plan) == [FindingReason.EXPIRED_EMPTY]
+
+
+def test__plan_maintenance__expire_truncate__foreign_table_in_the_subtree__a_warning_and_nothing_planned() -> None:
+    # Arrange: an expired branch with a foreign bucket someone attached -- TRUNCATE would empty the remote table
+    config = _config(
+        _range_level(_hash_level(modulus=2)),
+        lifecycle=_policy(retention=KeepNewest(count=1), expire=ExpireAction.TRUNCATE),
+    )
+    from_value, to_value = MONTHS.literals(_window(2026, 7))
+    july = f"{ROOT}__2026_07"
+    branch = PartitionNode(
+        name=july,
+        oid=7,
+        parent_name=ROOT,
+        level=1,
+        bounds=RangeBounds(from_value=from_value, to_value=to_value),
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        children=(
+            _bucket(july, 2, 0, level=2),
+            _bucket(july, 2, 1, level=2, relkind=RelationKind.FOREIGN),
+        ),
+        facts=HOLDS_ROWS,
+    )
+    root = _root(branch, _branch((2, 0), (2, 1)))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert plan.is_noop
+    assert _reasons(plan) == [FindingReason.TRUNCATE_BLOCKED]
+    assert f"its subtree holds a foreign table ({july}__h1)" in plan.findings[0].detail
+
+
+def test__plan_maintenance__expire_truncate__expired_branch__emptied_as_one_unit_and_left_unrepaired() -> None:
+    # Arrange: July is a branch missing a bucket; it expired, so it is emptied whole and not completed
+    config = _config(
+        _range_level(_hash_level(modulus=2)),
+        lifecycle=_policy(retention=KeepNewest(count=1), expire=ExpireAction.TRUNCATE),
+    )
+    from_value, to_value = MONTHS.literals(_window(2026, 7))
+    july = f"{ROOT}__2026_07"
+    branch = PartitionNode(
+        name=july,
+        oid=7,
+        parent_name=ROOT,
+        level=1,
+        bounds=RangeBounds(from_value=from_value, to_value=to_value),
+        partition_type=PartitionType.HASH,
+        partition_columns=("tenant_id",),
+        children=(_bucket(july, 2, 0, level=2),),
+        facts=HOLDS_ROWS,
+    )
+    root = _root(branch, _branch((2, 0), (2, 1)))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert [(op.kind, op.target) for op in plan.operations] == [(OperationKind.TRUNCATE, july)]
+
+
+def test__plan_maintenance__expire_truncate__facts_not_measured__the_truncate_is_planned() -> None:
+    # Arrange: emptying an empty table is harmless, and PostgreSQL refuses a referenced one outright
+    config = _truncating(KeepNewest(count=1))
+
+    # Act
+    plan = _plan(config, _root(*_months(7, 8)))
+
+    # Assert
+    assert _targets(plan.truncates) == [f"{ROOT}__2026_07"]
+
+
+def test__plan_maintenance__expire_truncate__parent_with_a_default__still_never_locks_the_parent() -> None:
+    # Arrange: the case a blocking detach would take ACCESS EXCLUSIVE on the parent for
+    config = _truncating(KeepNewest(count=1))
+    root = _root(*_months(7, 8), PartitionNode(name=f"{ROOT}_default", parent_name=ROOT, bounds=DefaultBounds()))
+
+    # Act
+    plan = _plan(config, root)
+
+    # Assert
+    assert [op.kind for op in plan.operations] == [OperationKind.TRUNCATE]
+    assert "nothing on the parent" in plan.truncates[0].capabilities.lock
+
+
+def test__plan_maintenance__expire_truncate__orphans_left_by_an_earlier_detach__still_follow_the_drop_policy() -> None:
+    # Arrange: the policy used to detach; one orphan is past its grace, a second inside it
+    config = _truncating(KeepNewest(count=1), drop=DropAfter(grace=timedelta(days=7)))
+    orphans = (
+        _orphan("events__2026_05", oid=5, detached_at=NOW - timedelta(days=30)),
+        _orphan("events__2026_06", oid=6, detached_at=NOW - timedelta(days=1)),
+    )
+
+    # Act
+    plan = _plan(config, _root(_month(2026, 7, oid=7, facts=HOLDS_ROWS), _month(2026, 8, oid=8)), orphans=orphans)
+
+    # Assert
+    assert [(op.kind, op.target) for op in plan.operations] == [
+        (OperationKind.TRUNCATE, f"{ROOT}__2026_07"),
+        (OperationKind.DROP, f"{ROOT}__2026_05"),
+    ]
+    assert _reasons(plan) == [FindingReason.GRACE_PENDING]
+
+
+def test__plan_maintenance__expire_truncate__reconcile_mode__empties_nothing() -> None:
+    # Arrange
+    config = _truncating(KeepNewest(count=1))
+
+    # Act
+    plan = _plan(config, _root(*_months(6, 7, 8)), context=_context(mode=PlanMode.RECONCILE))
+
+    # Assert
+    assert plan.is_noop
 
 
 # ── Ownership by alignment ──────────────────────────────────────────────────────

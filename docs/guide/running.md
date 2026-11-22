@@ -17,7 +17,7 @@ The commands, and which ones change anything:
 | `backfill` | yes | yes | with `--allow-hooks` | a Job, once, when an existing table gets partitions |
 
 `apply` creates and re-attaches by default and retires nothing; `--allow-destructive`
-adds detaches and drops. That is the whole difference between "safe at startup" and
+adds detaches, truncates and drops. That is the whole difference between "safe at startup" and
 "nightly maintenance", and it is one flag.
 
 Everything reads the same three inputs: a [document](../reference/document.md) (`-c`),

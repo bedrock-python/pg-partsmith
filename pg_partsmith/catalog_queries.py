@@ -166,11 +166,16 @@ UNATTACHED_SQL = """
 # usually is -- so such a relation is measured as its own single leaf.
 # Rows come from the statistics collector, never from ``COUNT(*)``: a plan
 # must not scan a 500 GB partition to decide what to do with it.
+#
+# ``heap_bytes`` is the main fork alone. ``TRUNCATE`` leaves it at zero bytes
+# while an index keeps its metapage, and the first row written afterwards
+# brings it back, which makes zero the exact answer to "already emptied".
 PARTITION_FACTS_SQL = """
     SELECT
         root.oid AS oid,
         COALESCE(SUM(pg_total_relation_size(t.relid)), 0) AS size_bytes,
-        COALESCE(SUM(COALESCE(s.n_live_tup, 0)), 0) AS row_estimate
+        COALESCE(SUM(COALESCE(s.n_live_tup, 0)), 0) AS row_estimate,
+        COALESCE(SUM(pg_relation_size(t.relid)), 0) AS heap_bytes
     FROM unnest(CAST(:oids AS oid[])) AS root(oid)
     CROSS JOIN LATERAL (
         SELECT pt.relid
@@ -213,6 +218,32 @@ INCOMING_FOREIGN_KEYS_SQL = """
       AND con.conparentid = 0
       AND con.confrelid = ANY(CAST(:oids AS oid[]))
     ORDER BY con.conname
+"""
+
+# The other tables whose foreign keys reach each relation in ``:oids``.
+#
+# A foreign key referencing a partitioned table is cloned onto every partition
+# below it with ``confrelid`` pointing at that partition, so looking for keys
+# into the relation's own subtree finds the ones declared on its ancestors
+# too. ``TRUNCATE`` refuses every such key whose referencing side it is not
+# also emptying, rows or no rows; a key from inside the subtree to inside the
+# subtree is truncated along with it and does not count.
+REFERENCING_TABLES_SQL = """
+    SELECT
+        root.oid AS oid,
+        array_agg(DISTINCT quote_ident(ns.nspname) || '.' || quote_ident(c.relname)) AS referencing
+    FROM unnest(CAST(:oids AS oid[])) AS root(oid)
+    CROSS JOIN LATERAL (
+        SELECT array_agg(pt.relid) || root.oid AS relids
+        FROM pg_partition_tree(root.oid) pt
+    ) subtree
+    JOIN pg_constraint con
+      ON con.contype = 'f'
+     AND con.confrelid = ANY(subtree.relids)
+     AND con.conrelid <> ALL(subtree.relids)
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    GROUP BY root.oid
 """
 
 # A relation's live column names, in its own physical order.

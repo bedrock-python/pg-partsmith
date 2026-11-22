@@ -94,6 +94,25 @@ does not ask.
 
 A partition that could not be measured reads as referenced, so it is kept.
 
+## Emptying in place is refused outright
+
+A policy with `expire=ExpireAction.TRUNCATE` empties an expired partition instead of
+detaching it, and `TRUNCATE` is stricter than `DETACH`: PostgreSQL refuses it for any
+partition a foreign key reaches, whether or not a row is referenced, because the
+constraint on the parent is cloned onto every partition.
+
+```text
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+```
+
+So with a foreign key on `ci_builds`, no partition of it can be emptied in place, the
+unreferenced ones included. The planner reads the referencing tables from the catalog and
+plans no statement that can only fail: each expired partition that still holds rows gets a
+`truncate_blocked` WARNING naming them, so `plan --check` exits 3 and `apply` carries it in
+`result.issues`. `Unreferenced()` does not help here, since it asks about rows. Expire a
+referenced table by detaching, with `Unreferenced()` in the retention rule as above, or
+drop the foreign key. See [Lifecycle policies](../concepts/lifecycle.md#empty-in-place-instead-of-detaching).
+
 ## Row moves and ON DELETE actions
 
 The movers — DEFAULT reconciliation at attach, `partition_data`, `unpartition` — move a

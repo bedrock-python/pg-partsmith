@@ -971,6 +971,7 @@ def test__maintenance_issue_step__covers_planning_and_attaching() -> None:
         "reconcile",
         "attach",
         "detach",
+        "truncate",
         "drop",
         "move",
     }

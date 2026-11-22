@@ -44,6 +44,7 @@ __all__ = [
     "DropAfter",
     "DropNever",
     "DropPolicy",
+    "ExpireAction",
     "ExpireIf",
     "KeepBehind",
     "KeepFor",
@@ -693,6 +694,23 @@ class DetachMode(StrEnum):
     BLOCKING = "blocking"
 
 
+class ExpireAction(StrEnum):
+    """What happens to a partition retention has expired.
+
+    Attributes:
+        DETACH: Take it out of the tree; ``detach`` says how and ``drop`` what
+            happens to the detached table afterwards.
+        TRUNCATE: Empty it in place with ``TRUNCATE``, subtree included, and
+            leave it attached. The lock is ``ACCESS EXCLUSIVE`` on the
+            partition and its subtree, never on the parent, so writers to the
+            other partitions do not wait for it. An expired partition that is
+            already empty is left alone, and the plan reports how many there are.
+    """
+
+    DETACH = "detach"
+    TRUNCATE = "truncate"
+
+
 class DropAfter(BaseModel):
     """Drop a detached partition once ``grace`` has passed since it was detached.
 
@@ -775,24 +793,37 @@ class LifecyclePolicy(BaseModel):
     Attributes:
         creation: Which windows ahead of the cursor must exist.
         retention: When a window behind the cursor has expired.
+        expire: What happens to an expired partition: detached (the default),
+            or emptied in place with ``TRUNCATE`` and left attached.
         detach: How an expired partition is detached.
         drop: What happens to it afterwards. Unless the policy says otherwise, it
             stays detached for a week, where it can still be inspected or
             re-attached, and is dropped after that. ``DropAfter()`` drops in the
-            same run as the detach; ``DropNever()`` leaves it alone.
+            same run as the detach; ``DropNever()`` leaves it alone. Under
+            ``expire=TRUNCATE`` it still governs the detached tables that
+            already exist.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     creation: CreationPolicy = Field(default_factory=CreateAhead)
     retention: RetentionPolicy = Field(default_factory=KeepNewest)
+    expire: ExpireAction = ExpireAction.DETACH
     detach: DetachMode = DetachMode.AUTO
     drop: DropPolicy = Field(default_factory=lambda: DropAfter(grace=timedelta(days=DEFAULT_DROP_GRACE_DAYS)))
 
     @property
     def required_facts(self) -> frozenset[FactKind]:
-        """Everything any rule needs measured."""
-        return self.creation.required_facts | self.retention.required_facts | self.drop.required_facts
+        """Everything any rule needs measured.
+
+        Emptying in place needs two answers of its own: whether the partition
+        is empty already, so it is not emptied again on every run, and which
+        tables reference it, since ``TRUNCATE`` refuses a referenced table.
+        """
+        truncating = (
+            frozenset({FactKind.EMPTY, FactKind.REFERENCED_BY}) if self.expire is ExpireAction.TRUNCATE else frozenset()
+        )
+        return self.creation.required_facts | self.retention.required_facts | self.drop.required_facts | truncating
 
     @property
     def sql_predicates(self) -> tuple[SqlPredicate, ...]:

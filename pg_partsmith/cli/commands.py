@@ -161,7 +161,7 @@ async def run_apply(
         kit: The wiring.
         configs: The tables to maintain, in order.
         plans: Plans read from a file, keyed by table; None to plan here.
-        allow_destructive: Carry out detaches and drops as well as creations.
+        allow_destructive: Carry out detaches, truncates and drops as well as creations.
         continue_on_error: Isolate a failed operation instead of aborting.
         allow_config_drift: Apply a saved plan whose configuration has changed.
 
@@ -178,7 +178,7 @@ async def run_apply(
         if plans is not None:
             plan = _plan_for(config, plans)
             if not allow_destructive:
-                plan = plan.without(OperationKind.DETACH, OperationKind.DROP)
+                plan = plan.without(OperationKind.DETACH, OperationKind.TRUNCATE, OperationKind.DROP)
             result = await kit.service.apply(
                 config, plan, continue_on_error=continue_on_error, allow_config_drift=allow_config_drift
             )
@@ -208,7 +208,7 @@ async def run_apply(
         blocks.append(_describe_result(config.qualified_name, result))
 
     if not allow_destructive:
-        blocks.append("Creations only: detaches and drops need --allow-destructive.")
+        blocks.append("Creations only: detaches, truncates and drops need --allow-destructive.")
     return CommandResult(
         code=ExitCode.FINDINGS if issues else ExitCode.OK,
         lines=blocks,
@@ -286,7 +286,7 @@ def _describe_result(table_name: str, result: MaintenanceResult) -> str:
     """One block per table: what it did, then anything it wants a human to see."""
     counts = (
         f"created {result.created_count}, repaired {result.repaired_count}, attached {result.attached_count}, "
-        f"detached {result.detached_count}, dropped {result.dropped_count}"
+        f"detached {result.detached_count}, truncated {result.truncated_count}, dropped {result.dropped_count}"
     )
     lines = [f"{table_name} — {counts}"]
     lines.extend(f"  [{issue.step.value}] {issue.partition_name}: {issue.error}" for issue in result.issues)

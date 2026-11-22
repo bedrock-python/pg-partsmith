@@ -14,7 +14,17 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pg_partsmith.entities import MaintenanceIssueStep
-from pg_partsmith.lifecycle import AllOf, CreateAhead, DropAfter, ExpireIf, KeepNewest, LifecyclePolicy, Unreferenced
+from pg_partsmith.lifecycle import (
+    AllOf,
+    CreateAhead,
+    DropAfter,
+    ExpireAction,
+    ExpireIf,
+    KeepNewest,
+    LifecyclePolicy,
+    Unreferenced,
+)
+from pg_partsmith.plan import FindingReason
 from pg_partsmith.topology import FactKind
 from pg_partsmith.utils import parse_orphan_comment
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config
@@ -158,6 +168,34 @@ def test__without_unreferenced__refused_detach_is_an_issue_and_the_run_goes_on(
     assert not is_attached(sync_db_engine, f"{events}__2026_07")
     assert set(range_children_of(sync_db_engine, events)) == {f"{events}__2026_06", f"{events}__2026_08"}
     assert scalar(sync_db_engine, f'SELECT count(*) FROM "{refs}"') == 1  # noqa: S608
+
+
+def test__expire_truncate__parent_referenced_by_a_foreign_key__a_warning_and_the_rows_stay(
+    sync_db_engine: Engine, events: str, refs: str
+) -> None:
+    # Arrange -- June is referenced, July is not; PostgreSQL refuses TRUNCATE of either,
+    # because the key on the parent is cloned onto every partition
+    _seed(sync_db_engine, events, refs)
+    config = monthly_config(
+        events,
+        lifecycle=LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(1), expire=ExpireAction.TRUNCATE),
+    )
+
+    # Act
+    result = run_maintenance(sync_db_engine, config, at_time=NOW)
+
+    # Assert -- a finding per partition with rows, no failed statement, nothing emptied
+    assert result.success
+    assert result.truncated_count == 0
+    plan = result.maintenance_plan
+    assert plan is not None
+    assert plan.truncates == ()
+    blocked = [f for f in plan.findings if f.reason is FindingReason.TRUNCATE_BLOCKED]
+    assert [f.partition_name for f in blocked] == [f"public.{events}__2026_06", f"public.{events}__2026_07"]
+    assert f"references it through a foreign key (public.{refs})" in blocked[0].detail
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.RECONCILE] * 2
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{events}"') == 2  # noqa: S608
+    assert is_attached(sync_db_engine, f"{events}__2026_06")
 
 
 def test__refused_detach__leaves_no_marker_and_the_later_detach_stamps_its_own_instant(

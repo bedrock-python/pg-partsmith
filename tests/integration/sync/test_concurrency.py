@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -19,7 +20,8 @@ from sqlalchemy import text
 
 from pg_partsmith.entities import MaintenanceResult, Period
 from pg_partsmith.exceptions import LockAcquisitionError
-from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.lifecycle import CreateAhead, DetachMode, ExpireAction, KeepNewest, LifecyclePolicy
+from pg_partsmith.plan import OperationKind
 from pg_partsmith.sync.maintainer import PartitionMaintainer
 from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
@@ -250,3 +252,66 @@ def test__partition_data__writer_filling_the_window__drains_it_without_raising(
     assert is_attached(sync_db_engine, march)
     assert _only_count(sync_db_engine, default) == 0
     assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{partitioned_table}"')) == 2000 + writer.written  # noqa: S608
+
+
+# ── a truncate under a live writer ──────────────────────────────────────────────
+#
+# The thread-based twin of the ``# sync-mirror: skip`` test in
+# ``tests/integration/aio/test_lifecycle_policies.py``: a truncate waiting for the
+# lock on an expired partition holds nothing on the parent, so a writer going
+# through the parent into the current month never waits for it.
+
+
+def test__expire_truncate__waiting_for_a_reader_of_the_partition__writers_to_the_others_go_through(
+    sync_db_engine: Engine, partitioned_table: str
+) -> None:
+    """The truncate locks the expired partition and nothing above it."""
+    # Arrange: June expired with rows, August current, and a DEFAULT, so a detach would be the blocking form
+    table = partitioned_table
+    june, august = f"{table}__2026_06", f"{table}__2026_08"
+    service = make_service(sync_db_engine, ddl_lock_timeout_ms=30_000)
+    service.ensure_partitions(monthly_config(table), [Period(year=2026, month=6), Period(year=2026, month=8)])
+    exec_sql(
+        sync_db_engine,
+        f"INSERT INTO \"{table}\" (created_at, payload) SELECT '2026-06-15', 'x' FROM generate_series(1, 10)",  # noqa: S608
+    )
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    lifecycle = LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(1), expire=ExpireAction.TRUNCATE)
+    config = monthly_config(table, lifecycle=lifecycle)
+    plan = service.plan(config, now=datetime(2026, 8, 26, tzinfo=UTC))
+    assert [op.kind for op in plan.operations] == [OperationKind.TRUNCATE]
+
+    with sync_db_engine.connect() as reader, ThreadPoolExecutor(max_workers=1) as pool:
+        reader.execute(text(f'SELECT count(*) FROM "{june}"'))  # noqa: S608
+        applying = pool.submit(service.apply, config, plan)
+        waiting = None
+        for _ in range(200):
+            time.sleep(0.05)
+            waiting = scalar(
+                sync_db_engine,
+                "SELECT pid FROM pg_locks WHERE NOT granted AND relation = to_regclass(:name)",
+                name=june,
+            )
+            if waiting is not None:
+                break
+        assert waiting is not None, "the truncate never queued for the lock on June"
+        held_on_parent = scalar(
+            sync_db_engine,
+            "SELECT count(*) FROM pg_locks WHERE pid = :pid AND relation = to_regclass(:name)",
+            pid=waiting,
+            name=table,
+        )
+
+        # Act: a live writer goes through the parent into August while the truncate waits
+        with _Writer(sync_db_engine, table, month=8) as writer:
+            time.sleep(0.5)
+        still_waiting = not applying.done()
+        reader.rollback()
+        result = applying.result(timeout=60)
+
+    # Assert
+    assert held_on_parent == 0
+    assert still_waiting
+    assert result.truncated_count == 1
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{june}"')) == 0  # noqa: S608
+    assert int(scalar(sync_db_engine, f'SELECT count(*) FROM "{august}"')) == writer.written  # noqa: S608

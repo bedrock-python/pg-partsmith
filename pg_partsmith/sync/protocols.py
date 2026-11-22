@@ -65,7 +65,8 @@ class PartitionLifecycle(Protocol):
         Args:
             config: Table partitioning configuration.
             skip_create: Leave out creations and re-attachments.
-            skip_detach: Leave out detaches (and the drops that follow them).
+            skip_detach: Leave out what retention does to an expired partition:
+                its detach (and the drop that follows it), or its truncate.
             skip_drop: Leave out drops.
             continue_on_error: Collect operation failures into
                 ``MaintenanceResult.issues`` and keep going instead of aborting.
@@ -183,6 +184,29 @@ class PartitionRepository(Protocol):
         Raises:
             PartitionNotFoundError: If partition doesn't exist.
             PartitionDetachInProgressError: If another detach is pending.
+            PlanStaleError: If the relation is not the one ``expected_oid`` named.
+        """
+        ...
+
+    def truncate_partition(
+        self,
+        parent_name: str,
+        partition_name: str,
+        *,
+        expected_oid: int | None = None,
+    ) -> None:
+        """Empty an attached partition in place, subtree included.
+
+        Args:
+            parent_name: The parent it is attached to, and stays attached to.
+            partition_name: Partition table name.
+            expected_oid: The catalog identity the caller decided on, checked
+                under the truncate's own lock. When the relation now holding
+                the name has another, or is no longer attached to
+                ``parent_name``, nothing is emptied.
+
+        Raises:
+            PartitionNotFoundError: If partition doesn't exist.
             PlanStaleError: If the relation is not the one ``expected_oid`` named.
         """
         ...

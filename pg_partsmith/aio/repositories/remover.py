@@ -1,4 +1,4 @@
-"""Helper for partition detachment and removal."""
+"""Helper for partition detachment, emptying and removal."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ _CONCURRENT_DETACH_UNAVAILABLE: frozenset[str] = frozenset({"0A000", "42601", "5
 
 
 class PartitionRemover:
-    """Helper for partition detachment and removal."""
+    """Helper for partition detachment, emptying and removal."""
 
     def __init__(
         self,
@@ -195,6 +195,40 @@ class PartitionRemover:
         await self._ensure_expected_oid(conn, partition_name, expected_oid)
         if not await self._resolver.is_attached_conn(conn, table_name, partition_name):
             raise PlanStaleError(partition_name, f"it is no longer attached to {table_name}")
+
+    async def truncate(self, table_name: str, partition_name: str, *, expected_oid: int | None = None) -> None:
+        """Empty an attached partition in place, subtree included.
+
+        ``TRUNCATE`` takes ``ACCESS EXCLUSIVE`` on the partition and on every
+        relation below it, and nothing on the parent: writers to the other
+        partitions never wait for it. The lock is taken first, under
+        ``lock_timeout``, so a long reader of the partition makes this give up
+        rather than queue every later query on it behind the wait; the identity
+        and attachment checks then see the relation the statement empties.
+
+        Args:
+            table_name: The parent it is attached to.
+            partition_name: The partition to empty.
+            expected_oid: The identity the decision to empty it was made about.
+
+        Raises:
+            PartitionNotFoundError: If the partition does not exist.
+            PlanStaleError: If the relation holding the name is not the one
+                ``expected_oid`` identifies, or is not attached to
+                ``table_name`` any more.
+        """
+        async with asyncio.timeout(self._ddl_timeout), self._engine.begin() as conn:
+            try:
+                await conn.execute(text(SET_LOCK_TIMEOUT_SQL), {"timeout": str(self._lock_timeout_ms)})
+                await conn.execute(
+                    build_ddl_statement("LOCK TABLE {partition} IN ACCESS EXCLUSIVE MODE", partition=partition_name)
+                )
+                await self._ensure_still_the_partition(conn, table_name, partition_name, expected_oid)
+                await conn.execute(build_ddl_statement("TRUNCATE TABLE {partition}", partition=partition_name))
+            except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                if pg_sqlstate(exc) == "42P01":
+                    raise PartitionNotFoundError(partition_name) from exc
+                raise
 
     async def adopt(self, table_name: str, partition_name: str) -> bool:
         """Stamp the orphan marker on a detached table this library did not detach.

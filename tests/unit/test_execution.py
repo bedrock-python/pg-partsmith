@@ -51,6 +51,7 @@ from pg_partsmith.plan import (
     Operation,
     PartitionBy,
     Reason,
+    TruncatePartition,
 )
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning
 from pg_partsmith.topology import PartitionBounds
@@ -114,6 +115,7 @@ def repo() -> MagicMock:
     repo.create_foreign_table_like = AsyncMock(side_effect=lambda *_args, **_kwargs: next(oids))
     repo.attach_partition = AsyncMock(return_value=None)
     repo.detach_partition = AsyncMock(return_value=None)
+    repo.truncate_partition = AsyncMock(return_value=None)
     repo.drop_partition = AsyncMock(return_value=0)
     repo.reconcile_default_rows = AsyncMock(return_value=0)
     repo.reconcile_and_attach = AsyncMock(return_value=0)
@@ -1312,6 +1314,117 @@ async def test__apply__detach_op_stale_with_continue_on_error__records_a_detach_
     assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.DETACH]
     assert "PlanStaleError" in result.issues[0].error
     assert result.detached_count == 0
+
+
+# ── truncate ────────────────────────────────────────────────────────────────────
+
+
+def _truncate_op(oid: int | None = 77) -> TruncatePartition:
+    return TruncatePartition(
+        target="events__2024_03", oid=oid, parent_name="events", bounds=MARCH, reason=Reason.RETENTION_EXPIRED
+    )
+
+
+async def test__apply__truncate_op__revalidates_then_empties_in_place_with_hooks_around_it(
+    repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 77
+    metadata.is_partition_attached.return_value = True
+    seen: list[tuple[HookPhase, PartitionInfo]] = []
+
+    class Truncates(BasePartitionLifecycleHooks):
+        async def on_event(self, event: PartitionEvent) -> None:
+            seen.append((event.phase, event.partition))
+
+    # Act
+    result = await PlanExecutor(repo, metadata, hooks=[Truncates()]).apply(_config(), _plan(_truncate_op()))
+
+    # Assert: the partition stays attached on both sides of the statement
+    repo.truncate_partition.assert_awaited_once_with("events", "events__2024_03", expected_oid=77)
+    repo.detach_partition.assert_not_awaited()
+    assert [phase for phase, _ in seen] == [HookPhase.BEFORE_TRUNCATE, HookPhase.AFTER_TRUNCATE]
+    expected = PartitionInfo(
+        name="events__2024_03",
+        oid=77,
+        partition_type=PartitionType.RANGE,
+        bounds=MARCH,
+        boundaries_expr="range",
+        is_attached=True,
+        parent_table="events",
+    )
+    assert [info for _, info in seen] == [expected, expected]
+    assert result.truncated_count == 1
+    assert result.detached_count == 0
+
+
+async def test__apply__before_truncate_refuses__nothing_is_emptied(repo: MagicMock, metadata: MagicMock) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 77
+    metadata.is_partition_attached.return_value = True
+
+    class Refuses(BasePartitionLifecycleHooks):
+        async def before_truncate(self, event: PartitionEvent) -> None:
+            raise RuntimeError("export failed")
+
+    # Act
+    result = await PlanExecutor(repo, metadata, hooks=[Refuses()]).apply(
+        _config(), _plan(_truncate_op()), continue_on_error=True
+    )
+
+    # Assert
+    repo.truncate_partition.assert_not_awaited()
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.TRUNCATE]
+    assert result.truncated_count == 0
+
+
+async def test__apply__truncate_op_oid_mismatch__is_stale_and_nothing_is_emptied(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock, hooks: _RecordingHooks
+) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 999
+
+    # Act / Assert
+    with pytest.raises(PlanStaleError):
+        await executor.apply(_config(), _plan(_truncate_op()))
+
+    repo.truncate_partition.assert_not_awaited()
+    assert hooks.calls == []
+
+
+async def test__apply__truncate_op_no_longer_attached__is_stale_and_recorded_when_continuing(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange: someone detached it in between; a detached table is not this plan's to empty
+    metadata.get_relation_oid.return_value = 77
+    metadata.is_partition_attached.return_value = False
+
+    # Act
+    result = await executor.apply(_config(), _plan(_truncate_op()), continue_on_error=True)
+
+    # Assert
+    repo.truncate_partition.assert_not_awaited()
+    assert [issue.step for issue in result.issues] == [MaintenanceIssueStep.TRUNCATE]
+    assert "no longer attached" in result.issues[0].error
+
+
+async def test__apply__truncate_not_granted_its_lock_in_time__records_an_issue_and_the_next_operation_runs(
+    executor: PlanExecutor, repo: MagicMock, metadata: MagicMock
+) -> None:
+    # Arrange
+    metadata.get_relation_oid.return_value = 77
+    metadata.is_partition_attached.return_value = True
+    repo.truncate_partition.side_effect = _sqlstate_error("55P03", "canceling statement due to lock timeout")
+
+    # Act
+    result = await executor.apply(_config(), _plan(_truncate_op(), _drop_op()))
+
+    # Assert
+    assert [(issue.step, issue.partition_name) for issue in result.issues] == [
+        (MaintenanceIssueStep.TRUNCATE, "events__2024_03")
+    ]
+    assert result.truncated_count == 0
+    assert result.dropped_count == 1
 
 
 # ── drop ────────────────────────────────────────────────────────────────────────

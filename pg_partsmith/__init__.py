@@ -64,6 +64,7 @@ from .lifecycle import (
     DropAfter,
     DropNever,
     DropPolicy,
+    ExpireAction,
     ExpireIf,
     KeepBehind,
     KeepFor,
@@ -92,6 +93,7 @@ from .plan import (
     PartitionBy,
     Reason,
     Severity,
+    TruncatePartition,
     validate_plan_for_config,
 )
 from .planner import PlanMode, PlanningContext, plan_maintenance
@@ -145,6 +147,7 @@ __all__ = [
     "DropPolicy",
     "DropRetryExhaustedError",
     "EpochBoundaryCodec",
+    "ExpireAction",
     "ExpireIf",
     "FactKind",
     "Finding",
@@ -226,6 +229,7 @@ __all__ = [
     "TimeBoundaries",
     "TimezoneAwareCalculator",
     "ToolkitOptions",
+    "TruncatePartition",
     "UUIDv7BoundaryCodec",
     "UnattachedTable",
     "UnmanagedPartitionDropError",
