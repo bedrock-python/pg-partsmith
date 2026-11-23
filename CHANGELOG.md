@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.10.0...pg-partsmith-v1.11.0) (2026-11-23)
+
+
+### Features
+
+* expired partitions can be emptied in place instead of detached ([#149](https://github.com/bedrock-python/pg-partsmith/issues/149)) ([1f95e78](https://github.com/bedrock-python/pg-partsmith/commit/1f95e782cfe2ec4c135b0965efa731484c57a1a3))
+
 ## 1.11.0 — expired partitions can be emptied in place
 
 A retention policy could only take an expired partition out of the tree: detach it, then
