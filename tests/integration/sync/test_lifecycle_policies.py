@@ -419,6 +419,7 @@ def test__detach_mode_auto__with_a_default_partition__is_planned_as_the_blocking
     detach = result.maintenance_plan.detaches[0]
     assert detach.mode is DetachMode.BLOCKING
     assert "DEFAULT partition" in detach.detail
+    assert "ACCESS EXCLUSIVE on the parent" in detach.capabilities.lock
 
 
 def test__detach_mode_auto__without_a_default_partition__stays_concurrent(sync_db_engine: Engine, table: str) -> None:

@@ -13,8 +13,10 @@ A test that cannot be mirrored mechanically (one that drives two coroutines
 concurrently, say) is marked in the aio suite with a ``# sync-mirror: skip``
 line right above it (above its decorators, if any) and is left out of the sync
 suite; its thread-based twin lives in ``tests/integration/sync/test_concurrency.py``,
-the one module of the sync suite that is written by hand. A module the aio
-suite no longer has is removed from the sync suite, that one excepted.
+the one module of the sync suite that is written by hand. ``test_cli.py`` has
+no sync twin: the CLI runs the aio service on an event loop of its own, so a
+mirror would run the same code again. A module the aio suite no longer has is
+removed from the sync suite, the hand-written one excepted.
 """
 
 from __future__ import annotations
@@ -28,9 +30,11 @@ AIO = ROOT / "tests" / "integration" / "aio"
 SYNC = ROOT / "tests" / "integration" / "sync"
 
 HANDWRITTEN = frozenset({"test_concurrency.py"})
+AIO_ONLY = frozenset({"test_cli.py"})
 SKIP_MARKER = "# sync-mirror: skip"
-TOP_LEVEL = re.compile(r"^(async def |def |class |@|# ──)")
-DEFINITION = re.compile(r"^(async )?def ")
+SECTION = "# ──"
+TOP_LEVEL = re.compile(rf"^(async def |def |class |@|{SECTION})")
+DEFINITION = re.compile(r"^((async )?def |class )")
 FOR_LOOP = re.compile(r"^(?P<indent>\s*)for (?P<var>\w+) in (?P<rest>.*)$")
 
 RULES: list[tuple[str, str]] = [
@@ -89,7 +93,7 @@ RULES: list[tuple[str, str]] = [
 
 def transform(text: str) -> str:
     """Turn one aio test module into its sync twin."""
-    text = "\n".join(_without_skipped(text.split("\n")))
+    text = "\n".join(_without_empty_sections(_without_skipped(text.split("\n"))))
     for pattern, repl in RULES:
         text = re.sub(pattern, repl, text)
     text = text.replace("import asyncio\n", "")
@@ -97,11 +101,10 @@ def transform(text: str) -> str:
 
 
 def _without_skipped(lines: list[str]) -> list[str]:
-    """Leave out every function under a ``# sync-mirror: skip`` line.
+    """Leave out every function or class under a ``# sync-mirror: skip`` line.
 
-    The marker sits right above the function -- above its decorators when it
-    has any -- and the function ends at the next top-level definition,
-    decorator or section heading.
+    The marker sits right above it -- above its decorators when it has any --
+    and it ends at the next top-level definition, decorator or section heading.
     """
     kept: list[str] = []
     state = "keep"
@@ -123,6 +126,25 @@ def _without_skipped(lines: list[str]) -> list[str]:
                 continue
             state = "keep"
         kept.append(line)
+    return kept
+
+
+def _without_empty_sections(lines: list[str]) -> list[str]:
+    """Drop a section heading, and the comments under it, when no code is left in its section."""
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith(SECTION):
+            end = i + 1
+            while end < len(lines) and (
+                not lines[end].strip() or (lines[end].startswith("#") and not lines[end].startswith(SECTION))
+            ):
+                end += 1
+            if end == len(lines) or lines[end].startswith(SECTION):
+                i = end
+                continue
+        kept.append(lines[i])
+        i += 1
     return kept
 
 
@@ -160,6 +182,8 @@ def main() -> None:
     SYNC.mkdir(parents=True, exist_ok=True)
     generated: set[str] = set()
     for source in sorted(AIO.glob("*.py")):
+        if source.name in AIO_ONLY:
+            continue
         target = SYNC / source.name
         target.write_text(transform(source.read_text(encoding="utf-8")), encoding="utf-8")
         generated.add(target.name)
