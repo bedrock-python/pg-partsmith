@@ -38,6 +38,9 @@ class HookPhase(StrEnum):
         BEFORE_DETACH: Before it leaves its parent — the rows are still
             reachable through the root.
         AFTER_DETACH: After the detach — the table stands alone.
+        BEFORE_TRUNCATE: The last moment the rows of an expired partition
+            exist, when the policy empties it in place instead of detaching it.
+        AFTER_TRUNCATE: After it is emptied; it is still attached.
         BEFORE_DROP: The last moment its rows exist.
         AFTER_DROP: After the table is gone.
     """
@@ -48,6 +51,8 @@ class HookPhase(StrEnum):
     AFTER_ATTACH = "after_attach"
     BEFORE_DETACH = "before_detach"
     AFTER_DETACH = "after_detach"
+    BEFORE_TRUNCATE = "before_truncate"
+    AFTER_TRUNCATE = "after_truncate"
     BEFORE_DROP = "before_drop"
     AFTER_DROP = "after_drop"
 

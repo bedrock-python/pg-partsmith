@@ -25,6 +25,7 @@ from pg_partsmith.lifecycle import (
     DetachMode,
     DropAfter,
     DropNever,
+    ExpireAction,
     ExpireIf,
     KeepFor,
     KeepNewest,
@@ -623,6 +624,96 @@ def test__keep_for__expires_windows_that_ended_more_than_the_age_ago(sync_db_eng
         f"{table}__2026_07",
         f"{table}__2026_08",
     }
+
+
+# ── Emptying expired partitions in place ────────────────────────────────────────
+
+
+def _truncating(retention: KeepFor | KeepNewest) -> LifecyclePolicy:
+    return LifecyclePolicy(creation=CreateAhead(count=1), retention=retention, expire=ExpireAction.TRUNCATE)
+
+
+def test__expire_truncate__a_year_old_partition__emptied_in_place_and_left_attached(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange: the reporter's setup -- a year of retention, and a DEFAULT partition, which
+    # would force a detach into its blocking form
+    july = _seed_month(sync_db_engine, table, 2025, 7, rows=40)
+    _seed_month(sync_db_engine, table, 2026, 8, rows=5)
+    exec_sql(sync_db_engine, f'CREATE TABLE "{table}_default" PARTITION OF "{table}" DEFAULT')
+    oid_before = relation_oid(sync_db_engine, july)
+    config = monthly_config(table, lifecycle=_truncating(KeepFor(age=timedelta(days=365))))
+
+    # Act
+    result = run_maintenance(sync_db_engine, config, at_time=NOW)
+
+    # Assert: the same table, still attached and now empty; nothing else touched
+    assert result.issues == ()
+    assert (result.truncated_count, result.detached_count, result.dropped_count) == (1, 0, 0)
+    assert is_attached(sync_db_engine, july)
+    assert relation_oid(sync_db_engine, july) == oid_before
+    assert table_comment(sync_db_engine, july) is None
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{july}"') == 0  # noqa: S608
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{table}"') == 5  # noqa: S608
+    assert set(range_children_of(sync_db_engine, table)) == {july, f"{table}__2026_08"}
+
+
+def test__expire_truncate__second_run__issues_no_ddl_and_reports_what_it_keeps(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange: one run has emptied July 2025 already
+    _seed_month(sync_db_engine, table, 2025, 7, rows=40)
+    _seed_month(sync_db_engine, table, 2026, 8, rows=5)
+    config = monthly_config(table, lifecycle=_truncating(KeepFor(age=timedelta(days=365))))
+    run_maintenance(sync_db_engine, config, at_time=NOW)
+
+    # Act
+    with count_ddl(sync_db_engine) as counter:
+        result = run_maintenance(sync_db_engine, config, at_time=NOW)
+
+    # Assert
+    assert counter.statements == []
+    assert result.truncated_count == 0
+    assert result.maintenance_plan is not None
+    assert [(f.reason, f.partition_name) for f in result.maintenance_plan.findings] == [
+        (FindingReason.EXPIRED_EMPTY, f"public.{table}")
+    ]
+    assert result.issues == ()
+
+
+def test__expire_truncate__a_late_row_in_an_emptied_partition__emptied_again(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange: emptied once, then a late write lands in the expired window
+    june = _seed_month(sync_db_engine, table, 2026, 6, rows=10)
+    _seed_month(sync_db_engine, table, 2026, 8)
+    config = monthly_config(table, lifecycle=_truncating(KeepNewest(count=1)))
+    run_maintenance(sync_db_engine, config, at_time=NOW)
+    exec_sql(sync_db_engine, f"INSERT INTO \"{table}\" (created_at, payload) VALUES ('2026-06-20', 'late')")  # noqa: S608
+
+    # Act
+    result = run_maintenance(sync_db_engine, config, at_time=NOW)
+
+    # Assert
+    assert result.truncated_count == 1
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{june}"') == 0  # noqa: S608
+
+
+def test__expire_truncate__switched_back_to_detach__the_emptied_partitions_are_retired(
+    sync_db_engine: Engine, table: str
+) -> None:
+    # Arrange: what replaces a later drop -- retention still says they expired
+    june = _seed_month(sync_db_engine, table, 2026, 6, rows=10)
+    _seed_month(sync_db_engine, table, 2026, 8)
+    run_maintenance(sync_db_engine, monthly_config(table, lifecycle=_truncating(KeepNewest(count=1))), at_time=NOW)
+    detaching = LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(count=1), drop=DropAfter())
+
+    # Act
+    result = run_maintenance(sync_db_engine, monthly_config(table, lifecycle=detaching), at_time=NOW)
+
+    # Assert
+    assert (result.detached_count, result.dropped_count) == (1, 1)
+    assert relkind(sync_db_engine, june) is None
 
 
 # ── Orphans that come back ──────────────────────────────────────────────────────

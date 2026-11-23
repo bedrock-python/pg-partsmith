@@ -10,9 +10,10 @@ plan's order:
   before it leaves a detached table that no writer can reach -- never a live
   branch that rejects part of its keyspace. The next run finds the table,
   completes it, and attaches it.
-* **revalidate before destroying.** A detach or drop is executed only if the
-  relation still has the OID the plan decided about; a table dropped and
-  recreated under the same name between plan and apply is left alone.
+* **revalidate before destroying.** A detach, truncate or drop is executed
+  only if the relation still has the OID the plan decided about; a table
+  dropped and recreated under the same name between plan and apply is left
+  alone.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 from pg_partsmith.boundaries import Window
 from pg_partsmith.constants import (
@@ -48,6 +49,7 @@ from pg_partsmith.plan import (
     FindingReason,
     MaintenancePlan,
     Operation,
+    TruncatePartition,
     validate_plan_for_config,
 )
 from pg_partsmith.planner import PlanMode, PlanningContext, plan_maintenance, to_maintenance_issue
@@ -76,6 +78,7 @@ class _Tally:
     repaired: int = 0
     attached: int = 0
     detached: int = 0
+    truncated: int = 0
     dropped: int = 0
 
 
@@ -105,10 +108,12 @@ class PlanExecutor:
         A topology conflict discovered while executing -- a DEFAULT sibling
         holding rows, a name held by a relation with other bounds, a detach
         PostgreSQL refuses because rows of another table still reference the
-        partition -- is recorded as an issue and never aborts the run: one odd
-        partition must not stop every other one from being maintained. Any
-        other failure aborts the run unless ``continue_on_error`` is set, in
-        which case it is recorded and the next operation runs.
+        partition, a truncate the repository refuses because a foreign key or a
+        foreign table reached the partition after the plan was made -- is
+        recorded as an issue and never aborts the run: one odd partition must
+        not stop every other one from being maintained. Any other failure
+        aborts the run unless ``continue_on_error`` is set, in which case it is
+        recorded and the next operation runs.
 
         Args:
             config: The configuration the plan was made from.
@@ -140,6 +145,9 @@ class PlanExecutor:
                     self.detach_single_partition(config, op)
                     detached.add(op.target)
                     tally.detached += 1
+                elif isinstance(op, TruncatePartition):
+                    self._truncate(config, op)
+                    tally.truncated += 1
                 elif isinstance(op, DropPartition):
                     if op.follows_detach and op.target not in detached:
                         logger.info(
@@ -149,6 +157,8 @@ class PlanExecutor:
                         continue
                     if self.drop_single_partition(config, op) is not None:
                         tally.dropped += 1
+                else:  # pragma: no cover - _step_of has refused an unknown operation already
+                    assert_never(op)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except PartitionTopologyError as exc:
@@ -186,6 +196,7 @@ class PlanExecutor:
             repaired_count=tally.repaired,
             attached_count=tally.attached,
             detached_count=tally.detached,
+            truncated_count=tally.truncated,
             dropped_count=tally.dropped,
             issues=tuple(issues),
             plan=plan,
@@ -727,14 +738,23 @@ class PlanExecutor:
             PlanStaleError: If the relation is no longer the one the plan saw,
                 or is no longer attached.
         """
-        self._require_same_relation(op.target, op.oid)
-        if not self._metadata.is_partition_attached(op.parent_name, op.target):
-            raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
-
-        info = _detach_info(config, op)
+        self._require_still_attached(op)
+        info = _attached_info(config, op)
         self._fire(HookPhase.BEFORE_DETACH, config, info, op)
         self._repo.detach_partition(op.parent_name, op.target, mode=op.mode, expected_oid=op.oid)
         self._fire(HookPhase.AFTER_DETACH, config, info.model_copy(update={"is_attached": False}), op)
+
+    def _truncate(self, config: TablePartitionConfig, op: TruncatePartition) -> None:
+        """Empty one expired partition in place, running the truncate hooks around it.
+
+        Identity is checked here, before the hooks run, and again by the
+        repository under the truncate's own lock, as for a detach.
+        """
+        self._require_still_attached(op)
+        info = _attached_info(config, op)
+        self._fire(HookPhase.BEFORE_TRUNCATE, config, info, op)
+        self._repo.truncate_partition(op.parent_name, op.target, expected_oid=op.oid)
+        self._fire(HookPhase.AFTER_TRUNCATE, config, info, op)
 
     def drop_single_partition(
         self, config: TablePartitionConfig, op: DropPartition, *, drain_into: str | None = None
@@ -761,6 +781,17 @@ class PlanExecutor:
             return None
         self._fire(HookPhase.AFTER_DROP, config, info, op)
         return drained
+
+    def _require_still_attached(self, op: DetachPartition | TruncatePartition) -> None:
+        """Refuse to detach or empty a relation the plan did not see, or one no longer attached.
+
+        Raises:
+            PlanStaleError: If the relation is no longer the one the plan saw,
+                or is no longer attached to the parent the plan named.
+        """
+        self._require_same_relation(op.target, op.oid)
+        if not self._metadata.is_partition_attached(op.parent_name, op.target):
+            raise PlanStaleError(op.target, f"it is no longer attached to {op.parent_name}")
 
     def _require_same_relation(self, name: str, expected_oid: int | None) -> None:
         """Refuse to act on a relation the plan did not see."""
@@ -853,11 +884,15 @@ def _step_of(op: Operation) -> MaintenanceIssueStep:
         return MaintenanceIssueStep.ATTACH
     if isinstance(op, DetachPartition):
         return MaintenanceIssueStep.DETACH
-    return MaintenanceIssueStep.DROP
+    if isinstance(op, TruncatePartition):
+        return MaintenanceIssueStep.TRUNCATE
+    if isinstance(op, DropPartition):
+        return MaintenanceIssueStep.DROP
+    assert_never(op)  # pragma: no cover - the plan's discriminated union admits no other kind
 
 
-def _detach_info(config: TablePartitionConfig, op: DetachPartition) -> PartitionInfo:
-    """What hooks see of a partition about to be detached.
+def _attached_info(config: TablePartitionConfig, op: DetachPartition | TruncatePartition) -> PartitionInfo:
+    """What hooks see of an attached partition about to be detached or emptied.
 
     Built without validation: the plan may know the partition only by name and
     OID (a caller handing in a listing that carried a raw bound, say), and a

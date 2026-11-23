@@ -25,6 +25,7 @@ from pg_partsmith.lifecycle import (
     DetachMode,
     DropAfter,
     DropNever,
+    ExpireAction,
     ExpireIf,
     KeepBehind,
     KeepFor,
@@ -820,6 +821,7 @@ def test__lifecycle_policy__defaults__create_ahead_keep_newest_auto_detach_drop_
     # Assert
     assert policy.creation == CreateAhead(count=DEFAULT_CREATE_AHEAD_COUNT)
     assert policy.retention == KeepNewest(count=DEFAULT_RETENTION_COUNT)
+    assert policy.expire is ExpireAction.DETACH
     assert policy.detach is DetachMode.AUTO
     assert policy.drop == DropAfter(grace=timedelta(days=7))
     assert policy.required_facts == frozenset()
@@ -838,6 +840,39 @@ def test__lifecycle_policy__required_facts__union_over_creation_retention_and_dr
     # Act / Assert
     assert policy.required_facts == frozenset({FactKind.SIZE, FactKind.ROWS})
     assert policy.needs_facts is True
+
+
+def test__lifecycle_policy__expire_truncate__asks_whether_a_partition_is_empty_and_who_references_it() -> None:
+    # Arrange: emptiness keeps a second run from emptying it again; the references are what TRUNCATE refuses
+    policy = LifecyclePolicy(retention=KeepFor(timedelta(days=365)), expire=ExpireAction.TRUNCATE)
+
+    # Act / Assert
+    assert policy.required_facts == frozenset({FactKind.EMPTY, FactKind.REFERENCING_TABLES})
+    assert policy.needs_facts is True
+
+
+def test__lifecycle_policy__expire_truncate__keeps_the_facts_the_rules_ask_for() -> None:
+    # Arrange
+    policy = LifecyclePolicy(retention=ExpireIf(when=SizeAbove(bytes=1)), expire=ExpireAction.TRUNCATE)
+
+    # Act / Assert
+    assert policy.required_facts == frozenset({FactKind.SIZE, FactKind.EMPTY, FactKind.REFERENCING_TABLES})
+
+
+def test__lifecycle_policy__expire__spelled_as_a_document_writes_it() -> None:
+    # Arrange / Act
+    policy = LifecyclePolicy.model_validate({"retention": {"kind": "keep_for", "age": "P365D"}, "expire": "truncate"})
+
+    # Assert
+    assert policy.expire is ExpireAction.TRUNCATE
+    assert policy.model_dump(mode="json")["expire"] == "truncate"
+    assert LifecyclePolicy.model_validate(policy.model_dump(mode="json")) == policy
+
+
+def test__lifecycle_policy__expire__unknown_action__refused() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValidationError, match="expire"):
+        LifecyclePolicy.model_validate({"expire": "delete"})
 
 
 def test__lifecycle_policy__sql_predicates__creation_then_retention_then_drop() -> None:

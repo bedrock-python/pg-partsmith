@@ -32,6 +32,8 @@ issues too, with the exception's name in front of the message.
 | `drop_deferred` | INFO | An orphan past its grace whose drop condition does not hold yet. | Nothing. |
 | `unattached_rows` | WARNING | A table under a window's partition name holds rows but was never attached — a fill that stopped before its attach — so no query through the root sees them. | Run `backfill` (`partition_data`); it attaches the table. |
 | `rows_in_default` | WARNING | The root's DEFAULT partition holds rows of a window behind the cursor that has no partition: history not yet moved, or a row written with a key no partition covers. No maintenance run reaches them, retention included. | Run `backfill` (`partition_data`). |
+| `expired_empty` | INFO | Expired partitions a policy empties in place (`expire=truncate`) that are already empty and stay attached. One finding per parent, with the count and the oldest. | Nothing. Switch `expire` to `detach` to retire them. |
+| `truncate_blocked` | WARNING | An expired partition that cannot be emptied in place: it holds rows and another table references it through a foreign key, which `TRUNCATE` refuses without `CASCADE` whether or not a row is referenced; or its subtree holds a foreign table, whose `TRUNCATE` would empty the remote table, or a child whose name the tree cannot show. | Drop the foreign key, or expire by detaching with `Unreferenced()`; take the foreign table out, or detach. |
 
 ## Operation reasons
 
@@ -47,7 +49,7 @@ issues too, with the exception's name in front of the message.
 | `list_group_missing` | create | a configured LIST group with no partition |
 | `list_default_missing` | create | the configured LIST catch-all with no partition |
 | `reattach` | attach | a detached orphan whose window is wanted again |
-| `retention_expired` | detach | the retention policy declared the window expired (also `detach_old_partitions`) |
+| `retention_expired` | detach, truncate | the retention policy declared the window expired (also `detach_old_partitions`) |
 | `detach_finalize` | detach | an interrupted `DETACH CONCURRENTLY` is completed with `FINALIZE` |
 | `follows_detach` | drop | dropped in the same run as its detach |
 | `grace_elapsed` | drop | an orphan past its grace period (also `drop_detached_partitions`) |
@@ -55,8 +57,8 @@ issues too, with the exception's name in front of the message.
 ## Issue steps
 
 `MaintenanceIssue.step` says where a problem occurred: `create`, `reconcile` (a planner
-finding, or a gap filled inside an existing branch), `attach`, `detach`, `drop`, `move`
-(the batch movers).
+finding, or a gap filled inside an existing branch), `attach`, `detach`, `truncate`,
+`drop`, `move` (the batch movers).
 
 ## Exceptions
 
@@ -64,12 +66,12 @@ finding, or a gap filled inside an existing branch), `attach`, `detach`, `drop`,
 |---|---|---|
 | `InvalidPartitionConfigError` | `plan()` and everything over it | the configuration does not match the table, or PostgreSQL would refuse it |
 | `LockAcquisitionError` | `apply()`, `maintain()`, the movers | another maintainer holds the table's lock |
-| `PartitionTopologyError` | recorded as an issue | a topology conflict met while executing |
+| `PartitionTopologyError` | recorded as an issue | a topology conflict met while executing, such as a foreign key added after the plan to a partition it empties (`truncate_blocked`) |
 | `PartitionReferencedError` | recorded as an issue | a detach PostgreSQL refused because rows are still referenced |
 | `RowMoveRefusedError` | recorded as an issue | a row move an incoming foreign key's `ON DELETE` action would corrupt |
-| `PlanStaleError` | detach and drop | the relation is not the one the plan decided about |
+| `PlanStaleError` | detach, truncate and drop | the relation is not the one the plan decided about |
 | `PartitionAlreadyExistsError` | `create_table_like` | the name is taken (handled by the executor as a race or a conflict) |
-| `PartitionNotFoundError` | detach, moves | the relation does not exist |
+| `PartitionNotFoundError` | detach, truncate, moves | the relation does not exist |
 | `PartitionAttachedError` | `drop_partition`, `adopt_partition` | the table is still attached |
 | `PartitionDetachInProgressError` | detach | another detach of the partition is pending |
 | `UnmanagedPartitionDropError` | `drop_partition` | the table carries no marker |

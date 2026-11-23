@@ -65,7 +65,8 @@ class PartitionLifecycle(Protocol):
         Args:
             config: Table partitioning configuration.
             skip_create: Leave out creations and re-attachments.
-            skip_detach: Leave out detaches (and the drops that follow them).
+            skip_detach: Leave out what retention does to an expired partition:
+                its detach (and the drop that follows it), or its truncate.
             skip_drop: Leave out drops.
             continue_on_error: Collect operation failures into
                 ``MaintenanceResult.issues`` and keep going instead of aborting.
@@ -184,6 +185,34 @@ class PartitionRepository(Protocol):
             PartitionNotFoundError: If partition doesn't exist.
             PartitionDetachInProgressError: If another detach is pending.
             PlanStaleError: If the relation is not the one ``expected_oid`` named.
+        """
+        ...
+
+    async def truncate_partition(
+        self,
+        parent_name: str,
+        partition_name: str,
+        *,
+        expected_oid: int | None = None,
+    ) -> None:
+        """Empty an attached partition in place, subtree included.
+
+        Args:
+            parent_name: The parent it is attached to, and stays attached to.
+            partition_name: Partition table name.
+            expected_oid: The catalog identity the caller decided on, checked
+                under the truncate's own lock. When the relation now holding
+                the name has another, nothing is emptied; nor is it when the
+                relation is not attached to ``parent_name``, with or without it.
+
+        Raises:
+            PartitionNotFoundError: If partition doesn't exist.
+            PlanStaleError: If the relation is not the one ``expected_oid`` named,
+                or is not attached to ``parent_name``.
+            PartitionTopologyError: If its subtree holds a foreign table, or a
+                foreign key of another table reaches it (``truncate_blocked``);
+                nothing is emptied. The executor records this as an issue and
+                the run goes on.
         """
         ...
 

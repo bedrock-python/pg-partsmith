@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.11.0 — expired partitions can be emptied in place
+
+A retention policy could only take an expired partition out of the tree: detach it, then
+drop it or keep it. A project that empties expired partitions in place, as data-rentgen's
+`cleanup_partitions truncate` does, could not switch without changing what its operators
+see ([#130](https://github.com/bedrock-python/pg-partsmith/issues/130)).
+
+**What is new:** `LifecyclePolicy(expire=ExpireAction.TRUNCATE)`, `expire: truncate` in a
+document, empties an expired partition with `TRUNCATE` and leaves it attached. The plan
+carries a `TruncatePartition` (kind `truncate`), the result a `truncated_count`, and hooks
+get `before_truncate` / `after_truncate`, which a document's `hooks` section takes too. The
+truncate locks the partition and the relations below it and never the parent, so writers to
+the other partitions do not wait for it, where a blocking detach holds the whole parent. A
+partition that is empty already gets no operation, and one `expired_empty` finding per
+parent counts them. One that a foreign key reaches, which PostgreSQL refuses to truncate
+whether or not a row is referenced, is reported as `truncate_blocked` rather than failing
+the run, and so is one whose subtree holds a foreign table, whose remote table `TRUNCATE`
+would empty, including a key or a foreign table that appears after the plan was made.
+`apply` without
+`--allow-destructive` and `maintain(skip_detach=True)` leave truncates out.
+
+**What stays:** the default is `ExpireAction.DETACH`, and a policy that names no `expire`
+plans exactly as before.
+
+**What to check:** a repository of your own has to implement
+`PartitionRepository.truncate_partition`, a metadata provider of your own has to answer
+`FactKind.EMPTY` and `FactKind.REFERENCING_TABLES` in `measure` (or every expired partition
+is truncated on every run), and a hook class that implements the protocol without
+subclassing `BasePartitionLifecycleHooks` needs `before_truncate` and `after_truncate`
+before it runs under `expire=truncate`. The policy serializes one more field, so
+`apply --plan` refuses a plan saved by 1.10 as made under another configuration: plan
+again, or pass `--allow-config-drift`. Before switching a table to `expire=truncate`, check
+three things: the role needs the `TRUNCATE` privilege on its partitions, which owning the
+parent does not give on partitions another role created; its publications, since logical
+replication carries a `TRUNCATE`, which it never did for a detach or a drop, so a subscriber
+keeping more history needs `truncate` left out of `publish`; and its readers, since a query
+pruned only when it runs, a `now()`-relative one say, waits for a truncate queued behind a
+reader of the expired partition, up to `ddl_lock_timeout_ms`.
+
 ## [1.10.0](https://github.com/bedrock-python/pg-partsmith/compare/pg-partsmith-v1.9.0...pg-partsmith-v1.10.0) (2026-10-17)
 
 

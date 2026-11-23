@@ -191,7 +191,9 @@ class ToolkitOptions(BaseModel):
     )
     ddl_timeout_seconds: float = Field(default=DEFAULT_DDL_TIMEOUT_SECONDS, gt=0, description="Statement timeout")
     ddl_lock_timeout_ms: int = Field(
-        default=DEFAULT_DDL_LOCK_TIMEOUT_MS, ge=0, description="lock_timeout for an attach, a row move or a detach"
+        default=DEFAULT_DDL_LOCK_TIMEOUT_MS,
+        ge=0,
+        description="lock_timeout for an attach, a row move, a detach or a truncate",
     )
     boundary_codec: str | None = Field(default=None, description="Codec name encoded bounds are read with")
     lock_prefix: str = Field(default=DEFAULT_LOCK_PREFIX, description="Prefix of the advisory lock keys")
@@ -292,6 +294,10 @@ class HookOptions(BaseModel):
     after_attach: HookAction | None = Field(default=None, description="After it is taking rows again")
     before_detach: HookAction | None = Field(default=None, description="While its rows are still reachable")
     after_detach: HookAction | None = Field(default=None, description="After it stands alone")
+    before_truncate: HookAction | None = Field(
+        default=None, description="The last moment the rows of a partition emptied in place exist"
+    )
+    after_truncate: HookAction | None = Field(default=None, description="After it is emptied, still attached")
     before_drop: HookAction | None = Field(default=None, description="The last moment its rows exist")
     after_drop: HookAction | None = Field(default=None, description="After the table is gone")
 

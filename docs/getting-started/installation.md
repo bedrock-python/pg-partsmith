@@ -7,7 +7,7 @@
 | Python | 3.11 or newer |
 | PostgreSQL | 15 or newer — the integration suite runs on 15 through 18 |
 | SQLAlchemy | 2.x, with `asyncpg` for the async API or `psycopg2` for the sync one |
-| Privileges | ownership of the partitioned table (to create, attach, detach and drop partitions) — no superuser |
+| Privileges | ownership of the partitioned table (to create, attach, detach and drop partitions), and under `expire=truncate` the `TRUNCATE` privilege on every partition it empties and the leaves below, which their owner has; owning the parent does not give it on partitions another role created; no superuser |
 
 ## Install
 

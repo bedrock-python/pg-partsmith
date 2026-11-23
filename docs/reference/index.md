@@ -110,6 +110,7 @@ entities, exceptions and period calculators.
         - KeepFor
         - KeepBehind
         - ExpireIf
+        - ExpireAction
         - DetachMode
         - DropAfter
         - DropNever
@@ -146,6 +147,7 @@ entities, exceptions and period calculators.
         - CreatePartition
         - AttachPartition
         - DetachPartition
+        - TruncatePartition
         - DropPartition
         - Finding
         - FindingReason

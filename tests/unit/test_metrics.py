@@ -59,6 +59,7 @@ def test__plan__pending_operations__are_counted_by_kind() -> None:
                     "operations": [
                         {"kind": "create", "children": [{"kind": "create", "children": []}]},
                         {"kind": "create", "children": []},
+                        {"kind": "truncate"},
                         {"kind": "drop"},
                     ],
                     "findings": [{"severity": "warning"}, {"severity": "info"}, {"severity": "warning"}],
@@ -74,6 +75,7 @@ def test__plan__pending_operations__are_counted_by_kind() -> None:
     assert samples['pg_partsmith_pending_operations{table="public.events",kind="create"}'] == 2
     assert samples['pg_partsmith_pending_operations{table="public.events",kind="drop"}'] == 1
     assert samples['pg_partsmith_pending_operations{table="public.events",kind="detach"}'] == 0
+    assert samples['pg_partsmith_pending_operations{table="public.events",kind="truncate"}'] == 1
     # Three relations: two top-level creations and one nested child
     assert samples['pg_partsmith_pending_relations{table="public.events"}'] == 3
     assert samples['pg_partsmith_findings{table="public.events",severity="warning"}'] == 2
@@ -159,6 +161,7 @@ def test__apply__reports_what_it_did_and_what_it_could_not() -> None:
                     "repaired_count": 0,
                     "attached_count": 1,
                     "detached_count": 1,
+                    "truncated_count": 3,
                     "dropped_count": 1,
                     "issues": [{"step": "drop", "error": "refused"}],
                 },
@@ -171,6 +174,7 @@ def test__apply__reports_what_it_did_and_what_it_could_not() -> None:
 
     # Assert
     assert samples['pg_partsmith_applied_operations{table="public.events",operation="created"}'] == 2
+    assert samples['pg_partsmith_applied_operations{table="public.events",operation="truncated"}'] == 3
     assert samples['pg_partsmith_applied_operations{table="public.events",operation="dropped"}'] == 1
     assert samples['pg_partsmith_issues{table="public.events"}'] == 1
 

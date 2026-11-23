@@ -109,10 +109,11 @@ class PartitionToolkit:
             ddl_timezone: Session timezone naive boundary literals are written
                 and read in, given to both for the same reason.
             ddl_timeout_seconds: Statement timeout for DDL.
-            ddl_lock_timeout_ms: ``lock_timeout`` an attach, a row move or a
-                blocking detach runs under. While such a step waits for a lock,
-                every writer of the table queues behind it; past this it gives up,
-                changes nothing, and the next run tries again.
+            ddl_lock_timeout_ms: ``lock_timeout`` an attach, a row move, a
+                blocking detach or a truncate runs under. While such a step waits
+                for a lock, every query that needs what it waits for queues behind
+                it; past this it gives up, changes nothing, and the next run tries
+                again.
             boundary_codec: Codec ``is_partition_closed`` reads encoded bounds
                 with; only needed when the key is an encoded identifier.
             lock_prefix: Prefix of the default advisory lock manager's keys.

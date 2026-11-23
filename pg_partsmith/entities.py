@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from .boundaries import Axis, CursorSource, TimeBoundaries
 from .leaves import LeafBackend, LocalLeaves
-from .lifecycle import CreateAhead, KeepNewest, LifecyclePolicy
+from .lifecycle import CreateAhead, ExpireAction, KeepNewest, LifecyclePolicy
 from .periods import PartitionGranularity, Period
 from .scheme import HashPartitioning, ListPartitioning, PartitionScheme, RangePartitioning, SchemeBase, name_fits
 from .topology import (
@@ -372,6 +372,13 @@ class TablePartitionConfig(BaseModel):
                         "CreateNextIf(...) or bound it with CreateUntil(...)"
                     )
                     raise ValueError(msg)
+
+        if self.lifecycle.expire is ExpireAction.TRUNCATE and self.manages_foreign_leaves:
+            msg = (
+                "expire=truncate empties a partition with TRUNCATE, which on a foreign table empties the remote "
+                "table; foreign leaves expire by detaching (expire=detach)"
+            )
+            raise ValueError(msg)
         return self
 
     # ── Derived views ───────────────────────────────────────────────────────────
@@ -536,6 +543,7 @@ class MaintenanceIssueStep(StrEnum):
     RECONCILE = "reconcile"
     ATTACH = "attach"
     DETACH = "detach"
+    TRUNCATE = "truncate"
     DROP = "drop"
     MOVE = "move"
 
@@ -569,6 +577,7 @@ class MaintenanceResult(BaseModel):
         attached_count: Detached partitions re-attached because their window
             was wanted again.
         detached_count: Partitions detached in this run.
+        truncated_count: Expired partitions emptied in place in this run.
         dropped_count: Partitions dropped.
         duration_ms: Duration of maintenance in milliseconds.
         error: Fatal error message (set when the whole maintenance run fails).
@@ -585,6 +594,7 @@ class MaintenanceResult(BaseModel):
     repaired_count: NonNegativeInt = 0
     attached_count: NonNegativeInt = 0
     detached_count: NonNegativeInt = 0
+    truncated_count: NonNegativeInt = 0
     dropped_count: NonNegativeInt = 0
     duration_ms: NonNegativeInt = 0
     error: str | None = None

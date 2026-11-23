@@ -1,4 +1,4 @@
-"""Helper for partition detachment and removal."""
+"""Helper for partition detachment, emptying and removal."""
 
 from __future__ import annotations
 
@@ -10,17 +10,24 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from pg_partsmith.catalog_queries import SET_LOCK_TIMEOUT_SQL
+from pg_partsmith.catalog_queries import (
+    FOREIGN_TABLES_IN_SUBTREE_SQL,
+    REFERENCING_TABLES_SQL,
+    RELATION_OID_SQL,
+    SET_LOCK_TIMEOUT_SQL,
+)
 from pg_partsmith.exceptions import (
     DropRetryExhaustedError,
     PartitionAttachedError,
     PartitionDetachInProgressError,
     PartitionNotFoundError,
     PartitionReferencedError,
+    PartitionTopologyError,
     PlanStaleError,
     UnmanagedPartitionDropError,
 )
 from pg_partsmith.lifecycle import DetachMode
+from pg_partsmith.plan import FindingReason
 from pg_partsmith.utils import (
     build_ddl_statement,
     coerce_str,
@@ -61,7 +68,7 @@ _CONCURRENT_DETACH_UNAVAILABLE: frozenset[str] = frozenset({"0A000", "42601", "5
 
 
 class PartitionRemover:
-    """Helper for partition detachment and removal."""
+    """Helper for partition detachment, emptying and removal."""
 
     def __init__(
         self,
@@ -195,6 +202,82 @@ class PartitionRemover:
         self._ensure_expected_oid(conn, partition_name, expected_oid)
         if not self._resolver.is_attached_conn(conn, table_name, partition_name):
             raise PlanStaleError(partition_name, f"it is no longer attached to {table_name}")
+
+    def truncate(self, table_name: str, partition_name: str, *, expected_oid: int | None = None) -> None:
+        """Empty an attached partition in place, subtree included.
+
+        ``TRUNCATE`` takes ``ACCESS EXCLUSIVE`` on the partition and on every
+        relation below it, and nothing on the parent: writers to the other
+        partitions never wait for it. The lock is taken first, under
+        ``lock_timeout``, so a long reader of the partition makes this give up
+        rather than queue every later query on it behind the wait; the identity
+        and attachment checks then see the relation the statement empties.
+
+        Two things the planner keeps out of the plan are looked for again under
+        the lock, since either can appear after the plan was made and both
+        have to wait for it: a foreign table in the subtree, whose remote table
+        ``TRUNCATE`` would empty, and a foreign key reaching the partition,
+        which makes PostgreSQL refuse the statement whether or not a row is
+        referenced.
+
+        Args:
+            table_name: The parent it is attached to.
+            partition_name: The partition to empty.
+            expected_oid: The identity the decision to empty it was made about.
+
+        Raises:
+            PartitionNotFoundError: If the partition does not exist.
+            PlanStaleError: If the relation holding the name is not the one
+                ``expected_oid`` identifies, or is not attached to
+                ``table_name``.
+            PartitionTopologyError: If its subtree holds a foreign table, or
+                another table references it through a foreign key
+                (``truncate_blocked``); nothing is emptied.
+        """
+        with self._engine.begin() as conn:
+            apply_local_statement_timeout(conn, self._ddl_timeout)
+            try:
+                conn.execute(text(SET_LOCK_TIMEOUT_SQL), {"timeout": str(self._lock_timeout_ms)})
+                conn.execute(
+                    build_ddl_statement("LOCK TABLE {partition} IN ACCESS EXCLUSIVE MODE", partition=partition_name)
+                )
+                self._ensure_expected_oid(conn, partition_name, expected_oid)
+                # Checked whatever ``expected_oid`` is: TRUNCATE names no parent,
+                # so nothing else stops it from emptying a detached table of that name.
+                if not self._resolver.is_attached_conn(conn, table_name, partition_name):
+                    raise PlanStaleError(partition_name, f"it is not attached to {table_name}")
+                self._ensure_truncate_reaches_nothing_else(conn, partition_name)
+                conn.execute(build_ddl_statement("TRUNCATE TABLE {partition}", partition=partition_name))
+            except (SQLAlchemyError, OSError, TimeoutError) as exc:
+                if pg_sqlstate(exc) == "42P01":
+                    raise PartitionNotFoundError(partition_name) from exc
+                raise
+
+    def _ensure_truncate_reaches_nothing_else(self, conn: Connection, partition_name: str) -> None:
+        """Refuse a subtree holding a foreign table, and a partition a foreign key reaches."""
+        value = (conn.execute(text(RELATION_OID_SQL), {"name": to_regclass_argument(partition_name)})).scalar()
+        if value is None:  # pragma: no cover - the relation was locked earlier in this transaction
+            raise PartitionNotFoundError(partition_name)
+        oid = int(value)
+
+        result = conn.execute(text(FOREIGN_TABLES_IN_SUBTREE_SQL), {"oid": oid})
+        foreign = [str(row.name) for row in result.fetchall()]
+        if foreign:
+            detail = (
+                f"{partition_name} was not emptied: its subtree holds a foreign table ({', '.join(foreign)}), and "
+                "TRUNCATE would empty the remote table behind it."
+            )
+            raise PartitionTopologyError(partition_name, FindingReason.TRUNCATE_BLOCKED.value, detail)
+
+        result = conn.execute(text(REFERENCING_TABLES_SQL), {"oids": [oid]})
+        referencing = sorted(str(name) for row in result.fetchall() for name in row.referencing or ())
+        if referencing:
+            detail = (
+                f"{partition_name} was not emptied: another table references it through a foreign key "
+                f"({', '.join(referencing)}), and PostgreSQL refuses TRUNCATE of a referenced table without "
+                "CASCADE, which this library never issues."
+            )
+            raise PartitionTopologyError(partition_name, FindingReason.TRUNCATE_BLOCKED.value, detail)
 
     def adopt(self, table_name: str, partition_name: str) -> bool:
         """Stamp the orphan marker on a detached table this library did not detach.

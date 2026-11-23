@@ -106,7 +106,9 @@ Three things every script should get right:
 ## The phases
 
 `before_create`, `after_create`, `before_attach`, `after_attach`, `before_detach`,
-`after_detach`, `before_drop`, `after_drop`. Each takes one command.
+`after_detach`, `before_truncate`, `after_truncate`, `before_drop`, `after_drop`. Each takes
+one command. The truncate pair fires only for a table whose policy empties expired
+partitions in place (`expire: truncate`).
 
 Hooks fire once per **lifecycle unit** — the partition directly under the root — never
 once per leaf. For a `RANGE → HASH` table, `before_drop` runs once for the week, not once

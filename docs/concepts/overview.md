@@ -56,9 +56,10 @@ mark for integers, the newest partition for a sliding list.
 ### 3. Lifecycle policy — when
 
 *When partitions of the progression level are created, detached and dropped.* A
-`LifecyclePolicy` has four parts: **creation** (`CreateAhead`, `CreateUntil`,
+`LifecyclePolicy` has five parts: **creation** (`CreateAhead`, `CreateUntil`,
 `CreateNextIf`), **retention** (`KeepNewest`, `KeepFor`, `KeepBehind`, or any predicate),
-**detach mode** and **drop** (`DropAfter` a grace period, or `DropNever`). Rules are pure
+**expire** (detach an expired partition, or empty it in place), **detach mode** and
+**drop** (`DropAfter` a grace period, or `DropNever`). Rules are pure
 predicates over a candidate partition; what they need to know — a size, whether rows are
 still referenced — is gathered up front, and only when a rule asks.
 

@@ -31,7 +31,7 @@ from .boundaries import Axis, CursorSource, RangeBoundaries, Window
 from .constants import MAX_IDENTIFIER_LENGTH
 from .entities import MaintenanceIssue, MaintenanceIssueStep, TablePartitionConfig
 from .exceptions import PartitionTopologyError
-from .lifecycle import Candidate, DetachMode, DropAfter, LifecyclePolicy
+from .lifecycle import Candidate, DetachMode, DropAfter, ExpireAction, LifecyclePolicy
 from .plan import (
     AttachPartition,
     CreatePartition,
@@ -43,6 +43,7 @@ from .plan import (
     Operation,
     PartitionBy,
     Reason,
+    TruncatePartition,
 )
 from .scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning, SchemeBase
 from .topology import (
@@ -122,7 +123,7 @@ def plan_maintenance(config: TablePartitionConfig, actual: ActualTree, context: 
         generated_at=context.now,
         cursors=dict(context.cursors),
         config_fingerprint=config.fingerprint,
-        operations=tuple(planner.creates + planner.attaches + planner.detaches + planner.drops),
+        operations=tuple(planner.creates + planner.attaches + planner.detaches + planner.truncates + planner.drops),
         findings=tuple(planner.findings),
     )
 
@@ -225,6 +226,7 @@ class _Planner:
     creates: list[Operation] = field(default_factory=list)
     attaches: list[Operation] = field(default_factory=list)
     detaches: list[Operation] = field(default_factory=list)
+    truncates: list[Operation] = field(default_factory=list)
     drops: list[Operation] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
 
@@ -405,12 +407,14 @@ class _Planner:
 
         desired_set = set(desired)
         if self.ctx.mode is PlanMode.MAINTAIN:
+            kept_empty: list[_Member] = []
             for member in managed.values():
                 if member.window in desired_set:
                     continue
-                if self._expire(level, node, member, cursor_window, boundaries):
+                if self._expire(level, node, member, cursor_window, boundaries, kept_empty):
                     continue
                 recurse_into.append(member.node)
+            self._report_kept_empty(node, kept_empty)
             occupied = {m.window for m in members if m.window is not None}
             for orphan in orphans:
                 if orphan.name in consumed:
@@ -650,8 +654,14 @@ class _Planner:
         member: _Member,
         cursor_window: Window,
         boundaries: RangeBoundaries,
+        kept_empty: list[_Member],
     ) -> bool:
-        """Plan the detach (and maybe the drop) of an expired member; True when it expired."""
+        """Plan what retention does to an expired member; True when it expired.
+
+        Under ``expire=detach`` that is the detach and maybe the drop; under
+        ``expire=truncate`` it is emptying the member in place, unless it is
+        empty already -- then it joins ``kept_empty`` -- or cannot be emptied.
+        """
         assert member.window is not None  # managed members always carry one
         if not member.window.end <= cursor_window.start:
             # The cursor's own window and everything ahead of it receive rows;
@@ -661,6 +671,10 @@ class _Planner:
         candidate = self._candidate(member, cursor_window, boundaries)
         if not self.policy.retention.evaluate(candidate):
             return False
+
+        if self.policy.expire is ExpireAction.TRUNCATE:
+            self._truncate(node, member, candidate, boundaries, kept_empty)
+            return True
 
         detail = f"{boundaries.describe(member.window)} expired under '{self.policy.retention.describe()}'"
         mode = self._detach_mode(node)
@@ -699,6 +713,89 @@ class _Planner:
                 )
             )
         return True
+
+    def _truncate(
+        self,
+        node: PartitionNode,
+        member: _Member,
+        candidate: Candidate,
+        boundaries: RangeBoundaries,
+        kept_empty: list[_Member],
+    ) -> None:
+        """Plan emptying an expired member in place, or say why it is not.
+
+        The subtree is looked at before emptiness: a foreign table has no heap
+        pages of its own, so a branch whose only rows are remote reads as empty.
+
+        Facts that were not measured -- a tree handed in without them -- plan
+        the truncate: it is harmless on an empty table, and the repository
+        refuses a referenced one under its lock, so guessing wrong loses nothing.
+        """
+        assert member.window is not None  # managed members always carry one
+        subtree = member.node.walk()
+        foreign = [n.name for n in subtree if n.is_foreign]
+        if foreign:
+            self._record(
+                member.node.name,
+                FindingReason.TRUNCATE_BLOCKED,
+                f"{member.node.name} expired, but its subtree holds a foreign table ({', '.join(foreign)}), and "
+                "TRUNCATE would empty the remote table behind it; it is left as it is.",
+            )
+            return
+        if any(n.has_unaddressable_children for n in subtree):
+            # The tree leaves such a child out, so what it is cannot be read off it.
+            self._record(
+                member.node.name,
+                FindingReason.TRUNCATE_BLOCKED,
+                f"{member.node.name} expired, but its subtree has a child whose name cannot be addressed by "
+                "qualified-name DDL, so whether TRUNCATE would reach a foreign table cannot be told; it is left "
+                "as it is.",
+            )
+            return
+
+        facts = candidate.facts
+        if facts.empty:
+            kept_empty.append(member)
+            return
+
+        if facts.referencing_tables:
+            self._record(
+                member.node.name,
+                FindingReason.TRUNCATE_BLOCKED,
+                f"{member.node.name} expired and holds rows, but another table references it through a foreign "
+                f"key ({', '.join(facts.referencing_tables)}), and PostgreSQL refuses TRUNCATE of a referenced table "
+                "without CASCADE, which this library never issues; drop the foreign key, or expire by detaching "
+                "with Unreferenced().",
+            )
+            return
+
+        self.truncates.append(
+            TruncatePartition(
+                target=member.node.name,
+                oid=member.node.oid,
+                parent_name=node.name,
+                bounds=member.node.bounds,
+                reason=Reason.RETENTION_EXPIRED,
+                detail=f"{boundaries.describe(member.window)} expired under '{self.policy.retention.describe()}'; "
+                "emptied in place",
+                size_bytes=facts.size_bytes,
+                row_estimate=facts.row_estimate,
+            )
+        )
+
+    def _report_kept_empty(self, node: PartitionNode, kept_empty: list[_Member]) -> None:
+        """Say how many expired partitions stay attached and empty, so a set that only grows stays visible."""
+        if not kept_empty:
+            return
+        oldest = min(kept_empty, key=lambda m: m.window.start)  # type: ignore[union-attr]
+        count = len(kept_empty)
+        partitions = "partition" if count == 1 else "partitions"
+        self._record(
+            node.name,
+            FindingReason.EXPIRED_EMPTY,
+            f"{node.name} keeps {count} expired {partitions} attached and empty, the oldest {oldest.node.name}; "
+            "emptying in place never takes a partition out of the tree, and expire=detach retires them.",
+        )
 
     def _reattachable_window(
         self,
