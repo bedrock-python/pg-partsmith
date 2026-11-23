@@ -7,7 +7,7 @@ at all. This guide combines the three tools for that — hooks, the grace period
 
 ## The hooks
 
-Eight phases fire around create, attach, detach and drop, once per **lifecycle unit** —
+Ten phases fire around create, attach, detach, truncate and drop, once per **lifecycle unit** —
 the partition directly under the root, never once per leaf of its subtree — and once per
 member of a root `HASH` or `LIST`:
 
@@ -19,6 +19,8 @@ member of a root `HASH` or `LIST`:
 | `after_attach(event)` | after it is attached and taking rows again |
 | `before_detach(event)` | before detaching — the data is still reachable through the parent |
 | `after_detach(event)` | after a successful detach — the table exists, standalone |
+| `before_truncate(event)` | before an expired partition is emptied in place (`expire=truncate`); it is still attached and takes writes until the truncate locks it, so a row written after the hook read it is emptied unread |
+| `after_truncate(event)` | after it is emptied; it is still attached |
 | `before_drop(event)` | before the table is dropped — the last chance to read it |
 | `after_drop(event)` | after the table is gone |
 | `on_event(event)` | all of the above, in addition to the method named for the phase |
@@ -27,7 +29,7 @@ Every one of them takes the same `PartitionEvent`:
 
 | Field | What it is |
 |---|---|
-| `phase` | which of the eight moments this is |
+| `phase` | which of the ten moments this is |
 | `config` | the table's configuration — the calendar, the codec, the policy in force |
 | `partition` | the partition itself: `name`, `bounds`, `oid`, `subpartition_type` |
 | `window` | the period it covers; `None` for a member of a root `HASH` or `LIST` |
@@ -64,7 +66,7 @@ logs.
 
 ### One method for every phase
 
-An audit trail or a metrics counter wants all eight moments and treats them alike. That is
+An audit trail or a metrics counter wants all ten moments and treats them alike. That is
 `on_event`, which fires for every phase in addition to the method named after it — so a
 hook implementing both is called twice, on purpose:
 

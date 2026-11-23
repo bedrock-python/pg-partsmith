@@ -42,6 +42,7 @@ from pg_partsmith.plan import (
     DropPartition,
     MaintenancePlan,
     Reason,
+    TruncatePartition,
 )
 from pg_partsmith.planner import PlanMode
 from pg_partsmith.scheme import HashPartitioning, ListGroup, ListPartitioning, RangePartitioning
@@ -591,6 +592,30 @@ async def test__maintain__skip_detach__keeps_the_orphan_drop(
     # Assert
     applied = service._executor.apply.call_args.args[1]
     assert [op.target for op in applied.drops] == ["events__2023_12"]
+
+
+async def test__maintain__skip_detach__also_leaves_out_what_empties_in_place(
+    service: PartitionLifecycleService, config: TablePartitionConfig
+) -> None:
+    # Arrange: under expire=truncate the truncate is what retention does instead of the detach
+    plan = MaintenancePlan(
+        table_name="events",
+        generated_at=NOW,
+        operations=(
+            CreatePartition(target="events__2024_04", parent_name="events", bounds=MARCH, reason=Reason.CREATE_AHEAD),
+            TruncatePartition(target="events__2024_01", parent_name="events", reason=Reason.RETENTION_EXPIRED),
+            DropPartition(target="events__2023_12", reason=Reason.GRACE_ELAPSED),
+        ),
+    )
+    service.plan = AsyncMock(return_value=plan)  # type: ignore[method-assign]
+    service._executor.apply = AsyncMock(return_value=MaintenanceResult())  # type: ignore[method-assign]
+
+    # Act
+    await service.maintain(config, skip_detach=True)
+
+    # Assert
+    applied = service._executor.apply.call_args.args[1]
+    assert [op.kind.value for op in applied.operations] == ["create", "drop"]
 
 
 async def test__maintain__end_to_end__returns_counters_and_the_plan_it_executed(

@@ -92,6 +92,44 @@ of the other partitions carry on. That is what the move-and-attach of
 integration suite asserts it on PostgreSQL 15 through 18 with a writer inserting into the
 window while the attach runs.
 
+### Emptying in place versus a blocking detach (measured on 15.20, 16.16, 17.11 and 18.7, 2026-11-22)
+
+A monthly parent `ev` with `ev_10`, `ev_11`, `ev_12` and a DEFAULT partition, one statement
+held open in a transaction while a second session looks at `pg_locks` and a third writes
+with `lock_timeout = 1s`. All four versions agreed:
+
+| Held open | Locks it holds | Insert through `ev` into another partition | Read of another partition, pruned at plan time |
+|---|---|---|---|
+| `TRUNCATE ev_10` | `ACCESS EXCLUSIVE` and `SHARE` on `ev_10`, `ACCESS EXCLUSIVE` on its indexes; nothing on `ev` | done in about 1 ms | done in about 1 ms |
+| `ALTER TABLE ev DETACH PARTITION ev_11` (blocking, forced by the DEFAULT) | `ACCESS EXCLUSIVE` on `ev`, `ev_11`, its indexes and `ev_default` | `55P03` after the 1 s timeout | `55P03` after the 1 s timeout |
+
+An insert routed into `ev_10` itself waits for the truncate, as any query that reads `ev_10`
+does. So does a read pruned only when it runs, since it locks every partition first: with
+the truncate held open, `WHERE ts >= now() - interval '1 day'` hit the 1 s `lock_timeout`
+too (measured on 17.11).
+
+The same holds while the truncate is only queued. Measured on 17.11 and 18.7, 2026-11-23: a
+session that has read the expired partition keeps its transaction open, the truncate
+queues for its lock under `lock_timeout = 3000ms`, and 0.3 s later a `now()`-relative read
+of the current month took 2.7 s, until the truncate gave up with `55P03`. An insert into the
+current month took 1.6 ms. With a concurrent detach queued behind the same reader instead,
+the same read took 2 ms and the insert 1.8 ms. `TRUNCATE` of a sub-partitioned branch takes `ACCESS EXCLUSIVE` on the branch and on
+every leaf below it, and still nothing on the root.
+
+After `TRUNCATE` the main fork of every leaf is 0 bytes (`pg_relation_size`), while each
+index keeps its metapage; one row written afterwards brings the main fork back to 8192
+bytes, and deleting it and running `VACUUM` takes it back to 0. That is what the `EMPTY`
+fact reads. The integration suite asserts the writer half on every run: a truncate queued
+behind a reader of the expired partition holds no lock on the parent, and inserts through
+the parent into the current month go through while it waits.
+
+Logical replication carries the `TRUNCATE` of a partition (measured on 17.11, 2026-11-22,
+publisher and subscriber in two containers): with `CREATE PUBLICATION p FOR TABLE ev` and its
+defaults (`pubtruncate = true`, `publish_via_partition_root = false`), `TRUNCATE ev_10` on
+the publisher emptied `ev_10` on the subscriber, 100 rows to 0. After
+`ALTER PUBLICATION p SET (publish = 'insert, update, delete')` the same statement left the
+subscriber's 100 rows in place. `DETACH` and `DROP` are DDL and never replicate.
+
 ## Foreign tables
 
 - `CREATE FOREIGN TABLE … PARTITION OF parent` and `ATTACH PARTITION` of a foreign table are
@@ -157,6 +195,18 @@ drops foreign leaves with the statements above.
 
 The library translates `23503` on detach into `PartitionReferencedError`, records it as an
 issue and goes on; `Unreferenced()` keeps such partitions out of the plan.
+
+`TRUNCATE` is stricter than `DETACH` (measured on 15.20 and 18.7, 2026-11-22). It refuses
+any table that a foreign key of a table outside the truncation reaches, with `0A000 cannot
+truncate a table referenced in a foreign key constraint`, whether or not a row is actually
+referenced. Because the FK on the parent is cloned onto every partition with `confrelid`
+pointing at that partition, one FK on the parent blocks the truncate of every partition,
+empty ones included. A self-referencing FK on the parent blocks it too, since its
+referencing side is the parent, outside the truncation. An FK pointing directly at one
+partition blocks only that one. The `REFERENCING_TABLES` fact asks the same question of
+`pg_constraint` (keys into the relation's subtree whose referencing side is outside it), and
+the planner turns a positive answer into a `truncate_blocked` finding instead of a statement
+that can only fail.
 
 ### Referential actions on single-statement moves (verified on 15, 16, 17)
 

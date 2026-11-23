@@ -640,7 +640,7 @@ class DdlCounter:
     def __call__(self, _conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
         """SQLAlchemy ``before_cursor_execute`` hook."""
         normalized = " ".join(statement.split()).upper()
-        if normalized.startswith(("CREATE TABLE", "ALTER TABLE", "DROP TABLE", "COMMENT ON TABLE")):
+        if normalized.startswith(("CREATE TABLE", "ALTER TABLE", "DROP TABLE", "COMMENT ON TABLE", "TRUNCATE")):
             self.statements.append(normalized)
 
     @property

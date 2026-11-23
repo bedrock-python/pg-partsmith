@@ -61,6 +61,10 @@ class PartitionLifecycleHooks(Protocol):
 
     async def after_detach(self, event: PartitionEvent) -> None: ...
 
+    async def before_truncate(self, event: PartitionEvent) -> None: ...
+
+    async def after_truncate(self, event: PartitionEvent) -> None: ...
+
     async def before_drop(self, event: PartitionEvent) -> None: ...
 
     async def after_drop(self, event: PartitionEvent) -> None: ...
@@ -133,6 +137,29 @@ class BasePartitionLifecycleHooks:
 
         Args:
             event: The partition, now a standalone table.
+        """
+
+    async def before_truncate(self, event: PartitionEvent) -> None:
+        """Called before an expired partition is emptied in place (``expire=truncate``).
+
+        Where its rows are read or exported before they go. The partition is
+        still attached and takes writes until the truncate locks it, after this
+        hook returns, so a row written into the expired window in between is
+        emptied unread; an export that must see every row stops those writes
+        itself, or the table expires by detaching, where ``before_drop`` runs
+        on a table nothing writes to. Raising aborts the truncate; the
+        partition keeps its rows and the next run plans it again.
+
+        Args:
+            event: The partition about to be emptied, with the reason
+                retention gave for it.
+        """
+
+    async def after_truncate(self, event: PartitionEvent) -> None:
+        """Called after an expired partition has been emptied; it stays attached.
+
+        Args:
+            event: The partition, now empty.
         """
 
     async def before_drop(self, event: PartitionEvent) -> None:

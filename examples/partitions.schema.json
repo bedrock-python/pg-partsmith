@@ -131,6 +131,46 @@
           "description": "After it stands alone",
           "title": "After Detach"
         },
+        "before_truncate": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The last moment the rows of a partition emptied in place exist",
+          "title": "Before Truncate"
+        },
+        "after_truncate": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "$ref": "#/$defs/PythonHook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "After it is emptied, still attached",
+          "title": "After Truncate"
+        },
         "before_drop": {
           "anyOf": [
             {
@@ -444,7 +484,7 @@
         },
         "ddl_lock_timeout_ms": {
           "default": 3000,
-          "description": "lock_timeout for an attach, a row move or a detach",
+          "description": "lock_timeout for an attach, a row move, a detach or a truncate",
           "minimum": 0,
           "title": "Ddl Lock Timeout Ms",
           "type": "integer"

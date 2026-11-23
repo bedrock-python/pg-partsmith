@@ -42,6 +42,7 @@ __all__ = [
     "PartitionBy",
     "Reason",
     "Severity",
+    "TruncatePartition",
     "validate_plan_for_config",
 ]
 
@@ -52,6 +53,7 @@ class OperationKind(StrEnum):
     CREATE = "create"
     ATTACH = "attach"
     DETACH = "detach"
+    TRUNCATE = "truncate"
     DROP = "drop"
 
 
@@ -69,7 +71,9 @@ class Reason(StrEnum):
         LIST_GROUP_MISSING: A configured LIST group with no partition.
         LIST_DEFAULT_MISSING: The configured LIST catch-all with no partition.
         REATTACH: A detached orphan whose window is wanted again.
-        RETENTION_EXPIRED: The retention policy declared the window expired.
+        RETENTION_EXPIRED: The retention policy declared the window expired;
+            the partition is detached, or emptied in place under
+            ``expire=truncate``.
         DETACH_FINALIZE: An interrupted ``DETACH CONCURRENTLY`` is completed
             with ``FINALIZE``; the partition was already leaving.
         FOLLOWS_DETACH: Dropped in the same run as its detach (no grace).
@@ -167,6 +171,13 @@ class FindingReason(StrEnum):
             have no partition: history not yet moved, or rows written with a key
             outside every partition. Retention never reaches them;
             ``partition_data`` moves them into partitions of their own.
+        EXPIRED_EMPTY: Expired partitions a policy empties in place
+            (``expire=truncate``) that are empty already and stay attached. One
+            finding per parent, with the count, because the set only grows.
+        TRUNCATE_BLOCKED: An expired partition holding rows that cannot be
+            emptied in place: another table references it through a foreign
+            key, which ``TRUNCATE`` refuses without ``CASCADE``, or its subtree
+            holds a foreign table, whose ``TRUNCATE`` would empty the remote one.
     """
 
     LEGACY_LEAF = "legacy_leaf"
@@ -191,6 +202,8 @@ class FindingReason(StrEnum):
     DROP_DEFERRED = "drop_deferred"
     UNATTACHED_ROWS = "unattached_rows"
     ROWS_IN_DEFAULT = "rows_in_default"
+    EXPIRED_EMPTY = "expired_empty"
+    TRUNCATE_BLOCKED = "truncate_blocked"
 
 
 # Reasons that describe a healthy, deliberate state (policy evolution, a
@@ -208,6 +221,7 @@ _INFORMATIONAL_REASONS = frozenset(
         FindingReason.DETACH_PENDING,
         FindingReason.GRACE_PENDING,
         FindingReason.DROP_DEFERRED,
+        FindingReason.EXPIRED_EMPTY,
     }
 )
 
@@ -316,7 +330,7 @@ class OperationBase(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def is_destructive(self) -> bool:
-        """True for operations that remove a partition from service."""
+        """True for operations that take a partition out of service or destroy its rows."""
         return False
 
     def describe(self) -> str:
@@ -465,6 +479,40 @@ class DetachPartition(OperationBase):
         return True
 
 
+class TruncatePartition(OperationBase):
+    """Empty an expired partition in place, subtree included, and leave it attached.
+
+    Attributes:
+        parent_name: The parent it stays attached to.
+        bounds: How it is bound in the parent, for hook context.
+    """
+
+    kind_name: Literal["truncate"] = Field(default="truncate", alias="kind")
+    parent_name: StrippedNonEmptyStr
+    bounds: PartitionBounds | None = None
+
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    @property
+    def kind(self) -> OperationKind:
+        """TRUNCATE."""
+        return OperationKind.TRUNCATE
+
+    @property
+    def capabilities(self) -> OperationCapabilities:
+        """Transactional; ACCESS EXCLUSIVE on the partition and its subtree, nothing on the parent."""
+        return OperationCapabilities(
+            transactional=True,
+            lock="ACCESS EXCLUSIVE on the partition and every relation below it; nothing on the parent, so "
+            "writers to the other partitions do not wait",
+        )
+
+    @property
+    def is_destructive(self) -> bool:
+        """It destroys data."""
+        return True
+
+
 class DropPartition(OperationBase):
     """Drop a detached, marker-tagged orphan.
 
@@ -503,7 +551,7 @@ class DropPartition(OperationBase):
 
 
 Operation = Annotated[
-    CreatePartition | AttachPartition | DetachPartition | DropPartition,
+    CreatePartition | AttachPartition | DetachPartition | TruncatePartition | DropPartition,
     Field(discriminator="kind_name"),
 ]
 """Any planned operation, discriminated on ``kind``."""
@@ -513,7 +561,8 @@ class MaintenancePlan(BaseModel):
     """Everything one maintenance run is going to do to one table.
 
     Operations are ordered as they must execute: creations and re-attachments
-    first (each with its subtree nested inside it), then detaches, then drops.
+    first (each with its subtree nested inside it), then detaches and truncates,
+    then drops.
 
     Attributes:
         table_name: Schema-qualified root.
@@ -559,6 +608,11 @@ class MaintenancePlan(BaseModel):
     def detaches(self) -> tuple[DetachPartition, ...]:
         """Detaches."""
         return tuple(op for op in self.operations if isinstance(op, DetachPartition))
+
+    @property
+    def truncates(self) -> tuple[TruncatePartition, ...]:
+        """Partitions emptied in place."""
+        return tuple(op for op in self.operations if isinstance(op, TruncatePartition))
 
     @property
     def drops(self) -> tuple[DropPartition, ...]:

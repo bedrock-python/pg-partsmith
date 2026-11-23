@@ -67,7 +67,7 @@ def _plan_metrics(lines: list[str], tables: list[dict[str, Any]]) -> None:
         plan = entry.get("plan") or {}
         operations = plan.get("operations", [])
         counted = Counter(str(op.get("kind", "unknown")) for op in operations)
-        for kind in ("create", "attach", "detach", "drop"):
+        for kind in ("create", "attach", "detach", "truncate", "drop"):
             pending.append(({"table": table, "kind": kind}, counted.get(kind, 0)))
         relations.append(({"table": table}, _relation_count(operations)))
         by_severity = Counter(str(f.get("severity", "unknown")) for f in plan.get("findings", []))
@@ -133,7 +133,7 @@ def _apply_metrics(lines: list[str], tables: list[dict[str, Any]]) -> None:
     for entry in tables:
         table = str(entry.get("table", ""))
         result = entry.get("result") or {}
-        for name in ("created", "repaired", "attached", "detached", "dropped"):
+        for name in ("created", "repaired", "attached", "detached", "truncated", "dropped"):
             applied.append(({"table": table, "operation": name}, result.get(f"{name}_count", 0)))
         issues.append(({"table": table}, len(result.get("issues", []))))
 

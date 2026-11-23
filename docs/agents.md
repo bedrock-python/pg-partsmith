@@ -33,7 +33,8 @@ a method that sounds plausible.
 ## Scope
 
 **It does** keep the partitions of a partitioned table in the shape you declare: create
-ahead of the cursor, fill gaps in a set, detach what expired, drop after a grace period.
+ahead of the cursor, fill gaps in a set, detach what expired (or empty it in place), drop
+after a grace period.
 It reads the tree from the catalog, produces a plan you can inspect before applying it,
 and moves rows in batches into partitions (`partition_data`) or back out into one table
 (`unpartition`).
@@ -56,8 +57,8 @@ A configuration is a **scheme** — the shape of the tree, level by level — an
   the locks, the service and the maintainer around one engine, giving each setting that
   belongs to two of them (`marker_prefix`, `ddl_timezone`, `boundary_codec`) exactly once.
 * `pg-partsmith` (extra `cli`) runs `inspect` / `plan` / `validate` / `apply` / `backfill`
-  over a document and a DSN. The first three issue no DDL; `apply` withholds detaches and
-  drops unless `--allow-destructive`. `backfill` is `partition_data` from the command line —
+  over a document and a DSN. The first three issue no DDL; `apply` withholds detaches,
+  truncates and drops unless `--allow-destructive`. `backfill` is `partition_data` from the command line —
   the one-off migration of a DEFAULT partition's rows into the partitions they belong in,
   `--batch-rows` / `--max-batches`, exiting 2 while anything is left to move. `plan --save FILE` writes the artifact `apply --plan FILE`
   reads back, and applying it is refused if it was made for another table or under a
@@ -212,9 +213,10 @@ TablePartitionConfig(
 ```
 
 `LifecyclePolicy()` with no arguments is `CreateAhead(6)`, `KeepNewest(12)`,
-`DetachMode.AUTO`, `DropAfter(grace=timedelta(days=7))`: **an expired partition stays
-detached for a week, then is dropped** (rule 8). `DropAfter()` with no grace drops in the
-same run as the detach; pass `drop=DropNever()` if detached tables should be kept.
+`ExpireAction.DETACH`, `DetachMode.AUTO`, `DropAfter(grace=timedelta(days=7))`: **an
+expired partition stays detached for a week, then is dropped** (rule 8). `DropAfter()` with
+no grace drops in the same run as the detach; pass `drop=DropNever()` if detached tables
+should be kept.
 
 ### Levels
 
@@ -242,6 +244,7 @@ Nesting is `child=`, up to five levels including the root.
 |---|---|
 | `creation` | `CreateAhead(count)`, `CreateUntil(position)`, `CreateNextIf(when)` |
 | `retention` | `KeepNewest(count)`, `KeepFor(age)`, `KeepBehind(distance)`, `ExpireIf(when)` |
+| `expire` | `ExpireAction.DETACH` (default), `.TRUNCATE`: empty the expired partition in place and leave it attached; locks the partition only, never the parent; `expire: truncate` in a document |
 | `detach` | `DetachMode.AUTO` (concurrent where PostgreSQL allows), `.CONCURRENT`, `.BLOCKING` |
 | `drop` | `DropAfter(grace, when=None)`, `DropNever()` |
 | predicates | `SizeAbove(bytes)`, `RowsAbove(rows)`, `WindowAgeAbove(age)`, `Unreferenced()`, `SqlPredicate(sql)`, `Callback(fn, facts, label)` |
@@ -293,8 +296,8 @@ error (`LockLostError`).
 `EXPLICIT` (only the windows named in `windows=`).
 
 On a `MaintenancePlan`: `.operations`, `.findings`, `.cursors`, `.generated_at`,
-`.config_fingerprint`, `.creates` / `.attaches` / `.detaches` / `.drops`, `.is_noop`,
-`.only(*kinds)`, `.without(*kinds)`, `.describe()`. Filtering a plan and applying the rest
+`.config_fingerprint`, `.creates` / `.attaches` / `.detaches` / `.truncates` / `.drops`,
+`.is_noop`, `.only(*kinds)`, `.without(*kinds)`, `.describe()`. Filtering a plan and applying the rest
 is supported and is how you split creation from pruning across schedules.
 
 Every operation dumps its `capabilities` (the heaviest lock it takes, and whether it can
@@ -312,11 +315,11 @@ still the same intent.
 Results:
 
 * `MaintenanceResult` — `created_count`, `repaired_count`, `attached_count`,
-  `detached_count`, `dropped_count`, `duration_ms`, `error`, `issues`, `.success`,
-  `.maintenance_plan`.
+  `detached_count`, `truncated_count`, `dropped_count`, `duration_ms`, `error`, `issues`,
+  `.success`, `.maintenance_plan`.
 * `MigrationResult` — `rows_moved`, `batches`, `partitions`, `complete`, `issues`. Call
   again while `complete` is `False`.
-* `MaintenanceIssue` — `step` (`create` `reconcile` `attach` `detach` `drop` `move`),
+* `MaintenanceIssue` — `step` (`create` `reconcile` `attach` `detach` `truncate` `drop` `move`),
   `error` (`"TypeName: message"`), `partition_name`.
 
 ## Hooks
@@ -327,10 +330,11 @@ class ColdStorageHooks(BasePartitionLifecycleHooks):
         await export(event.partition.name)   # raising aborts this drop; it is retried next tick
 ```
 
-Nine methods, each taking one `PartitionEvent(phase, config, partition, window, operation)`:
+Eleven methods, each taking one `PartitionEvent(phase, config, partition, window, operation)`:
 `before_create` / `after_create`, `before_attach` / `after_attach` (a detached partition
-coming back), `before_detach` / `after_detach`, `before_drop` / `after_drop`, and
-`on_event`, which fires for every phase in addition to the named method.
+coming back), `before_detach` / `after_detach`, `before_truncate` / `after_truncate` (an
+expired partition emptied in place), `before_drop` / `after_drop`, and `on_event`, which
+fires for every phase in addition to the named method.
 `event.table_name` is the root; `event.operation.reason` says why the operation is in the
 plan; `event.window` is the period, or None for a member of a root HASH or LIST.
 `before_*` exceptions abort that operation; `after_*` exceptions are logged. Hooks fire for
@@ -383,7 +387,11 @@ lifecycle units — partitions directly under the root — never once per leaf o
     shadowing Pydantic's own `schema()`.
 13. **Names must fit 63 bytes with the suffix**, and the scheme may be five levels deep at
     most, root included.
-14. **Two maintainers are safe.** `apply`, `maintain`, `partition_data` and `unpartition`
+14. **`ExpireAction.TRUNCATE` cannot empty a partition a foreign key reaches.** PostgreSQL
+    refuses `TRUNCATE` of it whether or not a row is referenced, and a key on the parent is
+    cloned onto every partition. Such partitions are reported `truncate_blocked` and kept;
+    expire a referenced table with `ExpireAction.DETACH` and `Unreferenced()`.
+15. **Two maintainers are safe.** `apply`, `maintain`, `partition_data` and `unpartition`
     take the table's lock; the granular methods do not, and lost races are recognised and
     reported rather than retried into a failure.
 

@@ -176,7 +176,9 @@ class PartitionLifecycleService:
         Args:
             config: Table partitioning configuration.
             skip_create: Leave out creations and re-attachments.
-            skip_detach: Leave out detaches, and the drops that follow them.
+            skip_detach: Leave out what retention does to an expired partition:
+                its detach, and the drop that follows it, or its truncate under
+                ``expire=truncate``.
             skip_drop: Leave out drops.
             continue_on_error: Isolate operation failures instead of aborting
                 the run: a failed create still prunes (which may free the space
@@ -197,7 +199,7 @@ class PartitionLifecycleService:
         if skip_create:
             excluded.extend((OperationKind.CREATE, OperationKind.ATTACH))
         if skip_detach:
-            excluded.append(OperationKind.DETACH)
+            excluded.extend((OperationKind.DETACH, OperationKind.TRUNCATE))
         if skip_drop:
             excluded.append(OperationKind.DROP)
 
@@ -414,6 +416,9 @@ class PartitionLifecycleService:
     async def get_partitions_for_pruning(self, config: TablePartitionConfig) -> list[PartitionInfo]:
         """Return the partitions a maintenance run would detach or drop, oldest first.
 
+        A partition the policy empties in place (``expire=truncate``) is neither,
+        and is not listed: :meth:`maintain` empties it.
+
         Returns:
             Attached partitions retention has expired, followed by detached
             orphans past their grace.
@@ -567,6 +572,7 @@ def _merged(first: MaintenanceResult, second: MaintenanceResult) -> MaintenanceR
             "repaired_count": first.repaired_count + second.repaired_count,
             "attached_count": first.attached_count + second.attached_count,
             "detached_count": first.detached_count + second.detached_count,
+            "truncated_count": first.truncated_count + second.truncated_count,
             "dropped_count": first.dropped_count + second.dropped_count,
             "issues": first.issues + second.issues,
         }

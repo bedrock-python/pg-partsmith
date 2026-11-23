@@ -559,7 +559,7 @@ def test__partition_facts__negative_measurement__rejected(field: str) -> None:
 
 def test__fact_kind__names_what_the_introspector_can_measure() -> None:
     # Arrange / Act / Assert
-    assert {kind.value for kind in FactKind} == {"size", "rows", "references"}
+    assert {kind.value for kind in FactKind} == {"size", "rows", "references", "empty", "referencing_tables"}
 
 
 # -- PartitionNode --------------------------------------------------------------------------------

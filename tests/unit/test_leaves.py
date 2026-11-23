@@ -9,7 +9,7 @@ import pytest
 
 from pg_partsmith.entities import PartitionGranularity, TablePartitionConfig
 from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
-from pg_partsmith.lifecycle import CreateAhead, DropAfter, DropNever, KeepNewest, LifecyclePolicy
+from pg_partsmith.lifecycle import CreateAhead, DropAfter, DropNever, ExpireAction, KeepNewest, LifecyclePolicy
 from pg_partsmith.plan import FindingReason, MaintenancePlan, Reason
 from pg_partsmith.planner import PlanningContext, plan_maintenance
 from pg_partsmith.scheme import HashPartitioning
@@ -206,6 +206,26 @@ def test__plan__foreign_member_under_local_leaves__inspected_never_expired() -> 
 
     assert _reasons(plan) == [FindingReason.FOREIGN_PARTITION]
     assert plan.detaches == ()
+
+
+def test__plan__foreign_member_under_local_leaves__never_emptied_in_place() -> None:
+    lifecycle = LifecyclePolicy(
+        creation=CreateAhead(count=1), retention=KeepNewest(count=2), expire=ExpireAction.TRUNCATE
+    )
+    root = _root(_month(5, relkind=RelationKind.FOREIGN), _month(7), _month(8))
+
+    plan = _plan(_config(lifecycle=lifecycle), root)
+
+    assert _reasons(plan) == [FindingReason.FOREIGN_PARTITION]
+    assert plan.is_noop
+
+
+def test__config__foreign_leaves_emptied_in_place__refused() -> None:
+    # TRUNCATE of a foreign table empties the remote table behind it, which a drop never touches.
+    lifecycle = LifecyclePolicy(expire=ExpireAction.TRUNCATE)
+
+    with pytest.raises(ValueError, match="foreign leaves expire by detaching"):
+        _config(leaves=ForeignLeaves(server="archive"), lifecycle=lifecycle)
 
 
 def test__plan__foreign_member_under_foreign_leaves__expires_like_any_other() -> None:

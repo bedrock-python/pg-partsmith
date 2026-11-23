@@ -25,7 +25,8 @@ class AuditedRepository(PostgresPartitionRepository):
 
 Tuning knobs on the constructor: `ddl_timezone` (the session timezone `ATTACH` runs
 under, `"UTC"` by default), `ddl_timeout_seconds`, `ddl_lock_timeout_ms` (how long an
-attach, a row move or a blocking detach waits for a lock, while writers queue behind it),
+attach, a row move, a blocking detach or a truncate waits for a lock, while what needs that
+lock queues behind it),
 `marker_prefix`, the drop retry
 settings (`drop_lock_timeout_ms`, `drop_max_retries`, `drop_retry_delay`,
 `drop_max_backoff`), and `drop_allow_unmanaged` (leave it off).
@@ -38,6 +39,7 @@ class PartitionRepository(Protocol):
     async def create_foreign_table_like(self, template_name, table_name, *, server, options) -> None: ...
     async def attach_partition(self, parent_name, partition_name, bounds, *, key_arity=1) -> None: ...
     async def detach_partition(self, parent_name, partition_name, *, mode=DetachMode.AUTO) -> None: ...
+    async def truncate_partition(self, parent_name, partition_name, *, expected_oid=None) -> None: ...
     async def drop_partition(self, partition_name, *, expected_oid=None) -> None: ...
     async def adopt_partition(self, table_name, partition_name) -> bool: ...
     async def reconcile_default_rows(self, *, default_partition_name, target_partition_name, key_columns, from_value, to_value, limit=None) -> int: ...
@@ -97,6 +99,11 @@ The protocol's reads: `get_partition_type`, `get_partition_columns`, `get_actual
 False rather than an exception when it cannot read the bound, `get_unattached_tables`, the
 tables named under the root and attached to nothing, and `current_time`, the
 database's clock a plan is made against when the caller names no instant.
+
+`measure` answers the facts it is asked for. A policy with `expire=ExpireAction.TRUNCATE`
+asks for `FactKind.EMPTY` and `FactKind.REFERENCING_TABLES`; a provider that leaves them
+unanswered gets every expired partition truncated on every run, empty or not, and a
+referenced one refused by the repository at execution time instead of reported in the plan.
 
 ## A lock manager
 

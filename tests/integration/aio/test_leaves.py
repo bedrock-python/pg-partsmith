@@ -17,11 +17,13 @@ import pytest_asyncio
 from sqlalchemy import text
 
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
-from pg_partsmith.entities import Period
+from pg_partsmith.boundaries import TimeBoundaries
+from pg_partsmith.entities import MaintenanceIssueStep, PartitionGranularity, Period, TablePartitionConfig
 from pg_partsmith.exceptions import InvalidPartitionConfigError, PlanStaleError
 from pg_partsmith.leaves import ForeignLeaves, LocalLeaves
-from pg_partsmith.lifecycle import CreateAhead, DropAfter, KeepNewest, LifecyclePolicy
-from pg_partsmith.plan import FindingReason
+from pg_partsmith.lifecycle import CreateAhead, DropAfter, ExpireAction, KeepNewest, LifecyclePolicy
+from pg_partsmith.plan import FindingReason, OperationKind
+from pg_partsmith.scheme import HashPartitioning, RangePartitioning
 from pg_partsmith.utils import DETACHED_AT_MARKER
 from tests.integration.aio.support import (
     exec_sql,
@@ -48,8 +50,6 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
     from testcontainers.postgres import PostgresContainer
-
-    from pg_partsmith.entities import TablePartitionConfig
 
 pytestmark = pytest.mark.integration
 
@@ -326,6 +326,109 @@ async def test__foreign_leaves__under_a_local_config__the_same_foreign_partition
     assert result.maintenance_plan is not None
     assert [f.reason for f in result.maintenance_plan.findings] == [FindingReason.FOREIGN_PARTITION]
     assert await is_attached(db_engine, may)
+
+
+# A RANGE -> HASH table with no unique index, so a foreign table can be one of its buckets.
+TENANT_TABLE_DDL = """
+    CREATE TABLE {table} (
+        id BIGINT,
+        tenant_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+    ) PARTITION BY RANGE (created_at)
+"""
+
+
+@pytest_asyncio.fixture
+async def tenant_events(db_engine: AsyncEngine) -> AsyncGenerator[str, None]:
+    async for name in make_table(db_engine, TENANT_TABLE_DDL, prefix="tev"):
+        yield name
+
+
+def _emptying_tenant_config(table: str) -> TablePartitionConfig:
+    return TablePartitionConfig(
+        table_name=table,
+        scheme=RangePartitioning(
+            key="created_at",
+            boundaries=TimeBoundaries(granularity=PartitionGranularity.MONTH),
+            child=HashPartitioning(key="tenant_id", modulus=2),
+        ),
+        lifecycle=LifecyclePolicy(creation=CreateAhead(count=1), retention=KeepNewest(1), expire=ExpireAction.TRUNCATE),
+    )
+
+
+async def _fill_june(engine: AsyncEngine, table: str) -> None:
+    """June as a branch of two buckets, holding 20 rows across them."""
+    await run_maintenance(engine, _emptying_tenant_config(table), at_time="2026-06-15")
+    await exec_sql(engine, f"INSERT INTO \"{table}\" SELECT g, g, '2026-06-10' FROM generate_series(1, 20) g")  # noqa: S608
+
+
+async def _make_a_bucket_foreign(engine: AsyncEngine, table: str, server: str, *, name: str) -> str:
+    """June's remainder-1 bucket moved to a remote table and attached back as a foreign table."""
+    june, bucket, archive = f"{table}__2026_06", f"{table}__2026_06__h1", f"{table}_archive"
+    await exec_sql(engine, f'ALTER TABLE "{june}" DETACH PARTITION "{bucket}"')
+    await exec_sql(engine, f'CREATE TABLE "{archive}" AS SELECT * FROM "{bucket}"')  # noqa: S608
+    await exec_sql(engine, f'DROP TABLE "{bucket}"')
+    await exec_sql(
+        engine,
+        f'CREATE FOREIGN TABLE "{name}" PARTITION OF "{june}" FOR VALUES WITH (MODULUS 2, REMAINDER 1) '
+        f"SERVER {server} OPTIONS (table_name '{archive}')",
+    )
+    return archive
+
+
+async def test__expire_truncate__foreign_bucket_attached_after_the_plan__refused_and_the_remote_rows_stay(
+    db_engine: AsyncEngine, tenant_events: str, loopback: str
+) -> None:
+    # Arrange -- planned while June was local, then one of its buckets became a foreign table
+    config = _emptying_tenant_config(tenant_events)
+    await _fill_june(db_engine, tenant_events)
+    service = make_service(db_engine)
+    plan = await service.plan(config, now=datetime(2026, 8, 26, tzinfo=UTC))
+    assert [op.kind for op in plan.operations] == [OperationKind.CREATE, OperationKind.TRUNCATE]
+    archive = await _make_a_bucket_foreign(
+        db_engine, tenant_events, loopback, name=f"{tenant_events}__2026_06_archived"
+    )
+    held = await scalar(db_engine, f'SELECT count(*) FROM "{archive}"')  # noqa: S608
+    try:
+        # Act
+        result = await service.apply(config, plan)
+
+        # Assert -- found under the truncate's lock: an issue, nothing emptied, here or on the remote side
+        assert held > 0
+        assert result.truncated_count == 0
+        assert [(issue.step, issue.partition_name) for issue in result.issues] == [
+            (MaintenanceIssueStep.TRUNCATE, f"public.{tenant_events}__2026_06")
+        ]
+        assert "foreign table" in result.issues[0].error
+        assert await scalar(db_engine, f'SELECT count(*) FROM "{archive}"') == held  # noqa: S608
+        assert await scalar(db_engine, f'SELECT count(*) FROM "{tenant_events}"') == 20  # noqa: S608
+    finally:
+        await exec_sql(db_engine, f'DROP TABLE IF EXISTS "{archive}" CASCADE')
+
+
+async def test__expire_truncate__foreign_bucket_the_tree_cannot_show__refused_in_the_plan(
+    db_engine: AsyncEngine, tenant_events: str, loopback: str
+) -> None:
+    # Arrange -- a dot in the foreign bucket's name keeps it out of the tree the planner reads
+    await _fill_june(db_engine, tenant_events)
+    archive = await _make_a_bucket_foreign(
+        db_engine, tenant_events, loopback, name=f"{tenant_events}__2026_06.archived"
+    )
+    held = await scalar(db_engine, f'SELECT count(*) FROM "{archive}"')  # noqa: S608
+    try:
+        # Act
+        result = await run_maintenance(db_engine, _emptying_tenant_config(tenant_events), at_time=NOW)
+
+        # Assert
+        assert held > 0
+        assert result.truncated_count == 0
+        assert result.maintenance_plan is not None
+        assert result.maintenance_plan.truncates == ()
+        blocked = [f for f in result.maintenance_plan.findings if f.reason is FindingReason.TRUNCATE_BLOCKED]
+        assert [f.partition_name for f in blocked] == [f"public.{tenant_events}__2026_06"]
+        assert await scalar(db_engine, f'SELECT count(*) FROM "{archive}"') == held  # noqa: S608
+    finally:
+        await exec_sql(db_engine, f'DROP TABLE IF EXISTS "{archive}" CASCADE')
 
 
 async def test__foreign_leaves__parent_with_a_primary_key__refused_before_any_ddl(

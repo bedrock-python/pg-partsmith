@@ -21,6 +21,7 @@ from pg_partsmith.catalog_queries import (
     PARTITION_STRATEGY_SQL,
     PARTITION_TREE_SQL,
     PARTITION_UPPER_BOUND_SQL,
+    REFERENCING_TABLES_SQL,
     RELATION_EXISTS_SQL,
     RELATION_KIND_SQL,
     RELATION_OID_SQL,
@@ -208,8 +209,9 @@ class PostgresMetadataProvider:
     ) -> ActualTree:
         """Return ``tree`` with facts attached to the named targets.
 
-        Sizes and row estimates come in one query for every target;
-        each SQL predicate is asked once per target.
+        Sizes, row estimates and emptiness come in one query for every target,
+        and so do the tables referencing each target; each SQL predicate is
+        asked once per target.
 
         Args:
             tree: The tree to annotate.
@@ -375,11 +377,21 @@ class PostgresMetadataProvider:
             return {}
 
         sizes: dict[int, tuple[int, int]] = {}
-        if FactKind.SIZE in facts or FactKind.ROWS in facts:
+        heaps: dict[int, int] = {}
+        if facts & {FactKind.SIZE, FactKind.ROWS, FactKind.EMPTY}:
             with self._engine.connect() as conn:
                 result = conn.execute(text(PARTITION_FACTS_SQL), {"oids": list(oids.values())})
                 for row in result.fetchall():
                     sizes[int(row.oid)] = (int(row.size_bytes or 0), int(row.row_estimate or 0))
+                    if FactKind.EMPTY in facts:
+                        heaps[int(row.oid)] = int(row.heap_bytes or 0)
+
+        referencing: dict[int, tuple[str, ...]] = {}
+        if FactKind.REFERENCING_TABLES in facts:
+            with self._engine.connect() as conn:
+                result = conn.execute(text(REFERENCING_TABLES_SQL), {"oids": list(oids.values())})
+                for row in result.fetchall():
+                    referencing[int(row.oid)] = tuple(sorted(str(name) for name in row.referencing or ()))
 
         foreign_keys: list[_ForeignKey] = []
         if FactKind.REFERENCES in facts:
@@ -404,6 +416,8 @@ class PostgresMetadataProvider:
                 size_bytes=size if FactKind.SIZE in facts else None,
                 row_estimate=rows if FactKind.ROWS in facts else None,
                 referenced=referenced_here,
+                empty=heaps.get(oid, 0) == 0 if FactKind.EMPTY in facts else None,
+                referencing_tables=referencing.get(oid, ()) if FactKind.REFERENCING_TABLES in facts else None,
                 predicates=answers,
             )
         return measured

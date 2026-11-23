@@ -128,6 +128,30 @@ and retention then treats that partition like any other. The finding names the e
 window. Rows of a window the same plan creates are left to its attach, and rows dated ahead
 of the cursor to the run that reaches them, so neither is reported.
 
+## `truncate_blocked`: an expired partition that cannot be emptied in place
+
+```text
+[warning] truncate_blocked: public.events__2025_06 expired and holds rows, but another table references it through a foreign key (public.refunds), and PostgreSQL refuses TRUNCATE of a referenced table without CASCADE, which this library never issues; drop the foreign key, or expire by detaching with Unreferenced().
+```
+
+Only under `expire=truncate`. PostgreSQL refuses `TRUNCATE` of a partition any foreign key
+reaches, rows or no rows, and a key on the parent reaches every partition, so the finding
+comes back on every run while the key exists and `plan --check` exits 3. Drop the key, or
+expire the table by detaching with `Unreferenced()` in the retention rule
+([Handle foreign keys](foreign-keys.md#emptying-in-place-is-refused-outright)). The same
+reason covers a subtree holding a foreign table, whose remote table `TRUNCATE` would empty,
+and one with a child whose name has a dot in it, which the tree cannot show: detach it, or
+take the foreign table out. Found at execution time instead, because it appeared after the
+plan was made, it is an issue with the same reason, and the run goes on.
+
+## `expired_empty` (INFO)
+
+Under `expire=truncate`, how many expired partitions a parent keeps attached and empty, and
+the oldest of them. Expected: emptying in place never takes a partition out of the tree.
+The number only grows, and every partition costs planning time and locks on queries that
+are not pruned at plan time ([Lifecycle policies](../concepts/lifecycle.md#empty-in-place-instead-of-detaching)
+has the numbers). Switching `expire` to `detach` retires them through the drop policy.
+
 ## `grace_pending`, `drop_deferred` (INFO)
 
 A detached orphan waiting out its grace period, or one whose `DropAfter(when=…)`
@@ -241,8 +265,8 @@ Seen directly only when calling the repository yourself.
 
 ## `a lock this step needs was not granted within ddl_lock_timeout_ms`
 
-An issue on the result, not an exception: an attach, a row move or a blocking detach
-waited `ddl_lock_timeout_ms` for a lock another session holds — usually a long
+An issue on the result, not an exception: an attach, a row move, a blocking detach or a
+truncate waited `ddl_lock_timeout_ms` for a lock another session holds — usually a long
 transaction reading or writing the table — and gave up rather than keep every writer
 waiting behind it. Nothing was changed; the next run tries again. If it keeps happening,
 find the transaction in `pg_stat_activity`. Raising the setting trades the chance of

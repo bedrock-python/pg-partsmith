@@ -12,14 +12,14 @@ result = await maintainer.run_maintenance_safe(config)
 | Field | Meaning | Alert? |
 |---|---|---|
 | `result.success` / `result.error` | the run failed as a whole: configuration mismatch, lock unavailable, connection lost | on `error`, except `LockAcquisitionError`, which means another replica ran |
-| `result.created_count`, `attached_count`, `detached_count`, `dropped_count`, `repaired_count` | what changed | export as metrics |
+| `result.created_count`, `attached_count`, `detached_count`, `truncated_count`, `dropped_count`, `repaired_count` | what changed | export as metrics |
 | `result.duration_ms` | how long it took | export; a jump usually means a slow attach against a full DEFAULT partition or a lock wait |
 | `result.issues` | per-partition problems in a run that otherwise went through | yes — and expect repeats until someone acts |
 | `result.plan` | the plan that was executed, findings included | log at debug |
 
 ## Issues
 
-An issue has a `step` — `create`, `reconcile`, `attach`, `detach`, `drop`, `move` —
+An issue has a `step` — `create`, `reconcile`, `attach`, `detach`, `truncate`, `drop`, `move` —
 a `partition_name` and an `error` string that starts with the exception type:
 
 ```text

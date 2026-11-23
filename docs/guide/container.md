@@ -74,6 +74,10 @@ GRANT USAGE, CREATE ON SCHEMA public TO partsmith;
 -- it maintains, or is a member of the role that does.
 ALTER TABLE public.events OWNER TO partsmith;
 -- or: GRANT app_owner TO partsmith;
+
+-- expire: truncate needs TRUNCATE on every partition it empties. Changing the parent's
+-- owner does not change the owner of partitions that already exist.
+GRANT TRUNCATE ON public.events__2025_11, public.events__2025_12 TO partsmith;
 ```
 
 The minimum is narrower for the read-only commands: `inspect`, `plan` and `validate` need

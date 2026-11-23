@@ -30,10 +30,11 @@ Operations are typed, ordered as they must execute, and nested where order matte
 | `CreatePartition` | create a partition, build its subtree, attach it | `parent_name`, `bounds`, `partition_by` (for a branch), `children`, `counts_as` |
 | `AttachPartition` | re-attach a detached orphan whose window is wanted again | `parent_name`, `bounds` |
 | `DetachPartition` | detach an expired partition, subtree included | `parent_name`, `mode`, `oid` |
+| `TruncatePartition` | empty an expired partition in place, subtree included, under `expire=truncate` | `parent_name`, `oid`, `bounds` |
 | `DropPartition` | drop a detached, marker-tagged orphan | `oid`, `detached_at`, `follows_detach`, `bounds` |
 
 Creations come first (each with its subtree inside it), then re-attachments, then
-detaches, then drops. Every operation records:
+detaches and truncates, then drops. Every operation records:
 
 - its **reason** — why it is in the plan: `create_ahead`, `create_until`, `create_next`,
   `explicit`, `subtree`, `hash_gap`, `hash_gap_historical_modulus`, `list_group_missing`,
@@ -46,8 +47,9 @@ detaches, then drops. Every operation records:
 - its **capabilities**: whether the statement may run inside a transaction block
   (`DETACH … CONCURRENTLY` may not) and the heaviest lock it takes, as measured.
 
-`plan.creates`, `plan.attaches`, `plan.detaches`, `plan.drops` are the typed views;
-`plan.relation_count` counts every relation the plan would create, subtrees included.
+`plan.creates`, `plan.attaches`, `plan.detaches`, `plan.truncates`, `plan.drops` are the
+typed views; `plan.relation_count` counts every relation the plan would create, subtrees
+included.
 
 ## Findings
 
@@ -92,7 +94,8 @@ MaintenancePlan.model_validate(payload)               # and back
 
 Removing the detaches also removes the drops that follow them — a partition that is not
 detached this run cannot be dropped this run. The `skip_create` / `skip_detach` /
-`skip_drop` flags of `maintain()` are these filters.
+`skip_drop` flags of `maintain()` are these filters; `skip_detach` leaves out the truncates
+as well, since a truncate is what retention does in place of the detach.
 
 The JSON form is what a CLI, a dashboard or an audit log would store. A plan carries the
 instant it was made (`generated_at`), the cursors it was made against, every operation

@@ -12,11 +12,16 @@ from pg_partsmith.aio.lock.postgres import PostgresAdvisoryLockManager
 from pg_partsmith.aio.metadata import PostgresMetadataProvider
 from pg_partsmith.aio.repositories import PostgresPartitionRepository
 from pg_partsmith.entities import PartitionType, TablePartitionConfig
-from pg_partsmith.exceptions import LockAcquisitionError, PartitionAlreadyExistsError, UnmanagedPartitionDropError
+from pg_partsmith.exceptions import (
+    LockAcquisitionError,
+    PartitionAlreadyExistsError,
+    PlanStaleError,
+    UnmanagedPartitionDropError,
+)
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import PartitionBy
 from pg_partsmith.topology import HashBounds, RangeBounds
-from tests.integration.aio.support import make_table, table_comment
+from tests.integration.aio.support import exec_sql, make_table, scalar, table_comment
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config, orphan_marker
 
 if TYPE_CHECKING:
@@ -119,6 +124,28 @@ async def test__repository__attach_partition__makes_it_visible_in_list(
     assert "2024-02-01" in attached[0].from_value
     assert attached[0].oid is not None
     assert attached[0].subpartition_type is None
+
+
+async def test__repository__truncate_partition__a_detached_table_of_that_name__refused_and_kept(
+    db_engine: AsyncEngine, config: TablePartitionConfig
+) -> None:
+    # Arrange -- detached by an earlier run and waiting out its grace, where it can still be inspected
+    repo = PostgresPartitionRepository(db_engine)
+    partition_name = f"{config.table_name}__2024_03"
+    await repo.create_table_like(config.table_name, partition_name, None)
+    await repo.attach_partition(
+        config.table_name, partition_name, RangeBounds(from_value="2024-03-01", to_value="2024-04-01")
+    )
+    await exec_sql(
+        db_engine,
+        f"INSERT INTO \"{config.table_name}\" (created_at, payload) VALUES ('2024-03-10', 'kept')",  # noqa: S608
+    )
+    await repo.detach_partition(config.table_name, partition_name, mode=DetachMode.BLOCKING)
+
+    # Act / Assert -- no identity to check, and still refused: TRUNCATE itself names no parent
+    with pytest.raises(PlanStaleError, match="not attached"):
+        await repo.truncate_partition(config.table_name, partition_name)
+    assert await scalar(db_engine, f'SELECT count(*) FROM "{partition_name}"') == 1  # noqa: S608
 
 
 async def test__repository__detach_and_drop__removes_partition_from_catalog(

@@ -8,7 +8,12 @@ import pytest
 from sqlalchemy import text
 
 from pg_partsmith.entities import PartitionType, TablePartitionConfig
-from pg_partsmith.exceptions import LockAcquisitionError, PartitionAlreadyExistsError, UnmanagedPartitionDropError
+from pg_partsmith.exceptions import (
+    LockAcquisitionError,
+    PartitionAlreadyExistsError,
+    PlanStaleError,
+    UnmanagedPartitionDropError,
+)
 from pg_partsmith.lifecycle import DetachMode
 from pg_partsmith.plan import PartitionBy
 from pg_partsmith.sync.lock.postgres import PostgresAdvisoryLockManager
@@ -16,7 +21,7 @@ from pg_partsmith.sync.metadata import PostgresMetadataProvider
 from pg_partsmith.sync.repositories import PostgresPartitionRepository
 from pg_partsmith.topology import HashBounds, RangeBounds
 from tests.integration.nested_support import MONTHLY_TABLE_DDL, monthly_config, orphan_marker
-from tests.integration.sync.support import make_table, table_comment
+from tests.integration.sync.support import exec_sql, make_table, scalar, table_comment
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -117,6 +122,28 @@ def test__repository__attach_partition__makes_it_visible_in_list(
     assert "2024-02-01" in attached[0].from_value
     assert attached[0].oid is not None
     assert attached[0].subpartition_type is None
+
+
+def test__repository__truncate_partition__a_detached_table_of_that_name__refused_and_kept(
+    sync_db_engine: Engine, config: TablePartitionConfig
+) -> None:
+    # Arrange -- detached by an earlier run and waiting out its grace, where it can still be inspected
+    repo = PostgresPartitionRepository(sync_db_engine)
+    partition_name = f"{config.table_name}__2024_03"
+    repo.create_table_like(config.table_name, partition_name, None)
+    repo.attach_partition(
+        config.table_name, partition_name, RangeBounds(from_value="2024-03-01", to_value="2024-04-01")
+    )
+    exec_sql(
+        sync_db_engine,
+        f"INSERT INTO \"{config.table_name}\" (created_at, payload) VALUES ('2024-03-10', 'kept')",  # noqa: S608
+    )
+    repo.detach_partition(config.table_name, partition_name, mode=DetachMode.BLOCKING)
+
+    # Act / Assert -- no identity to check, and still refused: TRUNCATE itself names no parent
+    with pytest.raises(PlanStaleError, match="not attached"):
+        repo.truncate_partition(config.table_name, partition_name)
+    assert scalar(sync_db_engine, f'SELECT count(*) FROM "{partition_name}"') == 1  # noqa: S608
 
 
 def test__repository__detach_and_drop__removes_partition_from_catalog(

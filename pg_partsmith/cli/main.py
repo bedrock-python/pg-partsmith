@@ -286,7 +286,7 @@ def apply(
         bool,
         typer.Option(
             "--allow-destructive",
-            help="carry out detaches and drops as well; without it, only partitions are created",
+            help="carry out detaches, truncates and drops as well; without it, only partitions are created",
         ),
     ] = False,
     continue_on_error: Annotated[

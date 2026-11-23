@@ -1401,3 +1401,47 @@ async def test__measure__references_and_sizes__both_queries_run() -> None:
 
     # Assert
     assert measured.root.children[0].facts == PartitionFacts(size_bytes=10, referenced=False)
+
+
+async def test__measure__empty_requested__read_from_the_heap_bytes_of_the_same_facts_query() -> None:
+    # Arrange: January was emptied (no heap page left), the orphan still holds a page
+    engine = _make_engine(
+        [
+            SimpleNamespace(oid=101, size_bytes=16384, row_estimate=0, heap_bytes=0),
+            SimpleNamespace(oid=500, size_bytes=24576, row_estimate=3, heap_bytes=8192),
+        ]
+    )
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = await provider.measure(
+        _sample_tree(),
+        targets=("public.events__2024_01", "public.events__2023_12"),
+        facts=frozenset({FactKind.EMPTY}),
+    )
+
+    # Assert
+    assert _conn(engine).execute.await_count == 1
+    assert "heap_bytes" in _statements(engine)[0]
+    assert measured.root.children[0].facts == PartitionFacts(empty=True)
+    assert measured.orphans[0].facts == PartitionFacts(empty=False)
+
+
+async def test__measure__referencing_tables_requested__one_query_naming_the_referencing_tables() -> None:
+    # Arrange: two keys reach January; nothing reaches the orphan
+    engine = _make_engine([SimpleNamespace(oid=101, referencing=["public.refunds", "public.audit"])])
+    provider = PostgresMetadataProvider(engine)
+
+    # Act
+    measured = await provider.measure(
+        _sample_tree(),
+        targets=("public.events__2024_01", "public.events__2023_12"),
+        facts=frozenset({FactKind.REFERENCING_TABLES}),
+    )
+
+    # Assert
+    assert _conn(engine).execute.await_count == 1
+    assert "pg_partition_tree" in _statements(engine)[0]
+    assert _conn(engine).execute.call_args.args[1] == {"oids": [101, 500]}
+    assert measured.root.children[0].facts == PartitionFacts(referencing_tables=("public.audit", "public.refunds"))
+    assert measured.orphans[0].facts == PartitionFacts(referencing_tables=())

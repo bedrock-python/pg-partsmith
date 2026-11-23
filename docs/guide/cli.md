@@ -27,7 +27,7 @@ has anything sensible to do: see [Adopting a table full of data](#adopting-a-tab
 | all five | `-c/--config FILE` (required), `--dsn`, `--table NAME` (repeatable), `-o/--output human\|json\|metrics`, `--write FILE` (the output, into a file, atomically), `-v/--verbose` |
 | `plan` | `--check` exit `2` on pending operations · `--save FILE` write the plan · `--locks` print what each operation locks |
 | `backfill` | `--batch-rows N` rows per statement (default 10000) · `--max-batches N` stop after N statements and exit `2` · `--allow-hooks` · `--ok-if-locked` |
-| `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks · `--ok-if-locked` exit `0` rather than `6` on a held lock |
+| `apply` | `--plan FILE` apply a saved plan · `--allow-destructive` detach, truncate and drop too · `--continue-on-error` isolate a failed operation · `--allow-config-drift` apply a plan whose document changed · `--allow-hooks` run the document's hooks · `--ok-if-locked` exit `0` rather than `6` on a held lock |
 | `schema` | no flags: prints the document's JSON Schema for an editor |
 | global | `--version` · `--install-completion` · `--show-completion` · `-h/--help` on anything |
 
@@ -259,7 +259,8 @@ pg-partsmith apply -c partitions.yaml --allow-destructive    # …and retire wha
 ```
 
 **Destructive operations are withheld unless you ask for them.** Without
-`--allow-destructive`, `apply` creates and re-attaches, and detaches and drops nothing.
+`--allow-destructive`, `apply` creates and re-attaches, and detaches, truncates and drops
+nothing.
 That is deliberate: the safe behaviour is the default one rather than a second mode
 somebody has to remember to select, and it is exactly what an init container wants —
 create the partitions the application is about to write into, retire nothing at startup.

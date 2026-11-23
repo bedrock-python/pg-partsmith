@@ -45,7 +45,7 @@ class PartitionMaintainer:
         Args:
             config: Table partition configuration.
             skip_create: Skip creating future partitions.
-            skip_detach: Skip detaching old partitions.
+            skip_detach: Skip detaching, or emptying in place, expired partitions.
             skip_drop: Skip dropping detached partitions.
             continue_on_error: Isolate step failures into ``result.issues``
                 instead of aborting the run (see ``maintain_lifecycle``).
@@ -88,6 +88,7 @@ class PartitionMaintainer:
                     "table_name": qualified_table,
                     "created_count": result.created_count,
                     "detached_count": result.detached_count,
+                    "truncated_count": result.truncated_count,
                     "dropped_count": result.dropped_count,
                     "duration_ms": duration_ms,
                     "duration": format_duration_ms(duration_ms),
@@ -162,7 +163,7 @@ class PartitionMaintainer:
         Args:
             config: Table partitioning configuration.
             skip_create: Skip creating future partitions.
-            skip_detach: Skip detaching old partitions.
+            skip_detach: Skip detaching, or emptying in place, expired partitions.
             skip_drop: Skip dropping detached partitions.
             continue_on_error: Isolate step failures into ``result.issues``
                 instead of aborting the run (see ``maintain_lifecycle``).
